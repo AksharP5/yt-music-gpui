@@ -60,6 +60,48 @@ impl From<PlaybackSpeed> for f64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioQuality {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl AudioQuality {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Normal, Self::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::High => "High",
+        }
+    }
+
+    fn selector(self) -> &'static str {
+        // yt-dlp exposes YouTube's audioQuality in format_note. Its VBR streams
+        // can exceed the nominal bitrate, so prefer the service's quality class.
+        match self {
+            Self::Low => {
+                "bestaudio[format_note~='(^|, )(ultralow|low)(,|$)']/bestaudio[abr<=64]/worstaudio/best"
+            }
+            Self::Normal => {
+                "bestaudio[format_note~='(^|, )(ultralow|low|medium)(,|$)']/bestaudio[abr<=128]/bestaudio/best"
+            }
+            Self::High => "bestaudio/best",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlayOptions {
+    pub quality: AudioQuality,
+    pub start: f64,
+    pub paused: bool,
+}
+
 pub struct PlayerOptions {
     pub credentials: Option<PlaybackCredentials>,
     pub volume: f64,
@@ -80,11 +122,9 @@ impl Default for PlayerOptions {
 
 #[derive(Debug)]
 pub enum PlayerEvent {
-    Loading {
-        track_id: u64,
-    },
     Started {
         track_id: u64,
+        paused: bool,
     },
     Position {
         track_id: u64,
@@ -118,7 +158,9 @@ enum PlayerCommand {
         track_id: u64,
         url: String,
         title: String,
+        options: PlayOptions,
     },
+    Pause(bool),
     Json(Value),
     Credentials(Option<PlaybackCredentials>),
     Stop,
@@ -152,7 +194,7 @@ impl Player {
         })
     }
 
-    pub fn play(&self, video_id: &str, title: &str) -> Result<u64> {
+    pub fn play(&self, video_id: &str, title: &str, options: PlayOptions) -> Result<u64> {
         if video_id.len() != 11
             || !video_id
                 .bytes()
@@ -163,15 +205,21 @@ impl Player {
         self.play_url(
             format!("https://music.youtube.com/watch?v={video_id}"),
             title,
+            options,
         )
     }
 
-    fn play_url(&self, url: String, title: &str) -> Result<u64> {
+    fn play_url(&self, url: String, title: &str, options: PlayOptions) -> Result<u64> {
+        ensure!(
+            options.start.is_finite() && options.start >= 0.,
+            "Invalid playback start position."
+        );
         let track_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.send(PlayerCommand::Play {
             track_id,
             url,
             title: title.to_owned(),
+            options,
         })?;
         Ok(track_id)
     }
@@ -182,12 +230,8 @@ impl Player {
     pub fn clear_cookies(&self) -> Result<()> {
         self.send(PlayerCommand::Credentials(None))
     }
-    pub fn toggle_pause(&self) -> Result<()> {
-        self.command(json!(["cycle", "pause"]))
-    }
-    #[cfg(test)]
     pub fn pause(&self, paused: bool) -> Result<()> {
-        self.command(json!(["set_property", "pause", paused]))
+        self.send(PlayerCommand::Pause(paused))
     }
     pub fn stop(&self) -> Result<()> {
         self.send(PlayerCommand::Stop)
@@ -238,16 +282,35 @@ impl Drop for Process {
     }
 }
 
-fn write_command(socket: &mut UnixStream, command: Value, request_id: Option<u64>) -> Result<()> {
+fn write_command(socket: &mut UnixStream, command: Value, request_id: Option<Value>) -> Result<()> {
     let mut message = json!({ "command": command });
     if let Some(id) = request_id {
-        message["request_id"] = json!(id);
+        message["request_id"] = id;
     }
     let mut bytes = serde_json::to_vec(&message)?;
     bytes.push(b'\n');
     socket
         .write_all(&bytes)
         .context("Could not send the command to mpv")
+}
+
+fn write_pause(socket: &mut UnixStream, paused: bool, revision: u64) -> Result<()> {
+    write_command(socket, json!(["set_property", "pause", paused]), None)?;
+    // A no-op set produces no property-change; always acknowledge the latest intent.
+    write_command(
+        socket,
+        json!(["get_property", "pause"]),
+        Some(json!(format!("pause:{revision}"))),
+    )
+}
+
+fn load_command(url: &str, title: &str, options: PlayOptions) -> Value {
+    json!(["loadfile", url, "replace", -1, {
+        "force-media-title": title,
+        "ytdl-format": options.quality.selector(),
+        "start": options.start.to_string(),
+        "pause": if options.paused { "yes" } else { "no" },
+    }])
 }
 
 fn writable_playback_cookies(mut source: File) -> Result<File> {
@@ -268,7 +331,7 @@ fn request(
     mut on_event: impl FnMut(Value),
 ) -> Result<Value> {
     // Track requests start at one. Zero is reserved for synchronous control changes.
-    write_command(socket, command, Some(0))?;
+    write_command(socket, command, Some(json!(0)))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         while let Some(end) = pending.iter().position(|c| *c == b'\n') {
@@ -408,7 +471,6 @@ fn run(
         "--no-osc",
         "--no-input-default-bindings",
         "--no-input-vo-keyboard",
-        "--ytdl-format=bestaudio/best",
         "--network-timeout=20",
         "--cache=yes",
         "--demuxer-max-bytes=32MiB",
@@ -499,16 +561,25 @@ fn run(
                     track_id,
                     url,
                     title,
+                    options,
                 }) => {
                     state.desired = Some(track_id);
                     state.loaded = false;
-                    let _ = events.send_blocking(PlayerEvent::Loading { track_id });
+                    state.paused = options.paused;
+                    state.pause_target = Some(options.paused);
+                    state.pause_after_load = true;
                     write_command(
                         &mut socket,
-                        json!(["loadfile", url, "replace", -1, {"force-media-title":title}]),
-                        Some(track_id),
+                        load_command(&url, &title, options),
+                        Some(json!(track_id)),
                     )?;
-                    write_command(&mut socket, json!(["set_property", "pause", false]), None)?;
+                }
+                Ok(PlayerCommand::Pause(paused)) => {
+                    state.pause_revision += 1;
+                    state.pause_target = Some(paused);
+                    state.paused = paused;
+                    state.pause_after_load = !state.loaded;
+                    write_pause(&mut socket, paused, state.pause_revision)?;
                 }
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Credentials(next)) => {
@@ -543,6 +614,13 @@ fn run(
                     let line: Vec<_> = pending.drain(..=end).collect();
                     if let Ok(message) = serde_json::from_slice(&line) {
                         state.message(message, events);
+                        if state.loaded && state.pause_after_load {
+                            state.pause_after_load = false;
+                            if let Some(paused) = state.pause_target {
+                                state.pause_revision += 1;
+                                write_pause(&mut socket, paused, state.pause_revision)?;
+                            }
+                        }
                     }
                 }
                 if pending.len() > 1024 * 1024 {
@@ -569,10 +647,34 @@ struct PlaybackState {
     current: Option<u64>,
     entries: HashMap<u64, u64>,
     loaded: bool,
+    paused: bool,
+    pause_target: Option<bool>,
+    pause_after_load: bool,
+    pause_revision: u64,
 }
 
 impl PlaybackState {
     fn message(&mut self, value: Value, events: &async_channel::Sender<PlayerEvent>) {
+        if let Some(revision) = value["request_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("pause:"))
+            .and_then(|revision| revision.parse::<u64>().ok())
+        {
+            if revision == self.pause_revision
+                && self.loaded
+                && !self.pause_after_load
+                && value["error"] == "success"
+                && let Some(paused) = value["data"].as_bool()
+                && self.pause_target.is_some()
+            {
+                self.pause_target = None;
+                self.paused = paused;
+                if let Some(track_id) = self.current.filter(|id| Some(*id) == self.desired) {
+                    let _ = events.send_blocking(PlayerEvent::Paused { track_id, paused });
+                }
+            }
+            return;
+        }
         if let Some(id) = value["request_id"].as_u64().filter(|id| *id > 0) {
             if let Some(entry) = value
                 .pointer("/data/playlist_entry_id")
@@ -597,6 +699,7 @@ impl PlaybackState {
                 self.loaded = true;
                 let _ = events.send_blocking(PlayerEvent::Started {
                     track_id: self.current.unwrap(),
+                    paused: self.paused,
                 });
             }
             Some("end-file") => {
@@ -636,6 +739,16 @@ impl PlaybackState {
                     }
                     return;
                 }
+                if value["name"] == "pause"
+                    && self.current.is_some()
+                    && self.current == self.desired
+                    && let Some(paused) = value["data"].as_bool()
+                {
+                    if self.pause_target.is_some_and(|target| target != paused) {
+                        return;
+                    }
+                    self.paused = paused;
+                }
                 let Some(track_id) = self
                     .current
                     .filter(|id| self.loaded && Some(*id) == self.desired)
@@ -674,6 +787,238 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_play_has_its_own_validated_options_and_track_id() {
+        let (commands, received) = mpsc::channel();
+        let (_, events) = async_channel::unbounded();
+        let player = Player {
+            commands,
+            events,
+            next_id: AtomicU64::new(1),
+        };
+        for start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.] {
+            assert!(
+                player
+                    .play(
+                        "csILUDfmtqM",
+                        "Track",
+                        PlayOptions {
+                            start,
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        assert!(received.try_recv().is_err());
+        let options = PlayOptions {
+            quality: AudioQuality::Low,
+            start: 32.5,
+            paused: true,
+        };
+        let first = player.play("csILUDfmtqM", "Track", options).unwrap();
+        let second = player.play("csILUDfmtqM", "Track", options).unwrap();
+        assert_ne!(first, second);
+        let PlayerCommand::Play {
+            track_id,
+            url,
+            title,
+            options,
+        } = received.try_recv().unwrap()
+        else {
+            panic!("play must enqueue a single load with its options");
+        };
+        assert_eq!(track_id, first);
+        let command = load_command(&url, &title, options);
+        assert_eq!(command[0], "loadfile");
+        assert_eq!(command[1], "https://music.youtube.com/watch?v=csILUDfmtqM");
+        assert_eq!(command[2], "replace");
+        assert_eq!(command[4]["start"], "32.5");
+        assert_eq!(command[4]["pause"], "yes");
+        assert_eq!(command[4]["ytdl-format"], AudioQuality::Low.selector());
+        let defaults = load_command("unused", "Track", PlayOptions::default());
+        assert_eq!(defaults[4]["start"], "0");
+        assert_eq!(defaults[4]["pause"], "no");
+        assert_eq!(defaults[4]["ytdl-format"], AudioQuality::Normal.selector());
+    }
+
+    #[test]
+    fn started_preserves_pause_intent_across_loading_notifications() {
+        for (requested, observed, override_pause, expected) in [
+            (false, Some(true), None, false),
+            (true, Some(false), None, true),
+            (true, Some(true), None, true),
+            (true, None, None, true),
+            (true, Some(true), Some(false), false),
+        ] {
+            let (events, received) = async_channel::unbounded();
+            let mut state = PlaybackState {
+                current: Some(1),
+                desired: Some(1),
+                paused: override_pause.unwrap_or(requested),
+                pause_target: Some(override_pause.unwrap_or(requested)),
+                pause_after_load: true,
+                ..Default::default()
+            };
+            if let Some(paused) = observed {
+                state.message(
+                    json!({"event":"property-change","name":"pause","data":paused}),
+                    &events,
+                );
+            }
+            assert!(received.try_recv().is_err());
+            state.message(json!({"event":"file-loaded"}), &events);
+            assert!(matches!(
+                received.try_recv(),
+                Ok(PlayerEvent::Started { track_id: 1, paused }) if paused == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_pause_survives_stale_events_until_the_latest_write_is_confirmed() {
+        let (events, received) = async_channel::unbounded();
+        let mut state = PlaybackState {
+            current: Some(1),
+            desired: Some(1),
+            paused: true,
+            pause_target: Some(true),
+            pause_after_load: true,
+            pause_revision: 1,
+            ..Default::default()
+        };
+        state.message(
+            json!({"event":"property-change","name":"pause","data":false}),
+            &events,
+        );
+        assert!(state.paused);
+        assert!(received.try_recv().is_err());
+        state.message(
+            json!({"event":"property-change","name":"pause","data":true}),
+            &events,
+        );
+        state.message(
+            json!({"request_id":"pause:1","error":"success","data":true}),
+            &events,
+        );
+        assert_eq!(state.pause_target, Some(true));
+        state.message(json!({"event":"file-loaded"}), &events);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Started { paused: true, .. })
+        ));
+
+        // The worker reapplies the target after per-file options, even for a no-op.
+        state.pause_after_load = false;
+        state.pause_revision = 2;
+        state.message(
+            json!({"event":"property-change","name":"pause","data":false}),
+            &events,
+        );
+        state.message(
+            json!({"request_id":"pause:1","error":"success","data":true}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        assert_eq!(state.pause_target, Some(true));
+        state.message(
+            json!({"request_id":"pause:2","error":"success","data":true}),
+            &events,
+        );
+        assert_eq!(state.pause_target, None);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Paused { paused: true, .. })
+        ));
+
+        // A newer opposite request supersedes both old replies and observations.
+        state.pause_revision = 3;
+        state.pause_target = Some(false);
+        state.paused = false;
+        state.message(
+            json!({"request_id":"pause:2","error":"success","data":true}),
+            &events,
+        );
+        state.message(
+            json!({"event":"property-change","name":"pause","data":true}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        assert!(!state.paused);
+        state.message(
+            json!({"request_id":"pause:3","error":"success","data":false}),
+            &events,
+        );
+        assert_eq!(state.pause_target, None);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Paused { paused: false, .. })
+        ));
+
+        // Once acknowledged, ordinary external media controls remain authoritative.
+        state.message(
+            json!({"event":"property-change","name":"pause","data":true}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Paused { paused: true, .. })
+        ));
+
+        // An external pause can win between the set and its confirmation query.
+        state.pause_revision = 4;
+        state.pause_target = Some(true);
+        state.message(
+            json!({"request_id":"pause:4","error":"success","data":false}),
+            &events,
+        );
+        assert_eq!(state.pause_target, None);
+        assert!(!state.paused);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Paused { paused: false, .. })
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires Python with yt-dlp; set YT_DLP_TEST_PYTHON if needed; no network"]
+    fn audio_quality_selectors_use_service_classes_before_bitrate() {
+        let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
+        let selectors = AudioQuality::ALL.map(AudioQuality::selector);
+        let output = Command::new(python)
+            .args(["-B", "-c", r#"
+import json, sys
+from yt_dlp import YoutubeDL
+
+selectors = json.loads(sys.argv[1])
+def select(selector, formats):
+    with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+        formats = [dict(url='https://example.invalid/audio', ext='webm', acodec='opus', vcodec='none', **f) for f in formats]
+        result = list(ydl.build_format_selector(selector)({'formats': formats, 'has_merged_format': False, 'incomplete_formats': False}))
+        return result[0]['format_id']
+
+# Guest service metadata observed on csILUDfmtqM, plus a synthetic high format.
+formats = [
+    dict(format_id='249', format_note='low', quality=2, abr=50.193),
+    dict(format_id='250', format_note='low', quality=2, abr=66.012),
+    dict(format_id='251', format_note='medium', quality=3, abr=131.297),
+    dict(format_id='high', format_note='high', quality=4, abr=256),
+]
+assert [select(s, formats) for s in selectors] == ['250', '251', 'high']
+assert select(selectors[0], [dict(format_id='fallback', abr=48), dict(format_id='larger', abr=192)]) == 'fallback'
+assert select(selectors[1], [dict(format_id='fallback', abr=96), dict(format_id='larger', abr=192)]) == 'fallback'
+assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
+"#])
+            .arg(serde_json::to_string(&selectors).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn playback_speed_is_validated_before_it_can_reach_mpv() {
@@ -938,38 +1283,45 @@ mod tests {
 
     #[test]
     fn replacing_track_does_not_finish_the_new_track() {
-        let (tx, rx) = async_channel::unbounded();
-        let mut state = PlaybackState {
-            desired: Some(2),
-            ..Default::default()
-        };
-        state.message(
-            json!({"request_id":1,"error":"success","data":{"playlist_entry_id":10}}),
-            &tx,
-        );
-        state.message(
-            json!({"request_id":2,"error":"success","data":{"playlist_entry_id":11}}),
-            &tx,
-        );
-        state.message(
-            json!({"event":"end-file","playlist_entry_id":10,"reason":"eof"}),
-            &tx,
-        );
-        assert!(rx.try_recv().is_err());
-        state.message(json!({"event":"start-file","playlist_entry_id":11}), &tx);
-        state.message(json!({"event":"file-loaded"}), &tx);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(PlayerEvent::Started { track_id: 2 })
-        ));
-        state.message(
-            json!({"event":"end-file","playlist_entry_id":11,"reason":"eof"}),
-            &tx,
-        );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(PlayerEvent::Ended { track_id: 2 })
-        ));
+        for reason in ["eof", "error", "stop"] {
+            let (tx, rx) = async_channel::unbounded();
+            let mut state = PlaybackState {
+                desired: Some(2),
+                ..Default::default()
+            };
+            state.message(
+                json!({"request_id":1,"error":"success","data":{"playlist_entry_id":10}}),
+                &tx,
+            );
+            state.message(
+                json!({"request_id":2,"error":"success","data":{"playlist_entry_id":11}}),
+                &tx,
+            );
+            state.message(json!({"event":"start-file","playlist_entry_id":11}), &tx);
+            state.message(json!({"event":"file-loaded"}), &tx);
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(PlayerEvent::Started {
+                    track_id: 2,
+                    paused: false
+                })
+            ));
+            state.message(
+                json!({"event":"end-file","playlist_entry_id":10,"reason":reason}),
+                &tx,
+            );
+            state.message(json!({"request_id":1,"error":"load failed"}), &tx);
+            assert!(rx.try_recv().is_err());
+            assert!(state.loaded);
+            state.message(
+                json!({"event":"end-file","playlist_entry_id":11,"reason":"eof"}),
+                &tx,
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(PlayerEvent::Ended { track_id: 2 })
+            ));
+        }
     }
 
     #[test]
@@ -981,7 +1333,11 @@ mod tests {
         })
         .unwrap();
         let id = player
-            .play("csILUDfmtqM", "Khruangbin - Hold Me Up")
+            .play(
+                "csILUDfmtqM",
+                "Khruangbin - Hold Me Up",
+                PlayOptions::default(),
+            )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(55);
         let mut started = false;
@@ -990,7 +1346,10 @@ mod tests {
             if let Some(event) = player.try_recv() {
                 println!("{event:?}");
                 match event {
-                    PlayerEvent::Started { track_id } if track_id == id => started = true,
+                    PlayerEvent::Started {
+                        track_id,
+                        paused: false,
+                    } if track_id == id => started = true,
                     PlayerEvent::Position { track_id, seconds }
                         if track_id == id && seconds > 1. =>
                     {
@@ -1024,6 +1383,95 @@ mod tests {
         assert!(
             paused && sought && sped_up,
             "pause, seek and playback speed must reach mpv"
+        );
+
+        let replacement = player
+            .play(
+                "csILUDfmtqM",
+                "Khruangbin - Hold Me Up",
+                PlayOptions {
+                    quality: AudioQuality::Low,
+                    start: 30.,
+                    paused: true,
+                },
+            )
+            .unwrap();
+        assert_ne!(replacement, id);
+        let deadline = Instant::now() + Duration::from_secs(55);
+        let mut resumed_paused = false;
+        let mut resumed_position = false;
+        while Instant::now() < deadline && !(resumed_paused && resumed_position) {
+            match player.try_recv() {
+                Some(event) => {
+                    println!("{event:?}");
+                    match event {
+                        PlayerEvent::Started { track_id, paused } if track_id == replacement => {
+                            assert!(paused, "quality reload must retain pause");
+                            resumed_paused = true;
+                        }
+                        PlayerEvent::Position { track_id, seconds } if track_id == replacement => {
+                            assert!(
+                                (29.5..30.5).contains(&seconds),
+                                "reload must resume at 30 seconds"
+                            );
+                            resumed_position = true;
+                        }
+                        PlayerEvent::Ended { track_id } if track_id == replacement => {
+                            panic!("quality reload ended prematurely")
+                        }
+                        PlayerEvent::Error { message, .. } => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+                None => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        assert!(
+            resumed_paused && resumed_position,
+            "quality reload must start paused at its saved position"
+        );
+        thread::sleep(Duration::from_millis(600));
+        while let Some(event) = player.try_recv() {
+            match event {
+                PlayerEvent::Position { track_id, seconds } if track_id == replacement => {
+                    assert!(
+                        (29.5..30.5).contains(&seconds),
+                        "paused reload must not advance"
+                    );
+                }
+                PlayerEvent::Paused { track_id, paused } if track_id == replacement => {
+                    assert!(paused)
+                }
+                PlayerEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        // A no-op pause still confirms, then external media controls can unpause.
+        player.pause(true).unwrap();
+        player
+            .command(json!(["set_property", "pause", false]))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut unpaused = false;
+        let mut resumed_progress = false;
+        while Instant::now() < deadline && !(unpaused && resumed_progress) {
+            match player.try_recv() {
+                Some(PlayerEvent::Paused {
+                    track_id,
+                    paused: false,
+                }) if track_id == replacement => unpaused = true,
+                Some(PlayerEvent::Position { track_id, seconds })
+                    if track_id == replacement && seconds > 31. =>
+                {
+                    resumed_progress = true
+                }
+                Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                _ => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        assert!(
+            unpaused && resumed_progress,
+            "quality reload must continue after unpausing"
         );
     }
 }

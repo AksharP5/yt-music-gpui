@@ -1,5 +1,5 @@
 use crate::catalog::{Collection, Track};
-use crate::player::PlaybackSpeed;
+use crate::player::{AudioQuality, PlaybackSpeed};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,6 +39,7 @@ pub struct Library {
     pub autoplay: bool,
     pub volume: f64,
     pub speed: PlaybackSpeed,
+    pub quality: AudioQuality,
 }
 
 impl Default for Library {
@@ -52,6 +53,7 @@ impl Default for Library {
             autoplay: true,
             volume: 0.,
             speed: PlaybackSpeed::default(),
+            quality: AudioQuality::default(),
         }
     }
 }
@@ -304,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn autoplay_defaults_on_and_preserves_the_saved_preference() {
+    fn playback_preferences_migrate_and_round_trip() {
         assert!(Library::default().autoplay);
         assert!(Library::new().autoplay);
         let migrated: Library = serde_json::from_value(serde_json::json!({
@@ -313,16 +315,21 @@ mod tests {
         .unwrap();
         assert!(migrated.autoplay);
         assert_eq!(migrated.speed, PlaybackSpeed::default());
+        assert_eq!(migrated.quality, AudioQuality::Normal);
         assert_eq!(migrated.volume, 37.);
         assert_eq!(migrated.repeat, Repeat::All);
         assert_eq!(migrated.liked[0].id, "saved");
         let library = Library {
             autoplay: false,
+            quality: AudioQuality::High,
             ..Library::new()
         };
         let saved = serde_json::to_value(library).unwrap();
         assert_eq!(saved["autoplay"], false);
-        assert!(!serde_json::from_value::<Library>(saved).unwrap().autoplay);
+        assert_eq!(saved["quality"], "high");
+        let restored = serde_json::from_value::<Library>(saved).unwrap();
+        assert!(!restored.autoplay);
+        assert_eq!(restored.quality, AudioQuality::High);
     }
 
     #[test]

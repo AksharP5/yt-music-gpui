@@ -4,7 +4,7 @@ use crate::{
     auth::{self, Operation, Session, SharedSession},
     catalog::{Catalog, Collection, Item, Page, Rating, Shelf, Track},
     library::{Library, LibraryWriter, Repeat, Store},
-    player::{PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
+    player::{AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
     playlist_form::{PlaylistForm, PlaylistFormEvent},
     search::{SearchFilter, SearchScope},
     search_box::{SearchBox, SearchBoxEvent},
@@ -95,10 +95,34 @@ enum PlaybackResult {
 #[derive(Clone, Copy, PartialEq)]
 enum Playback {
     Stopped,
-    Loading,
+    Loading { paused: bool, retried: bool },
     Playing,
     Paused,
     Buffering,
+}
+impl Playback {
+    fn is_paused(self) -> bool {
+        matches!(self, Self::Paused | Self::Loading { paused: true, .. })
+    }
+
+    fn with_pause(self, paused: bool) -> Self {
+        match self {
+            Self::Loading { retried, .. } => Self::Loading { paused, retried },
+            _ if paused => Self::Paused,
+            _ => Self::Playing,
+        }
+    }
+
+    fn retry(&mut self) -> bool {
+        let Self::Loading { retried, .. } = self else {
+            return false;
+        };
+        if *retried {
+            return false;
+        }
+        *retried = true;
+        true
+    }
 }
 #[derive(Clone)]
 enum Overlay {
@@ -679,7 +703,10 @@ impl Music {
             self.autoplay_waiting = None;
             self.play_current(cx);
         } else if self.radio_loading || self.watch_pending {
-            self.playback = Playback::Loading;
+            self.playback = Playback::Loading {
+                paused: false,
+                retried: false,
+            };
         } else {
             self.autoplay_waiting = None;
             self.playback = Playback::Stopped;
@@ -1428,10 +1455,20 @@ impl Music {
             cx.notify();
             return;
         };
-        match player.play(&track.id, &format!("{} - {}", track.artist, track.title)) {
+        match player.play(
+            &track.id,
+            &format!("{} - {}", track.artist, track.title),
+            PlayOptions {
+                quality: self.library.quality,
+                ..Default::default()
+            },
+        ) {
             Ok(id) => {
                 self.active_id = Some(id);
-                self.playback = Playback::Loading;
+                self.playback = Playback::Loading {
+                    paused: false,
+                    retried: false,
+                };
                 self.position = 0.;
                 self.duration = track.duration.unwrap_or(0) as f64;
                 self.error = None;
@@ -1461,6 +1498,51 @@ impl Music {
         self.extend_autoplay(cx);
         self.save();
         cx.notify();
+    }
+    fn set_audio_quality(&mut self, quality: AudioQuality, cx: &mut Context<Self>) {
+        if self.library.quality == quality {
+            return;
+        }
+        self.library.quality = quality;
+        if self.active_id.is_some() && self.playback != Playback::Stopped {
+            if let Playback::Loading { retried, .. } = &mut self.playback {
+                *retried = false;
+            }
+            if let Err(error) = self.reload_stream() {
+                self.error = Some(error.to_string());
+            }
+        }
+        self.save();
+        cx.notify();
+    }
+    fn reload_stream(&mut self) -> anyhow::Result<()> {
+        let track = self
+            .library
+            .queue
+            .current()
+            .ok_or_else(|| anyhow::anyhow!("There is no current song to reload."))?;
+        let player = self
+            .player
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("The audio player is unavailable. Restart the app."))?;
+        let paused = self.playback.is_paused();
+        let retried = matches!(self.playback, Playback::Loading { retried: true, .. });
+        let id = player.play(
+            &track.id,
+            &format!("{} - {}", track.artist, track.title),
+            PlayOptions {
+                quality: self.library.quality,
+                start: self.position,
+                paused,
+            },
+        )?;
+        if self.active_id.is_some() && self.history_track == self.active_id {
+            self.history_track = Some(id);
+        }
+        self.active_id = Some(id);
+        self.playback = Playback::Loading { paused, retried };
+        self.error = None;
+        Ok(())
     }
     fn replace_queue(&mut self, tracks: Vec<Track>, selected: usize, cx: &mut Context<Self>) {
         self.reset_radio();
@@ -1524,7 +1606,16 @@ impl Music {
     }
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
         if self.active_id.is_some() && self.playback != Playback::Stopped {
-            self.player_command(Player::toggle_pause);
+            let paused = !self.playback.is_paused();
+            if let Some(player) = &self.player {
+                match player.pause(paused) {
+                    Ok(()) => {
+                        self.playback = self.playback.with_pause(paused);
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+            cx.notify();
         } else {
             if self.library.queue.index.is_none() {
                 self.library.queue.select(0);
@@ -1581,16 +1672,30 @@ impl Music {
                     self.save();
                 }
             }
-            PlayerEvent::Error { track_id, message }
-                if track_id.is_none() || track_id == self.active_id =>
-            {
+            PlayerEvent::Error {
+                track_id,
+                mut message,
+            } if track_id.is_none() || track_id == self.active_id => {
+                if track_id.is_some() && self.playback.retry() {
+                    match self.reload_stream() {
+                        Ok(()) => {
+                            cx.notify();
+                            return;
+                        }
+                        Err(error) => message = format!("{message} Retry failed: {error}"),
+                    }
+                }
                 self.error = Some(message);
                 self.autoplay_waiting = None;
                 self.active_id = None;
                 self.playback = Playback::Stopped;
             }
-            PlayerEvent::Started { track_id } if Some(track_id) == self.active_id => {
-                self.playback = Playback::Playing;
+            PlayerEvent::Started { track_id, paused } if Some(track_id) == self.active_id => {
+                self.playback = if paused {
+                    Playback::Paused
+                } else {
+                    Playback::Playing
+                };
                 if self.history_track != Some(track_id)
                     && let Some(track) = self.library.queue.current().cloned()
                 {
@@ -1615,9 +1720,6 @@ impl Music {
                     }
                 }
             }
-            PlayerEvent::Loading { track_id } if Some(track_id) == self.active_id => {
-                self.playback = Playback::Loading
-            }
             PlayerEvent::Position { track_id, seconds } if Some(track_id) == self.active_id => {
                 changed = self.position.floor() != seconds.floor();
                 self.position = seconds;
@@ -1626,17 +1728,13 @@ impl Music {
                 self.duration = seconds
             }
             PlayerEvent::Paused { track_id, paused } if Some(track_id) == self.active_id => {
-                self.playback = if paused {
-                    Playback::Paused
-                } else {
-                    Playback::Playing
-                }
+                self.playback = self.playback.with_pause(paused)
             }
             PlayerEvent::Buffering {
                 track_id,
                 buffering,
             } if Some(track_id) == self.active_id => {
-                if buffering {
+                if buffering && !self.playback.is_paused() {
                     self.playback = Playback::Buffering;
                 } else if self.playback == Playback::Buffering {
                     self.playback = Playback::Playing;
@@ -2844,7 +2942,7 @@ impl Music {
                                                     view.playback,
                                                     Playback::Playing
                                                         | Playback::Buffering
-                                                        | Playback::Loading
+                                                        | Playback::Loading { paused: false, .. }
                                                 );
                                                 let current = view.library.queue.remove(index);
                                                 if current {
@@ -2898,7 +2996,7 @@ impl Music {
             let menu_track = track.clone();
             let liked = self.is_liked(&track);
             let subtitle = match self.playback {
-                Playback::Loading => "Loading track…".into(),
+                Playback::Loading { .. } => "Loading track…".into(),
                 Playback::Buffering => "Buffering…".into(),
                 _ => track.artist.clone(),
             };
@@ -2970,7 +3068,9 @@ impl Music {
         };
         let seek_bounds = self.seek_bounds.clone();
         let volume_bounds = self.volume_bounds.clone();
-        let playing = matches!(self.playback, Playback::Playing | Playback::Buffering);
+        let playing = self.active_id.is_some()
+            && self.playback != Playback::Stopped
+            && !self.playback.is_paused();
         div()
             .h(px(106.))
             .flex_shrink_0()
@@ -3271,6 +3371,41 @@ impl Music {
             body = body
                 .child(div().text_size(px(15.)).child("Playback speed"))
                 .child(speeds);
+            let mut qualities = div().mt(px(12.)).flex().gap(px(12.));
+            for (index, quality) in AudioQuality::ALL.into_iter().enumerate() {
+                qualities = qualities.child(
+                    div()
+                        .id(("audio-quality", index))
+                        .px(px(14.))
+                        .py(px(10.))
+                        .text_size(px(13.))
+                        .border_b_2()
+                        .border_color(if self.library.quality == quality {
+                            self.theme.accent
+                        } else {
+                            self.theme.panel
+                        })
+                        .when(self.library.quality == quality, |button| {
+                            button.text_color(self.theme.accent)
+                        })
+                        .hover(|button| button.bg(self.theme.raised))
+                        .cursor_pointer()
+                        .child(quality.label())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.set_audio_quality(quality, cx);
+                        })),
+                );
+            }
+            body = body
+                .child(div().mt(px(24.)).text_size(px(15.)).child("Audio quality"))
+                .child(qualities)
+                .child(
+                    div()
+                        .mt(px(12.))
+                        .text_size(px(13.))
+                        .text_color(self.theme.muted)
+                        .child("Available quality depends on the song and your membership."),
+                );
             let label = self
                 .account
                 .as_ref()
@@ -3294,7 +3429,10 @@ impl Music {
                     view.reset_radio();
                     view.player_command(Player::stop);
                     view.active_id = None;
-                    view.playback = Playback::Loading;
+                    view.playback = Playback::Loading {
+                        paused: false,
+                        retried: false,
+                    };
                     view.now_playing = None;
                     view.notice = Some("Loading radio…".into());
                     view.playback_request(
@@ -3888,5 +4026,33 @@ fn clock(seconds: f64) -> String {
         )
     } else {
         format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Playback;
+
+    #[test]
+    fn a_load_retries_once_and_pause_changes_do_not_reset_its_budget() {
+        for paused in [false, true] {
+            let mut playback = Playback::Loading {
+                paused,
+                retried: false,
+            };
+            assert!(playback.retry());
+            assert_eq!(playback.is_paused(), paused);
+            playback = playback.with_pause(!paused);
+            assert_eq!(playback.is_paused(), !paused);
+            assert!(!playback.retry());
+        }
+        for mut playback in [
+            Playback::Stopped,
+            Playback::Playing,
+            Playback::Paused,
+            Playback::Buffering,
+        ] {
+            assert!(!playback.retry());
+        }
     }
 }
