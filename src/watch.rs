@@ -521,6 +521,7 @@ mod tests {
             subtitle: "Yesterday".into(),
             duration_text: "2 hr 32 min".into(),
             watch_params: Some("issued-params".into()),
+            ..Default::default()
         }));
         let mut episode_row = row("lmnopqrstuv", false);
         episode_row["playlistPanelVideoRenderer"]["navigationEndpoint"]["watchEndpoint"] = json!({

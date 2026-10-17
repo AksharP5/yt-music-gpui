@@ -43,6 +43,12 @@ impl Track {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chapter {
+    pub title: String,
+    pub start_seconds: u32,
+}
+
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EpisodeContext {
@@ -50,6 +56,7 @@ pub struct EpisodeContext {
     pub description: String,
     pub subtitle: String,
     pub duration_text: String,
+    pub chapters: Vec<Chapter>,
     #[serde(skip)]
     pub(crate) watch_params: Option<String>,
 }
@@ -62,6 +69,7 @@ impl fmt::Debug for EpisodeContext {
             .field("description", &self.description)
             .field("subtitle", &self.subtitle)
             .field("duration_text", &self.duration_text)
+            .field("chapters", &self.chapters)
             .finish_non_exhaustive()
     }
 }
@@ -661,6 +669,7 @@ pub(crate) fn episode_context(
         description: text(&row["description"]),
         subtitle: text(&row["subtitle"]),
         duration_text,
+        chapters: Vec::new(),
         watch_params,
     })))
 }
@@ -679,13 +688,15 @@ pub(crate) fn episode_header(data: &Value, video_id: &str) -> Result<Track> {
         .collect();
     let mut episode = episode_context(header, video_id, &runs)?
         .context("YouTube Music returned no podcast episode playback details")?;
-    episode.description = data
+    let description = data
         .pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents")
         .and_then(Value::as_array)
         .and_then(|sections| sections.iter().find_map(|section| {
             section.pointer("/musicDescriptionShelfRenderer/description")
-        }))
-        .map(text)
+        }));
+    episode.description = description.map(text).unwrap_or_default();
+    episode.chapters = description
+        .map(|description| episode_chapters(description, video_id))
         .unwrap_or_default();
     let title = text(&header["title"]);
     ensure!(
@@ -711,6 +722,53 @@ pub(crate) fn episode_header(data: &Value, video_id: &str) -> Result<Track> {
         thumbnail: thumbnail(&header["thumbnail"]),
         details,
     })
+}
+
+fn episode_chapters(description: &Value, video_id: &str) -> Vec<Chapter> {
+    let Some(runs) = description["runs"].as_array() else {
+        return Vec::new();
+    };
+    let mut chapters = Vec::new();
+    let mut starts = HashSet::new();
+    for (index, run) in runs.iter().enumerate() {
+        let Some(endpoint) = run.pointer("/navigationEndpoint/watchEndpoint") else {
+            continue;
+        };
+        let label = run["text"].as_str().unwrap_or_default();
+        if endpoint["videoId"].as_str() != Some(video_id) || label.contains(['\n', '\r']) {
+            continue;
+        }
+        let start = match endpoint.get("startTimeSeconds") {
+            Some(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+            None if matches!(label, "0:00" | "00:00" | "0:00:00") => Some(0),
+            None => None,
+        };
+        let Some(start_seconds) = start else {
+            continue;
+        };
+        let mut title = String::new();
+        for following in &runs[index + 1..] {
+            if following.get("navigationEndpoint").is_some() {
+                break;
+            }
+            let Some(text) = following["text"].as_str() else {
+                break;
+            };
+            if let Some((line, _)) = text.split_once(['\n', '\r']) {
+                title.push_str(line);
+                break;
+            }
+            title.push_str(text);
+        }
+        let title = title.trim().trim_start_matches('-').trim();
+        if !title.is_empty() && starts.insert(start_seconds) {
+            chapters.push(Chapter {
+                title: title.to_owned(),
+                start_seconds,
+            });
+        }
+    }
+    chapters
 }
 
 fn apply_episode_page(page: &mut Page, data: &Value, browse_id: &str) -> Result<()> {
@@ -1384,7 +1442,10 @@ mod tests {
                     {"text":" First topic"}
                 ]}}
             }]}}
-        }},"frameworkUpdates":{"musicDescriptionShelfRenderer":{"description":{"simpleText":"Unrelated description"}}}})
+        }},"frameworkUpdates":{"musicDescriptionShelfRenderer":{"description":{"runs":[
+            {"text":"00:00","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}}},
+            {"text":" Unrelated description"}
+        ]}}}})
     }
 
     #[test]
@@ -1443,6 +1504,13 @@ mod tests {
                 .description,
             page.description
         );
+        assert_eq!(
+            page.tracks()[0].details.episode.as_ref().unwrap().chapters,
+            [Chapter {
+                title: "First topic".into(),
+                start_seconds: 245,
+            }]
+        );
         assert!(!page.editable && page.continuation.is_none());
         assert!(episode_header(&response, "lmnopqrstuv").is_err());
 
@@ -1457,7 +1525,95 @@ mod tests {
                 .description
                 .is_empty()
         );
+        assert!(
+            episode_header(&unrelated, "abcdefghijk")
+                .unwrap()
+                .details
+                .episode
+                .unwrap()
+                .chapters
+                .is_empty()
+        );
         assert!(BrowseLink::new("MPEDinvalid", "Episode").body().is_err());
+    }
+
+    fn chapter_link(label: &str, start: Option<Value>, video_id: &str) -> Value {
+        let mut endpoint = json!({"videoId":video_id});
+        if let Some(start) = start {
+            endpoint["startTimeSeconds"] = start;
+        }
+        json!({"text":label,"navigationEndpoint":{"watchEndpoint":endpoint}})
+    }
+
+    #[test]
+    fn chapter_offsets_are_authoritative_with_narrow_zero_defaults_and_stable_deduplication() {
+        let video = "abcdefghijk";
+        let description = json!({"runs":[
+            chapter_link("00:00",None,video), {"text":" - Introduction\n"},
+            chapter_link("99:59",Some(json!(15)),video), {"text":" - "}, {"text":"A service offset\n"},
+            chapter_link("0:00",None,video), {"text":" Duplicate introduction\n"},
+            chapter_link("00:03",Some(json!(3)),video), {"text":" Earlier in service order\n"},
+            chapter_link("00:15",Some(json!(15)),video), {"text":" Duplicate offset\n"}
+        ]});
+        assert_eq!(
+            episode_chapters(&description, video),
+            [
+                Chapter {
+                    title: "Introduction".into(),
+                    start_seconds: 0
+                },
+                Chapter {
+                    title: "A service offset".into(),
+                    start_seconds: 15
+                },
+                Chapter {
+                    title: "Earlier in service order".into(),
+                    start_seconds: 3
+                },
+            ]
+        );
+        for label in ["0:00", "00:00", "0:00:00"] {
+            let description =
+                json!({"runs":[chapter_link(label,None,video),{"text":" Beginning"}]});
+            assert_eq!(episode_chapters(&description, video)[0].start_seconds, 0);
+        }
+    }
+
+    #[test]
+    fn chapter_links_require_matching_video_valid_offsets_and_plain_same_line_titles() {
+        let video = "abcdefghijk";
+        for offset in [
+            json!(-1),
+            json!(1.5),
+            json!("12"),
+            json!(true),
+            Value::Null,
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            let description = json!({"runs":[chapter_link("00:00",Some(offset),video),{"text":" Invalid offset"}]});
+            assert!(episode_chapters(&description, video).is_empty());
+        }
+        for label in ["00:15", "00:00:00", "Watch this episode"] {
+            let description =
+                json!({"runs":[chapter_link(label,None,video),{"text":" No issued position"}]});
+            assert!(episode_chapters(&description, video).is_empty());
+        }
+        let description = json!({"runs":[
+            chapter_link("00:15",Some(json!(15)),"lmnopqrstuv"),{"text":" Wrong video\n"},
+            chapter_link("00:20",Some(json!(20)),video),{"text":"\nTitle on another line\n"},
+            chapter_link("00:25\n",Some(json!(25)),video),{"text":" Split timestamp line\n"},
+            chapter_link("00:30",Some(json!(30)),video),{"text":"Linked title","navigationEndpoint":{"urlEndpoint":{"url":"https://example.invalid"}}},
+            {"text":"00:45 - Plain text is not a chapter\n"},
+            chapter_link("An explicit zero",Some(json!(0)),video),{"text":" A valid title"}
+        ]});
+        assert_eq!(
+            episode_chapters(&description, video),
+            [Chapter {
+                title: "A valid title".into(),
+                start_seconds: 0
+            }]
+        );
+        assert!(episode_chapters(&json!({"nested":{"runs":[chapter_link("00:00",None,video),{"text":" Unrelated"}]}}),video).is_empty());
     }
 
     #[test]
@@ -2296,6 +2452,27 @@ mod tests {
             page.title,
             page.tracks().len()
         );
+    }
+
+    #[test]
+    #[ignore = "reads a public podcast episode description with issued chapter links"]
+    fn live_public_episode_chapters() {
+        let catalog = Catalog::new().unwrap();
+        let page = catalog
+            .browse(&BrowseLink::new("MPEDK5LhnIlxN4g", "Episode"))
+            .unwrap();
+        let track = page.tracks().pop().unwrap();
+        let chapters = &track.details.episode.as_ref().unwrap().chapters;
+        assert_eq!(track.id, "K5LhnIlxN4g");
+        assert!(chapters.len() >= 2);
+        assert_eq!(chapters[0].start_seconds, 0);
+        assert!(chapters.iter().all(|chapter| !chapter.title.is_empty()));
+        let starts: Vec<_> = chapters
+            .iter()
+            .map(|chapter| chapter.start_seconds)
+            .collect();
+        assert_eq!(starts.iter().collect::<HashSet<_>>().len(), starts.len());
+        println!("Public episode chapter offsets: {starts:?}");
     }
 
     #[test]

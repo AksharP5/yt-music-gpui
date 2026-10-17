@@ -10,7 +10,7 @@ This is an independent client. The public-catalog player is working. Account int
 - Streaming audio, pause, seek, previous/next, volume, mute, audio quality and playback speed.
 - A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
 - Radio, continued autoplay, lyrics, song credits and related music when the service provides them.
-- Podcast show and episode pages, full descriptions, show navigation and episode duration labels.
+- Podcast show and episode pages, full descriptions, chapter navigation, show navigation and episode duration labels.
 - Local liked songs, saved collections, and recently played songs.
 - Keyboard controls, native text input, and a compact sidebar on narrow windows.
 - Media keys and desktop playback controls when `mpv-mpris` is installed.
@@ -59,6 +59,8 @@ Click an album, artist, or playlist to open it. Click a song to play from that p
 Explore keeps the service's main navigation and mood section. Mood and genre links retain their exact category parameters through navigation, Back and Refresh. Navigation links open pages; collection rows retain their separate save controls.
 
 The song menu offers credits, radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Credits retain the service's roles and names. Lyrics and credits load independently of radio and autoplay. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
+
+Episode details expose the service's chapter links in a native Chapters dialog. Choosing a chapter starts that episode at its timestamp or seeks the current episode, preserving pause when it is already loaded. Podcast episodes advance through the explicit queue without adding music recommendations.
 
 Settings changes playback speed from 0.25× to 2× and audio quality between Low, Normal and High. Both preferences are saved on this device. Normal is the default quality. Changing quality reloads the current stream at its playback position, keeping its pause state, queue and existing history report.
 

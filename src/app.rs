@@ -140,6 +140,7 @@ enum Overlay {
         title: String,
         text: String,
     },
+    Chapters(Box<Track>),
     Track {
         track: Track,
         index: Option<usize>,
@@ -1498,6 +1499,9 @@ impl Music {
         }
     }
     fn play_current(&mut self, cx: &mut Context<Self>) {
+        self.play_current_at(0., cx);
+    }
+    fn play_current_at(&mut self, start: f64, cx: &mut Context<Self>) {
         let Some(track) = self.library.queue.current().cloned() else {
             return;
         };
@@ -1521,6 +1525,7 @@ impl Music {
             &format!("{} - {}", track.artist, track.title),
             PlayOptions {
                 quality: self.library.quality,
+                start,
                 ..Default::default()
             },
         ) {
@@ -1530,7 +1535,7 @@ impl Music {
                     paused: false,
                     retried: false,
                 };
-                self.position = 0.;
+                self.position = start;
                 self.duration = track.duration.unwrap_or(0) as f64;
                 self.error = None;
                 if !self
@@ -1559,6 +1564,34 @@ impl Music {
         self.extend_autoplay(cx);
         self.save();
         cx.notify();
+    }
+    fn play_chapter(&mut self, track: Track, seconds: u32, cx: &mut Context<Self>) {
+        self.overlay = None;
+        let current = self
+            .library
+            .queue
+            .current()
+            .is_some_and(|current| current.id == track.id);
+        if current && self.active_id.is_some() && self.playback != Playback::Stopped {
+            if matches!(self.playback, Playback::Loading { .. }) {
+                let previous = self.position;
+                self.position = seconds as f64;
+                if let Err(error) = self.reload_stream() {
+                    self.position = previous;
+                    self.error = Some(error.to_string());
+                }
+            } else {
+                self.player_command(|player| player.seek(seconds as f64));
+            }
+            cx.notify();
+            return;
+        }
+        if !current {
+            self.reset_radio();
+            self.now_playing = None;
+            self.library.queue.replace(vec![track], 0);
+        }
+        self.play_current_at(seconds as f64, cx);
     }
     fn set_audio_quality(&mut self, quality: AudioQuality, cx: &mut Context<Self>) {
         if self.library.quality == quality {
@@ -2505,6 +2538,18 @@ impl Music {
         let has_tracks = self.rows.iter().any(|i| matches!(i, Item::Track(_)));
         let single_episode =
             matches!(self.rows.as_slice(), [Item::Track(track)] if track.details.episode.is_some());
+        let chapter_track = match self.rows.as_slice() {
+            [Item::Track(track)]
+                if track
+                    .details
+                    .episode
+                    .as_ref()
+                    .is_some_and(|episode| !episode.chapters.is_empty()) =>
+            {
+                Some(track.clone())
+            }
+            _ => None,
+        };
         let mut content = div()
             .flex_1()
             .min_w_0()
@@ -2543,6 +2588,21 @@ impl Music {
                                         title: view.page.title.clone(),
                                         text: view.page.description.clone(),
                                     });
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when_some(chapter_track, |heading, track| {
+                        heading.child(
+                            div()
+                                .id("page-chapters")
+                                .py(px(10.))
+                                .text_size(px(13.))
+                                .cursor_pointer()
+                                .child("Chapters")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    window.focus(&view.focus, cx);
+                                    view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
                                     cx.notify();
                                 })),
                         )
@@ -3586,6 +3646,7 @@ impl Music {
                                 Overlay::Help => "Keyboard shortcuts".to_owned(),
                                 Overlay::Settings => "Settings".into(),
                                 Overlay::Description { .. } => "Description".into(),
+                                Overlay::Chapters(_) => "Chapters".into(),
                                 Overlay::Track { track, .. } => track.title.clone(),
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
@@ -3710,6 +3771,44 @@ impl Music {
                         .child(title.clone()),
                 )
                 .child(div().mt(px(18.)).text_size(px(14.)).child(text.clone()));
+        } else if let Overlay::Chapters(track) = kind {
+            body = body.child(
+                div()
+                    .mb(px(18.))
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(track.title.clone()),
+            );
+            if let Some(episode) = &track.details.episode {
+                let selected = Rc::new((**track).clone());
+                for (index, chapter) in episode.chapters.iter().enumerate() {
+                    let selected = selected.clone();
+                    let seconds = chapter.start_seconds;
+                    body = body.child(
+                        div()
+                            .id(("chapter", index))
+                            .py(px(12.))
+                            .px(px(8.))
+                            .flex()
+                            .items_start()
+                            .gap(px(14.))
+                            .text_size(px(14.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(self.theme.raised))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .flex_shrink_0()
+                                    .text_color(self.theme.muted)
+                                    .child(clock(seconds as f64)),
+                            )
+                            .child(div().flex_1().min_w_0().child(chapter.title.clone()))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.play_chapter((*selected).clone(), seconds, cx);
+                            })),
+                    );
+                }
+            }
         } else if let Overlay::Track { track, index } = kind {
             if let Some(episode) = &track.details.episode {
                 if !episode.subtitle.is_empty() {
@@ -3730,6 +3829,19 @@ impl Music {
                         view.navigate(Route::Browse(target.clone()), cx);
                     },
                 ));
+                if !episode.chapters.is_empty() {
+                    let track = track.clone();
+                    body = body.child(self.menu_action(
+                        "menu-chapters",
+                        "Chapters",
+                        cx,
+                        move |view, window, cx| {
+                            window.focus(&view.focus, cx);
+                            view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
+                            cx.notify();
+                        },
+                    ));
+                }
                 if let Some(id) = &episode.show_id {
                     let target = BrowseLink::new(id.clone(), track.artist.clone());
                     body = body.child(self.menu_action(
