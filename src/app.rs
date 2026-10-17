@@ -1303,7 +1303,10 @@ impl Music {
                     .pb(px(18.))
                     .text_size(px(12.))
                     .text_color(self.theme.muted)
-                    .child(format!("{} songs", self.library.queue.tracks.len())),
+                    .child(match self.library.queue.tracks.len() {
+                        1 => "1 song".to_owned(),
+                        count => format!("{count} songs"),
+                    }),
             )
             .child(
                 uniform_list(
@@ -1806,7 +1809,14 @@ fn button(id: impl Into<ElementId>, name: &'static str, theme: Theme) -> Statefu
         .text_color(theme.muted)
         .cursor_pointer()
         .tooltip(move |_, cx| cx.new(|_| Hint { text: label, theme }).into())
-        .hover(move |d| d.bg(theme.raised).text_color(theme.text))
+        .hover(move |d| {
+            let background = if matches!(name, "play" | "pause") {
+                theme.text
+            } else {
+                theme.raised
+            };
+            d.bg(background)
+        })
         .child(icon(
             name,
             19.,
