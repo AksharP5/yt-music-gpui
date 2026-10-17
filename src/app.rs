@@ -1849,7 +1849,9 @@ impl Music {
         }
         collection.details.saved.unwrap_or(matches!(
             self.route,
-            Route::Library(Section::Albums | Section::Playlists | Section::Subscriptions)
+            Route::Library(
+                Section::Albums | Section::Playlists | Section::Subscriptions | Section::Podcasts
+            )
         ))
     }
     fn set_volume(&mut self, volume: f64, cx: &mut Context<Self>) {
