@@ -1,3 +1,4 @@
+mod account;
 mod app;
 mod artwork;
 mod assets;
@@ -12,6 +13,15 @@ use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions
 use std::path::PathBuf;
 
 fn main() {
+    // A crash dump must not persist reusable account credentials.
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+        eprintln!("Could not disable credential-bearing crash dumps.");
+        std::process::exit(1);
+    }
     let mut cookies = None;
     let mut connect = false;
     let mut args = std::env::args().skip(1);

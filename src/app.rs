@@ -1,6 +1,8 @@
 use crate::{
+    account::{self, Effect, Mutation, Section},
     artwork::Artwork,
-    catalog::{Catalog, Collection, Item, Page, Shelf, Track},
+    auth::{self, Session, SharedSession},
+    catalog::{Account, Catalog, Collection, Item, Page, Rating, Shelf, Track},
     input::{InputEvent, SearchInput},
     library::{Library, LibraryWriter, Repeat, Store},
     player::{Player, PlayerEvent, PlayerOptions},
@@ -9,11 +11,12 @@ use crate::{
 use gpui::{prelude::*, *};
 use std::{
     cell::Cell,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -28,6 +31,7 @@ enum Route {
     Liked,
     Recent,
     Saved,
+    Library(Section),
 }
 #[derive(Clone)]
 enum Query {
@@ -36,6 +40,7 @@ enum Query {
     Search(String),
     Browse(String),
     More { token: String, search: bool },
+    Library(Section),
 }
 struct Job {
     id: u64,
@@ -67,6 +72,12 @@ enum Drag {
 
 pub struct Music {
     theme: Theme,
+    session: SharedSession,
+    account: Option<Account>,
+    account_commands: async_channel::Sender<account::Command>,
+    login: Option<Arc<AtomicBool>>,
+    pending_mutations: HashSet<String>,
+    ratings: HashMap<String, Rating>,
     focus: FocusHandle,
     search: Entity<SearchInput>,
     route: Route,
@@ -122,8 +133,41 @@ impl Music {
             .detach();
             writer
         });
+        let (session, error) = match cookies
+            .as_deref()
+            .map(Session::from_cookie_file)
+            .transpose()
+        {
+            Ok(Some(session)) => (Some(session), error),
+            Ok(None) => (None, error),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        let has_session = session.is_some();
+        let (cookie_file, error) = match session.as_ref().map(Session::playback_file).transpose() {
+            Ok(file) => (file, error),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        let session = auth::shared(session);
+        let (account_commands, account_events) = account::start(session.clone());
+        let _ = account_commands.try_send(if has_session {
+            account::Command::Verify
+        } else {
+            account::Command::LoadSaved
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(event) = account_events.recv().await {
+                if view
+                    .update_in(cx, |view, _, cx| view.account_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         let (player, error) = match Player::new(PlayerOptions {
-            cookies,
+            cookies: None,
+            cookie_file,
             volume: library.volume,
             ..Default::default()
         }) {
@@ -138,10 +182,11 @@ impl Music {
             let receiver = receiver.clone();
             let results = results.clone();
             let generation = generation.clone();
+            let session = session.clone();
             thread::Builder::new()
                 .name(format!("catalog-{worker}"))
                 .spawn(move || {
-                    let catalog = Catalog::new();
+                    let catalog = Catalog::with_session(session);
                     while let Ok(job) = receiver.recv_blocking() {
                         if generation.load(Ordering::Relaxed) != job.id {
                             continue;
@@ -152,6 +197,7 @@ impl Music {
                             Ok(catalog) => match &job.query {
                                 Query::Home => catalog.home(),
                                 Query::Explore => catalog.explore(),
+                                Query::Library(section) => catalog.library(*section),
                                 Query::Search(q) => catalog.search(q),
                                 Query::Browse(id) => catalog.browse(id),
                                 Query::More { token, search } => catalog.more(token, *search),
@@ -245,6 +291,12 @@ impl Music {
             });
         let mut view = Self {
             theme: Theme::load(),
+            session,
+            account: None,
+            account_commands,
+            login: None,
+            pending_mutations: HashSet::new(),
+            ratings: HashMap::new(),
             focus: cx.focus_handle(),
             search,
             route: Route::Home,
@@ -252,6 +304,9 @@ impl Music {
                 title: "Home".into(),
                 shelves: Vec::new(),
                 continuation: None,
+                editable: false,
+                description: String::new(),
+                privacy: None,
             },
             rows: Vec::new(),
             back: Vec::new(),
@@ -327,6 +382,19 @@ impl Music {
                 self.page.title = "Loading collection".into();
                 self.request(Query::Browse(id), cx);
             }
+            Route::Library(section) => {
+                self.page.title = section.title().into();
+                self.request(Query::Library(section), cx);
+            }
+            Route::Liked | Route::Saved | Route::Recent if self.account.is_some() => {
+                let section = match route {
+                    Route::Liked => Section::Liked,
+                    Route::Recent => Section::History,
+                    _ => Section::Songs,
+                };
+                self.page.title = section.title().into();
+                self.request(Query::Library(section), cx);
+            }
             _ => {
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 self.loading = false;
@@ -374,6 +442,9 @@ impl Music {
                 items: rows,
             }],
             continuation: None,
+            editable: false,
+            description: String::new(),
+            privacy: None,
         };
         self.rows = self
             .page
@@ -385,6 +456,11 @@ impl Music {
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
         if let Some((route, page)) = self.back.pop() {
+            if self.account.is_some() {
+                self.route = route.clone();
+                self.navigate(route, cx);
+                return;
+            }
             self.generation.fetch_add(1, Ordering::Relaxed);
             self.list_id = self.list_id.wrapping_add(1);
             self.route = route;
@@ -415,6 +491,11 @@ impl Music {
                 } else {
                     self.page = page;
                 }
+                for track in self.page.tracks() {
+                    if let Some(rating) = track.details.rating {
+                        self.ratings.insert(track.id, rating);
+                    }
+                }
                 self.rows = self
                     .page
                     .shelves
@@ -431,6 +512,124 @@ impl Music {
         if let Some(store) = &self.store {
             store.save(&self.library);
         }
+    }
+    fn is_liked(&self, track: &Track) -> bool {
+        if self.account.is_some() {
+            self.ratings
+                .get(&track.id)
+                .copied()
+                .or(track.details.rating)
+                == Some(Rating::Like)
+        } else {
+            self.library.liked.iter().any(|t| t.id == track.id)
+        }
+    }
+    fn connect_account(&mut self, cx: &mut Context<Self>) {
+        if self.login.is_some() {
+            return;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        match self
+            .account_commands
+            .try_send(account::Command::Connect(cancelled.clone()))
+        {
+            Ok(()) => {
+                self.login = Some(cancelled);
+                self.notice = Some("Sign in to Google in the account window".into());
+            }
+            Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
+        }
+        cx.notify();
+    }
+    fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
+        let key = mutation.key();
+        if self.pending_mutations.contains(&key) {
+            return;
+        }
+        match self
+            .account_commands
+            .try_send(account::Command::Apply(mutation))
+        {
+            Ok(()) => {
+                self.pending_mutations.insert(key);
+                self.notice = Some("Saving to YouTube Music…".into());
+            }
+            Err(_) => {
+                self.error = Some("Too many pending changes. Wait for them to finish.".into())
+            }
+        }
+        cx.notify();
+    }
+    fn refresh_remote(&mut self, cx: &mut Context<Self>) {
+        let query = match &self.route {
+            Route::Home => Query::Home,
+            Route::Explore => Query::Explore,
+            Route::Search(q) => Query::Search(q.clone()),
+            Route::Browse(id) => Query::Browse(id.clone()),
+            Route::Liked => Query::Library(Section::Liked),
+            Route::Recent => Query::Library(Section::History),
+            Route::Saved => Query::Library(Section::Songs),
+            Route::Library(section) => Query::Library(*section),
+        };
+        self.request(query, cx);
+    }
+    fn account_event(&mut self, event: account::Event, cx: &mut Context<Self>) {
+        match event {
+            account::Event::Disconnected(result) => match result {
+                Ok(()) => {
+                    self.account = None;
+                    self.ratings.clear();
+                    self.notice = Some("Signed out of YouTube Music".into());
+                    self.navigate(Route::Home, cx);
+                }
+                Err(error) => self.error = Some(error),
+            },
+            account::Event::Connected(result) => {
+                self.login = None;
+                match result {
+                    Ok(account) => {
+                        let file = self
+                            .session
+                            .read()
+                            .ok()
+                            .and_then(|s| s.as_ref().map(Session::playback_file));
+                        if let Some(result) = file {
+                            match result {
+                                Ok(file) => self.player_command(|p| p.set_cookies(file)),
+                                Err(error) => self.error = Some(format!("{error:#}")),
+                            }
+                        }
+                        self.notice = Some(format!("Connected as {}", account.name));
+                        self.account = Some(account);
+                        self.ratings.clear();
+                        self.refresh_remote(cx);
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+            account::Event::Applied { mutation, result } => {
+                self.pending_mutations.remove(&mutation.key());
+                match result {
+                    Ok(effect) => {
+                        if let Mutation::RateSong { track, rating } = mutation {
+                            self.ratings.insert(track.id, rating);
+                        }
+                        self.notice = Some("Saved to YouTube Music".into());
+                        match effect {
+                            Effect::CreatedPlaylist(id) => {
+                                self.navigate(Route::Browse(format!("VL{id}")), cx)
+                            }
+                            Effect::Changed => self.refresh_remote(cx),
+                        }
+                    }
+                    Err(error) => {
+                        self.notice = None;
+                        self.error = Some(error);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
     fn player_command(&mut self, command: impl FnOnce(&Player) -> anyhow::Result<()>) {
         if let Some(player) = &self.player
@@ -563,6 +762,21 @@ impl Music {
         }
     }
     fn toggle_like(&mut self, track: &Track, cx: &mut Context<Self>) {
+        if self.account.is_some() {
+            let rating = if self.is_liked(track) {
+                Rating::Indifferent
+            } else {
+                Rating::Like
+            };
+            self.mutate(
+                Mutation::RateSong {
+                    track: track.clone(),
+                    rating,
+                },
+                cx,
+            );
+            return;
+        }
         self.library.toggle_like(track);
         self.save();
         self.refresh_local();
@@ -575,6 +789,11 @@ impl Music {
         cx.notify();
     }
     fn save_collection(&mut self, collection: Collection, cx: &mut Context<Self>) {
+        if self.account.is_some() {
+            let save = collection.details.saved != Some(true);
+            self.mutate(Mutation::CollectionLibrary { collection, save }, cx);
+            return;
+        }
         if let Some(i) = self
             .library
             .saved
@@ -821,7 +1040,11 @@ impl Music {
             .child(self.nav(
                 "saved-nav",
                 "library",
-                "Saved collections",
+                if self.account.is_some() {
+                    "Library"
+                } else {
+                    "Saved collections"
+                },
                 Route::Saved,
                 compact,
                 cx,
@@ -1038,7 +1261,7 @@ impl Music {
             );
         match item {
             Item::Track(track) => {
-                let liked = self.library.liked.iter().any(|t| t.id == track.id);
+                let liked = self.is_liked(&track);
                 let like_track = track.clone();
                 row = row
                     .child(
@@ -1415,7 +1638,7 @@ impl Music {
             .gap(px(12.));
         if let Some(track) = current {
             let art = self.art(track.thumbnail.as_deref(), 52.);
-            let liked = self.library.liked.iter().any(|t| t.id == track.id);
+            let liked = self.is_liked(&track);
             let subtitle = match self.playback {
                 Playback::Loading => "Loading track…".into(),
                 Playback::Buffering => "Buffering…".into(),
@@ -1689,10 +1912,17 @@ impl Music {
                 );
             }
         } else {
-            body=body.child(div().text_size(px(15.)).child("YouTube Music for your desktop"))
-                .child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child("Your liked songs, saved collections, and queue are stored on this computer. The colors follow your Omarchy theme."))
-                .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music in your browser").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")))
-                .child(div().mt(px(24.)).text_size(px(12.)).text_color(self.theme.muted).child("Version 0.1.0"));
+            let label = self
+                .account
+                .as_ref()
+                .map(|a| format!("{} {}", a.name, a.handle))
+                .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
+            body=body.child(div().text_size(px(15.)).child(label))
+                .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
+                    .child(if self.login.is_some(){"Waiting for Google sign-in…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
+                    .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
+                .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Refresh to load changes made on the web."}else{"Guest likes and saved collections stay on this computer until you connect an account."}))
+                .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
         }
         div()
             .absolute()

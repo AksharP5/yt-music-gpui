@@ -2,7 +2,7 @@
 
 A native Linux music client built in Rust with GPUI. It browses YouTube Music's live catalog and plays audio through mpv and yt-dlp. The interface follows the current Omarchy theme and runs on Wayland or X11.
 
-This is an independent client, not Google's application. This first version uses the public catalog. Likes, saved collections, history, and the queue live on your computer; they do not sync with a Google account.
+This is an independent client. The public-catalog player is working. Account integration is under development, and sign-in is disabled until its security review and account verification are complete. See [the parity checklist](docs/parity.md) for the remaining work.
 
 ## What works
 
@@ -34,13 +34,13 @@ bin/install
 
 The installer writes to `~/.local/bin` and `$XDG_DATA_HOME`, defaulting to `~/.local/share`. It does not install system dependencies. Alternatively, build an Arch package by running `makepkg` inside `packaging/`, then install that package with your package manager.
 
-For playback that requires your own session, supply a Netscape-format cookie file:
+For an explicitly supplied playback session, you can import a Netscape-format cookie file:
 
 ```sh
 yt-music-gpui --cookies /absolute/path/to/cookies.txt
 ```
 
-Cookies are passed to yt-dlp for playback only. They do not enable account-backed browsing or library sync. The app never extracts cookies from your browser. Keep cookie files outside this repository.
+Imported cookies are restricted to YouTube domains and used for account requests and playback. They are supplied by the user and are never read from existing browser profiles. Keep source cookie files outside this repository. The account connection being developed uses an isolated Google login window, the OS keyring, and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports.
 
 ## Controls
 
@@ -93,6 +93,8 @@ bin/test -- --ignored --nocapture
 
 The ordinary tests cover catalog parsing, duration and video ID validation, queue transitions and shuffle, library write flushing, and stale playback events. The ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause and seek. They need network access, mpv, and yt-dlp.
 
-YouTube's internal API and stream extraction can change. Update yt-dlp if songs stop loading; catalog changes may require a client update. Downloads, lyrics, Google sign-in, and account library sync are not implemented. GPUI's custom controls currently have limited screen-reader support.
+YouTube's internal API and stream extraction can change. Update yt-dlp if songs stop loading; catalog changes may require a client update. Complete account parity, downloads, lyrics, and other gaps are tracked in docs/parity.md. Account mutations are not yet verified against a signed-in account. GPUI's custom controls currently have limited screen-reader support.
 
 MIT licensed, with the adapted GPUI text input example under Apache-2.0. See NOTICE and LICENSE-APACHE.
+
+The account security design and verification limits are documented in [docs/account-security.md](docs/account-security.md).

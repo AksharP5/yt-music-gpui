@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
@@ -22,6 +22,46 @@ pub struct Track {
     pub album: Option<String>,
     pub duration: Option<u64>,
     pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub details: TrackDetails,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Rating {
+    Like,
+    Dislike,
+    #[default]
+    Indifferent,
+}
+impl Rating {
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Self::Like => "like/like",
+            Self::Dislike => "like/dislike",
+            Self::Indifferent => "like/removelike",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackDetails {
+    pub rating: Option<Rating>,
+    pub in_library: Option<bool>,
+    pub add_library: Option<String>,
+    pub remove_library: Option<String>,
+    pub remove_history: Option<String>,
+    pub set_video_id: Option<String>,
+    pub artist_id: Option<String>,
+    pub album_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectionDetails {
+    pub playlist_id: Option<String>,
+    pub saved: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +70,8 @@ pub struct Collection {
     pub title: String,
     pub subtitle: String,
     pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub details: CollectionDetails,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +118,9 @@ pub struct Page {
     pub title: String,
     pub shelves: Vec<Shelf>,
     pub continuation: Option<String>,
+    pub editable: bool,
+    pub description: String,
+    pub privacy: Option<String>,
 }
 
 impl Page {
@@ -97,7 +142,7 @@ impl Page {
 #[derive(Clone)]
 pub struct Catalog {
     client: Client,
-    session: SharedSession,
+    pub(crate) session: SharedSession,
 }
 
 impl Catalog {
@@ -188,7 +233,12 @@ impl Catalog {
             .header("Origin", ORIGIN)
             .header("Referer", format!("{ORIGIN}/"))
             .header("X-YouTube-Client-Name", "67")
-            .header("X-YouTube-Client-Version", CLIENT_VERSION)
+            .header(
+                "X-YouTube-Client-Version",
+                session
+                    .as_ref()
+                    .map_or(CLIENT_VERSION, |s| s.client_version.as_str()),
+            )
             .json(&body);
         let request = match session.as_ref() {
             Some(session) => session.apply(request)?,
@@ -348,6 +398,7 @@ fn parse_item(value: &Value) -> Option<Item> {
             album,
             duration,
             thumbnail: thumbnail(row),
+            details: track_details(row, &runs),
         }));
     }
     let id = endpoint?.pointer("/browseEndpoint/browseId")?.as_str()?;
@@ -360,7 +411,73 @@ fn parse_item(value: &Value) -> Option<Item> {
             .find(|s| !s.is_empty())
             .unwrap_or_default(),
         thumbnail: thumbnail(row),
+        details: CollectionDetails {
+            playlist_id: id.strip_prefix("VL").map(str::to_owned),
+            saved: find(row, "likeStatus")
+                .and_then(Value::as_str)
+                .map(|s| s == "LIKE"),
+        },
     }))
+}
+
+fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
+    let browse_id = |prefix: &str| {
+        runs.iter()
+            .filter_map(|r| {
+                r.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                    .and_then(Value::as_str)
+            })
+            .find(|id| id.starts_with(prefix))
+            .map(str::to_owned)
+    };
+    let mut details = TrackDetails {
+        rating: find(row, "likeStatus").and_then(|v| serde_json::from_value(v.clone()).ok()),
+        set_video_id: find(row, "setVideoId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        artist_id: browse_id("UC"),
+        album_id: browse_id("MPRE"),
+        ..Default::default()
+    };
+    for item in row
+        .pointer("/menu/menuRenderer/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(menu) = item
+            .get("toggleMenuServiceItemRenderer")
+            .or_else(|| item.get("menuServiceItemRenderer"))
+        else {
+            continue;
+        };
+        let icon = menu
+            .pointer("/defaultIcon/iconType")
+            .or_else(|| menu.pointer("/icon/iconType"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let token = |key: &str| {
+            menu.get(key)
+                .and_then(|v| find(v, "feedbackToken"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        match icon {
+            "BOOKMARK_BORDER" => {
+                details.in_library = Some(menu["isToggled"].as_bool().unwrap_or(false));
+                details.add_library = token("defaultServiceEndpoint");
+                details.remove_library = token("toggledServiceEndpoint");
+            }
+            "BOOKMARK" => {
+                details.in_library = Some(true);
+                details.add_library = token("toggledServiceEndpoint");
+                details.remove_library = token("defaultServiceEndpoint");
+            }
+            "REMOVE_FROM_HISTORY" => details.remove_history = token("serviceEndpoint"),
+            _ => {}
+        }
+    }
+    details
 }
 
 fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
@@ -383,7 +500,6 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                         text(&shelf["title"])
                     };
                     let contents = shelf.get("contents").or_else(|| shelf.get("items"));
-                    let mut seen = HashSet::new();
                     let mut items: Vec<Item> = if key == "musicCardShelfRenderer" {
                         parse_item(value).into_iter().collect()
                     } else {
@@ -394,8 +510,7 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(parse_item)
-                            .filter(|item| seen.insert(item.id().to_owned())),
+                            .filter_map(parse_item),
                     );
                     if key == "musicCardShelfRenderer" {
                         for item in &mut items {
@@ -418,15 +533,24 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
             }
         }
         Value::Array(items) => {
+            let rows: Vec<_> = items.iter().filter_map(parse_item).collect();
+            if !rows.is_empty() {
+                shelves.push(Shelf {
+                    title: String::new(),
+                    items: rows,
+                });
+            }
             for item in items {
-                parse_shelves(item, shelves);
+                if parse_item(item).is_none() {
+                    parse_shelves(item, shelves);
+                }
             }
         }
         _ => {}
     }
 }
 
-fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
+pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     let mut shelves = Vec::new();
     parse_shelves(data, &mut shelves);
     let title = [
@@ -449,6 +573,12 @@ fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         title,
         shelves,
         continuation,
+        editable: find(data, "musicEditablePlaylistDetailHeaderRenderer").is_some()
+            || find(data, "editablePlaylistId").is_some(),
+        description: find(data, "description").map(text).unwrap_or_default(),
+        privacy: find(data, "musicPlaylistEditHeaderRenderer")
+            .and_then(|v| v["privacy"].as_str())
+            .map(str::to_owned),
     })
 }
 

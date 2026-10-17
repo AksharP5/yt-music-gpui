@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    fs::File,
     io::{ErrorKind, Read, Write},
+    os::fd::AsRawFd,
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
     path::PathBuf,
@@ -17,6 +19,7 @@ use std::{
 
 pub struct PlayerOptions {
     pub cookies: Option<PathBuf>,
+    pub cookie_file: Option<File>,
     pub volume: f64,
     pub audio_output: Option<String>,
 }
@@ -25,6 +28,7 @@ impl Default for PlayerOptions {
     fn default() -> Self {
         Self {
             cookies: None,
+            cookie_file: None,
             volume: 60.,
             audio_output: None,
         }
@@ -72,6 +76,7 @@ enum PlayerCommand {
         title: String,
     },
     Json(Value),
+    Cookies(File),
     Stop,
     Quit,
 }
@@ -127,6 +132,9 @@ impl Player {
         Ok(track_id)
     }
 
+    pub fn set_cookies(&self, file: File) -> Result<()> {
+        self.send(PlayerCommand::Cookies(file))
+    }
     pub fn toggle_pause(&self) -> Result<()> {
         self.command(json!(["cycle", "pause"]))
     }
@@ -244,7 +252,15 @@ fn run(
     {
         cmd.arg("--script=/usr/lib/mpv-mpris/mpris.so");
     }
-    let raw_options = if let Some(path) = &options.cookies {
+    let mut cookie_file = options.cookie_file;
+    let ram_path = cookie_file.as_ref().map(|file| {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ))
+    });
+    let raw_options = if let Some(path) = ram_path.as_ref().or(options.cookies.as_ref()) {
         if !path.is_file() {
             bail!("The selected cookies file no longer exists.");
         }
@@ -323,6 +339,15 @@ fn run(
                     write_command(&mut socket, json!(["set_property", "pause", false]), None)?;
                 }
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
+                Ok(PlayerCommand::Cookies(file)) => {
+                    let path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
+                    write_command(
+                        &mut socket,
+                        json!(["set_property","options/ytdl-raw-options",{"ignore-config":"","cookies":path}]),
+                        None,
+                    )?;
+                    cookie_file = Some(file);
+                }
                 Ok(PlayerCommand::Stop) => {
                     state.desired = None;
                     state.loaded = false;
@@ -356,6 +381,7 @@ fn run(
                 ) => {}
             Err(error) => return Err(error).context("Lost the connection to mpv"),
         }
+        let _ = &cookie_file;
         if let Some(status) = child.0.try_wait()? {
             bail!("mpv stopped unexpectedly ({status}).");
         }

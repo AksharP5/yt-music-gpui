@@ -230,6 +230,7 @@ mod tests {
             album: None,
             duration: None,
             thumbnail: None,
+            details: Default::default(),
         }
     }
 
