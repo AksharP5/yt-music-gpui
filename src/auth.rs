@@ -1,11 +1,11 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
@@ -51,13 +51,20 @@ pub struct Session {
     playback_cookie: String,
     pub authuser: String,
     pub delegated_session_id: Option<String>,
+    data_sync_id: String,
     pub client_version: String,
+}
+
+pub struct PlaybackCredentials {
+    pub(crate) cookies: File,
+    pub(crate) identity: File,
 }
 
 #[derive(Deserialize)]
 struct BrowserAccount {
     authuser: String,
     delegated_session_id: Option<String>,
+    data_sync_id: String,
     client_version: String,
 }
 #[derive(Deserialize)]
@@ -93,73 +100,73 @@ impl Session {
         session.validate()?;
         Ok(Some(session))
     }
-    fn save(&self) -> Result<()> {
-        let mut child = Command::new("/usr/bin/secret-tool")
+    pub(crate) fn save(&self) -> Result<()> {
+        self.validate()?;
+        // A RAM stdin file cannot block on a full pipe while the keyring is locked.
+        let mut input = sealed_file(&serde_json::to_vec(self)?)?;
+        input.rewind()?;
+        let mut command = Command::new("/usr/bin/secret-tool");
+        command
             .args(["store", "--label=YouTube Music GPUI"])
             .args(KEYRING_ATTRIBUTES)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(input))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("The OS keyring is unavailable. Account connection was not saved.")?;
-        {
-            let mut input = child
-                .stdin
-                .take()
-                .context("Could not open the keyring input")?;
-            serde_json::to_writer(&mut input, self)?;
-        }
+            .stderr(Stdio::null());
+        let mut process = KeyringProcess::spawn(&mut command)?;
         ensure!(
-            child.wait()?.success(),
+            process.wait(Duration::from_secs(30))?.success(),
             "The OS keyring could not save the account. No plaintext fallback is used."
         );
         Ok(())
     }
     pub fn disconnect() -> Result<()> {
-        let status = Command::new("/usr/bin/secret-tool")
+        let mut command = Command::new("/usr/bin/secret-tool");
+        command
             .arg("clear")
             .args(KEYRING_ATTRIBUTES)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .context("The OS keyring is unavailable")?;
+            .stderr(Stdio::null());
+        let mut process = KeyringProcess::spawn(&mut command)?;
         ensure!(
-            status.success(),
+            process.wait(Duration::from_secs(30))?.success(),
             "Could not remove the saved account from the keyring"
         );
         Ok(())
     }
-    pub fn from_cookie_file(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path).context("Could not read the selected cookie file")?;
-        let mut cookies = Vec::new();
-        let mut playback_cookie = "# Netscape HTTP Cookie File\n".to_owned();
-        for line in text.lines() {
-            let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
-            if line.starts_with('#') || line.trim().is_empty() {
-                continue;
-            }
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() != 7 || !youtube_domain(fields[0]) {
-                continue;
-            }
-            let expires = fields[4].parse::<u64>().unwrap_or(0);
-            if expires > 0 && expires < timestamp() {
-                continue;
-            }
-            cookies.push(format!("{}={}", fields[5], fields[6]));
-            playback_cookie.push_str(line);
-            playback_cookie.push('\n');
-        }
-        let session = Self {
-            cookie: cookies.join("; "),
-            playback_cookie,
-            authuser: "0".into(),
-            delegated_session_id: None,
-            client_version: "1.20261013.15.00".into(),
+    pub fn from_cookie_file(_path: &Path) -> Result<Self> {
+        bail!(
+            "Cookie files do not identify the selected Google account. Connect through the dedicated sign-in window."
+        )
+    }
+    pub fn validate_playback_identity(&self) -> Result<()> {
+        ensure!(
+            self.authuser.parse::<u32>().is_ok()
+                && !self.authuser.is_empty()
+                && self.authuser.bytes().all(|c| c.is_ascii_digit()),
+            "Invalid Google account index"
+        );
+        let (first, second) = self
+            .data_sync_id
+            .split_once("||")
+            .context("The saved account has no playback identity. Connect your account again.")?;
+        let valid_id = |id: &str| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
         };
-        session.validate()?;
-        Ok(session)
+        ensure!(
+            valid_id(first) && (second.is_empty() || valid_id(second)),
+            "Invalid Google playback identity. Connect your account again."
+        );
+        let delegated = (!second.is_empty()).then_some(first);
+        ensure!(
+            delegated == self.delegated_session_id.as_deref(),
+            "The Google playback identity does not match the selected account. Connect again."
+        );
+        Ok(())
     }
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -170,10 +177,7 @@ impl Session {
             self.sapisid().is_some(),
             "Sign in to Google in the account connection window first."
         );
-        ensure!(
-            !self.authuser.is_empty() && self.authuser.bytes().all(|c| c.is_ascii_digit()),
-            "Invalid Google account index"
-        );
+        self.validate_playback_identity()?;
         Ok(())
     }
     fn sapisid(&self) -> Option<&str> {
@@ -211,26 +215,83 @@ impl Session {
             .header("X-Goog-AuthUser", &self.authuser)
             .header("X-Origin", ORIGIN))
     }
-    /// mpv/yt-dlp reads this anonymous RAM file through the parent process's fd.
-    /// No cookie file is created on disk, and closing the last fd destroys it.
+    pub fn playback_credentials(&self) -> Result<PlaybackCredentials> {
+        self.validate()?;
+        let identity = serde_json::to_vec(&json!({
+            "authuser": self.authuser,
+            "delegated_session_id": self.delegated_session_id,
+            "data_sync_id": self.data_sync_id,
+        }))?;
+        Ok(PlaybackCredentials {
+            cookies: self.playback_file()?,
+            identity: sealed_file(&identity)?,
+        })
+    }
+    /// Closing the last descriptor destroys the anonymous sealed RAM file.
     pub fn playback_file(&self) -> Result<File> {
-        let fd = unsafe {
-            libc::memfd_create(
-                c"yt-music-session".as_ptr(),
-                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-            )
-        };
-        ensure!(fd >= 0, "Could not create private playback credentials");
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(self.playback_cookie.as_bytes())?;
-        let seals =
-            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-        ensure!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } >= 0,
-            "Could not protect playback credentials"
-        );
-        Ok(file)
+        sealed_file(self.playback_cookie.as_bytes())
+    }
+}
+
+pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
+    let fd = unsafe {
+        libc::memfd_create(
+            c"yt-music-session".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    ensure!(fd >= 0, "Could not create private playback credentials");
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    ensure!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } >= 0,
+        "Could not protect playback credentials"
+    );
+    Ok(file)
+}
+
+struct KeyringProcess(Child);
+impl KeyringProcess {
+    fn spawn(command: &mut Command) -> Result<Self> {
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(0);
+                }
+                Ok(())
+            });
+        }
+        Ok(Self(
+            command.spawn().context("The OS keyring is unavailable")?,
+        ))
+    }
+    fn wait(&mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "The OS keyring operation timed out"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+impl Drop for KeyringProcess {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -435,7 +496,6 @@ pub fn connect(operation: &Operation) -> Result<(Session, crate::catalog::Accoun
         );
         if let Some((session, account)) = capture(&mut pipe)? {
             ensure!(!operation.is_cancelled(), "Account connection cancelled");
-            session.save()?;
             let _ = pipe.call("Browser.close", json!({}), None);
             return Ok((session, account));
         }
@@ -467,7 +527,7 @@ fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Ac
         .as_str()
         .context("Could not attach to the sign-in window")?;
     let result = (|| {
-        let account=pipe.call("Runtime.evaluate",json!({"expression":"(() => { const c = window.ytcfg; return c?.get('LOGGED_IN') ? { authuser: String(c.get('SESSION_INDEX') ?? 0), delegated_session_id: c.get('DELEGATED_SESSION_ID') ?? null, client_version: c.get('INNERTUBE_CLIENT_VERSION') } : null; })()","returnByValue":true}),Some(id))?;
+        let account=pipe.call("Runtime.evaluate",json!({"expression":"(() => { const c = window.ytcfg; return c?.get('LOGGED_IN') ? { authuser: String(c.get('SESSION_INDEX') ?? 0), delegated_session_id: c.get('DELEGATED_SESSION_ID') ?? null, data_sync_id: c.get('DATASYNC_ID'), client_version: c.get('INNERTUBE_CLIENT_VERSION') } : null; })()","returnByValue":true}),Some(id))?;
         if account["result"]["value"].is_null() {
             return Ok(None);
         }
@@ -508,6 +568,7 @@ fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Ac
             playback_cookie,
             authuser: account.authuser,
             delegated_session_id: account.delegated_session_id,
+            data_sync_id: account.data_sync_id,
             client_version: account.client_version,
         };
         session.validate()?;
@@ -528,8 +589,26 @@ mod tests {
             playback_cookie: "# Netscape HTTP Cookie File\n".into(),
             authuser: "0".into(),
             delegated_session_id: None,
+            data_sync_id: "synthetic-user||".into(),
             client_version: String::new(),
         }
+    }
+    #[test]
+    fn a_timed_out_keyring_process_is_terminated_and_reaped() {
+        let mut command = Command::new("/usr/bin/sleep");
+        command.arg("30");
+        let mut process = KeyringProcess::spawn(&mut command).unwrap();
+        let pid = process.0.id() as libc::pid_t;
+        assert!(process.wait(Duration::from_millis(20)).is_err());
+        drop(process);
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
     #[test]
     fn exact_cookie_names_and_fresh_authorization() {
@@ -545,13 +624,26 @@ mod tests {
         );
     }
     #[test]
-    fn imports_only_youtube_cookies() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f,"#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tvalue\n.evil-youtube.com\tTRUE\t/\tTRUE\t0\tSECRET\twrong").unwrap();
-        assert_eq!(
-            Session::from_cookie_file(f.path()).unwrap().cookie,
-            "SAPISID=value"
-        );
+    fn cookie_imports_cannot_guess_an_account_identity() {
+        assert!(Session::from_cookie_file(Path::new("/not-read")).is_err());
+        for domain in ["youtube.com", ".youtube.com", "music.youtube.com"] {
+            assert!(youtube_domain(domain));
+        }
+        for domain in ["evil-youtube.com", "youtube.com.evil.test"] {
+            assert!(!youtube_domain(domain));
+        }
+    }
+    #[test]
+    fn playback_identity_requires_consistent_primary_or_brand_context() {
+        let mut s = session("SAPISID=synthetic");
+        s.authuser = "2".into();
+        assert!(s.validate_playback_identity().is_ok());
+        s.data_sync_id = "brand||user".into();
+        assert!(s.validate_playback_identity().is_err());
+        s.delegated_session_id = Some("brand".into());
+        assert!(s.validate_playback_identity().is_ok());
+        s.data_sync_id.clear();
+        assert!(s.validate_playback_identity().is_err());
     }
     #[test]
     fn credentials_are_redacted_in_request_debug() {
@@ -567,15 +659,21 @@ mod tests {
     }
     #[test]
     fn playback_credentials_are_anonymous_and_read_only() {
-        let mut file = session("SAPISID=value").playback_file().unwrap();
-        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(
-            fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                .unwrap()
-                .to_string_lossy()
-                .contains("memfd:")
-        );
-        assert!(file.write_all(b"changed").is_err());
+        let credentials = session("SAPISID=value").playback_credentials().unwrap();
+        for mut file in [credentials.cookies, credentials.identity] {
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(
+                fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("memfd:")
+            );
+            assert_ne!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            assert!(file.write_all(b"changed").is_err());
+        }
     }
     #[test]
     fn browser_pipe_handles_events_and_fragmented_messages() {

@@ -9,6 +9,7 @@ mod library;
 mod player;
 mod playlist_form;
 mod theme;
+mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use std::path::PathBuf;
@@ -38,7 +39,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--connect] [--cookies FILE]\n\n--connect        Connect your Google account in a dedicated sign-in window\n--cookies FILE   Import a Netscape-format YouTube account session\n\nCtrl K searches. Press ? in the app for all shortcuts."
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--connect]\n\n--connect        Connect your Google account in a dedicated sign-in window\n\nCookie imports are unsupported because they cannot identify the selected account.\nCtrl K searches. Press ? in the app for all shortcuts."
                 );
                 return;
             }
@@ -55,15 +56,6 @@ fn main() {
     if (connect || cookies.is_some()) && !auth::ACCOUNT_LOGIN_ENABLED {
         eprintln!("Account connection is disabled until the security review is complete.");
         std::process::exit(1);
-    }
-    if connect {
-        eprintln!(
-            "Sign in to YouTube Music in the Google account window. It will close when the connection is ready."
-        );
-        if let Err(error) = auth::connect(&auth::Operation::default()) {
-            eprintln!("{error:#}");
-            std::process::exit(1);
-        }
     }
     gpui_platform::application()
         .with_assets(assets::Assets)
@@ -87,7 +79,7 @@ fn main() {
                     app_id: Some("yt-music-gpui".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| app::Music::new(cookies, window, cx)),
+                |window, cx| cx.new(|cx| app::Music::new(cookies, connect, window, cx)),
             )
             .expect("open YouTube Music window");
             cx.activate(true);

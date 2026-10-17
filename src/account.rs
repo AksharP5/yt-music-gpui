@@ -147,6 +147,7 @@ pub struct Connection {
 
 impl Connection {
     fn verify(session: Session, catalog: &Catalog) -> Result<Self> {
+        session.validate_playback_identity()?;
         let session = Arc::new(session);
         let account = catalog.for_session(Some(session.clone())).account()?;
         Ok(Self { account, session })
@@ -173,11 +174,13 @@ pub enum Command {
         operation: Operation,
     },
     Disconnect(Operation),
+    Persist(Arc<Session>),
 }
 pub enum Event {
     Connected {
         operation: Operation,
         result: Result<Option<Connection>, String>,
+        save_session: bool,
     },
     Disconnected {
         operation: Operation,
@@ -188,6 +191,25 @@ pub enum Event {
         mutation: Box<Mutation>,
         result: Result<Effect, String>,
     },
+    Persisted {
+        session: Arc<Session>,
+        result: Result<(), String>,
+    },
+}
+
+pub struct Worker {
+    commands: async_channel::Sender<Command>,
+    thread: thread::JoinHandle<Result<()>>,
+}
+
+impl Worker {
+    /// Finish pending sign-out work before the process can exit.
+    pub fn finish(self) -> Result<()> {
+        self.commands.close();
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("The account cleanup worker stopped unexpectedly"))?
+    }
 }
 
 pub fn start(
@@ -195,13 +217,15 @@ pub fn start(
 ) -> (
     async_channel::Sender<Command>,
     async_channel::Receiver<Event>,
+    Worker,
 ) {
     let (requests, commands) = async_channel::bounded(64);
     let (events, completed) = async_channel::unbounded();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("account-sync".into())
-        .spawn(move || {
+        .spawn(move || -> Result<()> {
             let catalog = Catalog::new();
+            let mut cleanup_error = None;
             while let Ok(command) = commands.recv_blocking() {
                 let event = match command {
                     Command::Connect(operation) => {
@@ -210,7 +234,7 @@ pub fn start(
                             Connection { session: Arc::new(candidate), account }
                                 .publish(&session, &operation).map(Some)
                         })().map_err(|e| format!("{e:#}"));
-                        Event::Connected { operation, result }
+                        Event::Connected { operation, result, save_session: true }
                     }
                     Command::Restore { path, operation } => {
                         let result = (|| {
@@ -225,12 +249,13 @@ pub fn start(
                                 Connection::verify(candidate, catalog)?.publish(&session, &operation)
                             }).transpose()
                         })();
-                        Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")) }
+                        Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")), save_session: false }
                     }
                     Command::Disconnect(operation) => {
                         // End in-memory authority even if keyring removal needs another attempt.
                         if let Ok(mut current) = session.write() { *current = None; }
                         let result = auth::Session::disconnect().map_err(|e| format!("{e:#}"));
+                        cleanup_error = result.as_ref().err().cloned();
                         Event::Disconnected { operation, result }
                     }
                     Command::Apply { session: expected, mutation } => {
@@ -241,14 +266,43 @@ pub fn start(
                         })().map_err(|e| format!("{e:#}"));
                         Event::Applied { session: expected, mutation, result }
                     }
+                    Command::Persist(expected) => {
+                        let result = (|| {
+                            ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
+                            persist_current_session(&session, &expected, || expected.save(), Session::disconnect)
+                        })().map_err(|error| format!("{error:#}"));
+                        Event::Persisted { session: expected, result }
+                    }
                 };
-                if events.send_blocking(event).is_err() {
-                    break;
-                }
+                // Closing the UI must not discard a queued sign-out behind this event.
+                let _ = events.send_blocking(event);
             }
+            if let Some(error) = cleanup_error {
+                anyhow::bail!(error);
+            }
+            Ok(())
         })
         .expect("start account sync worker");
-    (requests, completed)
+    let worker = Worker {
+        commands: requests.clone(),
+        thread: worker,
+    };
+    (requests, completed, worker)
+}
+
+fn persist_current_session(
+    shared: &SharedSession,
+    expected: &Arc<Session>,
+    save: impl FnOnce() -> Result<()>,
+    clear: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    require_current_session(shared, expected)?;
+    let saved = save();
+    if let Err(revoked) = require_current_session(shared, expected) {
+        clear().context("Could not remove a revoked account from the keyring")?;
+        return Err(revoked);
+    }
+    saved
 }
 
 fn require_current_session(shared: &SharedSession, expected: &Arc<Session>) -> Result<()> {
@@ -467,7 +521,8 @@ mod tests {
         serde_json::from_value(json!({
             "cookie":"SAPISID=synthetic-test-value",
             "playback_cookie":"# Netscape HTTP Cookie File\n",
-            "authuser":"0", "delegated_session_id":null, "client_version":"test"
+            "authuser":"0", "delegated_session_id":null, "client_version":"test",
+            "data_sync_id":"synthetic-user||"
         }))
         .unwrap()
     }
@@ -521,7 +576,7 @@ mod tests {
         if auth::ACCOUNT_LOGIN_ENABLED {
             return;
         }
-        let (commands, events) = start(auth::shared(None));
+        let (commands, events, worker) = start(auth::shared(None));
         commands
             .send_blocking(Command::Restore {
                 path: Some(PathBuf::from("/nonexistent-synthetic-cookie-file")),
@@ -536,6 +591,52 @@ mod tests {
             }
             _ => panic!("account import must fail closed"),
         }
+        worker.finish().unwrap();
+    }
+    #[test]
+    fn revoked_persistence_is_cleared_even_after_a_partial_store_failure() {
+        use std::cell::Cell;
+        for store_succeeds in [true, false] {
+            let shared = auth::shared(Some(synthetic_session()));
+            let expected = shared.read().unwrap().clone().unwrap();
+            let cleared = Cell::new(false);
+            let result = persist_current_session(
+                &shared,
+                &expected,
+                || {
+                    *shared.write().unwrap() = None;
+                    ensure!(store_succeeds, "Synthetic partial store failure");
+                    Ok(())
+                },
+                || {
+                    cleared.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(cleared.get());
+        }
+    }
+    #[test]
+    fn finishing_worker_drains_commands_after_the_event_receiver_closes() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let (commands, events, worker) = start(shared.clone());
+        drop(events);
+        let operation = Operation::default();
+        operation.cancel();
+        for _ in 0..2 {
+            commands
+                .send_blocking(Command::Restore {
+                    path: None,
+                    operation: operation.clone(),
+                })
+                .unwrap();
+        }
+        worker.finish().unwrap();
+        assert!(commands.is_closed());
+        assert!(commands.is_empty());
+        assert!(require_current_session(&shared, &expected).is_ok());
     }
     #[test]
     fn failed_or_missing_acknowledgements_are_not_success() {

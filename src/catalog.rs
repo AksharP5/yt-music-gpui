@@ -63,6 +63,17 @@ pub struct TrackDetails {
     pub album_id: Option<String>,
 }
 
+impl TrackDetails {
+    pub fn clear_account_state(&mut self) {
+        self.rating = None;
+        self.in_library = None;
+        self.add_library = None;
+        self.remove_library = None;
+        self.remove_history = None;
+        self.set_video_id = None;
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectionDetails {
@@ -293,7 +304,7 @@ pub fn find<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-fn thumbnail(value: &Value) -> Option<String> {
+pub(crate) fn thumbnail(value: &Value) -> Option<String> {
     find(value, "thumbnails")?
         .as_array()?
         .iter()
@@ -307,7 +318,7 @@ fn thumbnail(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn duration(s: &str) -> Option<u64> {
+pub(crate) fn duration(s: &str) -> Option<u64> {
     let parts: Vec<_> = s.trim().split(':').collect();
     if !(2..=3).contains(&parts.len()) {
         return None;
@@ -323,7 +334,7 @@ fn duration(s: &str) -> Option<u64> {
     Some(seconds)
 }
 
-fn valid_video_id(id: &str) -> bool {
+pub(crate) fn valid_video_id(id: &str) -> bool {
     id.len() == 11
         && id
             .bytes()
@@ -471,7 +482,7 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
     }
 }
 
-fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
+pub(crate) fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
     let browse_id = |prefix: &str| {
         runs.iter()
             .filter_map(|r| {
@@ -843,8 +854,8 @@ mod tests {
     }
 
     #[test]
-    fn persisted_metadata_excludes_account_state_and_occurrence_tokens() {
-        let details = TrackDetails {
+    fn account_state_is_cleared_on_disk_and_in_memory() {
+        let mut details = TrackDetails {
             rating: Some(Rating::Like),
             in_library: Some(true),
             add_library: Some("add-song".into()),
@@ -874,6 +885,8 @@ mod tests {
                 ..Default::default()
             }
         );
+        details.clear_account_state();
+        assert_eq!(details, restored);
     }
 
     #[test]

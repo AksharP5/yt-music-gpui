@@ -8,6 +8,7 @@ use crate::{
     player::{Player, PlayerEvent, PlayerOptions},
     playlist_form::{PlaylistForm, PlaylistFormEvent},
     theme::Theme,
+    watch::Watch,
 };
 use gpui::{prelude::*, *};
 use std::{
@@ -60,6 +61,26 @@ enum CatalogTarget {
     Page,
     PlaylistPicker,
 }
+enum PlaybackQuery {
+    Watch { video_id: String, radio: bool },
+    Lyrics(String),
+}
+struct PlaybackJob {
+    id: u64,
+    query: PlaybackQuery,
+    session: Option<Arc<Session>>,
+}
+enum PlaybackResult {
+    Watch {
+        id: u64,
+        radio: bool,
+        result: Result<Box<Watch>, String>,
+    },
+    Lyrics {
+        id: u64,
+        result: Result<String, String>,
+    },
+}
 #[derive(Clone, Copy, PartialEq)]
 enum Playback {
     Stopped,
@@ -89,6 +110,10 @@ enum Overlay {
         id: String,
         title: String,
     },
+    Lyrics {
+        title: String,
+        text: Option<String>,
+    },
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
@@ -112,6 +137,7 @@ pub struct Music {
     session: SharedSession,
     account: Option<Connection>,
     account_commands: async_channel::Sender<account::Command>,
+    account_worker: Option<account::Worker>,
     account_operation: Option<AccountOperation>,
     pending_mutations: HashSet<String>,
     ratings: HashMap<String, Rating>,
@@ -128,6 +154,10 @@ pub struct Music {
     generation: Arc<AtomicU64>,
     jobs: async_channel::Sender<Job>,
     pending_jobs: async_channel::Receiver<Job>,
+    playback_jobs: async_channel::Sender<PlaybackJob>,
+    pending_playback_jobs: async_channel::Receiver<PlaybackJob>,
+    playback_generation: Arc<AtomicU64>,
+    now_playing: Option<Watch>,
     artwork: Artwork,
     library: Library,
     store: Option<LibraryWriter>,
@@ -147,7 +177,12 @@ pub struct Music {
 }
 
 impl Music {
-    pub fn new(cookies: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        cookies: Option<PathBuf>,
+        connect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(SearchInput::new);
         let (store, library, error) = match Store::load() {
             Ok((s, l)) => (Some(s), l, None),
@@ -172,13 +207,18 @@ impl Music {
             writer
         });
         let session = auth::shared(None);
-        let (account_commands, account_events) = account::start(session.clone());
+        let (account_commands, account_events, account_worker) = account::start(session.clone());
         let account_operation = auth::ACCOUNT_LOGIN_ENABLED.then(|| {
             let operation = Operation::default();
-            let _ = account_commands.try_send(account::Command::Restore {
-                path: cookies,
-                operation: operation.clone(),
-            });
+            let command = if connect {
+                account::Command::Connect(operation.clone())
+            } else {
+                account::Command::Restore {
+                    path: cookies,
+                    operation: operation.clone(),
+                }
+            };
+            let _ = account_commands.try_send(command);
             AccountOperation::Connecting(operation)
         });
         cx.spawn_in(window, async move |view, cx| {
@@ -193,8 +233,7 @@ impl Music {
         })
         .detach();
         let (player, error) = match Player::new(PlayerOptions {
-            cookies: None,
-            cookie_file: None,
+            credentials: None,
             volume: library.volume,
             ..Default::default()
         }) {
@@ -265,6 +304,58 @@ impl Music {
             while let Ok(result) = completed.recv().await {
                 if view
                     .update_in(cx, |view, _, cx| view.catalog_result(result, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let (playback_jobs, playback_receiver) = async_channel::bounded::<PlaybackJob>(1);
+        let (playback_results, playback_completed) = async_channel::unbounded();
+        let playback_generation = Arc::new(AtomicU64::new(0));
+        let worker_receiver = playback_receiver.clone();
+        let worker_generation = playback_generation.clone();
+        thread::Builder::new()
+            .name("playback-details".into())
+            .spawn(move || {
+                let catalog = Catalog::new();
+                while let Ok(job) = worker_receiver.recv_blocking() {
+                    if job.id != worker_generation.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let catalog = catalog
+                        .as_ref()
+                        .map(|catalog| catalog.for_session(job.session))
+                        .map_err(|error| format!("{error:#}"));
+                    let result = match job.query {
+                        PlaybackQuery::Watch { video_id, radio } => PlaybackResult::Watch {
+                            id: job.id,
+                            radio,
+                            result: catalog.and_then(|catalog| {
+                                catalog
+                                    .watch(&video_id, radio)
+                                    .map(Box::new)
+                                    .map_err(|error| format!("{error:#}"))
+                            }),
+                        },
+                        PlaybackQuery::Lyrics(id) => PlaybackResult::Lyrics {
+                            id: job.id,
+                            result: catalog.and_then(|catalog| {
+                                catalog.lyrics(&id).map_err(|error| format!("{error:#}"))
+                            }),
+                        },
+                    };
+                    if playback_results.send_blocking(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("start playback details worker");
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(result) = playback_completed.recv().await {
+                if view
+                    .update_in(cx, |view, _, cx| view.playback_result(result, cx))
                     .is_err()
                 {
                     break;
@@ -347,6 +438,7 @@ impl Music {
             session,
             account: None,
             account_commands,
+            account_worker: Some(account_worker),
             account_operation,
             pending_mutations: HashSet::new(),
             ratings: HashMap::new(),
@@ -370,6 +462,10 @@ impl Music {
             generation,
             jobs,
             pending_jobs: receiver,
+            playback_jobs,
+            pending_playback_jobs: playback_receiver,
+            playback_generation,
+            now_playing: None,
             artwork,
             library,
             store,
@@ -390,6 +486,99 @@ impl Music {
         window.focus(&view.focus, cx);
         view.request(Query::Home, cx);
         view
+    }
+
+    fn playback_request(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
+        let id = self.playback_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.pending_playback_jobs.try_recv();
+        let session = self
+            .account
+            .as_ref()
+            .map(|connection| connection.session.clone());
+        if self
+            .playback_jobs
+            .try_send(PlaybackJob { id, query, session })
+            .is_err()
+        {
+            self.error = Some(
+                "The playback details connection stopped. Restart the app to reconnect.".into(),
+            );
+        }
+        cx.notify();
+    }
+
+    fn playback_result(&mut self, result: PlaybackResult, cx: &mut Context<Self>) {
+        match result {
+            PlaybackResult::Watch { id, radio, result } => {
+                if id != self.playback_generation.load(Ordering::Relaxed) {
+                    return;
+                }
+                match result {
+                    Ok(watch) => {
+                        let watch = *watch;
+                        if radio {
+                            let Some(index) = watch.current_index else {
+                                self.error = Some("YouTube Music did not include the requested song in its radio.".into());
+                                cx.notify();
+                                return;
+                            };
+                            self.library.queue.replace(watch.queue.clone(), index);
+                            self.notice = Some("Radio started".into());
+                        }
+                        if let Some(track) = &watch.current
+                            && let Some(index) = self.library.queue.index
+                            && let Some(current) = self.library.queue.tracks.get_mut(index)
+                            && current.id == track.id
+                        {
+                            // Keep the selected playlist occurrence when refreshing song metadata.
+                            let occurrence = current.details.set_video_id.clone();
+                            current.details = track.details.clone();
+                            current.details.set_video_id = occurrence;
+                            if let Some(rating) = track.details.rating {
+                                self.ratings.insert(track.id.clone(), rating);
+                            }
+                        }
+                        self.now_playing = Some(watch);
+                        if radio {
+                            self.play_current(cx);
+                        }
+                    }
+                    Err(error) if radio => self.error = Some(error),
+                    Err(error) => {
+                        self.notice = Some(format!("Song details are unavailable: {error}"))
+                    }
+                }
+            }
+            PlaybackResult::Lyrics { id, result } => {
+                if id != self.playback_generation.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(Overlay::Lyrics { text, .. }) = &mut self.overlay {
+                    *text = Some(result.unwrap_or_else(|error| error));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_account_state(&mut self) {
+        self.ratings.clear();
+        self.pending_mutations.clear();
+        self.playback_generation.fetch_add(1, Ordering::Relaxed);
+        let _ = self.pending_playback_jobs.try_recv();
+        self.now_playing = None;
+        self.overlay = None;
+        self.form_subscription = None;
+        for track in self
+            .library
+            .queue
+            .tracks
+            .iter_mut()
+            .chain(&mut self.library.recent)
+            .chain(&mut self.library.liked)
+        {
+            track.details.clear_account_state();
+        }
     }
 
     fn request(&mut self, query: Query, cx: &mut Context<Self>) {
@@ -669,8 +858,7 @@ impl Music {
             *session = None;
         }
         self.account = None;
-        self.ratings.clear();
-        self.pending_mutations.clear();
+        self.clear_account_state();
         self.player_command(Player::clear_cookies);
         self.active_id = None;
         self.playback = Playback::Stopped;
@@ -808,7 +996,11 @@ impl Music {
                     Err(error) => self.error = Some(error),
                 }
             }
-            account::Event::Connected { operation, result } => {
+            account::Event::Connected {
+                operation,
+                result,
+                save_session,
+            } => {
                 if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active)) if active.matches(&operation))
                 {
                     return;
@@ -817,18 +1009,34 @@ impl Music {
                 match result {
                     Ok(Some(connection)) => {
                         let label = format!("Connected as {}", connection.account.name);
-                        let file = connection.session.playback_file();
+                        let credentials = match connection.session.playback_credentials() {
+                            Ok(credentials) => credentials,
+                            Err(error) => {
+                                self.disconnect_account(cx);
+                                self.error = Some(format!(
+                                    "Could not activate playback credentials: {error:#}"
+                                ));
+                                cx.notify();
+                                return;
+                            }
+                        };
+                        let session = connection.session.clone();
                         self.account = Some(connection);
-                        self.ratings.clear();
-                        self.pending_mutations.clear();
+                        self.clear_account_state();
+                        window.focus(&self.focus, cx);
                         self.navigate(Route::Home, cx);
                         self.back.clear();
                         self.player_command(Player::clear_cookies);
                         self.active_id = None;
                         self.playback = Playback::Stopped;
-                        match file {
-                            Ok(file) => self.player_command(|p| p.set_cookies(file)),
-                            Err(error) => self.error = Some(format!("{error:#}")),
+                        self.player_command(|p| p.set_credentials(credentials));
+                        if save_session
+                            && self
+                                .account_commands
+                                .try_send(account::Command::Persist(session))
+                                .is_err()
+                        {
+                            self.error = Some("Connected for this session, but the account could not be queued for keyring storage.".into());
                         }
                         self.notice = Some(label);
                     }
@@ -897,6 +1105,18 @@ impl Music {
                     }
                 }
             }
+            account::Event::Persisted { session, result } => {
+                if self
+                    .account
+                    .as_ref()
+                    .is_some_and(|connection| Arc::ptr_eq(&connection.session, &session))
+                    && let Err(error) = result
+                {
+                    self.error = Some(format!(
+                        "Connected for this session, but the account was not saved: {error}"
+                    ));
+                }
+            }
         }
         cx.notify();
     }
@@ -924,6 +1144,27 @@ impl Music {
                 self.position = 0.;
                 self.duration = track.duration.unwrap_or(0) as f64;
                 self.error = None;
+                if self
+                    .now_playing
+                    .as_ref()
+                    .and_then(|watch| watch.current.as_ref())
+                    .is_some_and(|current| current.id == track.id)
+                {
+                    self.playback_generation.fetch_add(1, Ordering::Relaxed);
+                    let _ = self.pending_playback_jobs.try_recv();
+                } else {
+                    self.now_playing = None;
+                    if matches!(self.overlay, Some(Overlay::Lyrics { .. })) {
+                        self.overlay = None;
+                    }
+                    self.playback_request(
+                        PlaybackQuery::Watch {
+                            video_id: track.id,
+                            radio: false,
+                        },
+                        cx,
+                    );
+                }
             }
             Err(error) => self.error = Some(error.to_string()),
         }
@@ -2067,6 +2308,7 @@ impl Music {
             .gap(px(12.));
         if let Some(track) = current {
             let art = self.art(track.thumbnail.as_deref(), 52.);
+            let menu_track = track.clone();
             let liked = self.is_liked(&track);
             let subtitle = match self.playback {
                 Playback::Loading => "Loading track…".into(),
@@ -2105,6 +2347,26 @@ impl Music {
                     )
                     .when(liked, |d| d.text_color(self.theme.accent))
                     .on_click(cx.listener(move |view, _, _, cx| view.toggle_like(&track, cx))),
+                )
+                .child(
+                    div()
+                        .id("current-song-menu")
+                        .w(px(26.))
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_size(px(22.))
+                        .child("⋯")
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            window.focus(&view.focus, cx);
+                            view.overlay = Some(Overlay::Track {
+                                track: menu_track.clone(),
+                                index: None,
+                            });
+                            cx.notify();
+                        })),
                 );
         } else {
             details = details.child(
@@ -2359,6 +2621,7 @@ impl Music {
                                 Overlay::Track { track, .. } => track.title.clone(),
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
+                                Overlay::Lyrics { title, .. } => format!("Lyrics · {title}"),
                                 Overlay::PlaylistForm { .. } => unreachable!(),
                             }),
                     )
@@ -2402,6 +2665,58 @@ impl Music {
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
         } else if let Overlay::Track { track, index } = kind {
+            let song = track.clone();
+            body = body.child(self.menu_action(
+                "menu-radio",
+                "Start radio",
+                cx,
+                move |view, _, cx| {
+                    view.overlay = None;
+                    view.notice = Some("Loading radio…".into());
+                    view.playback_request(
+                        PlaybackQuery::Watch {
+                            video_id: song.id.clone(),
+                            radio: true,
+                        },
+                        cx,
+                    );
+                },
+            ));
+            if let Some(watch) = &self.now_playing
+                && watch
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.id == track.id)
+            {
+                if let Some(id) = &watch.lyrics {
+                    let id = id.clone();
+                    let title = track.title.clone();
+                    body = body.child(self.menu_action(
+                        "menu-lyrics",
+                        "Lyrics",
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = Some(Overlay::Lyrics {
+                                title: title.clone(),
+                                text: None,
+                            });
+                            view.playback_request(PlaybackQuery::Lyrics(id.clone()), cx);
+                        },
+                    ));
+                }
+                if let Some(id) = &watch.related {
+                    let id = id.clone();
+                    body = body.child(self.menu_action(
+                        "menu-related",
+                        "Related music",
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = None;
+                            view.navigate(Route::Browse(id.clone()), cx);
+                        },
+                    ));
+                }
+            }
             let song = track.clone();
             body = body.child(self.menu_action(
                 "menu-like",
@@ -2612,6 +2927,12 @@ impl Music {
                     cx.notify();
                 },
             ));
+        } else if let Overlay::Lyrics { text, .. } = kind {
+            body = body.child(
+                div()
+                    .text_size(px(17.))
+                    .child(text.clone().unwrap_or_else(|| "Loading lyrics…".into())),
+            );
         } else if let Overlay::PlaylistPicker {
             track,
             page,
@@ -2744,6 +3065,14 @@ impl Drop for Music {
     fn drop(&mut self) {
         if let Some(AccountOperation::Connecting(operation)) = &self.account_operation {
             operation.cancel();
+        }
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::Disconnecting(_))
+        ) && let Some(worker) = self.account_worker.take()
+            && let Err(error) = worker.finish()
+        {
+            eprintln!("Could not finish account sign-out: {error:#}");
         }
     }
 }
