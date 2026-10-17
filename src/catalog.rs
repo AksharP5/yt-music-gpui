@@ -1,10 +1,11 @@
 use crate::auth::Session;
 use anyhow::{Context, Result, bail, ensure};
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, header::HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::Arc,
     time::Duration,
 };
@@ -237,11 +238,51 @@ pub struct Shelf {
     pub items: Vec<Item>,
 }
 
+#[derive(Clone)]
+pub struct Continuation {
+    token: String,
+    visitor: Option<HeaderValue>,
+    session: Option<Arc<Session>>,
+}
+
+impl Continuation {
+    fn new(token: &str) -> Self {
+        Self {
+            token: token.to_owned(),
+            visitor: None,
+            session: None,
+        }
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn require_session(&self, session: Option<&Arc<Session>>) -> Result<()> {
+        let matches = match (self.session.as_ref(), session) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+            _ => false,
+        };
+        ensure!(
+            matches,
+            "The account changed before this page could continue"
+        );
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Continuation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Continuation { .. }")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Page {
     pub title: String,
     pub shelves: Vec<Shelf>,
-    pub continuation: Option<String>,
+    pub continuation: Option<Continuation>,
     pub editable: bool,
     pub description: String,
     pub privacy: Option<String>,
@@ -316,23 +357,95 @@ impl Catalog {
     pub fn browse(&self, link: &BrowseLink) -> Result<Page> {
         let data = self.request("browse", link.body()?)?;
         let mut page = parse_page(&data, &link.title)?;
+        if matches!(link.id.as_str(), "FEmusic_home" | "FEmusic_explore") {
+            page.continuation = data
+                .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer")
+                .and_then(section_continuation);
+        }
         match link.id.as_str() {
             "FEmusic_home" => page.chips = home_choices(&data)?,
             "FEmusic_charts" => page.countries = chart_choices(&data, link)?,
             _ => {}
         }
+        self.bind_page(page, &data, None)
+    }
+
+    pub fn more(&self, continuation: &Continuation) -> Result<Page> {
+        let data = self.request_with_continuation(
+            "browse",
+            json!({"continuation": continuation.token()}),
+            Some(continuation),
+        )?;
+        self.bind_page(parse_page(&data, "More music")?, &data, Some(continuation))
+    }
+
+    pub(crate) fn bind_page(
+        &self,
+        mut page: Page,
+        response: &Value,
+        previous: Option<&Continuation>,
+    ) -> Result<Page> {
+        if let Some(continuation) = &mut page.continuation {
+            continuation.session = self.session.clone();
+            continuation.visitor = match previous.and_then(|previous| previous.visitor.clone()) {
+                Some(visitor) => Some(visitor),
+                None => response
+                    .pointer("/responseContext/visitorData")
+                    .map(|value| -> Result<HeaderValue> {
+                        let visitor = value
+                            .as_str()
+                            .context("YouTube Music returned an invalid page visitor")?;
+                        let mut visitor = HeaderValue::from_str(visitor)
+                            .context("YouTube Music returned an invalid page visitor")?;
+                        visitor.set_sensitive(true);
+                        Ok(visitor)
+                    })
+                    .transpose()?,
+            };
+        }
         Ok(page)
     }
 
-    pub fn more(&self, continuation: &str, search: bool) -> Result<Page> {
-        let data = self.request(
-            if search { "search" } else { "browse" },
-            json!({"continuation": continuation}),
-        )?;
-        parse_page(&data, "More music")
+    pub fn request(&self, endpoint: &str, body: Value) -> Result<Value> {
+        self.request_with_continuation(endpoint, body, None)
     }
 
-    pub fn request(&self, endpoint: &str, mut body: Value) -> Result<Value> {
+    pub(crate) fn request_with_continuation(
+        &self,
+        endpoint: &str,
+        body: Value,
+        continuation: Option<&Continuation>,
+    ) -> Result<Value> {
+        let response = self
+            .page_request(endpoint, body, continuation)?
+            .send()
+            .map_err(reqwest::Error::without_url)
+            .context("Could not reach YouTube Music. Check your connection and try again.")?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)
+            .context("YouTube Music rejected the request")?;
+        let value: Value = response
+            .json()
+            .map_err(reqwest::Error::without_url)
+            .context("YouTube Music returned an unreadable response")?;
+        if let Some(error) = value.get("error") {
+            bail!(
+                "YouTube Music: {}",
+                error["message"].as_str().unwrap_or("request failed")
+            );
+        }
+        Ok(value)
+    }
+
+    fn page_request(
+        &self,
+        endpoint: &str,
+        mut body: Value,
+        continuation: Option<&Continuation>,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        if let Some(continuation) = continuation {
+            continuation.require_session(self.session.as_ref())?;
+        }
         body["context"] = json!({"client": {
             "clientName": "WEB_REMIX", "clientVersion": CLIENT_VERSION, "hl": "en", "gl": "US"
         }});
@@ -356,28 +469,15 @@ impl Catalog {
                     .map_or(CLIENT_VERSION, |s| s.client_version.as_str()),
             )
             .json(&body);
+        let request = match continuation.and_then(|continuation| continuation.visitor.as_ref()) {
+            Some(visitor) => request.header("X-Goog-Visitor-Id", visitor),
+            None => request,
+        };
         let request = match session.as_ref() {
             Some(session) => session.apply(request)?,
             None => request,
         };
-        let response = request
-            .send()
-            .map_err(reqwest::Error::without_url)
-            .context("Could not reach YouTube Music. Check your connection and try again.")?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)
-            .context("YouTube Music rejected the request")?;
-        let value: Value = response
-            .json()
-            .map_err(reqwest::Error::without_url)
-            .context("YouTube Music returned an unreadable response")?;
-        if let Some(error) = value.get("error") {
-            bail!(
-                "YouTube Music: {}",
-                error["message"].as_str().unwrap_or("request failed")
-            );
-        }
-        Ok(value)
+        Ok(request)
     }
 }
 
@@ -736,6 +836,19 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
     }
 }
 
+fn section_continuation(owner: &Value) -> Option<Continuation> {
+    owner["continuations"]
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            entry
+                .pointer("/nextContinuationData/continuation")
+                .and_then(Value::as_str)
+        })
+        .filter(|token| !token.is_empty())
+        .map(Continuation::new)
+}
+
 pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     let mut shelves = Vec::new();
     parse_shelves(data, &mut shelves);
@@ -763,10 +876,17 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         })
         .map(text)
         .unwrap_or_default();
-    let continuation = find(data, "nextContinuationData")
-        .and_then(|v| v["continuation"].as_str())
-        .or_else(|| find(data, "continuationCommand").and_then(|v| v["token"].as_str()))
-        .map(str::to_owned);
+    let continuation = match data
+        .pointer("/continuationContents/sectionListContinuation")
+        .or_else(|| data.get("sectionListContinuation"))
+    {
+        Some(owner) => section_continuation(owner),
+        None => find(data, "nextContinuationData")
+            .and_then(|v| v["continuation"].as_str())
+            .or_else(|| find(data, "continuationCommand").and_then(|v| v["token"].as_str()))
+            .filter(|token| !token.is_empty())
+            .map(Continuation::new),
+    };
     if shelves.is_empty() && find(data, "contents").is_none() {
         bail!("YouTube Music returned no music. Try again or open a different collection.");
     }
@@ -978,6 +1098,156 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn continued_page(visitor: Value, token: &str) -> Value {
+        json!({
+            "responseContext":{"visitorData":visitor},
+            "continuationContents":{"sectionListContinuation":{
+                "contents":[{"musicCarouselShelfRenderer":{
+                    "header":{"musicCarouselShelfBasicHeaderRenderer":{"title":{"simpleText":"More"}}},
+                    "contents":[{"musicTwoRowItemRenderer":{
+                        "title":{"simpleText":"A collection"},
+                        "navigationEndpoint":{"browseEndpoint":{"browseId":"VLcollection"}}
+                    }}],
+                    "continuations":[{"nextContinuationData":{"continuation":"shelf-token"}}]
+                }}],
+                "continuations":[{"nextContinuationData":{"continuation":token}}]
+            }}
+        })
+    }
+
+    #[test]
+    fn continuation_keeps_its_page_token_and_originating_visitor() {
+        let catalog = Catalog::new().unwrap();
+        let response = continued_page(json!("original-visitor"), "page-token");
+        let page = catalog
+            .bind_page(parse_page(&response, "More").unwrap(), &response, None)
+            .unwrap();
+        assert_eq!(page.shelves.len(), 1);
+        assert_eq!(page.shelves[0].items.len(), 1);
+        let first = page.continuation.unwrap();
+        assert_eq!(first.token(), "page-token");
+        let response = continued_page(json!("later-visitor"), "next-page-token");
+        let next = catalog
+            .bind_page(
+                parse_page(&response, "More").unwrap(),
+                &response,
+                Some(&first),
+            )
+            .unwrap()
+            .continuation
+            .unwrap();
+        let request = catalog
+            .page_request("browse", json!({"continuation":next.token()}), Some(&next))
+            .unwrap()
+            .build()
+            .unwrap();
+        let visitor = &request.headers()["X-Goog-Visitor-Id"];
+        assert_eq!(visitor, "original-visitor");
+        assert!(visitor.is_sensitive());
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["continuation"], "next-page-token");
+        assert_eq!(request.url().host_str(), Some("music.youtube.com"));
+        assert_eq!(request.url().path(), "/youtubei/v1/browse");
+        let debug = format!("{next:?}");
+        assert!(!debug.contains("visitor") && !debug.contains("token"));
+    }
+
+    #[test]
+    fn a_finished_section_list_does_not_use_a_nested_shelf_continuation() {
+        let mut response = continued_page(json!("visitor"), "page-token");
+        response["continuationContents"]["sectionListContinuation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("continuations");
+        assert!(
+            parse_page(&response, "More")
+                .unwrap()
+                .continuation
+                .is_none()
+        );
+        assert!(
+            section_continuation(&response["continuationContents"]["sectionListContinuation"])
+                .is_none()
+        );
+        let shelf = json!({"continuationContents":{"musicShelfContinuation":{
+            "contents":[],"continuations":[{"nextContinuationData":{"continuation":"library-token"}}]
+        }}});
+        assert_eq!(
+            parse_page(&shelf, "Library")
+                .unwrap()
+                .continuation
+                .as_ref()
+                .map(Continuation::token),
+            Some("library-token")
+        );
+    }
+
+    #[test]
+    fn continuation_requires_the_exact_account_snapshot_before_preparing_a_request() {
+        let session =
+            || {
+                Arc::new(serde_json::from_value::<Session>(json!({
+                "cookie":"SAPISID=synthetic", "playback_cookie":"# Netscape HTTP Cookie File\n",
+                "authuser":"2", "delegated_session_id":null, "data_sync_id":"user||",
+                "client_version":"test"
+            })).unwrap())
+            };
+        let expected = session();
+        let catalog = Catalog::with_session(Some(expected.clone())).unwrap();
+        let response = continued_page(json!("visitor"), "token");
+        let continuation = catalog
+            .bind_page(parse_page(&response, "More").unwrap(), &response, None)
+            .unwrap()
+            .continuation
+            .unwrap();
+        assert!(
+            catalog
+                .page_request("browse", json!({}), Some(&continuation))
+                .is_ok()
+        );
+        for current in [None, Some(session())] {
+            let other = catalog.for_session(current);
+            assert!(
+                other
+                    .page_request("browse", json!({}), Some(&continuation))
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("account changed")
+            );
+        }
+        let guest = Catalog::new().unwrap();
+        let guest_context = guest
+            .bind_page(parse_page(&response, "More").unwrap(), &response, None)
+            .unwrap()
+            .continuation
+            .unwrap();
+        assert!(
+            catalog
+                .page_request("browse", json!({}), Some(&guest_context))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_page_visitors_fail_without_disclosing_the_value() {
+        let catalog = Catalog::new().unwrap();
+        for visitor in [
+            json!(null),
+            json!(42),
+            json!("private-visitor\r\ninjected:value"),
+        ] {
+            let response = continued_page(visitor, "token");
+            let error = catalog
+                .bind_page(parse_page(&response, "More").unwrap(), &response, None)
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("invalid page visitor"));
+            assert!(!message.contains("private-visitor") && !message.contains("injected"));
+        }
+    }
 
     fn home_filter_fixture(selected: bool) -> Value {
         let chip = |label, selected, params| {
@@ -1600,6 +1870,24 @@ mod tests {
                 category.title,
                 playlists.shelves.len()
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "uses two public Home continuation reads without an account"]
+    fn live_public_home_continuation() {
+        let catalog = Catalog::new().unwrap();
+        let mut page = catalog.home().unwrap();
+        assert!(!page.shelves.is_empty());
+        for _ in 0..2 {
+            page = catalog
+                .more(page.continuation.as_ref().expect("Home must paginate"))
+                .unwrap();
+            assert!(
+                !page.shelves.is_empty(),
+                "Home continuation must contain shelves"
+            );
+            assert!(page.shelves.iter().all(|shelf| !shelf.items.is_empty()));
         }
     }
 

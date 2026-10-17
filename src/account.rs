@@ -335,7 +335,7 @@ impl Catalog {
     pub fn library(&self, section: Section) -> Result<Page> {
         self.require_account()?;
         let data = self.request("browse", json!({"browseId":section.browse_id()}))?;
-        let mut page = parse_page(&data, section.title())?;
+        let mut page = self.bind_page(parse_page(&data, section.title())?, &data, None)?;
         if section == Section::Liked {
             for shelf in &mut page.shelves {
                 for item in &mut shelf.items {

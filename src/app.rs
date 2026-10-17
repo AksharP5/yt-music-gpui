@@ -2,7 +2,7 @@ use crate::{
     account::{self, Connection, Effect, Mutation, Privacy, Section},
     artwork::Artwork,
     auth::{self, Operation, Session, SharedSession},
-    catalog::{BrowseLink, Catalog, Collection, Item, Page, Rating, Shelf, Track},
+    catalog::{BrowseLink, Catalog, Collection, Continuation, Item, Page, Rating, Shelf, Track},
     country_picker::{CountryPicker, CountryPickerEvent},
     library::{Library, LibraryWriter, Repeat, Store},
     player::{AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
@@ -57,12 +57,12 @@ enum Query {
     Search(Search),
     Browse(BrowseLink),
     More {
-        token: String,
+        token: Continuation,
         search: Option<Search>,
     },
     Library(Section),
     PlaylistChoices,
-    PlaylistChoicesMore(String),
+    PlaylistChoicesMore(Continuation),
 }
 struct Job {
     id: u64,
@@ -323,7 +323,7 @@ impl Music {
                                     Query::Explore => catalog.explore(),
                                     Query::Library(section) => catalog.library(*section),
                                     Query::PlaylistChoices => catalog.library(Section::Playlists),
-                                    Query::PlaylistChoicesMore(token) => catalog.more(token, false),
+                                    Query::PlaylistChoicesMore(token) => catalog.more(token),
                                     Query::Search(search) => catalog.search_filtered(
                                         &search.query,
                                         search.filter,
@@ -342,7 +342,7 @@ impl Music {
                                     Query::More {
                                         token,
                                         search: None,
-                                    } => catalog.more(token, false),
+                                    } => catalog.more(token),
                                 }
                                 .map_err(|e| format!("{e:#}"))
                             }

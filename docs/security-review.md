@@ -36,6 +36,8 @@ The browse-filter checkpoint passes 65 ordinary tests and strict all-target Clip
 
 Native checks caught modal key handling swallowing printable input. The fix consumes only handled navigation keys, and the app's modal guard runs before search/refresh shortcuts. Native country search, selection, empty results, Escape and Refresh/Back passed. A separate local fixture verified playlist title/description typing, Tab and submission without an account. These checks establish input behavior, not successful remote playlist edits.
 
+The pagination checkpoint passes 69 ordinary tests and strict all-target Clippy. Each continuation owns its original visitor header and exact account snapshot; a changed account is rejected before preparing a request. Visitor headers are validated and marked sensitive, and continuation Debug output is redacted. No visitor state is shared globally or persisted. Home and section-list continuation pages use their own page token instead of a nested shelf token. Live public Home checks returned two further pages; public search categories, suggestions and song pagination still pass. Authenticated pagination remains unverified.
+
 ## Dependency maintenance
 
 687 locked packages were checked against RustSec advisory database commit 999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b. Version requirements were matched using Rust's semver implementation, excluding withdrawn advisories. No current vulnerability or unsoundness advisory matched. Six active transitive dependencies matched unmaintained advisories, with no patched versions listed:

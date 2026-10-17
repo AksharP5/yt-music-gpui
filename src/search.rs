@@ -1,4 +1,4 @@
-use crate::catalog::{Catalog, Page, parse_page};
+use crate::catalog::{Catalog, Continuation, Page, parse_page};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
@@ -116,12 +116,8 @@ impl Catalog {
         query: &str,
         filter: SearchFilter,
         scope: SearchScope,
-        continuation: &str,
+        continuation: &Continuation,
     ) -> Result<Page> {
-        ensure!(
-            !continuation.is_empty(),
-            "No more search results are available"
-        );
         self.search_results(query, filter, scope, Some(continuation))
     }
 
@@ -130,15 +126,19 @@ impl Catalog {
         query: &str,
         filter: SearchFilter,
         scope: SearchScope,
-        continuation: Option<&str>,
+        continuation: Option<&Continuation>,
     ) -> Result<Page> {
-        let body = search_request(query, filter, scope, continuation)?;
+        let body = search_request(query, filter, scope, continuation.map(Continuation::token))?;
         ensure!(
             !scope.requires_account() || self.session.is_some(),
             "Connect your Google account to search your library or uploads"
         );
-        let response = self.request("search", body)?;
-        parse_search_page(&response, query.trim(), filter, scope)
+        let response = self.request_with_continuation("search", body, continuation)?;
+        self.bind_page(
+            parse_search_page(&response, query.trim(), filter, scope)?,
+            &response,
+            continuation,
+        )
     }
 
     pub fn suggestions(&self, query: &str) -> Result<Vec<String>> {
@@ -317,7 +317,10 @@ mod tests {
             parse_search_page(&response, "test", SearchFilter::All, SearchScope::Library).unwrap();
         assert_eq!(library.shelves.len(), 1);
         assert_eq!(library.shelves[0].items[0].title(), "Library");
-        assert_eq!(library.continuation.as_deref(), Some("library-token"));
+        assert_eq!(
+            library.continuation.as_ref().map(Continuation::token),
+            Some("library-token")
+        );
         assert!(
             parse_search_page(&response, "test", SearchFilter::All, SearchScope::Catalog).is_err()
         );
@@ -332,7 +335,10 @@ mod tests {
         let uploads =
             parse_search_page(&response, "test", SearchFilter::All, SearchScope::Uploads).unwrap();
         assert_eq!(uploads.shelves[0].items[0].title(), "Uploads");
-        assert_eq!(uploads.continuation.as_deref(), Some("uploads-token"));
+        assert_eq!(
+            uploads.continuation.as_ref().map(Continuation::token),
+            Some("uploads-token")
+        );
 
         let filtered = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[
             tab("Library songs", "library-songs-token", true),
@@ -341,7 +347,10 @@ mod tests {
         let songs = parse_search_page(&filtered, "test", SearchFilter::Songs, SearchScope::Library)
             .unwrap();
         assert_eq!(songs.shelves[0].items[0].title(), "Library songs");
-        assert_eq!(songs.continuation.as_deref(), Some("library-songs-token"));
+        assert_eq!(
+            songs.continuation.as_ref().map(Continuation::token),
+            Some("library-songs-token")
+        );
 
         let missing = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[
             tab("Public", "public-token", true)
@@ -376,7 +385,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(more.shelves[0].items[0].title(), "More library results");
-        assert_eq!(more.continuation.as_deref(), Some("next-library-token"));
+        assert_eq!(
+            more.continuation.as_ref().map(Continuation::token),
+            Some("next-library-token")
+        );
         let mut logged_out = continuation.clone();
         logged_out["responseContext"] = json!({"mainAppWebResponseContext":{"loggedOut":true}});
         let mut not_logged_in = continuation;
@@ -426,6 +438,13 @@ mod tests {
                     .contains("Connect your Google account")
             );
         }
+        let continuation = parse_page(
+            &json!({"contents":[],"nextContinuationData":{"continuation":"token"}}),
+            "Search",
+        )
+        .unwrap()
+        .continuation
+        .unwrap();
         for filter in SearchFilter::ALL
             .into_iter()
             .filter(|filter| *filter != SearchFilter::All)
@@ -440,7 +459,7 @@ mod tests {
             );
             assert!(
                 catalog
-                    .search_more("a song", filter, SearchScope::Uploads, "token")
+                    .search_more("a song", filter, SearchScope::Uploads, &continuation)
                     .is_err()
             );
         }
@@ -484,7 +503,7 @@ mod tests {
             if filter == SearchFilter::Songs {
                 let continuation = page
                     .continuation
-                    .as_deref()
+                    .as_ref()
                     .expect("song search should paginate");
                 let more = catalog
                     .search_more(query, filter, SearchScope::Catalog, continuation)
