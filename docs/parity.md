@@ -8,7 +8,11 @@ The initial release implements public catalog browsing, search, audio playback a
 
 Prepared for signed-in verification: account library categories, song ratings and separate library feedback, playlist create/edit/privacy/delete/add/remove/reorder with occurrence IDs, history removal, and account switching/sign-out. The native controls are wired to service requests and refresh after acknowledgement. Account pages also refresh when the window regains focus; Ctrl R refreshes explicitly. None of this is marked complete until tested with an authenticated account against the web client. The reviewed sign-in flow is available so these checks can proceed.
 
-Native radio, current-song account metadata, lyrics and related-music controls are wired to a separate bounded worker. Public next/lyrics requests have passed a live service check. Radio preserves the server's queue order and repeated occurrences. Authenticated behavior and the new controls still need an interactive desktop check; the current desktop automation backend refuses input because its Hyprland plugin is unavailable.
+Native radio, current-song account metadata, lyrics and related-music controls use a separate bounded worker. Public next/lyrics requests and two further radio pages have passed live service checks. Radio preserves the server's queue order and repeated occurrences. Continued autoplay keeps recommendations separate from the explicit queue and adds one occurrence when that queue ends. Turning autoplay off drops pending recommendations. Queue arrows preserve the selected occurrence, and Clear stops playback and cancels pending recommendations.
+
+Search has debounced native suggestions with keyboard selection, public category filters, and pagination that retains the query and filter. Live public checks covered all eight public categories, suggestions and song pagination. Library and uploads scopes are wired but unverified. Combined category/scope filters and search-history deletion remain missing.
+
+Authenticated behavior and the newest search, radio and queue controls still need an interactive desktop check; the current desktop automation backend refuses input because its Hyprland plugin is unavailable. The user deferred Google sign-in, so real account checks remain pending.
 
 - [ ] Google account connection, reconnect, account identity and account switching.
 - [ ] Personalized home, mixes and discovery, moods, genres, charts and new releases.

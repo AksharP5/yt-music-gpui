@@ -2,6 +2,7 @@ use crate::catalog::{Collection, Track};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     fs,
     io::Write,
     path::PathBuf,
@@ -26,7 +27,7 @@ impl Repeat {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
     pub liked: Vec<Track>,
@@ -34,7 +35,22 @@ pub struct Library {
     pub saved: Vec<Collection>,
     pub queue: Queue,
     pub repeat: Repeat,
+    pub autoplay: bool,
     pub volume: f64,
+}
+
+impl Default for Library {
+    fn default() -> Self {
+        Self {
+            liked: Vec::new(),
+            recent: Vec::new(),
+            saved: Vec::new(),
+            queue: Queue::default(),
+            repeat: Repeat::default(),
+            autoplay: true,
+            volume: 0.,
+        }
+    }
 }
 
 impl Library {
@@ -92,6 +108,26 @@ impl Queue {
         }
         repeat != Repeat::Off && self.select(0)
     }
+    pub fn advance_with_autoplay(
+        &mut self,
+        repeat: Repeat,
+        natural_end: bool,
+        autoplay: bool,
+        recommendations: &mut VecDeque<Track>,
+    ) -> bool {
+        if self.advance(repeat, natural_end) {
+            return true;
+        }
+        if !autoplay {
+            return false;
+        }
+        let Some(track) = recommendations.pop_front() else {
+            return false;
+        };
+        self.index = Some(self.tracks.len());
+        self.tracks.push(track);
+        true
+    }
     pub fn previous(&mut self) -> bool {
         self.index.is_some_and(|i| i > 0 && self.select(i - 1))
     }
@@ -108,6 +144,20 @@ impl Queue {
             None => None,
         };
         was_current
+    }
+    pub fn move_track(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.tracks.len() || to >= self.tracks.len() {
+            return false;
+        }
+        let track = self.tracks.remove(from);
+        self.tracks.insert(to, track);
+        self.index = self.index.map(|current| match current {
+            i if i == from => to,
+            i if from < i && i <= to => i - 1,
+            i if to <= i && i < from => i + 1,
+            i => i,
+        });
+        true
     }
     pub fn shuffle_upcoming(&mut self) {
         let start = self.index.map_or(0, |i| i + 1);
@@ -248,6 +298,138 @@ mod tests {
         assert!(errors.try_recv().is_err());
         let saved: Library = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved.volume, 39.);
+    }
+
+    #[test]
+    fn autoplay_defaults_on_and_preserves_the_saved_preference() {
+        assert!(Library::default().autoplay);
+        assert!(Library::new().autoplay);
+        let migrated: Library = serde_json::from_value(serde_json::json!({
+            "volume": 37., "repeat": "All", "liked": [track("saved")]
+        }))
+        .unwrap();
+        assert!(migrated.autoplay);
+        assert_eq!(migrated.volume, 37.);
+        assert_eq!(migrated.repeat, Repeat::All);
+        assert_eq!(migrated.liked[0].id, "saved");
+        let library = Library {
+            autoplay: false,
+            ..Library::new()
+        };
+        let saved = serde_json::to_value(library).unwrap();
+        assert_eq!(saved["autoplay"], false);
+        assert!(!serde_json::from_value::<Library>(saved).unwrap().autoplay);
+    }
+
+    #[test]
+    fn autoplay_off_leaves_prefilled_recommendations_pending_at_queue_end() {
+        let mut queue = Queue::default();
+        queue.replace(vec![track("explicit")], 0);
+        let mut recommendations = VecDeque::from([track("next"), track("later")]);
+        let before = queue.clone();
+        let pending = recommendations.clone();
+        for natural_end in [false, true] {
+            assert!(!queue.advance_with_autoplay(
+                Repeat::Off,
+                natural_end,
+                false,
+                &mut recommendations
+            ));
+            assert_eq!(queue.tracks, before.tracks);
+            assert_eq!(queue.index, before.index);
+            assert_eq!(recommendations, pending);
+        }
+    }
+
+    #[test]
+    fn explicit_enqueues_advance_before_pending_recommendations() {
+        let mut queue = Queue::default();
+        queue.replace(vec![track("playing")], 0);
+        let mut recommendations = VecDeque::from([track("recommended")]);
+        queue.tracks.push(track("enqueued"));
+        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert_eq!(queue.current().unwrap().id, "enqueued");
+        assert_eq!(queue.tracks.len(), 2);
+        assert_eq!(recommendations.len(), 1);
+        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert_eq!(queue.current().unwrap().id, "recommended");
+        assert!(recommendations.is_empty());
+    }
+
+    #[test]
+    fn autoplay_consumes_one_occurrence_only_after_normal_advance_is_exhausted() {
+        let mut queue = Queue::default();
+        queue.replace(vec![track("duplicate")], 0);
+        let mut recommendations = VecDeque::from([track("duplicate"), track("later")]);
+        for (repeat, natural_end) in [(Repeat::One, true), (Repeat::All, false)] {
+            assert!(queue.advance_with_autoplay(repeat, natural_end, true, &mut recommendations));
+            assert_eq!(queue.index, Some(0));
+            assert_eq!(queue.tracks.len(), 1);
+            assert_eq!(recommendations.len(), 2);
+        }
+        assert!(queue.advance_with_autoplay(Repeat::Off, false, true, &mut recommendations));
+        assert_eq!(queue.index, Some(1));
+        assert_eq!(queue.current().unwrap().id, "duplicate");
+        assert_eq!(queue.tracks.len(), 2);
+        assert_eq!(recommendations.len(), 1);
+        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert_eq!(queue.index, Some(2));
+        assert_eq!(queue.current().unwrap().id, "later");
+        assert!(recommendations.is_empty());
+        assert!(!queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert_eq!(queue.index, Some(2));
+        assert_eq!(queue.tracks.len(), 3);
+    }
+
+    #[test]
+    fn moving_tracks_preserves_the_selected_duplicate_occurrence() {
+        let tracks: Vec<_> = (0..4)
+            .map(|n| {
+                let mut song = track("duplicate");
+                song.title = format!("Occurrence {n}");
+                song
+            })
+            .collect();
+        for from in 0..tracks.len() {
+            for to in 0..tracks.len() {
+                for selected in [None, Some(0), Some(1), Some(2), Some(3)] {
+                    let mut queue = Queue {
+                        tracks: tracks.clone(),
+                        index: selected,
+                    };
+                    let current = queue.current().cloned();
+                    assert_eq!(queue.move_track(from, to), from != to);
+                    assert_eq!(queue.current(), current.as_ref());
+                    assert_eq!(queue.tracks[to], tracks[from]);
+                    let remaining: Vec<_> = queue
+                        .tracks
+                        .iter()
+                        .filter(|song| song.title != tracks[from].title)
+                        .collect();
+                    let expected: Vec<_> = tracks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, song)| (i != from).then_some(song))
+                        .collect();
+                    assert_eq!(remaining, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_queue_moves_leave_everything_unchanged() {
+        let mut queue = Queue::default();
+        assert!(!queue.move_track(0, 0));
+        assert!(queue.tracks.is_empty());
+        assert_eq!(queue.index, None);
+        queue.replace(vec![track("a"), track("b")], 1);
+        for (from, to) in [(0, 2), (2, 0), (usize::MAX, usize::MAX), (1, 1)] {
+            let before = queue.clone();
+            assert!(!queue.move_track(from, to));
+            assert_eq!(queue.tracks, before.tracks);
+            assert_eq!(queue.index, before.index);
+        }
     }
 
     #[test]

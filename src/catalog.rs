@@ -204,15 +204,6 @@ impl Catalog {
         self.browse_named("FEmusic_explore", "Explore")
     }
 
-    pub fn search(&self, query: &str) -> Result<Page> {
-        let query = query.trim();
-        if query.is_empty() {
-            bail!("Enter a song, artist, album, or playlist.");
-        }
-        let data = self.request("search", json!({"query": query}))?;
-        parse_page(&data, &format!("Results for \"{query}\""))
-    }
-
     pub fn browse(&self, id: &str) -> Result<Page> {
         if id.is_empty()
             || id.len() > 256
@@ -903,7 +894,9 @@ mod tests {
         let api = Catalog::new().unwrap();
         let home = api.home().unwrap();
         assert!(!home.shelves.is_empty());
-        let results = api.search("Khruangbin").unwrap();
+        let results = api
+            .search_filtered("Khruangbin", crate::search::SearchFilter::All)
+            .unwrap();
         assert!(!results.tracks().is_empty());
         let collection = home
             .shelves

@@ -16,7 +16,9 @@ Validation passed:
 - Live public guest mpv playback, pause and seek. Invented credentials no longer have a live streaming test because authenticated playback must reject an unconfirmed account rather than fall back to guest playback.
 - A synthetic Secret Service store/read/remove round trip under unique test attributes. No existing credential entry was accessed.
 
-No real Google account was used by the checks above. Authenticated compatibility and cross-client mutations remain unverified. Sign-in and saved-session loading are now available for controlled live verification; cookie imports are unsupported. A private runtime lock prevents concurrent app processes from racing shared account state. Its exclusivity, release and symlink refusal have a focused test. The current 35 ordinary tests pass after replacing the obsolete disabled-import test with the instance-lock check.
+No real Google account was used by the checks above. Authenticated compatibility and cross-client mutations remain unverified. Sign-in and saved-session loading are now available for controlled live verification; cookie imports are unsupported. A private runtime lock prevents concurrent app processes from racing shared account state. Its exclusivity, release and symlink refusal have a focused test.
+
+The search and autoplay checkpoint passes 47 ordinary tests and strict all-target Clippy. Suggestions reject replies from a previous query, generation or exact account session. Radio continuation carries its original account identity and rejects another session before making a request. These checks supplement the earlier review; they do not extend the sealed security scan to newer commits. The user deferred sign-in, and no authenticated cross-client check has run.
 
 ## Dependency maintenance
 

@@ -8,6 +8,8 @@ mod input;
 mod library;
 mod player;
 mod playlist_form;
+mod search;
+mod search_box;
 mod theme;
 mod watch;
 

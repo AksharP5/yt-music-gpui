@@ -6,9 +6,10 @@ This is an independent client. The public-catalog player is working. Account int
 
 ## What works
 
-- Home and Explore, search, and artist, album, and playlist browsing.
+- Home and Explore, search suggestions and category filters, and artist, album, and playlist browsing.
 - Streaming audio, pause, seek, previous/next, volume, and mute.
-- A persistent queue with add, remove, shuffle upcoming tracks, and repeat off/all/one.
+- A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
+- Radio, continued autoplay, lyrics and related music when the service provides them.
 - Local liked songs, saved collections, and recently played songs.
 - Keyboard controls, native text input, and a compact sidebar on narrow windows.
 - Media keys and desktop playback controls when `mpv-mpris` is installed.
@@ -40,7 +41,7 @@ Connect from Settings or launch with `--connect`. Sign in only in the dedicated 
 
 | Key | Action |
 | --- | --- |
-| Ctrl K | Focus search; Enter submits |
+| Ctrl K | Focus search; Up/Down selects suggestions; Enter submits |
 | Ctrl R | Refresh the current page |
 | Space | Play or pause |
 | Ctrl Right / Ctrl Left | Next / previous song |
@@ -52,7 +53,9 @@ Connect from Settings or launch with `--connect`. Sign in only in the dedicated 
 | Escape | Close help or queue; leave search |
 | Ctrl Q | Quit |
 
-Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. The song menu offers radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Shuffle changes upcoming songs and preserves the current track.
+Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. Search categories keep their filter while loading more results. Library and uploads search require a connected account.
+
+The song menu offers radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
 
 ## Data and performance
 
@@ -75,7 +78,7 @@ Measured on the development Omarchy desktop on 2026-10-15, using the optimized b
 | Paused | 0.27% | 0.00% | 242.6 MiB |
 | Playing | 0.53% | 0.87% | 253.0 MiB |
 
-The stripped release executable is 33.2 MiB. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
+The current stripped release executable is 33.8 MiB. The CPU and memory samples above predate account integration, search suggestions and continued autoplay, so those need fresh measurements. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
 
 ## Validation
 
@@ -86,7 +89,7 @@ bin/test
 bin/test -- --ignored --nocapture
 ```
 
-The ordinary tests cover catalog parsing, duration and video ID validation, queue transitions and shuffle, library write flushing, and stale playback events. The ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause and seek. They need network access, mpv, and yt-dlp.
+The ordinary tests cover account isolation, catalog and search parsing, stale suggestions, radio continuation, queue reordering and autoplay transitions, library write flushing, and stale playback events. The ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause and seek. They need network access, mpv, and yt-dlp. Public search categories, suggestions and radio continuation have passed live service checks. The newest native search and queue controls still need an interactive desktop check; signed-in search scopes and account sync remain unverified.
 
 YouTube's internal API and stream extraction can change. Public guest playback may need an updated yt-dlp; authenticated playback deliberately rejects versions that have not been reviewed. Catalog changes may require a client update. Complete account parity and remaining verification are tracked in docs/parity.md. Account mutations are not yet verified against a signed-in account. GPUI's custom controls currently have limited screen-reader support.
 
