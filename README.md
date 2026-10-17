@@ -6,7 +6,7 @@ This is an independent client. The public-catalog player is working. Account int
 
 ## What works
 
-- Home and Explore, new releases, charts, mood and genre pages, search suggestions and category filters, and artist, album, and playlist browsing.
+- Home filters and Explore, new releases, charts with country selection, mood and genre pages, search suggestions and category filters, and artist, album, and playlist browsing.
 - Streaming audio, pause, seek, previous/next, volume, mute, audio quality and playback speed.
 - A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
 - Radio, continued autoplay, lyrics, song credits and related music when the service provides them.

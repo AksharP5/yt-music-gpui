@@ -86,8 +86,8 @@ impl PlaylistForm {
                 },
                 cx,
             );
+            cx.stop_propagation();
         }
-        cx.stop_propagation();
     }
 }
 

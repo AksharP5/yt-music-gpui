@@ -3,7 +3,11 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
@@ -106,6 +110,7 @@ pub struct BrowseLink {
     pub title: String,
     pub id: String,
     pub params: Option<String>,
+    pub chart_country: Option<String>,
 }
 
 impl BrowseLink {
@@ -114,6 +119,7 @@ impl BrowseLink {
             title: title.into(),
             id: id.into(),
             params: None,
+            chart_country: None,
         }
     }
 
@@ -144,8 +150,47 @@ impl BrowseLink {
                 ensure!(valid, "YouTube Music returned an invalid page link");
             }
         }
+        if let Some(country) = &self.chart_country {
+            ensure!(
+                self.id == "FEmusic_charts" && valid_chart_country(country),
+                "YouTube Music returned an invalid chart country"
+            );
+        }
         Ok(())
     }
+
+    fn from_endpoint(endpoint: &Value, title: String) -> Option<Self> {
+        let link = Self {
+            title,
+            id: endpoint["browseId"].as_str()?.to_owned(),
+            params: match endpoint.get("params") {
+                Some(params) => Some(params.as_str()?.to_owned()),
+                None => None,
+            },
+            chart_country: None,
+        };
+        link.validate().ok()?;
+        Some(link)
+    }
+
+    fn body(&self) -> Result<Value> {
+        self.validate()?;
+        let mut body = json!({"browseId":self.id});
+        if let Some(params) = &self.params {
+            body["params"] = json!(params);
+        }
+        if let Some(country) = &self.chart_country {
+            body["formData"] = json!({"selectedValues":[country]});
+        }
+        Ok(body)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowseChoice {
+    pub label: String,
+    pub selected: bool,
+    pub target: BrowseLink,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +245,8 @@ pub struct Page {
     pub editable: bool,
     pub description: String,
     pub privacy: Option<String>,
+    pub chips: Vec<BrowseChoice>,
+    pub countries: Vec<BrowseChoice>,
 }
 
 impl Page {
@@ -267,13 +314,14 @@ impl Catalog {
     }
 
     pub fn browse(&self, link: &BrowseLink) -> Result<Page> {
-        link.validate()?;
-        let mut body = json!({"browseId":link.id});
-        if let Some(params) = &link.params {
-            body["params"] = json!(params);
+        let data = self.request("browse", link.body()?)?;
+        let mut page = parse_page(&data, &link.title)?;
+        match link.id.as_str() {
+            "FEmusic_home" => page.chips = home_choices(&data)?,
+            "FEmusic_charts" => page.countries = chart_choices(&data, link)?,
+            _ => {}
         }
-        let data = self.request("browse", body)?;
-        parse_page(&data, &link.title)
+        Ok(page)
     }
 
     pub fn more(&self, continuation: &str, search: bool) -> Result<Page> {
@@ -393,15 +441,7 @@ pub(crate) fn valid_video_id(id: &str) -> bool {
 fn parse_item(value: &Value) -> Option<Item> {
     if let Some(button) = value.get("musicNavigationButtonRenderer") {
         let endpoint = button.pointer("/clickCommand/browseEndpoint")?;
-        let link = BrowseLink {
-            title: text(&button["buttonText"]),
-            id: endpoint["browseId"].as_str()?.to_owned(),
-            params: match endpoint.get("params") {
-                Some(params) => Some(params.as_str()?.to_owned()),
-                None => None,
-            },
-        };
-        link.validate().ok()?;
+        let link = BrowseLink::from_endpoint(endpoint, text(&button["buttonText"]))?;
         return Some(Item::Navigation(link));
     }
     let row = value
@@ -740,12 +780,376 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
             .and_then(|v| v["privacy"].as_str())
             .filter(|privacy| matches!(*privacy, "PRIVATE" | "UNLISTED" | "PUBLIC"))
             .map(str::to_owned),
+        chips: Vec::new(),
+        countries: Vec::new(),
     })
+}
+
+fn home_choices(data: &Value) -> Result<Vec<BrowseChoice>> {
+    let Some(chips) = data.pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/header/chipCloudRenderer/chips").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut choices = Vec::new();
+    let mut reset: Option<BrowseLink> = None;
+    let mut selected_count = 0;
+    for chip in chips
+        .iter()
+        .filter_map(|chip| chip.get("chipCloudChipRenderer"))
+    {
+        let label = text(&chip["text"]);
+        ensure!(
+            !label.trim().is_empty(),
+            "YouTube Music returned an unreadable Home filter"
+        );
+        let selected = chip["isSelected"]
+            .as_bool()
+            .context("YouTube Music did not identify the selected Home filter")?;
+        let target =
+            BrowseLink::from_endpoint(&chip["navigationEndpoint"]["browseEndpoint"], "Home".into())
+                .context("YouTube Music returned an invalid Home filter")?;
+        let deselect = BrowseLink::from_endpoint(
+            &chip["onDeselectedCommand"]["browseEndpoint"],
+            "Home".into(),
+        )
+        .context("YouTube Music returned an invalid Home reset filter")?;
+        ensure!(
+            target.id == "FEmusic_home" && deselect.id == "FEmusic_home",
+            "YouTube Music returned an invalid Home filter destination"
+        );
+        ensure!(
+            reset.as_ref().is_none_or(|reset| reset == &deselect),
+            "YouTube Music returned conflicting Home reset filters"
+        );
+        reset = Some(deselect.clone());
+        selected_count += usize::from(selected);
+        choices.push(BrowseChoice {
+            label,
+            selected,
+            target: if selected { deselect } else { target },
+        });
+    }
+    ensure!(
+        selected_count <= 1,
+        "YouTube Music returned conflicting selected Home filters"
+    );
+    if let Some(target) = reset {
+        choices.insert(
+            0,
+            BrowseChoice {
+                label: "All".into(),
+                selected: selected_count == 0,
+                target,
+            },
+        );
+    }
+    Ok(choices)
+}
+
+fn valid_chart_country(country: &str) -> bool {
+    country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
+}
+
+fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>> {
+    let mutations = data
+        .pointer("/frameworkUpdates/entityBatchUpdate/mutations")
+        .and_then(Value::as_array)
+        .context("YouTube Music did not return chart country state")?;
+    let entities = |kind: &str| -> HashMap<&str, &Value> {
+        mutations
+            .iter()
+            .filter_map(|mutation| {
+                let entity = mutation["payload"].get(kind)?;
+                Some((entity["id"].as_str()?, entity))
+            })
+            .collect()
+    };
+    let forms = entities("musicForm");
+    let states = entities("musicFormBooleanChoice");
+    let sections = data.pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents").and_then(Value::as_array)
+        .context("YouTube Music did not return chart country choices")?;
+    let options = sections
+        .iter()
+        .filter_map(|section| {
+            section
+                .pointer("/musicShelfRenderer/subheaders")
+                .and_then(Value::as_array)
+        })
+        .flatten()
+        .filter_map(|header| {
+            header
+                .pointer("/musicSideAlignedItemRenderer/startItems")
+                .and_then(Value::as_array)
+        })
+        .flatten()
+        .find_map(|item| {
+            item.pointer("/musicSortFilterButtonRenderer/menu/musicMultiSelectMenuRenderer/options")
+                .and_then(Value::as_array)
+        })
+        .context("YouTube Music did not return chart country choices")?;
+    let mut choices = Vec::new();
+    let mut countries = HashSet::new();
+    for option in options
+        .iter()
+        .filter_map(|option| option.get("musicMultiSelectMenuItemRenderer"))
+    {
+        let parsed = (|| {
+            let key = option["formItemEntityKey"].as_str()?;
+            let state = states.get(key)?;
+            let parent = state["parentFormEntityKey"].as_str()?;
+            let form = forms.get(parent)?;
+            if !form["booleanChoiceEntityKeys"]
+                .as_array()?
+                .iter()
+                .any(|value| value.as_str() == Some(key))
+            {
+                return None;
+            }
+            let country = state["opaqueToken"].as_str()?;
+            if !valid_chart_country(country) {
+                return None;
+            }
+            let selected = state["selected"].as_bool()?;
+            let label = text(&option["title"]);
+            if label.trim().is_empty() {
+                return None;
+            }
+            let mut target = match option.get("selectedCommand") {
+                Some(command) => {
+                    let commands = command
+                        .pointer("/commandExecutorCommand/commands")?
+                        .as_array()?;
+                    let mut checked = commands
+                        .iter()
+                        .filter_map(|command| command.get("musicCheckboxFormItemMutatedCommand"))
+                        .filter(|command| command["newCheckedState"] == true);
+                    if checked.next()?["formItemEntityKey"].as_str() != Some(key)
+                        || checked.next().is_some()
+                    {
+                        return None;
+                    }
+                    let mut binders = commands
+                        .iter()
+                        .filter_map(|command| command.get("musicBrowseFormBinderCommand"));
+                    let binder = binders.next()?;
+                    if binders.next().is_some() || binder["formEntityKey"].as_str() != Some(parent)
+                    {
+                        return None;
+                    }
+                    BrowseLink::from_endpoint(&binder["browseEndpoint"], "Charts".into())?
+                }
+                None if selected => BrowseLink {
+                    title: "Charts".into(),
+                    ..current.clone()
+                },
+                None => return None,
+            };
+            if target.id != "FEmusic_charts" {
+                return None;
+            }
+            target.chart_country = Some(country.to_owned());
+            target.validate().ok()?;
+            Some(BrowseChoice {
+                label,
+                selected,
+                target,
+            })
+        })();
+        if let Some(choice) = parsed
+            && countries.insert(choice.target.chart_country.clone())
+        {
+            choices.push(choice);
+        }
+    }
+    let selected: Vec<_> = choices.iter().filter(|choice| choice.selected).collect();
+    ensure!(
+        selected.len() == 1,
+        "YouTube Music did not identify one selected chart country"
+    );
+    ensure!(
+        current
+            .chart_country
+            .as_ref()
+            .is_none_or(|country| selected[0].target.chart_country.as_ref() == Some(country)),
+        "YouTube Music did not return the requested chart country"
+    );
+    Ok(choices)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn home_filter_fixture(selected: bool) -> Value {
+        let chip = |label, selected, params| {
+            json!({"chipCloudChipRenderer":{
+                "text":{"simpleText":label},"isSelected":selected,
+                "navigationEndpoint":{"browseEndpoint":{"browseId":"FEmusic_home","params":params}},
+                "onDeselectedCommand":{"browseEndpoint":{"browseId":"FEmusic_home","params":"all-filter"}}
+            }})
+        };
+        json!({"contents":{"singleColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{
+            "sectionListRenderer":{"contents":[],"header":{"chipCloudRenderer":{"chips":[
+                chip("Relax", selected, "relax-filter"), chip("Focus", false, "focus-filter")
+            ]}}}
+        }}}]}}})
+    }
+
+    fn chart_filter_fixture() -> Value {
+        let option = |label, key, selected: bool| {
+            let mut option = json!({"title":{"simpleText":label},"formItemEntityKey":key});
+            if !selected {
+                option["selectedCommand"] = json!({"commandExecutorCommand":{"commands":[
+                    {"musicCheckboxFormItemMutatedCommand":{"formItemEntityKey":key,"newCheckedState":true}},
+                    {"musicCheckboxFormItemMutatedCommand":{"formItemEntityKey":"us-choice","newCheckedState":false}},
+                    {"musicBrowseFormBinderCommand":{"formEntityKey":"country-form","browseEndpoint":{
+                        "browseId":"FEmusic_charts","params":"issued-chart-params"
+                    }}}
+                ]}});
+            }
+            json!({"musicMultiSelectMenuItemRenderer":option})
+        };
+        let state = |key, token, selected| {
+            json!({"payload":{"musicFormBooleanChoice":{
+                "id":key,"parentFormEntityKey":"country-form","opaqueToken":token,"selected":selected
+            }}})
+        };
+        json!({
+            "contents":{"singleColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{
+                "sectionListRenderer":{"contents":[{"musicShelfRenderer":{"subheaders":[{
+                    "musicSideAlignedItemRenderer":{"startItems":[{"musicSortFilterButtonRenderer":{
+                        "title":{"simpleText":"Misleading display label"},"menu":{"musicMultiSelectMenuRenderer":{"options":[
+                            option("United States","us-choice",true), option("Canada","ca-choice",false),
+                            option("Global","global-choice",false), option("United States","us-choice",true)
+                        ]}}
+                    }}]}
+                }]}}]}
+            }}}]}},
+            "frameworkUpdates":{"entityBatchUpdate":{"mutations":[
+                {"payload":{"musicForm":{"id":"country-form","booleanChoiceEntityKeys":["us-choice","ca-choice","global-choice"]}}},
+                state("us-choice","US",true), state("ca-choice","CA",false), state("global-choice","ZZ",false)
+            ]}}
+        })
+    }
+
+    #[test]
+    fn home_filters_use_service_selection_and_reset_actions() {
+        let response = home_filter_fixture(true);
+        let choices = home_choices(&response).unwrap();
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>(),
+            ["All", "Relax", "Focus"]
+        );
+        assert!(!choices[0].selected);
+        assert!(choices[1].selected);
+        assert_eq!(choices[0].target.params.as_deref(), Some("all-filter"));
+        assert_eq!(choices[1].target, choices[0].target);
+        assert_eq!(choices[2].target.params.as_deref(), Some("focus-filter"));
+        assert!(choices.iter().all(|choice| choice.target.title == "Home"));
+        let reset = home_choices(&home_filter_fixture(false)).unwrap();
+        assert!(reset[0].selected);
+        assert!(!reset[1].selected);
+        assert_eq!(reset[1].target.params.as_deref(), Some("relax-filter"));
+        let parsed = parse_page(&response, "Unscoped parser").unwrap();
+        assert!(parsed.chips.is_empty() && parsed.countries.is_empty());
+
+        let chips = "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/header/chipCloudRenderer/chips";
+        for (suffix, value) in [
+            ("/0/chipCloudChipRenderer/onDeselectedCommand", Value::Null),
+            (
+                "/1/chipCloudChipRenderer/onDeselectedCommand/browseEndpoint/params",
+                json!("conflicting-reset"),
+            ),
+            (
+                "/1/chipCloudChipRenderer/navigationEndpoint/browseEndpoint/browseId",
+                json!("FEmusic_radio_builder"),
+            ),
+            ("/1/chipCloudChipRenderer/isSelected", json!(true)),
+        ] {
+            let mut invalid = response.clone();
+            *invalid.pointer_mut(&format!("{chips}{suffix}")).unwrap() = value;
+            assert!(home_choices(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn chart_choices_bind_entities_commands_and_current_request_context() {
+        let current = BrowseLink {
+            params: Some("current-chart-params".into()),
+            ..BrowseLink::new("FEmusic_charts", "Charts")
+        };
+        let response = chart_filter_fixture();
+        let choices = chart_choices(&response, &current).unwrap();
+        assert_eq!(choices.len(), 3);
+        assert!(choices[0].selected);
+        assert_eq!(choices[0].label, "United States");
+        assert_eq!(choices[0].target.chart_country.as_deref(), Some("US"));
+        assert_eq!(choices[0].target.params, current.params);
+        let canada = &choices[1].target;
+        assert_eq!(canada.title, "Charts");
+        assert_eq!(
+            canada.body().unwrap(),
+            json!({"browseId":"FEmusic_charts","params":"issued-chart-params","formData":{"selectedValues":["CA"]}})
+        );
+        assert_ne!(canada, &choices[2].target);
+        assert!(chart_choices(&response, canada).is_err());
+
+        let option = "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicShelfRenderer/subheaders/0/musicSideAlignedItemRenderer/startItems/0/musicSortFilterButtonRenderer/menu/musicMultiSelectMenuRenderer/options";
+        for (path, value) in [
+            (format!("{option}/1/musicMultiSelectMenuItemRenderer/selectedCommand/commandExecutorCommand/commands/0/musicCheckboxFormItemMutatedCommand/formItemEntityKey"), json!("global-choice")),
+            (format!("{option}/1/musicMultiSelectMenuItemRenderer/selectedCommand/commandExecutorCommand/commands/2/musicBrowseFormBinderCommand/formEntityKey"), json!("other-form")),
+            (format!("{option}/1/musicMultiSelectMenuItemRenderer/selectedCommand/commandExecutorCommand/commands/2/musicBrowseFormBinderCommand/browseEndpoint/browseId"), json!("FEmusic_radio_builder")),
+            ("/frameworkUpdates/entityBatchUpdate/mutations/2/payload/musicFormBooleanChoice/parentFormEntityKey".into(), json!("other-form")),
+            ("/frameworkUpdates/entityBatchUpdate/mutations/2/payload/musicFormBooleanChoice/opaqueToken".into(), json!("../")),
+        ] {
+            let mut invalid = response.clone();
+            *invalid.pointer_mut(&path).unwrap() = value;
+            let choices = chart_choices(&invalid, &current).unwrap();
+            assert!(choices.iter().all(|choice| choice.label != "Canada"));
+        }
+        let mut missing_action = response.clone();
+        missing_action
+            .pointer_mut(&format!("{option}/1/musicMultiSelectMenuItemRenderer"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("selectedCommand");
+        assert!(
+            chart_choices(&missing_action, &current)
+                .unwrap()
+                .iter()
+                .all(|choice| choice.label != "Canada")
+        );
+        let mut malformed_selected = response;
+        for index in [0, 3] {
+            malformed_selected
+                .pointer_mut(&format!(
+                    "{option}/{index}/musicMultiSelectMenuItemRenderer"
+                ))
+                .unwrap()["selectedCommand"] = Value::Null;
+        }
+        assert!(chart_choices(&malformed_selected, &current).is_err());
+    }
+
+    #[test]
+    fn chart_form_values_are_narrowly_typed() {
+        for id in ["FEmusic_home", "FEmusic_radio_builder"] {
+            let target = BrowseLink {
+                chart_country: Some("CA".into()),
+                ..BrowseLink::new(id, "Not charts")
+            };
+            assert!(target.body().is_err());
+        }
+        for country in ["", "ca", "CAN", "C1", "../"] {
+            let target = BrowseLink {
+                chart_country: Some(country.into()),
+                ..BrowseLink::new("FEmusic_charts", "Charts")
+            };
+            assert!(target.body().is_err());
+        }
+    }
 
     fn navigation(title: &str, params: &str) -> Value {
         json!({"musicNavigationButtonRenderer":{
@@ -1197,5 +1601,90 @@ mod tests {
                 playlists.shelves.len()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "uses public Home filter and Charts country reads without an account"]
+    fn live_public_browse_filters() {
+        let catalog = Catalog::new().unwrap();
+        let home = catalog.home().unwrap();
+        assert!(
+            home.chips
+                .iter()
+                .any(|choice| choice.label == "All" && choice.selected)
+        );
+        let relax = &home
+            .chips
+            .iter()
+            .find(|choice| choice.label == "Relax")
+            .expect("Home must expose Relax")
+            .target;
+        let filtered = catalog.browse(relax).unwrap();
+        assert!(
+            filtered
+                .chips
+                .iter()
+                .any(|choice| choice.label == "Relax" && choice.selected)
+        );
+        assert_eq!(filtered.chips.len(), home.chips.len());
+        let deselect = &filtered
+            .chips
+            .iter()
+            .find(|choice| choice.label == "Relax" && choice.selected)
+            .unwrap()
+            .target;
+        let reset = catalog.browse(deselect).unwrap();
+        assert!(
+            reset
+                .chips
+                .iter()
+                .any(|choice| choice.label == "All" && choice.selected)
+        );
+        assert!(
+            reset
+                .chips
+                .iter()
+                .filter(|choice| choice.label != "All")
+                .all(|choice| !choice.selected)
+        );
+        assert_eq!(reset.title, "Home");
+
+        let explore = catalog.explore().unwrap();
+        let charts = explore
+            .shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .find_map(|item| {
+                if let Item::Navigation(link) = item {
+                    (link.id == "FEmusic_charts").then_some(link)
+                } else {
+                    None
+                }
+            })
+            .expect("Explore must expose Charts");
+        let countries = catalog.browse(charts).unwrap();
+        for label in ["Canada", "United Kingdom", "Global"] {
+            let target = &countries
+                .countries
+                .iter()
+                .find(|choice| choice.label == label)
+                .expect("Charts must expose the country")
+                .target;
+            let selected = catalog.browse(target).unwrap();
+            assert_eq!(selected.title, "Charts");
+            assert_eq!(selected.countries.len(), countries.countries.len());
+            assert!(selected.countries.iter().any(
+                |choice| choice.selected && choice.target.chart_country == target.chart_country
+            ));
+            assert!(!selected.shelves.is_empty());
+            println!(
+                "{label}: service-confirmed selection, {} country choices",
+                selected.countries.len()
+            );
+        }
+        println!(
+            "Home: {} chips; select and reset confirmed",
+            home.chips.len()
+        );
     }
 }

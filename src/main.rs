@@ -4,6 +4,7 @@ mod artwork;
 mod assets;
 mod auth;
 mod catalog;
+mod country_picker;
 mod history;
 mod input;
 mod library;

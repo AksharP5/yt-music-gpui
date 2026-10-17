@@ -3,6 +3,7 @@ use crate::{
     artwork::Artwork,
     auth::{self, Operation, Session, SharedSession},
     catalog::{BrowseLink, Catalog, Collection, Item, Page, Rating, Shelf, Track},
+    country_picker::{CountryPicker, CountryPickerEvent},
     library::{Library, LibraryWriter, Repeat, Store},
     player::{AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
     playlist_form::{PlaylistForm, PlaylistFormEvent},
@@ -42,6 +43,12 @@ enum Route {
     Recent,
     Saved,
     Library(Section),
+}
+impl Route {
+    fn is_home(&self) -> bool {
+        matches!(self, Self::Home)
+            || matches!(self, Self::Browse(link) if link.id == "FEmusic_home")
+    }
 }
 #[derive(Clone)]
 enum Query {
@@ -128,6 +135,7 @@ impl Playback {
 enum Overlay {
     Help,
     Settings,
+    CountryPicker(Entity<CountryPicker>),
     Track {
         track: Track,
         index: Option<usize>,
@@ -213,7 +221,7 @@ pub struct Music {
     duration: f64,
     show_queue: bool,
     overlay: Option<Overlay>,
-    form_subscription: Option<Subscription>,
+    overlay_subscription: Option<Subscription>,
     drag: Option<Drag>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -545,6 +553,8 @@ impl Music {
                 editable: false,
                 description: String::new(),
                 privacy: None,
+                chips: Vec::new(),
+                countries: Vec::new(),
             },
             rows: Vec::new(),
             back: Vec::new(),
@@ -578,7 +588,7 @@ impl Music {
             duration: 0.,
             show_queue: false,
             overlay: None,
-            form_subscription: None,
+            overlay_subscription: None,
             drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -814,7 +824,7 @@ impl Music {
         let _ = self.pending_playback_jobs.try_recv();
         self.now_playing = None;
         self.overlay = None;
-        self.form_subscription = None;
+        self.overlay_subscription = None;
         for track in self
             .library
             .queue
@@ -860,6 +870,8 @@ impl Music {
         self.page.editable = false;
         self.page.description.clear();
         self.page.privacy = None;
+        self.page.chips.clear();
+        self.page.countries.clear();
         self.rows.clear();
         match route {
             Route::Home => {
@@ -943,6 +955,8 @@ impl Music {
             editable: false,
             description: String::new(),
             privacy: None,
+            chips: Vec::new(),
+            countries: Vec::new(),
         };
         self.rows = self
             .page
@@ -1180,7 +1194,7 @@ impl Music {
         };
         let form = cx.new(|cx| PlaylistForm::new(title, description, privacy, cx));
         let edit_id = id.clone();
-        self.form_subscription = Some(cx.subscribe_in(
+        self.overlay_subscription = Some(cx.subscribe_in(
             &form,
             window,
             move |view, _, event, window, cx| match event {
@@ -1223,10 +1237,32 @@ impl Music {
         });
         self.request(Query::PlaylistChoices, cx);
     }
+    fn country_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page.countries.is_empty() {
+            return;
+        }
+        let picker = cx.new(|cx| CountryPicker::new(self.page.countries.clone(), cx));
+        self.overlay_subscription = Some(cx.subscribe_in(
+            &picker,
+            window,
+            |view, picker, event, window, cx| {
+                if !matches!(&view.overlay, Some(Overlay::CountryPicker(current)) if current == picker) {
+                    return;
+                }
+                view.close_overlay(window, cx);
+                if let CountryPickerEvent::Choose(target) = event {
+                    view.navigate(Route::Browse(target.clone()), cx);
+                }
+            },
+        ));
+        window.focus(&picker.focus_handle(cx), cx);
+        self.overlay = Some(Overlay::CountryPicker(picker));
+        cx.notify();
+    }
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.song_text.cancel();
         self.overlay = None;
-        self.form_subscription = None;
+        self.overlay_subscription = None;
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1858,19 +1894,19 @@ impl Music {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let control = event.keystroke.modifiers.control;
-        if control && key == "k" {
-            window.focus(&self.search.focus_handle(cx), cx);
-            return;
-        }
         if control && key == "q" {
             cx.quit();
             return;
         }
-        if control && key == "r" {
-            self.navigate(self.route.clone(), cx);
+        if self.overlay.is_some() && key != "escape" {
             return;
         }
-        if self.overlay.is_some() && key != "escape" {
+        if control && key == "k" {
+            window.focus(&self.search.focus_handle(cx), cx);
+            return;
+        }
+        if control && key == "r" {
+            self.navigate(self.route.clone(), cx);
             return;
         }
         if self.search.focus_handle(cx).is_focused(window) {
@@ -1948,6 +1984,7 @@ impl Music {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let active = self.route == route
+            || (route == Route::Home && self.route.is_home())
             || (route == Route::Saved && matches!(self.route, Route::Library(_)));
         div()
             .id(id)
@@ -2428,7 +2465,7 @@ impl Music {
         row.into_any_element()
     }
     fn content(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let home = matches!(self.route, Route::Home | Route::Explore);
+        let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let has_tracks = self.rows.iter().any(|i| matches!(i, Item::Track(_)));
         let mut content = div()
             .flex_1()
@@ -2454,6 +2491,30 @@ impl Music {
                             .font_weight(FontWeight::BOLD)
                             .child(self.page.title.clone()),
                     )
+                    .when(!self.page.countries.is_empty(), |heading| {
+                        let label = self
+                            .page
+                            .countries
+                            .iter()
+                            .find(|choice| choice.selected)
+                            .map(|choice| choice.label.clone())
+                            .unwrap_or_else(|| "Country".into());
+                        heading.child(
+                            div()
+                                .id("chart-country")
+                                .py(px(10.))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .text_size(px(14.))
+                                .cursor_pointer()
+                                .child(label)
+                                .child(icon("forward", 14., self.theme.muted))
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.country_picker(window, cx)
+                                })),
+                        )
+                    })
                     .when(
                         self.account.is_some()
                             && matches!(
@@ -2522,6 +2583,40 @@ impl Music {
                         )
                     }),
             );
+        if !self.page.chips.is_empty() {
+            content = content.child(
+                div()
+                    .id("home-filters")
+                    .mx(px(30.))
+                    .mb(px(20.))
+                    .flex()
+                    .gap(px(22.))
+                    .overflow_x_scroll()
+                    .children(self.page.chips.iter().enumerate().map(|(index, choice)| {
+                        let target = choice.target.clone();
+                        div()
+                            .id(("home-filter", index))
+                            .flex_shrink_0()
+                            .pb(px(9.))
+                            .border_b_2()
+                            .border_color(if choice.selected {
+                                self.theme.accent
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .text_color(if choice.selected {
+                                self.theme.text
+                            } else {
+                                self.theme.muted
+                            })
+                            .cursor_pointer()
+                            .child(choice.label.clone())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.navigate(Route::Browse(target.clone()), cx)
+                            }))
+                    })),
+            );
+        }
         if let Route::Search(search) = &self.route {
             if self.account.is_some() {
                 content = content.child(
@@ -3376,6 +3471,9 @@ impl Music {
             .into_any_element()
     }
     fn overlay(&self, kind: &Overlay, cx: &Context<Self>) -> AnyElement {
+        if let Overlay::CountryPicker(picker) = kind {
+            return self.backdrop(picker.clone().into_any_element(), cx);
+        }
         if let Overlay::PlaylistForm { form, .. } = kind {
             let mut body = div().flex().flex_col().gap(px(12.)).child(form.clone());
             if let Some(error) = &self.error {
@@ -3418,7 +3516,9 @@ impl Music {
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::SongText { title, .. } => title.clone(),
-                                Overlay::PlaylistForm { .. } => unreachable!(),
+                                Overlay::PlaylistForm { .. } | Overlay::CountryPicker(_) => {
+                                    unreachable!()
+                                }
                             }),
                     )
                     .child(button("close-overlay", "close", self.theme).on_click(
