@@ -16,7 +16,23 @@ pub struct Watch {
     pub queue: Vec<Track>,
     pub lyrics: Option<String>,
     pub related: Option<String>,
+    pub alternatives: Option<Box<MediaPair>>,
     pub continuation: Option<WatchContinuation>,
+}
+
+#[derive(Clone)]
+pub struct MediaPair {
+    pub song: Track,
+    pub video: Track,
+}
+
+impl MediaPair {
+    pub fn target(&self, current: &str, video: bool) -> Option<&Track> {
+        if current != self.song.id && current != self.video.id {
+            return None;
+        }
+        Some(if video { &self.video } else { &self.song })
+    }
 }
 
 #[derive(Clone)]
@@ -148,12 +164,13 @@ fn parse_watch(
     let contents = panel["contents"]
         .as_array()
         .context("YouTube Music returned an unreadable playback queue")?;
-    let (mut queue, current_index) = parse_queue(contents, &seed.id);
+    let (mut queue, current_index, mut alternatives) = parse_queue(contents, &seed.id);
     ensure!(
         !queue.is_empty(),
         "YouTube Music returned no playable songs"
     );
     if let Some(episode) = &seed.details.episode {
+        alternatives = None;
         let current = current_index
             .map(|index| &mut queue[index])
             .context("YouTube Music did not include the requested episode in its playback queue")?;
@@ -193,6 +210,7 @@ fn parse_watch(
         queue,
         lyrics,
         related,
+        alternatives,
         continuation: watch_continuation(panel, request, session),
     })
 }
@@ -225,7 +243,7 @@ fn parse_watch_more(response: &Value, previous: &WatchContinuation) -> Result<Wa
         .as_array()
         .context("YouTube Music returned an unreadable continued radio queue")?;
     // Continuation rows are recommendations, never authoritative metadata for the selected song.
-    let (queue, _) = parse_queue(contents, "");
+    let (queue, _, _) = parse_queue(contents, "");
     let continuation = if queue.is_empty() {
         None
     } else {
@@ -237,7 +255,10 @@ fn parse_watch_more(response: &Value, previous: &WatchContinuation) -> Result<Wa
     })
 }
 
-fn parse_queue(contents: &[Value], current_id: &str) -> (Vec<Track>, Option<usize>) {
+fn parse_queue(
+    contents: &[Value],
+    current_id: &str,
+) -> (Vec<Track>, Option<usize>, Option<Box<MediaPair>>) {
     let mut queue = Vec::new();
     let mut first_match = None;
     let mut selected_match = None;
@@ -251,15 +272,93 @@ fn parse_queue(contents: &[Value], current_id: &str) -> (Vec<Track>, Option<usiz
         let Some(track) = parse_track(row, current_id) else {
             continue;
         };
-        if track.id == current_id {
-            first_match.get_or_insert(queue.len());
-            if row["selected"] == true {
-                selected_match.get_or_insert(queue.len());
+        let pair = item
+            .get("playlistPanelVideoWrapperRenderer")
+            .and_then(|wrapper| media_pair(wrapper, &track, current_id));
+        if track.id == current_id || pair.is_some() {
+            first_match.get_or_insert_with(|| (queue.len(), pair.clone()));
+            let selected = row["selected"] == true
+                || (pair.is_some()
+                    && item
+                        .pointer("/playlistPanelVideoWrapperRenderer/counterpart")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| {
+                            entry.pointer("/counterpartRenderer/playlistPanelVideoRenderer")
+                        })
+                        .any(|row| {
+                            row["videoId"].as_str() == Some(current_id) && row["selected"] == true
+                        }));
+            if selected {
+                selected_match.get_or_insert((queue.len(), pair));
             }
         }
         queue.push(track);
     }
-    (queue, selected_match.or(first_match))
+    let Some((index, alternatives)) = selected_match.or(first_match) else {
+        return (queue, None, None);
+    };
+    if let Some(pair) = &alternatives
+        && queue[index].id != current_id
+    {
+        queue[index] = if pair.song.id == current_id {
+            pair.song.clone()
+        } else {
+            pair.video.clone()
+        };
+    }
+    (queue, Some(index), alternatives)
+}
+
+fn media_pair(wrapper: &Value, primary: &Track, current_id: &str) -> Option<Box<MediaPair>> {
+    let primary_row = wrapper.pointer("/primaryRenderer/playlistPanelVideoRenderer")?;
+    if primary_row["videoId"].as_str()? != primary.id {
+        return None;
+    }
+    let primary_type = music_video_type(primary_row)?;
+    let mut pairs = wrapper["counterpart"]
+        .as_array()?
+        .iter()
+        .filter_map(|entry| entry.pointer("/counterpartRenderer/playlistPanelVideoRenderer"))
+        .filter(|row| primary.id == current_id || row["videoId"].as_str() == Some(current_id))
+        .filter_map(|row| {
+            let counterpart_type = music_video_type(row)?;
+            let counterpart = parse_track(row, current_id)?;
+            if primary.id == counterpart.id
+                || primary.details.episode.is_some()
+                || counterpart.details.episode.is_some()
+            {
+                return None;
+            }
+            match (primary_type, counterpart_type) {
+                ("MUSIC_VIDEO_TYPE_ATV", "MUSIC_VIDEO_TYPE_OMV" | "MUSIC_VIDEO_TYPE_UGC") => {
+                    Some(MediaPair {
+                        song: primary.clone(),
+                        video: counterpart,
+                    })
+                }
+                ("MUSIC_VIDEO_TYPE_OMV" | "MUSIC_VIDEO_TYPE_UGC", "MUSIC_VIDEO_TYPE_ATV") => {
+                    Some(MediaPair {
+                        song: counterpart,
+                        video: primary.clone(),
+                    })
+                }
+                _ => None,
+            }
+        });
+    let pair = pairs.next()?;
+    pairs.next().is_none().then(|| Box::new(pair))
+}
+
+fn music_video_type(row: &Value) -> Option<&str> {
+    let endpoint = row.pointer("/navigationEndpoint/watchEndpoint")?;
+    if endpoint["videoId"].as_str()? != row["videoId"].as_str()? {
+        return None;
+    }
+    endpoint
+        .pointer("/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")?
+        .as_str()
 }
 
 fn parse_track(row: &Value, current_id: &str) -> Option<Track> {
@@ -437,6 +536,169 @@ mod tests {
                 }}
             ]}}
         }})
+    }
+
+    fn media_row(id: &str, selected: bool, kind: &str) -> Value {
+        let mut row = row(id, selected);
+        row["playlistPanelVideoRenderer"]["navigationEndpoint"]["watchEndpoint"]["watchEndpointMusicSupportedConfigs"] = json!({
+            "watchEndpointMusicConfig":{"musicVideoType":kind}
+        });
+        row
+    }
+
+    fn media_wrapper(primary: Value, counterpart: Value) -> Value {
+        json!({"playlistPanelVideoWrapperRenderer":{
+            "primaryRenderer":primary,
+            "counterpart":[{"counterpartRenderer":counterpart}]
+        }})
+    }
+
+    #[test]
+    fn service_media_pairs_keep_each_recordings_own_identity_and_account_state() {
+        for video_kind in ["MUSIC_VIDEO_TYPE_OMV", "MUSIC_VIDEO_TYPE_UGC"] {
+            let song = media_row("abcdefghijk", true, "MUSIC_VIDEO_TYPE_ATV");
+            let video = media_row("lmnopqrstuv", false, video_kind);
+            for (primary, counterpart) in [(song.clone(), video.clone()), (video, song)] {
+                let response = watch_response(json!([media_wrapper(primary, counterpart)]));
+                for current in ["abcdefghijk", "lmnopqrstuv"] {
+                    let watch = parse_watch(&response, &track(current), json!({}), None).unwrap();
+                    assert_eq!(watch.current.as_ref().unwrap().id, current);
+                    assert_eq!(watch.queue.len(), 1);
+                    assert_eq!(watch.queue[0].id, current);
+                    let pair = watch.alternatives.unwrap();
+                    assert_eq!(pair.song.id, "abcdefghijk");
+                    assert_eq!(pair.video.id, "lmnopqrstuv");
+                    for member in ["abcdefghijk", "lmnopqrstuv"] {
+                        assert_eq!(pair.target(member, false).unwrap().id, "abcdefghijk");
+                        assert_eq!(pair.target(member, true).unwrap().id, "lmnopqrstuv");
+                    }
+                    assert!(pair.target("vwxyzABCDEF", false).is_none());
+                    assert!(pair.target("vwxyzABCDEF", true).is_none());
+                    for member in [&pair.song, &pair.video] {
+                        if member.id == current {
+                            assert_eq!(member.details.rating, Some(Rating::Like));
+                            assert_eq!(
+                                member.details.add_library.as_deref(),
+                                Some(format!("add-{current}").as_str())
+                            );
+                        } else {
+                            assert_eq!(member.details.rating, None);
+                            assert_eq!(member.details.add_library, None);
+                            assert_eq!(member.details.in_library, None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_requested_counterpart_replaces_only_the_selected_duplicate_occurrence() {
+        for primary_selected in [false, true] {
+            let first = media_wrapper(
+                media_row("abcdefghijk", false, "MUSIC_VIDEO_TYPE_ATV"),
+                media_row("lmnopqrstuv", false, "MUSIC_VIDEO_TYPE_OMV"),
+            );
+            let mut current_video =
+                media_row("lmnopqrstuv", !primary_selected, "MUSIC_VIDEO_TYPE_OMV");
+            current_video["playlistPanelVideoRenderer"]["title"] =
+                json!({"simpleText":"Selected video"});
+            let selected = media_wrapper(
+                media_row("abcdefghijk", primary_selected, "MUSIC_VIDEO_TYPE_ATV"),
+                current_video,
+            );
+            let response = watch_response(json!([first, row("vwxyzABCDEF", false), selected]));
+            let watch = parse_watch(&response, &track("lmnopqrstuv"), json!({}), None).unwrap();
+            assert_eq!(watch.current_index, Some(2));
+            assert_eq!(
+                watch
+                    .queue
+                    .iter()
+                    .map(|track| track.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["abcdefghijk", "vwxyzABCDEF", "lmnopqrstuv"]
+            );
+            assert_eq!(watch.current.unwrap().title, "Selected video");
+            assert_eq!(watch.alternatives.unwrap().video.title, "Selected video");
+        }
+    }
+
+    #[test]
+    fn incomplete_ambiguous_and_unrelated_media_rows_do_not_create_switches() {
+        let wrapper = media_wrapper(
+            media_row("abcdefghijk", true, "MUSIC_VIDEO_TYPE_ATV"),
+            media_row("lmnopqrstuv", false, "MUSIC_VIDEO_TYPE_OMV"),
+        );
+        for (path, value) in [
+            (
+                "/primaryRenderer/playlistPanelVideoRenderer/navigationEndpoint/watchEndpoint/videoId",
+                json!("vwxyzABCDEF"),
+            ),
+            (
+                "/counterpart/0/counterpartRenderer/playlistPanelVideoRenderer/navigationEndpoint/watchEndpoint/videoId",
+                json!("vwxyzABCDEF"),
+            ),
+            (
+                "/counterpart/0/counterpartRenderer/playlistPanelVideoRenderer/navigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType",
+                json!("MUSIC_VIDEO_TYPE_ATV"),
+            ),
+            (
+                "/counterpart/0/counterpartRenderer/playlistPanelVideoRenderer/navigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType",
+                json!(PODCAST_EPISODE),
+            ),
+            (
+                "/counterpart/0/counterpartRenderer/playlistPanelVideoRenderer/title",
+                json!({}),
+            ),
+            ("/counterpart", json!([])),
+        ] {
+            let mut invalid = wrapper.clone();
+            *invalid["playlistPanelVideoWrapperRenderer"]
+                .pointer_mut(path)
+                .unwrap() = value;
+            let watch = parse_watch(
+                &watch_response(json!([invalid])),
+                &track("abcdefghijk"),
+                json!({}),
+                None,
+            )
+            .unwrap();
+            assert!(watch.alternatives.is_none());
+            assert_eq!(watch.current.unwrap().id, "abcdefghijk");
+        }
+        let mut unavailable = wrapper.clone();
+        unavailable["playlistPanelVideoWrapperRenderer"]["counterpart"][0]["counterpartRenderer"]
+            ["playlistPanelVideoRenderer"]["unplayableText"] = json!({"simpleText":"Unavailable"});
+        let mut same_id = wrapper.clone();
+        same_id["playlistPanelVideoWrapperRenderer"]["counterpart"][0]["counterpartRenderer"] =
+            media_row("abcdefghijk", false, "MUSIC_VIDEO_TYPE_OMV");
+        let mut ambiguous = wrapper.clone();
+        ambiguous["playlistPanelVideoWrapperRenderer"]["counterpart"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "counterpartRenderer":media_row("vwxyzABCDEF",false,"MUSIC_VIDEO_TYPE_OMV")
+            }));
+        for invalid in [unavailable, same_id, ambiguous] {
+            assert!(
+                parse_watch(
+                    &watch_response(json!([invalid])),
+                    &track("abcdefghijk"),
+                    json!({}),
+                    None
+                )
+                .unwrap()
+                .alternatives
+                .is_none()
+            );
+        }
+        let response = watch_response(json!([wrapper.clone()]));
+        let unrelated = parse_watch(&response, &track("vwxyzABCDEF"), json!({}), None).unwrap();
+        assert!(unrelated.current.is_none() && unrelated.alternatives.is_none());
+        let response = watch_response(json!([row("abcdefghijk", true), wrapper]));
+        let selected = parse_watch(&response, &track("abcdefghijk"), json!({}), None).unwrap();
+        assert_eq!(selected.current_index, Some(0));
+        assert!(selected.alternatives.is_none());
     }
 
     #[test]
