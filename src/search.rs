@@ -13,12 +13,10 @@ pub enum SearchFilter {
     Playlists,
     Podcasts,
     Episodes,
-    Library,
-    Uploads,
 }
 
 impl SearchFilter {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 8] = [
         Self::All,
         Self::Songs,
         Self::Videos,
@@ -27,8 +25,6 @@ impl SearchFilter {
         Self::Playlists,
         Self::Podcasts,
         Self::Episodes,
-        Self::Library,
-        Self::Uploads,
     ];
 
     pub fn label(self) -> &'static str {
@@ -41,87 +37,108 @@ impl SearchFilter {
             Self::Playlists => "Playlists",
             Self::Podcasts => "Podcasts",
             Self::Episodes => "Episodes",
+        }
+    }
+
+    fn param(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Songs => Some("II"),
+            Self::Videos => Some("IQ"),
+            Self::Albums => Some("IY"),
+            Self::Artists => Some("Ig"),
+            Self::Playlists => Some("Io"),
+            Self::Podcasts => Some("JQ"),
+            Self::Episodes => Some("JI"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchScope {
+    #[default]
+    Catalog,
+    Library,
+    Uploads,
+}
+
+impl SearchScope {
+    pub const ALL: [Self; 3] = [Self::Catalog, Self::Library, Self::Uploads];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Catalog => "Catalog",
             Self::Library => "Library",
             Self::Uploads => "Uploads",
         }
     }
 
     pub fn requires_account(self) -> bool {
-        matches!(self, Self::Library | Self::Uploads)
+        self != Self::Catalog
     }
 
-    fn params(self) -> Option<&'static str> {
+    pub fn supported_filters(self) -> &'static [SearchFilter] {
         match self {
-            Self::All => None,
-            Self::Songs => Some("EgWKAQIIAWoMEA4QChADEAQQCRAF"),
-            Self::Videos => Some("EgWKAQIQAWoMEA4QChADEAQQCRAF"),
-            Self::Albums => Some("EgWKAQIYAWoMEA4QChADEAQQCRAF"),
-            Self::Artists => Some("EgWKAQIgAWoMEA4QChADEAQQCRAF"),
-            Self::Playlists => Some("Eg-KAQwIABAAGAAgACgBMABqChAEEAMQCRAFEAo%3D"),
-            Self::Podcasts => Some("EgWKAQJQAWoMEA4QChADEAQQCRAF"),
-            Self::Episodes => Some("EgWKAQJIAWoMEA4QChADEAQQCRAF"),
-            Self::Library => Some("agIYBA%3D%3D"),
-            Self::Uploads => Some("agIYAw%3D%3D"),
+            Self::Catalog | Self::Library => &SearchFilter::ALL,
+            Self::Uploads => &[SearchFilter::All],
         }
     }
 
-    fn tab_index(self) -> usize {
+    pub fn supports(self, filter: SearchFilter) -> bool {
+        self.supported_filters().contains(&filter)
+    }
+
+    fn tab_index(self, filter: SearchFilter) -> usize {
+        // A category-filtered library response also uses the first results tab.
+        if filter != SearchFilter::All {
+            return 0;
+        }
         match self {
+            Self::Catalog => 0,
             Self::Library => 1,
             Self::Uploads => 2,
-            _ => 0,
         }
     }
 }
 
 impl Catalog {
-    pub fn search_filtered(&self, query: &str, filter: SearchFilter) -> Result<Page> {
-        self.search_results(query, filter, None)
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        filter: SearchFilter,
+        scope: SearchScope,
+    ) -> Result<Page> {
+        self.search_results(query, filter, scope, None)
     }
 
     pub fn search_more(
         &self,
         query: &str,
         filter: SearchFilter,
+        scope: SearchScope,
         continuation: &str,
     ) -> Result<Page> {
         ensure!(
             !continuation.is_empty(),
             "No more search results are available"
         );
-        self.search_results(query, filter, Some(continuation))
+        self.search_results(query, filter, scope, Some(continuation))
     }
 
     fn search_results(
         &self,
         query: &str,
         filter: SearchFilter,
+        scope: SearchScope,
         continuation: Option<&str>,
     ) -> Result<Page> {
-        let query = query.trim();
+        let body = search_request(query, filter, scope, continuation)?;
         ensure!(
-            !query.is_empty(),
-            "Enter a song, artist, album, or playlist"
-        );
-        ensure!(
-            !filter.requires_account() || self.session.is_some(),
+            !scope.requires_account() || self.session.is_some(),
             "Connect your Google account to search your library or uploads"
         );
-        let mut body = json!({"query": query});
-        if let Some(params) = filter.params() {
-            body["params"] = json!(params);
-        }
-        if let Some(continuation) = continuation {
-            body["continuation"] = json!(continuation);
-        }
         let response = self.request("search", body)?;
-        ensure!(
-            !filter.requires_account()
-                || response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
-                    != Some(&json!(true)),
-            "YouTube Music did not accept the account session. Connect again."
-        );
-        parse_search_page(&response, query, filter)
+        parse_search_page(&response, query.trim(), filter, scope)
     }
 
     pub fn suggestions(&self, query: &str) -> Result<Vec<String>> {
@@ -133,7 +150,56 @@ impl Catalog {
     }
 }
 
-fn parse_search_page(response: &Value, query: &str, filter: SearchFilter) -> Result<Page> {
+fn search_request(
+    query: &str,
+    filter: SearchFilter,
+    scope: SearchScope,
+    continuation: Option<&str>,
+) -> Result<Value> {
+    let query = query.trim();
+    ensure!(
+        !query.is_empty(),
+        "Enter a song, artist, album, or playlist"
+    );
+    ensure!(
+        scope.supports(filter),
+        "Uploads search does not support category filters"
+    );
+    let params = match (scope, filter.param()) {
+        (SearchScope::Catalog, None) => None,
+        (SearchScope::Catalog, _) if filter == SearchFilter::Playlists => {
+            Some("Eg-KAQwIABAAGAAgACgBMABqChAEEAMQCRAFEAo%3D".into())
+        }
+        (SearchScope::Catalog, Some(param)) => Some(format!("EgWKAQ{param}AWoMEA4QChADEAQQCRAF")),
+        (SearchScope::Library, None) => Some("agIYBA%3D%3D".into()),
+        (SearchScope::Library, Some(param)) => {
+            Some(format!("EgWKAQ{param}AWoKEAUQCRADEAoYBA%3D%3D"))
+        }
+        (SearchScope::Uploads, _) => Some("agIYAw%3D%3D".into()),
+    };
+    let mut body = json!({"query": query});
+    if let Some(params) = params {
+        body["params"] = json!(params);
+    }
+    if let Some(continuation) = continuation {
+        body["continuation"] = json!(continuation);
+    }
+    Ok(body)
+}
+
+fn parse_search_page(
+    response: &Value,
+    query: &str,
+    filter: SearchFilter,
+    scope: SearchScope,
+) -> Result<Page> {
+    ensure!(
+        !scope.requires_account()
+            || (response["LOGGED_IN"] != false
+                && response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+                    != Some(&json!(true))),
+        "YouTube Music did not accept the account session. Connect again."
+    );
     let title = format!("Results for \"{query}\"");
     if let Some(contents) = response.get("continuationContents") {
         return parse_page(contents, &title);
@@ -144,10 +210,16 @@ fn parse_search_page(response: &Value, query: &str, filter: SearchFilter) -> Res
     let results = if let Some(tabbed) = contents.get("tabbedSearchResultsRenderer") {
         tabbed["tabs"]
             .as_array()
-            .and_then(|tabs| tabs.get(filter.tab_index()))
-            .and_then(|tab| tab.pointer("/tabRenderer/content"))
+            .and_then(|tabs| tabs.get(scope.tab_index(filter)))
+            .and_then(|tab| tab.get("tabRenderer"))
+            .filter(|tab| tab["selected"] != false)
+            .and_then(|tab| tab.get("content"))
             .context("YouTube Music did not return the requested search scope")?
     } else {
+        ensure!(
+            !scope.requires_account(),
+            "YouTube Music did not return the requested search scope"
+        );
         contents
     };
     parse_page(results, &title)
@@ -181,36 +253,114 @@ fn parse_suggestions(response: &Value) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    fn tab(name: &str, token: &str, selected: bool) -> Value {
+        json!({"tabRenderer":{"selected":selected,"content":{"sectionListRenderer":{"contents":[{
+            "musicShelfRenderer":{"title":{"simpleText":name},"contents":[{
+                "musicResponsiveListItemRenderer":{
+                    "title":{"simpleText":name},
+                    "navigationEndpoint":{"browseEndpoint":{"browseId":format!("VL{name}")}}
+                }
+            }],"continuations":[{"nextContinuationData":{"continuation":token}}]}
+        }]}}}})
+    }
+
     #[test]
-    fn account_scopes_never_mix_public_results_or_continuations() {
-        let scope = |name, token| {
-            json!({"tabRenderer":{"content":{"sectionListRenderer":{"contents":[{
-                "musicShelfRenderer":{"title":{"simpleText":name},"contents":[{
-                    "musicResponsiveListItemRenderer":{
-                        "title":{"simpleText":name},
-                        "navigationEndpoint":{"browseEndpoint":{"browseId":format!("VL{name}")}}
-                    }
-                }],"continuations":[{"nextContinuationData":{"continuation":token}}]}
-            }]}}}})
-        };
-        let response = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[
-            scope("Public", "public-token"), scope("Library", "library-token"), scope("Uploads", "uploads-token")
+    fn library_category_and_scope_params_survive_pagination() {
+        for (filter, params) in [
+            (SearchFilter::All, "agIYBA%3D%3D"),
+            (SearchFilter::Songs, "EgWKAQIIAWoKEAUQCRADEAoYBA%3D%3D"),
+            (SearchFilter::Videos, "EgWKAQIQAWoKEAUQCRADEAoYBA%3D%3D"),
+            (SearchFilter::Albums, "EgWKAQIYAWoKEAUQCRADEAoYBA%3D%3D"),
+            (SearchFilter::Artists, "EgWKAQIgAWoKEAUQCRADEAoYBA%3D%3D"),
+            (SearchFilter::Playlists, "EgWKAQIoAWoKEAUQCRADEAoYBA%3D%3D"),
+            (SearchFilter::Podcasts, "EgWKAQJQAWoKEAUQCRADEAoYBA%3D%3D"),
+            (SearchFilter::Episodes, "EgWKAQJIAWoKEAUQCRADEAoYBA%3D%3D"),
+        ] {
+            let first = search_request(" a song ", filter, SearchScope::Library, None).unwrap();
+            assert_eq!(first, json!({"query":"a song","params":params}));
+            let more = search_request(
+                " a song ",
+                filter,
+                SearchScope::Library,
+                Some("library-token"),
+            )
+            .unwrap();
+            assert_eq!(
+                more,
+                json!({"query":"a song","params":params,"continuation":"library-token"})
+            );
+        }
+        assert_eq!(
+            search_request(
+                "a playlist",
+                SearchFilter::Playlists,
+                SearchScope::Catalog,
+                None
+            )
+            .unwrap()["params"],
+            "Eg-KAQwIABAAGAAgACgBMABqChAEEAMQCRAFEAo%3D"
+        );
+        assert_eq!(
+            search_request("an upload", SearchFilter::All, SearchScope::Uploads, None).unwrap()["params"],
+            "agIYAw%3D%3D"
+        );
+    }
+
+    #[test]
+    fn account_tabs_never_fall_back_to_public_or_stale_scope_contents() {
+        let mut response = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[
+            tab("Public", "public-token", false),
+            tab("Library", "library-token", true),
+            tab("Uploads", "uploads-token", false)
         ]}}});
-        let library = parse_search_page(&response, "test", SearchFilter::Library).unwrap();
+        let library =
+            parse_search_page(&response, "test", SearchFilter::All, SearchScope::Library).unwrap();
         assert_eq!(library.shelves.len(), 1);
         assert_eq!(library.shelves[0].items[0].title(), "Library");
         assert_eq!(library.continuation.as_deref(), Some("library-token"));
-        let uploads = parse_search_page(&response, "test", SearchFilter::Uploads).unwrap();
+        assert!(
+            parse_search_page(&response, "test", SearchFilter::All, SearchScope::Catalog).is_err()
+        );
+        assert!(
+            parse_search_page(&response, "test", SearchFilter::Songs, SearchScope::Library)
+                .is_err()
+        );
+
+        let tabs = &mut response["contents"]["tabbedSearchResultsRenderer"]["tabs"];
+        tabs[1]["tabRenderer"]["selected"] = json!(false);
+        tabs[2]["tabRenderer"]["selected"] = json!(true);
+        let uploads =
+            parse_search_page(&response, "test", SearchFilter::All, SearchScope::Uploads).unwrap();
         assert_eq!(uploads.shelves[0].items[0].title(), "Uploads");
         assert_eq!(uploads.continuation.as_deref(), Some("uploads-token"));
+
+        let filtered = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[
+            tab("Library songs", "library-songs-token", true),
+            tab("Stale library", "stale-library-token", false)
+        ]}}});
+        let songs = parse_search_page(&filtered, "test", SearchFilter::Songs, SearchScope::Library)
+            .unwrap();
+        assert_eq!(songs.shelves[0].items[0].title(), "Library songs");
+        assert_eq!(songs.continuation.as_deref(), Some("library-songs-token"));
+
+        let missing = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[
+            tab("Public", "public-token", true)
+        ]}}});
         assert!(
-            parse_search_page(
-                &json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[]}}}),
-                "test",
-                SearchFilter::Library
-            )
-            .is_err()
+            parse_search_page(&missing, "test", SearchFilter::All, SearchScope::Library).is_err()
         );
+        for scope in [SearchScope::Library, SearchScope::Uploads] {
+            assert!(
+                parse_search_page(
+                    &json!({"contents":{"musicShelfRenderer":{}}}),
+                    "test",
+                    SearchFilter::All,
+                    scope
+                )
+                .is_err()
+            );
+        }
+
         let continuation = json!({"continuationContents":{"musicShelfContinuation":{
             "contents":[{"musicResponsiveListItemRenderer":{
                 "title":{"simpleText":"More library results"},
@@ -218,9 +368,25 @@ mod tests {
             }}],
             "continuations":[{"nextContinuationData":{"continuation":"next-library-token"}}]
         }}});
-        let more = parse_search_page(&continuation, "test", SearchFilter::Library).unwrap();
+        let more = parse_search_page(
+            &continuation,
+            "test",
+            SearchFilter::Songs,
+            SearchScope::Library,
+        )
+        .unwrap();
         assert_eq!(more.shelves[0].items[0].title(), "More library results");
         assert_eq!(more.continuation.as_deref(), Some("next-library-token"));
+        let mut logged_out = continuation.clone();
+        logged_out["responseContext"] = json!({"mainAppWebResponseContext":{"loggedOut":true}});
+        let mut not_logged_in = continuation;
+        not_logged_in["LOGGED_IN"] = json!(false);
+        for rejected in [logged_out, not_logged_in] {
+            assert!(
+                parse_search_page(&rejected, "test", SearchFilter::Songs, SearchScope::Library)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -249,19 +415,47 @@ mod tests {
     }
 
     #[test]
-    fn guest_search_rejects_account_scopes_before_any_request() {
+    fn invalid_combinations_and_guest_account_scopes_fail_before_http() {
         let catalog = Catalog::new().unwrap();
-        for filter in [SearchFilter::Library, SearchFilter::Uploads] {
+        for scope in [SearchScope::Library, SearchScope::Uploads] {
             assert!(
                 catalog
-                    .search_filtered("a song", filter)
+                    .search_filtered("a song", SearchFilter::All, scope)
                     .unwrap_err()
                     .to_string()
                     .contains("Connect your Google account")
             );
         }
-        assert!(catalog.search_filtered("  ", SearchFilter::All).is_err());
-        let empty = parse_search_page(&json!({}), "no results", SearchFilter::All).unwrap();
+        for filter in SearchFilter::ALL
+            .into_iter()
+            .filter(|filter| *filter != SearchFilter::All)
+        {
+            assert!(!SearchScope::Uploads.supports(filter));
+            assert!(
+                catalog
+                    .search_filtered("a song", filter, SearchScope::Uploads)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not support category filters")
+            );
+            assert!(
+                catalog
+                    .search_more("a song", filter, SearchScope::Uploads, "token")
+                    .is_err()
+            );
+        }
+        assert!(
+            catalog
+                .search_filtered("  ", SearchFilter::All, SearchScope::Catalog)
+                .is_err()
+        );
+        let empty = parse_search_page(
+            &json!({}),
+            "no results",
+            SearchFilter::All,
+            SearchScope::Catalog,
+        )
+        .unwrap();
         assert!(empty.shelves.is_empty());
     }
 
@@ -279,7 +473,9 @@ mod tests {
             (SearchFilter::Podcasts, "science"),
             (SearchFilter::Episodes, "science"),
         ] {
-            let page = catalog.search_filtered(query, filter).unwrap();
+            let page = catalog
+                .search_filtered(query, filter, SearchScope::Catalog)
+                .unwrap();
             assert!(
                 !page.shelves.is_empty(),
                 "{} returned no results",
@@ -290,7 +486,9 @@ mod tests {
                     .continuation
                     .as_deref()
                     .expect("song search should paginate");
-                let more = catalog.search_more(query, filter, continuation).unwrap();
+                let more = catalog
+                    .search_more(query, filter, SearchScope::Catalog, continuation)
+                    .unwrap();
                 assert!(!more.tracks().is_empty());
             }
         }

@@ -26,6 +26,15 @@ pub struct Track {
     pub details: TrackDetails,
 }
 
+impl Track {
+    pub fn credits_id(&self) -> Option<String> {
+        self.details
+            .credits_id
+            .clone()
+            .or_else(|| valid_video_id(&self.id).then(|| format!("MPTC{}", self.id)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Rating {
@@ -61,6 +70,7 @@ pub struct TrackDetails {
     pub set_video_id: Option<String>,
     pub artist_id: Option<String>,
     pub album_id: Option<String>,
+    pub credits_id: Option<String>,
 }
 
 impl TrackDetails {
@@ -502,6 +512,13 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
         .into_iter()
         .flatten()
     {
+        if let Some(id) = item
+            .pointer("/menuNavigationItemRenderer/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("MPTC"))
+        {
+            details.credits_id = Some(id.to_owned());
+        }
         let Some(menu) = item
             .get("toggleMenuServiceItemRenderer")
             .or_else(|| item.get("menuServiceItemRenderer"))
@@ -858,17 +875,18 @@ mod tests {
             set_video_id: Some("occurrence-1".into()),
             artist_id: Some("UCartist".into()),
             album_id: Some("MPREalbum".into()),
+            credits_id: Some("MPTCabcdefghijk".into()),
         };
         assert_eq!(
             serde_json::to_value(&details).unwrap(),
             json!({
-                "artist_id":"UCartist","album_id":"MPREalbum"
+                "artist_id":"UCartist","album_id":"MPREalbum","credits_id":"MPTCabcdefghijk"
             })
         );
         let restored: TrackDetails = serde_json::from_value(json!({
             "rating":"LIKE","in_library":true,"add_library":"stale-add-song",
             "remove_library":"stale-remove-song","remove_history":"stale-history",
-            "set_video_id":"stale-occurrence","artist_id":"UCartist","album_id":"MPREalbum"
+            "set_video_id":"stale-occurrence","artist_id":"UCartist","album_id":"MPREalbum","credits_id":"MPTCabcdefghijk"
         }))
         .unwrap();
         assert_eq!(
@@ -876,6 +894,7 @@ mod tests {
             TrackDetails {
                 artist_id: Some("UCartist".into()),
                 album_id: Some("MPREalbum".into()),
+                credits_id: Some("MPTCabcdefghijk".into()),
                 ..Default::default()
             }
         );
@@ -886,9 +905,21 @@ mod tests {
     #[test]
     fn parses_current_search_item_sections() {
         let data = json!({"contents":{"sectionListRenderer":{"contents":[{"itemSectionRenderer":{"contents":[{
-            "musicResponsiveListItemRenderer":{"title":{"runs":[{"text":"A song","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}}}]}}
+            "musicResponsiveListItemRenderer":{"title":{"runs":[{"text":"A song","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}}}]},
+                "menu":{"menuRenderer":{"items":[
+                    {"menuNavigationItemRenderer":{"navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}},
+                    {"menuNavigationItemRenderer":{"navigationEndpoint":{"browseEndpoint":{"browseId":"MPTCcanonical"}}}}
+                ]}}}
         }]}}]}}});
-        assert_eq!(parse_page(&data, "Search").unwrap().tracks().len(), 1);
+        let mut tracks = parse_page(&data, "Search").unwrap().tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].details.credits_id.as_deref(),
+            Some("MPTCcanonical")
+        );
+        assert_eq!(tracks[0].credits_id().as_deref(), Some("MPTCcanonical"));
+        tracks[0].details.credits_id = None;
+        assert_eq!(tracks[0].credits_id().as_deref(), Some("MPTCabcdefghijk"));
     }
 
     #[test]
@@ -898,7 +929,11 @@ mod tests {
         let home = api.home().unwrap();
         assert!(!home.shelves.is_empty());
         let results = api
-            .search_filtered("Khruangbin", crate::search::SearchFilter::All)
+            .search_filtered(
+                "Khruangbin",
+                crate::search::SearchFilter::All,
+                crate::search::SearchScope::Catalog,
+            )
             .unwrap();
         assert!(!results.tracks().is_empty());
         let collection = home

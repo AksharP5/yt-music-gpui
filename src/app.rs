@@ -6,8 +6,9 @@ use crate::{
     library::{Library, LibraryWriter, Repeat, Store},
     player::{PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
     playlist_form::{PlaylistForm, PlaylistFormEvent},
-    search::SearchFilter,
+    search::{SearchFilter, SearchScope},
     search_box::{SearchBox, SearchBoxEvent},
+    song_text::{self, Content as SongText, Query as TextQuery},
     theme::Theme,
     watch::{Watch, WatchContinuation, WatchPage},
 };
@@ -25,10 +26,17 @@ use std::{
 };
 
 #[derive(Clone, PartialEq)]
+struct Search {
+    query: String,
+    filter: SearchFilter,
+    scope: SearchScope,
+}
+
+#[derive(Clone, PartialEq)]
 enum Route {
     Home,
     Explore,
-    Search(String, SearchFilter),
+    Search(Search),
     Browse(String),
     Liked,
     Recent,
@@ -39,11 +47,11 @@ enum Route {
 enum Query {
     Home,
     Explore,
-    Search(String, SearchFilter),
+    Search(Search),
     Browse(String),
     More {
         token: String,
-        search: Option<(String, SearchFilter)>,
+        search: Option<Search>,
     },
     Library(Section),
     PlaylistChoices,
@@ -66,7 +74,6 @@ enum CatalogTarget {
 }
 enum PlaybackQuery {
     Watch { video_id: String, radio: bool },
-    Lyrics(String),
     More(WatchContinuation),
 }
 struct PlaybackJob {
@@ -79,10 +86,6 @@ enum PlaybackResult {
         id: u64,
         radio: bool,
         result: Result<Box<Watch>, String>,
-    },
-    Lyrics {
-        id: u64,
-        result: Result<String, String>,
     },
     More {
         id: u64,
@@ -118,9 +121,10 @@ enum Overlay {
         id: String,
         title: String,
     },
-    Lyrics {
+    SongText {
+        id: u64,
         title: String,
-        text: Option<String>,
+        content: Option<Result<SongText, String>>,
     },
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -154,7 +158,7 @@ pub struct Music {
     route: Route,
     page: Page,
     rows: Vec<Item>,
-    back: Vec<(Route, Page)>,
+    back: Vec<(Route, Option<Page>)>,
     list_id: usize,
     loading: bool,
     error: Option<String>,
@@ -173,6 +177,7 @@ pub struct Music {
     autoplay_waiting: Option<bool>,
     autoplay_tracks: VecDeque<Track>,
     watch_pending: bool,
+    song_text: song_text::Worker,
     artwork: Artwork,
     library: Library,
     store: Option<LibraryWriter>,
@@ -287,12 +292,21 @@ impl Music {
                                     Query::Library(section) => catalog.library(*section),
                                     Query::PlaylistChoices => catalog.library(Section::Playlists),
                                     Query::PlaylistChoicesMore(token) => catalog.more(token, false),
-                                    Query::Search(q, filter) => catalog.search_filtered(q, *filter),
+                                    Query::Search(search) => catalog.search_filtered(
+                                        &search.query,
+                                        search.filter,
+                                        search.scope,
+                                    ),
                                     Query::Browse(id) => catalog.browse(id),
                                     Query::More {
                                         token,
-                                        search: Some((q, filter)),
-                                    } => catalog.search_more(q, *filter, token),
+                                        search: Some(search),
+                                    } => catalog.search_more(
+                                        &search.query,
+                                        search.filter,
+                                        search.scope,
+                                        token,
+                                    ),
                                     Query::More {
                                         token,
                                         search: None,
@@ -362,12 +376,6 @@ impl Music {
                                     .map_err(|error| format!("{error:#}"))
                             }),
                         },
-                        PlaybackQuery::Lyrics(id) => PlaybackResult::Lyrics {
-                            id: job.id,
-                            result: catalog.and_then(|catalog| {
-                                catalog.lyrics(&id).map_err(|error| format!("{error:#}"))
-                            }),
-                        },
                         PlaybackQuery::More(continuation) => PlaybackResult::More {
                             id: job.id,
                             result: catalog.and_then(|catalog| {
@@ -387,6 +395,25 @@ impl Music {
             while let Ok(result) = playback_completed.recv().await {
                 if view
                     .update_in(cx, |view, _, cx| view.playback_result(result, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let (song_text, text_events) = song_text::Worker::start();
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(event) = text_events.recv().await {
+                if view
+                    .update_in(cx, |view, _, cx| {
+                        if let Some(Overlay::SongText { id, content, .. }) = &mut view.overlay
+                            && *id == event.id
+                        {
+                            *content = Some(event.result);
+                            cx.notify();
+                        }
+                    })
                     .is_err()
                 {
                     break;
@@ -448,11 +475,18 @@ impl Music {
             cx.subscribe_in(&search, window, |view, _, event, window, cx| match event {
                 SearchBoxEvent::Submit(query) => {
                     if !query.is_empty() {
-                        let filter = match view.route {
-                            Route::Search(_, filter) => filter,
-                            _ => SearchFilter::All,
+                        let search = match &view.route {
+                            Route::Search(search) => Search {
+                                query: query.clone(),
+                                ..search.clone()
+                            },
+                            _ => Search {
+                                query: query.clone(),
+                                filter: SearchFilter::All,
+                                scope: SearchScope::Catalog,
+                            },
                         };
-                        view.navigate(Route::Search(query.clone(), filter), cx);
+                        view.navigate(Route::Search(search), cx);
                         window.focus(&view.focus, cx);
                     }
                 }
@@ -508,6 +542,7 @@ impl Music {
             autoplay_waiting: None,
             autoplay_tracks: VecDeque::new(),
             watch_pending: false,
+            song_text,
             artwork,
             library,
             store,
@@ -682,8 +717,11 @@ impl Music {
                         {
                             // Keep the selected playlist occurrence when refreshing song metadata.
                             let occurrence = current.details.set_video_id.clone();
+                            let credits = current.details.credits_id.clone();
                             current.details = track.details.clone();
                             current.details.set_video_id = occurrence;
+                            current.details.credits_id =
+                                track.details.credits_id.clone().or(credits);
                             if let Some(rating) = track.details.rating {
                                 self.ratings.insert(track.id.clone(), rating);
                             }
@@ -708,15 +746,6 @@ impl Music {
                         self.notice = Some(format!("Song details are unavailable: {error}"))
                     }
                 }
-            }
-            PlaybackResult::Lyrics { id, result } => {
-                if id != self.playback_generation.load(Ordering::Relaxed) {
-                    return;
-                }
-                if let Some(Overlay::Lyrics { text, .. }) = &mut self.overlay {
-                    *text = Some(result.unwrap_or_else(|error| error));
-                }
-                self.extend_autoplay(cx);
             }
             PlaybackResult::More { id, result } => {
                 if id != self.radio_generation.load(Ordering::Relaxed) {
@@ -750,6 +779,7 @@ impl Music {
             .update(cx, |search, cx| search.set_session(session, cx));
         self.ratings.clear();
         self.history_track = None;
+        self.song_text.cancel();
         self.pending_mutations.clear();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
         self.watch_pending = false;
@@ -787,7 +817,9 @@ impl Music {
 
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         if self.route != route {
-            self.back.push((self.route.clone(), self.page.clone()));
+            let cached = (self.account.is_none() && !self.loading && self.error.is_none())
+                .then(|| self.page.clone());
+            self.back.push((self.route.clone(), cached));
             if self.back.len() > 12 {
                 self.back.remove(0);
             }
@@ -811,11 +843,11 @@ impl Music {
                 self.page.title = "Explore".into();
                 self.request(Query::Explore, cx);
             }
-            Route::Search(query, filter) => {
-                self.page.title = format!("Results for \"{query}\"");
+            Route::Search(search) => {
+                self.page.title = format!("Results for \"{}\"", search.query);
                 self.search
-                    .update(cx, |input, cx| input.set_query(query.clone(), cx));
-                self.request(Query::Search(query, filter), cx);
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+                self.request(Query::Search(search), cx);
             }
             Route::Browse(id) => {
                 self.page.title = "Loading collection".into();
@@ -895,17 +927,22 @@ impl Music {
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
         if let Some((route, page)) = self.back.pop() {
-            if self.account.is_some() {
+            let Some(page) = page.filter(|_| self.account.is_none()) else {
                 self.route = route.clone();
                 self.navigate(route, cx);
                 return;
-            }
+            };
             self.generation.fetch_add(1, Ordering::Relaxed);
             self.list_id = self.list_id.wrapping_add(1);
             self.route = route;
+            if let Route::Search(search) = &self.route {
+                self.search
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+            }
             self.page = page;
             self.loading = false;
             self.error = None;
+            self.notice = None;
             self.rows = self
                 .page
                 .shelves
@@ -1070,7 +1107,7 @@ impl Music {
         let query = match &self.route {
             Route::Home => Query::Home,
             Route::Explore => Query::Explore,
-            Route::Search(q, filter) => Query::Search(q.clone(), *filter),
+            Route::Search(search) => Query::Search(search.clone()),
             Route::Browse(id) => Query::Browse(id.clone()),
             Route::Liked => Query::Library(Section::Liked),
             Route::Recent => Query::Library(Section::History),
@@ -1160,9 +1197,30 @@ impl Music {
         self.request(Query::PlaylistChoices, cx);
     }
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.song_text.cancel();
         self.overlay = None;
         self.form_subscription = None;
         window.focus(&self.focus, cx);
+        cx.notify();
+    }
+    fn show_song_text(&mut self, query: TextQuery, title: &str, cx: &mut Context<Self>) {
+        let label = match &query {
+            TextQuery::Lyrics(_) => "Lyrics",
+            TextQuery::Credits(_) => "Credits",
+        };
+        let title = format!("{label} · {title}");
+        let session = self.account.as_ref().map(|account| account.session.clone());
+        self.overlay = None;
+        match self.song_text.load(query, session) {
+            Ok(id) => {
+                self.overlay = Some(Overlay::SongText {
+                    id,
+                    title,
+                    content: None,
+                })
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
         cx.notify();
     }
     fn account_event(
@@ -1385,7 +1443,8 @@ impl Music {
                 {
                     self.now_playing = None;
                     self.autoplay_seeded = false;
-                    if matches!(self.overlay, Some(Overlay::Lyrics { .. })) {
+                    if matches!(self.overlay, Some(Overlay::SongText { .. })) {
+                        self.song_text.cancel();
                         self.overlay = None;
                     }
                     self.playback_request(
@@ -2295,7 +2354,45 @@ impl Music {
                         )
                     }),
             );
-        if let Route::Search(query, selected) = &self.route {
+        if let Route::Search(search) = &self.route {
+            if self.account.is_some() {
+                content = content.child(
+                    div()
+                        .id("search-scopes")
+                        .mx(px(30.))
+                        .mb(px(16.))
+                        .flex()
+                        .gap(px(22.))
+                        .children(SearchScope::ALL.into_iter().enumerate().map(
+                            |(index, scope)| {
+                                let mut next = search.clone();
+                                next.scope = scope;
+                                if !scope.supports(next.filter) {
+                                    next.filter = SearchFilter::All;
+                                }
+                                div()
+                                    .id(("search-scope", index))
+                                    .pb(px(8.))
+                                    .border_b_2()
+                                    .border_color(if scope == search.scope {
+                                        self.theme.accent
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .text_color(if scope == search.scope {
+                                        self.theme.text
+                                    } else {
+                                        self.theme.muted
+                                    })
+                                    .cursor_pointer()
+                                    .child(scope.label())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.navigate(Route::Search(next.clone()), cx)
+                                    }))
+                            },
+                        )),
+                );
+            }
             content = content.child(
                 div()
                     .id("search-filters")
@@ -2305,25 +2402,28 @@ impl Music {
                     .gap(px(22.))
                     .overflow_x_scroll()
                     .children(
-                        SearchFilter::ALL
-                            .into_iter()
+                        search
+                            .scope
+                            .supported_filters()
+                            .iter()
+                            .copied()
                             .enumerate()
-                            .filter(|(_, filter)| {
-                                !filter.requires_account() || self.account.is_some()
-                            })
                             .map(|(index, filter)| {
-                                let query = query.clone();
+                                let next = Search {
+                                    filter,
+                                    ..search.clone()
+                                };
                                 div()
                                     .id(("search-filter", index))
                                     .flex_shrink_0()
                                     .pb(px(9.))
                                     .border_b_2()
-                                    .border_color(if filter == *selected {
+                                    .border_color(if filter == search.filter {
                                         self.theme.accent
                                     } else {
                                         gpui::transparent_black()
                                     })
-                                    .text_color(if filter == *selected {
+                                    .text_color(if filter == search.filter {
                                         self.theme.text
                                     } else {
                                         self.theme.muted
@@ -2331,7 +2431,7 @@ impl Music {
                                     .cursor_pointer()
                                     .child(filter.label())
                                     .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.navigate(Route::Search(query.clone(), filter), cx)
+                                        view.navigate(Route::Search(next.clone()), cx)
                                     }))
                             }),
                     ),
@@ -2511,9 +2611,7 @@ impl Music {
                                 Query::More {
                                     token,
                                     search: match &view.route {
-                                        Route::Search(query, filter) => {
-                                            Some((query.clone(), *filter))
-                                        }
+                                        Route::Search(search) => Some(search.clone()),
                                         _ => None,
                                     },
                                 },
@@ -3110,7 +3208,7 @@ impl Music {
                                 Overlay::Track { track, .. } => track.title.clone(),
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
-                                Overlay::Lyrics { title, .. } => format!("Lyrics · {title}"),
+                                Overlay::SongText { title, .. } => title.clone(),
                                 Overlay::PlaylistForm { .. } => unreachable!(),
                             }),
                     )
@@ -3222,11 +3320,7 @@ impl Music {
                         "Lyrics",
                         cx,
                         move |view, _, cx| {
-                            view.overlay = Some(Overlay::Lyrics {
-                                title: title.clone(),
-                                text: None,
-                            });
-                            view.playback_request(PlaybackQuery::Lyrics(id.clone()), cx);
+                            view.show_song_text(TextQuery::Lyrics(id.clone()), &title, cx);
                         },
                     ));
                 }
@@ -3242,6 +3336,17 @@ impl Music {
                         },
                     ));
                 }
+            }
+            if let Some(id) = track.credits_id() {
+                let title = track.title.clone();
+                body = body.child(self.menu_action(
+                    "menu-credits",
+                    "Song credits",
+                    cx,
+                    move |view, _, cx| {
+                        view.show_song_text(TextQuery::Credits(id.clone()), &title, cx)
+                    },
+                ));
             }
             let song = track.clone();
             body = body.child(self.menu_action(
@@ -3454,12 +3559,37 @@ impl Music {
                     cx.notify();
                 },
             ));
-        } else if let Overlay::Lyrics { text, .. } = kind {
-            body = body.child(
-                div()
-                    .text_size(px(17.))
-                    .child(text.clone().unwrap_or_else(|| "Loading lyrics…".into())),
-            );
+        } else if let Overlay::SongText { content, .. } = kind {
+            match content {
+                None => body = body.child(div().text_color(self.theme.muted).child("Loading…")),
+                Some(Err(error)) => {
+                    body = body.child(div().text_color(self.theme.muted).child(error.clone()))
+                }
+                Some(Ok(SongText::Lyrics(text))) => {
+                    body = body.child(div().text_size(px(17.)).child(text.clone()))
+                }
+                Some(Ok(SongText::Credits(credits))) => {
+                    for section in credits {
+                        body = body.child(
+                            div()
+                                .mb(px(22.))
+                                .child(
+                                    div()
+                                        .text_size(px(16.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(section.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(8.))
+                                        .text_size(px(14.))
+                                        .text_color(self.theme.muted)
+                                        .child(section.names.clone()),
+                                ),
+                        );
+                    }
+                }
+            }
         } else if let Overlay::PlaylistPicker {
             track,
             page,

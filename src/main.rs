@@ -11,6 +11,7 @@ mod player;
 mod playlist_form;
 mod search;
 mod search_box;
+mod song_text;
 mod theme;
 mod watch;
 
