@@ -2,11 +2,11 @@
 
 The source review covered every changed source file between e9cfcdf and 5899fb5. It found no reportable vulnerability in that gated build. This is a bounded review, not a guarantee that the application has no vulnerabilities.
 
-Subsequent hardening binds queued edits and catalog jobs to a verified session, preserves the previous session when verification fails, revokes playback credentials during sign-out, blocks authenticated redirects, and applies the disabled account gate to imports and saved sessions. Account feedback tokens, occurrence IDs and rating snapshots are excluded from device-state serialization. Playback uses an acknowledged stop before replacing or closing its private RAM cookie jar. Raw extractor diagnostics cannot reach user-facing playback errors.
+Subsequent hardening binds queued edits and catalog jobs to a verified session, preserves the previous session when verification fails, revokes playback credentials during sign-out, blocks authenticated redirects, and applies the disabled account gate to imports and saved sessions. Connection completion must match the active, uncancelled operation in both the worker and UI. Sign-out clears navigation history after resetting the page, and it supersedes an old queued edit if the command queue is full. Account feedback tokens, occurrence IDs and rating snapshots are excluded from device-state serialization. Playback uses an acknowledged stop before replacing or closing its private RAM cookie jar. Raw extractor diagnostics cannot reach user-facing playback errors.
 
 Validation passed:
 
-- 26 ordinary tests, including session binding, failed verification, disabled imports, cookie filtering, request redaction, RAM file permissions/lifetimes and account metadata parsing.
+- 27 ordinary tests, including session binding, cancelled connection publication, failed verification, disabled imports, cookie filtering, request redaction, RAM file permissions/lifetimes and account metadata parsing.
 - A live isolated Chromium transport check with no debugging TCP port or inherited extensions.
 - Live mpv playback with invented initial cookies, replacement cookies and cleared credentials.
 - A synthetic Secret Service store/read/remove round trip under unique test attributes. No existing credential entry was accessed.

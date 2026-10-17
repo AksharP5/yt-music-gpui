@@ -59,7 +59,7 @@ fn main() {
         eprintln!(
             "Sign in to YouTube Music in the Google account window. It will close when the connection is ready."
         );
-        if let Err(error) = auth::connect(&std::sync::atomic::AtomicBool::new(false)) {
+        if let Err(error) = auth::connect(&auth::Operation::default()) {
             eprintln!("{error:#}");
             std::process::exit(1);
         }

@@ -1,14 +1,10 @@
 use crate::{
-    auth::{self, Session, SharedSession},
+    auth::{self, Operation, Session, SharedSession},
     catalog::{Account, Catalog, Collection, Page, Rating, Track, find, parse_page},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-    thread,
-};
+use std::{path::PathBuf, sync::Arc, thread};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -156,27 +152,37 @@ impl Connection {
         Ok(Self { account, session })
     }
 
-    fn publish(self, shared: &SharedSession) -> Result<Self> {
-        *shared
+    fn publish(self, shared: &SharedSession, operation: &Operation) -> Result<Self> {
+        let mut current = shared
             .write()
-            .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))? =
-            Some(self.session.clone());
+            .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?;
+        ensure!(!operation.is_cancelled(), "Account connection cancelled");
+        *current = Some(self.session.clone());
         Ok(self)
     }
 }
 
 pub enum Command {
-    Connect(Arc<AtomicBool>),
+    Connect(Operation),
     Apply {
         session: Arc<Session>,
         mutation: Mutation,
     },
-    Restore(Option<PathBuf>),
-    Disconnect,
+    Restore {
+        path: Option<PathBuf>,
+        operation: Operation,
+    },
+    Disconnect(Operation),
 }
 pub enum Event {
-    Connected(Result<Connection, String>),
-    Disconnected(Result<(), String>),
+    Connected {
+        operation: Operation,
+        result: Result<Option<Connection>, String>,
+    },
+    Disconnected {
+        operation: Operation,
+        result: Result<(), String>,
+    },
     Applied {
         session: Arc<Session>,
         mutation: Mutation,
@@ -198,36 +204,34 @@ pub fn start(
             let catalog = Catalog::with_session(session.clone());
             while let Ok(command) = commands.recv_blocking() {
                 let event = match command {
-                    Command::Connect(cancelled) => Event::Connected(
-                        (|| {
-                            let (candidate, account) = auth::connect(&cancelled)?;
-                            Connection { session: Arc::new(candidate), account }.publish(&session)
-                        })()
-                        .map_err(|e| format!("{e:#}")),
-                    ),
-                    Command::Restore(path) => {
+                    Command::Connect(operation) => {
+                        let result = (|| {
+                            let (candidate, account) = auth::connect(&operation)?;
+                            Connection { session: Arc::new(candidate), account }
+                                .publish(&session, &operation).map(Some)
+                        })().map_err(|e| format!("{e:#}"));
+                        Event::Connected { operation, result }
+                    }
+                    Command::Restore { path, operation } => {
                         let result = (|| {
                             ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
+                            ensure!(!operation.is_cancelled(), "Account connection cancelled");
                             let candidate = match path {
                                 Some(path) => Some(Session::from_cookie_file(&path)?),
                                 None => Session::load()?,
                             };
                             candidate.map(|candidate| {
                                 let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                                Connection::verify(candidate, catalog)?.publish(&session)
+                                Connection::verify(candidate, catalog)?.publish(&session, &operation)
                             }).transpose()
                         })();
-                        match result {
-                            Ok(Some(connection)) => Event::Connected(Ok(connection)),
-                            Ok(None) => continue,
-                            Err(error) => Event::Connected(Err(format!("{error:#}"))),
-                        }
+                        Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")) }
                     }
-                    Command::Disconnect => {
+                    Command::Disconnect(operation) => {
                         // End in-memory authority even if keyring removal needs another attempt.
                         if let Ok(mut current) = session.write() { *current = None; }
                         let result = auth::Session::disconnect().map_err(|e| format!("{e:#}"));
-                        Event::Disconnected(result)
+                        Event::Disconnected { operation, result }
                     }
                     Command::Apply { session: expected, mutation } => {
                         let result = (|| {
@@ -492,18 +496,44 @@ mod tests {
         assert!(require_current_session(&shared, &expected).is_ok());
     }
     #[test]
+    fn cancelled_connection_cannot_publish_after_sign_out() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let operation = Operation::default();
+        let completion = operation.clone();
+        let old_session = shared.read().unwrap().clone().unwrap();
+        let candidate = Connection {
+            session: Arc::new(synthetic_session()),
+            account: Account {
+                name: "Synthetic account".into(),
+                handle: String::new(),
+            },
+        };
+        operation.cancel();
+        *shared.write().unwrap() = None;
+        assert!(candidate.publish(&shared, &completion).is_err());
+        assert!(shared.read().unwrap().is_none());
+        assert!(!operation.matches(&completion));
+        assert!(require_current_session(&shared, &old_session).is_err());
+        let fresh = Operation::default();
+        assert!(!fresh.matches(&completion));
+        assert!(fresh.matches(&fresh.clone()));
+    }
+    #[test]
     fn disabled_accounts_reject_import_before_reading_credentials() {
         if auth::ACCOUNT_LOGIN_ENABLED {
             return;
         }
         let (commands, events) = start(auth::shared(None));
         commands
-            .send_blocking(Command::Restore(Some(PathBuf::from(
-                "/nonexistent-synthetic-cookie-file",
-            ))))
+            .send_blocking(Command::Restore {
+                path: Some(PathBuf::from("/nonexistent-synthetic-cookie-file")),
+                operation: Operation::default(),
+            })
             .unwrap();
         match events.recv_blocking().unwrap() {
-            Event::Connected(Err(error)) => {
+            Event::Connected {
+                result: Err(error), ..
+            } => {
                 assert!(error.contains("disabled until the security review"))
             }
             _ => panic!("account import must fail closed"),

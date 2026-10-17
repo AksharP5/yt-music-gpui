@@ -23,6 +23,20 @@ use std::{
 pub const ACCOUNT_LOGIN_ENABLED: bool = false;
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
+
+#[derive(Clone, Default)]
+pub struct Operation(Arc<AtomicBool>);
+impl Operation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    pub fn matches(&self, other: &Self) -> bool {
+        !self.is_cancelled() && Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 const KEYRING_ATTRIBUTES: [&str; 4] = [
     "application",
     "yt-music-gpui",
@@ -398,7 +412,7 @@ fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe
 }
 
 /// Explicit user action only. Credentials stay in the OS keyring and RAM.
-pub fn connect(cancelled: &AtomicBool) -> Result<(Session, crate::catalog::Account)> {
+pub fn connect(operation: &Operation) -> Result<(Session, crate::catalog::Account)> {
     ensure!(
         ACCOUNT_LOGIN_ENABLED,
         "Account connection is disabled until the security review is complete."
@@ -410,10 +424,7 @@ pub fn connect(cancelled: &AtomicBool) -> Result<(Session, crate::catalog::Accou
     let (mut browser, mut pipe) = start_browser(ORIGIN, false)?;
     let deadline = Instant::now() + Duration::from_secs(15 * 60);
     loop {
-        ensure!(
-            !cancelled.load(Ordering::Relaxed),
-            "Account connection cancelled"
-        );
+        ensure!(!operation.is_cancelled(), "Account connection cancelled");
         ensure!(
             browser.child.try_wait()?.is_none(),
             "The Google sign-in window closed before connection finished"
@@ -423,6 +434,7 @@ pub fn connect(cancelled: &AtomicBool) -> Result<(Session, crate::catalog::Accou
             "Account connection timed out. Try again when you are ready to sign in."
         );
         if let Some((session, account)) = capture(&mut pipe)? {
+            ensure!(!operation.is_cancelled(), "Account connection cancelled");
             session.save()?;
             let _ = pipe.call("Browser.close", json!({}), None);
             return Ok((session, account));

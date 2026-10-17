@@ -1,7 +1,7 @@
 use crate::{
     account::{self, Connection, Effect, Mutation, Section},
     artwork::Artwork,
-    auth::{self, Session, SharedSession},
+    auth::{self, Operation, Session, SharedSession},
     catalog::{Catalog, Collection, Item, Page, Rating, Shelf, Track},
     input::{InputEvent, SearchInput},
     library::{Library, LibraryWriter, Repeat, Store},
@@ -16,7 +16,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -70,13 +70,24 @@ enum Drag {
     Seek,
     Volume,
 }
+enum AccountOperation {
+    Connecting(Operation),
+    Disconnecting(Operation),
+}
+impl AccountOperation {
+    fn token(&self) -> &Operation {
+        match self {
+            Self::Connecting(token) | Self::Disconnecting(token) => token,
+        }
+    }
+}
 
 pub struct Music {
     theme: Theme,
     session: SharedSession,
     account: Option<Connection>,
     account_commands: async_channel::Sender<account::Command>,
-    login: Option<Arc<AtomicBool>>,
+    account_operation: Option<AccountOperation>,
     pending_mutations: HashSet<String>,
     ratings: HashMap<String, Rating>,
     focus: FocusHandle,
@@ -136,9 +147,14 @@ impl Music {
         });
         let session = auth::shared(None);
         let (account_commands, account_events) = account::start(session.clone());
-        if auth::ACCOUNT_LOGIN_ENABLED {
-            let _ = account_commands.try_send(account::Command::Restore(cookies));
-        }
+        let account_operation = auth::ACCOUNT_LOGIN_ENABLED.then(|| {
+            let operation = Operation::default();
+            let _ = account_commands.try_send(account::Command::Restore {
+                path: cookies,
+                operation: operation.clone(),
+            });
+            AccountOperation::Connecting(operation)
+        });
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = account_events.recv().await {
                 if view
@@ -282,7 +298,7 @@ impl Music {
             session,
             account: None,
             account_commands,
-            login: None,
+            account_operation,
             pending_mutations: HashSet::new(),
             ratings: HashMap::new(),
             focus: cx.focus_handle(),
@@ -524,16 +540,16 @@ impl Music {
             cx.notify();
             return;
         }
-        if self.login.is_some() {
+        if self.account_operation.is_some() {
             return;
         }
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let operation = Operation::default();
         match self
             .account_commands
-            .try_send(account::Command::Connect(cancelled.clone()))
+            .try_send(account::Command::Connect(operation.clone()))
         {
             Ok(()) => {
-                self.login = Some(cancelled);
+                self.account_operation = Some(AccountOperation::Connecting(operation));
                 self.notice = Some("Sign in to Google in the account window".into());
             }
             Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
@@ -541,8 +557,8 @@ impl Music {
         cx.notify();
     }
     fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
-        if self.login.is_some() {
-            self.error = Some("Finish or cancel account sign-in before saving changes.".into());
+        if self.account_operation.is_some() {
+            self.error = Some("Finish the account change before saving edits.".into());
             cx.notify();
             return;
         }
@@ -568,8 +584,14 @@ impl Music {
         cx.notify();
     }
     fn disconnect_account(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancelled) = self.login.take() {
-            cancelled.store(true, Ordering::Release);
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::Disconnecting(_))
+        ) {
+            return;
+        }
+        if let Some(operation) = self.account_operation.take() {
+            operation.token().cancel();
         }
         if let Ok(mut session) = self.session.write() {
             *session = None;
@@ -577,17 +599,21 @@ impl Music {
         self.account = None;
         self.ratings.clear();
         self.pending_mutations.clear();
-        self.back.clear();
         self.player_command(Player::clear_cookies);
         self.active_id = None;
         self.playback = Playback::Stopped;
         self.navigate(Route::Home, cx);
+        self.back.clear();
+        let operation = Operation::default();
         if self
             .account_commands
-            .try_send(account::Command::Disconnect)
+            // Sign-out supersedes a queued edit if the bounded queue is full.
+            .force_send(account::Command::Disconnect(operation.clone()))
             .is_err()
         {
             self.error = Some("Playback and account access stopped. The account worker could not remove the saved keyring entry.".into());
+        } else {
+            self.account_operation = Some(AccountOperation::Disconnecting(operation));
         }
         cx.notify();
     }
@@ -606,14 +632,12 @@ impl Music {
     }
     fn account_event(&mut self, event: account::Event, cx: &mut Context<Self>) {
         match event {
-            account::Event::Disconnected(result) => {
-                self.account = None;
-                self.ratings.clear();
-                self.back.clear();
-                self.player_command(Player::clear_cookies);
-                self.active_id = None;
-                self.playback = Playback::Stopped;
-                self.navigate(Route::Home, cx);
+            account::Event::Disconnected { operation, result } => {
+                if !matches!(&self.account_operation, Some(AccountOperation::Disconnecting(active)) if active.matches(&operation))
+                {
+                    return;
+                }
+                self.account_operation = None;
                 match result {
                     Ok(()) => {
                         self.notice = Some("Signed out of YouTube Music".into());
@@ -621,10 +645,14 @@ impl Music {
                     Err(error) => self.error = Some(error),
                 }
             }
-            account::Event::Connected(result) => {
-                self.login = None;
+            account::Event::Connected { operation, result } => {
+                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active)) if active.matches(&operation))
+                {
+                    return;
+                }
+                self.account_operation = None;
                 match result {
-                    Ok(connection) => {
+                    Ok(Some(connection)) => {
                         self.player_command(Player::clear_cookies);
                         self.active_id = None;
                         self.playback = Playback::Stopped;
@@ -642,6 +670,7 @@ impl Music {
                         self.page.continuation = None;
                         self.refresh_remote(cx);
                     }
+                    Ok(None) => {}
                     Err(error) => self.error = Some(error),
                 }
             }
@@ -1968,7 +1997,7 @@ impl Music {
                 .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
             body=body.child(div().text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if self.login.is_some(){"Waiting for Google sign-in…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
+                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if self.account_operation.is_some(){"Connecting account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
                 .when(self.account.is_some(), |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Sign out").on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Refresh to load changes made on the web."}else{"Guest likes and saved collections stay on this computer until you connect an account."}))
@@ -1995,8 +2024,8 @@ impl Music {
 
 impl Drop for Music {
     fn drop(&mut self) {
-        if let Some(cancelled) = &self.login {
-            cancelled.store(true, Ordering::Release);
+        if let Some(AccountOperation::Connecting(operation)) = &self.account_operation {
+            operation.cancel();
         }
     }
 }
