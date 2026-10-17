@@ -166,7 +166,7 @@ pub enum Command {
     Connect(Operation),
     Apply {
         session: Arc<Session>,
-        mutation: Mutation,
+        mutation: Box<Mutation>,
     },
     Restore {
         path: Option<PathBuf>,
@@ -185,7 +185,7 @@ pub enum Event {
     },
     Applied {
         session: Arc<Session>,
-        mutation: Mutation,
+        mutation: Box<Mutation>,
         result: Result<Effect, String>,
     },
 }
@@ -201,7 +201,7 @@ pub fn start(
     thread::Builder::new()
         .name("account-sync".into())
         .spawn(move || {
-            let catalog = Catalog::with_session(session.clone());
+            let catalog = Catalog::new();
             while let Ok(command) = commands.recv_blocking() {
                 let event = match command {
                     Command::Connect(operation) => {
@@ -281,13 +281,7 @@ impl Catalog {
         Ok(page)
     }
     fn require_account(&self) -> Result<()> {
-        ensure!(
-            self.session
-                .read()
-                .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?
-                .is_some(),
-            "Connect your Google account first"
-        );
+        ensure!(self.session.is_some(), "Connect your Google account first");
         Ok(())
     }
     pub fn mutate(&self, mutation: &Mutation) -> Result<Effect> {
@@ -462,6 +456,10 @@ fn confirm_mutation(endpoint: &str, response: &Value) -> Result<()> {
     Ok(())
 }
 
+fn playlist_id(id: &str) -> &str {
+    id.strip_prefix("VL").unwrap_or(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +486,7 @@ mod tests {
     fn rejected_candidate_preserves_the_previous_verified_session() {
         let shared = auth::shared(Some(synthetic_session()));
         let expected = shared.read().unwrap().clone().unwrap();
-        let catalog = Catalog::with_session(shared.clone()).unwrap();
+        let catalog = Catalog::new().unwrap();
         let mut candidate = synthetic_session();
         // An invalid request header fails before any network connection is made.
         candidate.client_version = "invalid\nclient".into();
@@ -564,8 +562,4 @@ mod tests {
             .is_ok()
         );
     }
-}
-
-fn playlist_id(id: &str) -> &str {
-    id.strip_prefix("VL").unwrap_or(id)
 }

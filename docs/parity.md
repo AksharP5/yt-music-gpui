@@ -6,6 +6,8 @@ The initial release implements public catalog browsing, search, audio playback a
 
 ## Required work
 
+Prepared for signed-in verification: account library categories, song ratings and separate library feedback, playlist create/edit/privacy/delete/add/remove/reorder with occurrence IDs, history removal, and account switching/sign-out. The native controls are wired to service requests and refresh after acknowledgement. Account pages also refresh when the window regains focus; Ctrl R refreshes explicitly. None of this is marked complete until tested with an authenticated account against the web client. Sign-in remains gated.
+
 - [ ] Google account connection, reconnect, account identity and account switching.
 - [ ] Personalized home, mixes and discovery, moods, genres, charts and new releases.
 - [ ] Account library with songs, albums, artists, subscriptions, playlists and liked music.

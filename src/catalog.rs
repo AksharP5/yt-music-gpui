@@ -1,12 +1,9 @@
-use crate::auth::{self, Session, SharedSession};
+use crate::auth::Session;
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
@@ -151,15 +148,15 @@ impl Page {
 #[derive(Clone)]
 pub struct Catalog {
     client: Client,
-    pub(crate) session: SharedSession,
+    pub(crate) session: Option<Arc<Session>>,
 }
 
 impl Catalog {
     pub fn new() -> Result<Self> {
-        Self::with_session(auth::shared(None))
+        Self::with_session(None)
     }
 
-    pub fn with_session(session: SharedSession) -> Result<Self> {
+    pub fn with_session(session: Option<Arc<Session>>) -> Result<Self> {
         Ok(Self {
             session, client: Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36")
@@ -172,7 +169,7 @@ impl Catalog {
     pub fn for_session(&self, session: Option<Arc<Session>>) -> Self {
         Self {
             client: self.client.clone(),
-            session: Arc::new(RwLock::new(session)),
+            session,
         }
     }
 
@@ -234,10 +231,7 @@ impl Catalog {
         body["context"] = json!({"client": {
             "clientName": "WEB_REMIX", "clientVersion": CLIENT_VERSION, "hl": "en", "gl": "US"
         }});
-        let session = self
-            .session
-            .read()
-            .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?;
+        let session = &self.session;
         if let Some(session) = session.as_ref() {
             body["context"]["client"]["clientVersion"] = json!(session.client_version);
             if let Some(delegated) = &session.delegated_session_id {
@@ -261,7 +255,6 @@ impl Catalog {
             Some(session) => session.apply(request)?,
             None => request,
         };
-        drop(session);
         let response = request
             .send()
             .context("Could not reach YouTube Music. Check your connection and try again.")?

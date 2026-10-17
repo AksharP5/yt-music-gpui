@@ -41,6 +41,7 @@ Account sign-in, saved-session loading and explicit cookie import are currently 
 | Key | Action |
 | --- | --- |
 | Ctrl K | Focus search; Enter submits |
+| Ctrl R | Refresh the current page |
 | Space | Play or pause |
 | Ctrl Right / Ctrl Left | Next / previous song |
 | Right / Left | Seek 5 seconds |
@@ -51,7 +52,7 @@ Account sign-in, saved-session loading and explicit cookie import are currently 
 | Escape | Close help or queue; leave search |
 | Ctrl Q | Quit |
 
-Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. Shuffle changes upcoming songs and preserves the current track.
+Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. The song menu offers play next, queue and sharing actions, plus available artist and album links. Shuffle changes upcoming songs and preserves the current track.
 
 ## Data and performance
 

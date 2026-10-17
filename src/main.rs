@@ -7,6 +7,7 @@ mod catalog;
 mod input;
 mod library;
 mod player;
+mod playlist_form;
 mod theme;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};

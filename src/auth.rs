@@ -512,7 +512,7 @@ fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Ac
         };
         session.validate()?;
         let account =
-            crate::catalog::Catalog::with_session(shared(Some(session.clone())))?.account()?;
+            crate::catalog::Catalog::with_session(Some(Arc::new(session.clone())))?.account()?;
         Ok(Some((session, account)))
     })();
     let _ = pipe.call("Target.detachFromTarget", json!({"sessionId":id}), None);

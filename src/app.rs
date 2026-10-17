@@ -1,11 +1,12 @@
 use crate::{
-    account::{self, Connection, Effect, Mutation, Section},
+    account::{self, Connection, Effect, Mutation, Privacy, Section},
     artwork::Artwork,
     auth::{self, Operation, Session, SharedSession},
     catalog::{Catalog, Collection, Item, Page, Rating, Shelf, Track},
     input::{InputEvent, SearchInput},
     library::{Library, LibraryWriter, Repeat, Store},
     player::{Player, PlayerEvent, PlayerOptions},
+    playlist_form::{PlaylistForm, PlaylistFormEvent},
     theme::Theme,
 };
 use gpui::{prelude::*, *};
@@ -41,6 +42,8 @@ enum Query {
     Browse(String),
     More { token: String, search: bool },
     Library(Section),
+    PlaylistChoices,
+    PlaylistChoicesMore(String),
 }
 struct Job {
     id: u64,
@@ -51,6 +54,11 @@ struct CatalogResult {
     id: u64,
     append: bool,
     result: Result<Page, String>,
+    target: CatalogTarget,
+}
+enum CatalogTarget {
+    Page,
+    PlaylistPicker,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Playback {
@@ -60,10 +68,27 @@ enum Playback {
     Paused,
     Buffering,
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone)]
 enum Overlay {
     Help,
     Settings,
+    Track {
+        track: Track,
+        index: Option<usize>,
+    },
+    PlaylistPicker {
+        track: Track,
+        page: Option<Page>,
+        duplicates: bool,
+    },
+    PlaylistForm {
+        form: Entity<PlaylistForm>,
+        track: Option<Track>,
+    },
+    DeletePlaylist {
+        id: String,
+        title: String,
+    },
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
@@ -113,6 +138,7 @@ pub struct Music {
     duration: f64,
     show_queue: bool,
     overlay: Option<Overlay>,
+    form_subscription: Option<Subscription>,
     drag: Option<Drag>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -158,7 +184,7 @@ impl Music {
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = account_events.recv().await {
                 if view
-                    .update_in(cx, |view, _, cx| view.account_event(event, cx))
+                    .update_in(cx, |view, window, cx| view.account_event(event, window, cx))
                     .is_err()
                 {
                     break;
@@ -183,16 +209,26 @@ impl Music {
             let receiver = receiver.clone();
             let results = results.clone();
             let generation = generation.clone();
-            let session = session.clone();
             thread::Builder::new()
                 .name(format!("catalog-{worker}"))
                 .spawn(move || {
-                    let catalog = Catalog::with_session(session);
+                    let catalog = Catalog::new();
                     while let Ok(job) = receiver.recv_blocking() {
                         if generation.load(Ordering::Relaxed) != job.id {
                             continue;
                         }
-                        let append = matches!(job.query, Query::More { .. });
+                        let append = matches!(
+                            job.query,
+                            Query::More { .. } | Query::PlaylistChoicesMore(_)
+                        );
+                        let target = if matches!(
+                            job.query,
+                            Query::PlaylistChoices | Query::PlaylistChoicesMore(_)
+                        ) {
+                            CatalogTarget::PlaylistPicker
+                        } else {
+                            CatalogTarget::Page
+                        };
                         let result = match &catalog {
                             Err(e) => Err(format!("{e:#}")),
                             Ok(catalog) => {
@@ -201,6 +237,8 @@ impl Music {
                                     Query::Home => catalog.home(),
                                     Query::Explore => catalog.explore(),
                                     Query::Library(section) => catalog.library(*section),
+                                    Query::PlaylistChoices => catalog.library(Section::Playlists),
+                                    Query::PlaylistChoicesMore(token) => catalog.more(token, false),
                                     Query::Search(q) => catalog.search(q),
                                     Query::Browse(id) => catalog.browse(id),
                                     Query::More { token, search } => catalog.more(token, *search),
@@ -213,6 +251,7 @@ impl Music {
                                 id: job.id,
                                 append,
                                 result,
+                                target,
                             })
                             .is_err()
                         {
@@ -293,6 +332,16 @@ impl Music {
                 InputEvent::Blur => window.focus(&view.focus, cx),
                 InputEvent::Changed => {}
             });
+        let activation = cx.observe_window_activation(window, |view, window, cx| {
+            if window.is_window_active()
+                && view.account.is_some()
+                && view.account_operation.is_none()
+                && view.overlay.is_none()
+                && !view.loading
+            {
+                view.refresh_remote(cx);
+            }
+        });
         let mut view = Self {
             theme: Theme::load(),
             session,
@@ -331,11 +380,12 @@ impl Music {
             duration: 0.,
             show_queue: false,
             overlay: None,
+            form_subscription: None,
             drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
             drag_position: None,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, activation],
         };
         window.focus(&view.focus, cx);
         view.request(Query::Home, cx);
@@ -370,6 +420,9 @@ impl Music {
         self.notice = None;
         self.page.shelves.clear();
         self.page.continuation = None;
+        self.page.editable = false;
+        self.page.description.clear();
+        self.page.privacy = None;
         self.rows.clear();
         match route {
             Route::Home => {
@@ -491,6 +544,25 @@ impl Music {
             return;
         }
         self.loading = false;
+        if matches!(result.target, CatalogTarget::PlaylistPicker) {
+            if let Some(Overlay::PlaylistPicker { page, .. }) = &mut self.overlay {
+                match result.result {
+                    Ok(choices) => {
+                        if result.append
+                            && let Some(current) = page
+                        {
+                            current.continuation = choices.continuation;
+                            current.shelves.extend(choices.shelves);
+                        } else {
+                            *page = Some(choices);
+                        }
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                cx.notify();
+            }
+            return;
+        }
         match result.result {
             Ok(page) => {
                 if result.append {
@@ -571,7 +643,7 @@ impl Music {
         }
         match self.account_commands.try_send(account::Command::Apply {
             session: connection.session.clone(),
-            mutation,
+            mutation: Box::new(mutation),
         }) {
             Ok(()) => {
                 self.pending_mutations.insert(key);
@@ -630,7 +702,98 @@ impl Music {
         };
         self.request(query, cx);
     }
-    fn account_event(&mut self, event: account::Event, cx: &mut Context<Self>) {
+    fn playlist_form(
+        &mut self,
+        edit: bool,
+        track: Option<Track>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (id, title, description, privacy) = if edit {
+            let Route::Browse(id) = &self.route else {
+                return;
+            };
+            if !self.page.editable {
+                return;
+            }
+            let privacy = match self.page.privacy.as_deref() {
+                Some("PRIVATE") => Privacy::Private,
+                Some("UNLISTED") => Privacy::Unlisted,
+                Some("PUBLIC") => Privacy::Public,
+                _ => {
+                    self.error = Some(
+                        "Refresh the playlist to load its current privacy before editing.".into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+            };
+            (
+                Some(id.clone()),
+                self.page.title.clone(),
+                self.page.description.clone(),
+                privacy,
+            )
+        } else {
+            (None, String::new(), String::new(), Privacy::Private)
+        };
+        let form = cx.new(|cx| PlaylistForm::new(title, description, privacy, cx));
+        let edit_id = id.clone();
+        self.form_subscription = Some(cx.subscribe_in(
+            &form,
+            window,
+            move |view, _, event, window, cx| match event {
+                PlaylistFormEvent::Save {
+                    title,
+                    description,
+                    privacy,
+                } => {
+                    let mutation = match &edit_id {
+                        Some(id) => Mutation::EditPlaylist {
+                            id: id.clone(),
+                            title: title.clone(),
+                            description: description.clone(),
+                            privacy: *privacy,
+                        },
+                        None => Mutation::CreatePlaylist {
+                            title: title.clone(),
+                            description: description.clone(),
+                            privacy: *privacy,
+                        },
+                    };
+                    view.mutate(mutation, cx);
+                }
+                PlaylistFormEvent::Cancel => {
+                    view.close_overlay(window, cx);
+                }
+            },
+        ));
+        window.focus(&form.focus_handle(cx), cx);
+        self.error = None;
+        self.overlay = Some(Overlay::PlaylistForm { form, track });
+        cx.notify();
+    }
+    fn playlist_picker(&mut self, track: Track, cx: &mut Context<Self>) {
+        self.error = None;
+        self.overlay = Some(Overlay::PlaylistPicker {
+            track,
+            page: None,
+            duplicates: false,
+        });
+        self.request(Query::PlaylistChoices, cx);
+    }
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = None;
+        self.form_subscription = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+    fn account_event(
+        &mut self,
+        event: account::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             account::Event::Disconnected { operation, result } => {
                 if !matches!(&self.account_operation, Some(AccountOperation::Disconnecting(active)) if active.matches(&operation))
@@ -653,22 +816,21 @@ impl Music {
                 self.account_operation = None;
                 match result {
                     Ok(Some(connection)) => {
-                        self.player_command(Player::clear_cookies);
-                        self.active_id = None;
-                        self.playback = Playback::Stopped;
-                        match connection.session.playback_file() {
-                            Ok(file) => self.player_command(|p| p.set_cookies(file)),
-                            Err(error) => self.error = Some(format!("{error:#}")),
-                        }
-                        self.notice = Some(format!("Connected as {}", connection.account.name));
+                        let label = format!("Connected as {}", connection.account.name);
+                        let file = connection.session.playback_file();
                         self.account = Some(connection);
                         self.ratings.clear();
                         self.pending_mutations.clear();
+                        self.navigate(Route::Home, cx);
                         self.back.clear();
-                        self.page.shelves.clear();
-                        self.rows.clear();
-                        self.page.continuation = None;
-                        self.refresh_remote(cx);
+                        self.player_command(Player::clear_cookies);
+                        self.active_id = None;
+                        self.playback = Playback::Stopped;
+                        match file {
+                            Ok(file) => self.player_command(|p| p.set_cookies(file)),
+                            Err(error) => self.error = Some(format!("{error:#}")),
+                        }
+                        self.notice = Some(label);
                     }
                     Ok(None) => {}
                     Err(error) => self.error = Some(error),
@@ -686,18 +848,47 @@ impl Music {
                 {
                     return;
                 }
+                let mutation = *mutation;
                 self.pending_mutations.remove(&mutation.key());
                 match result {
                     Ok(effect) => {
-                        if let Mutation::RateSong { track, rating } = mutation {
-                            self.ratings.insert(track.id, rating);
+                        let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
+                        if let Mutation::RateSong { track, rating } = &mutation {
+                            self.ratings.insert(track.id.clone(), *rating);
                         }
                         self.notice = Some("Saved to YouTube Music".into());
                         match effect {
                             Effect::CreatedPlaylist(id) => {
+                                let track = match self.overlay.take() {
+                                    Some(Overlay::PlaylistForm { track, .. }) => track,
+                                    _ => None,
+                                };
+                                self.close_overlay(window, cx);
+                                if let Some(track) = track {
+                                    self.mutate(
+                                        Mutation::AddToPlaylist {
+                                            id: id.clone(),
+                                            video_ids: vec![track.id],
+                                            duplicates: false,
+                                        },
+                                        cx,
+                                    );
+                                }
                                 self.navigate(Route::Browse(format!("VL{id}")), cx)
                             }
-                            Effect::Changed => self.refresh_remote(cx),
+                            Effect::Changed => {
+                                if matches!(
+                                    mutation,
+                                    Mutation::EditPlaylist { .. } | Mutation::DeletePlaylist { .. }
+                                ) {
+                                    self.close_overlay(window, cx);
+                                }
+                                if deleting {
+                                    self.navigate(Route::Library(Section::Playlists), cx);
+                                } else {
+                                    self.refresh_remote(cx);
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -744,7 +935,9 @@ impl Music {
             Item::Collection(collection) => self.navigate(Route::Browse(collection.id), cx),
             Item::Track(track) => {
                 let tracks = self.page.tracks();
-                if let Some(index) = tracks.iter().position(|t| t.id == track.id) {
+                if let Some(index) = tracks.iter().position(|t| {
+                    t.id == track.id && t.details.set_video_id == track.details.set_video_id
+                }) {
                     self.library.queue.replace(tracks, index);
                 } else {
                     self.library.queue.replace(vec![track], 0);
@@ -868,7 +1061,7 @@ impl Music {
     }
     fn save_collection(&mut self, collection: Collection, cx: &mut Context<Self>) {
         if self.account.is_some() {
-            let save = collection.details.saved != Some(true);
+            let save = !self.is_saved(&collection);
             self.mutate(Mutation::CollectionLibrary { collection, save }, cx);
             return;
         }
@@ -887,6 +1080,15 @@ impl Music {
         self.save();
         self.refresh_local();
         cx.notify();
+    }
+    fn is_saved(&self, collection: &Collection) -> bool {
+        if self.account.is_none() {
+            return self.library.saved.iter().any(|c| c.id == collection.id);
+        }
+        collection.details.saved.unwrap_or(matches!(
+            self.route,
+            Route::Library(Section::Albums | Section::Playlists | Section::Subscriptions)
+        ))
     }
     fn set_volume(&mut self, volume: f64, cx: &mut Context<Self>) {
         let volume = volume.clamp(0., 100.).round();
@@ -938,6 +1140,13 @@ impl Music {
             cx.quit();
             return;
         }
+        if control && key == "r" {
+            self.navigate(self.route.clone(), cx);
+            return;
+        }
+        if self.overlay.is_some() && key != "escape" {
+            return;
+        }
         if self.search.focus_handle(cx).is_focused(window) {
             return;
         }
@@ -971,7 +1180,7 @@ impl Music {
                 cx.notify();
             }
             "escape" => {
-                self.overlay = None;
+                self.close_overlay(window, cx);
                 self.show_queue = false;
                 cx.notify();
             }
@@ -1012,7 +1221,8 @@ impl Music {
         compact: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let active = self.route == route;
+        let active = self.route == route
+            || (route == Route::Saved && matches!(self.route, Route::Library(_)));
         div()
             .id(id)
             .h(px(44.))
@@ -1149,7 +1359,8 @@ impl Music {
                     .hover(|d| d.text_color(self.theme.text))
                     .child(icon("help", 20., self.theme.text))
                     .when(!compact, |d| d.child("Keyboard shortcuts"))
-                    .on_click(cx.listener(|view, _, _, cx| {
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        window.focus(&view.focus, cx);
                         view.overlay = Some(Overlay::Help);
                         cx.notify();
                     })),
@@ -1167,7 +1378,8 @@ impl Music {
                     .hover(|d| d.text_color(self.theme.text))
                     .child(icon("settings", 20., self.theme.text))
                     .when(!compact, |d| d.child("Settings"))
-                    .on_click(cx.listener(|view, _, _, cx| {
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        window.focus(&view.focus, cx);
                         view.overlay = Some(Overlay::Settings);
                         cx.notify();
                     })),
@@ -1216,6 +1428,15 @@ impl Music {
             .child(
                 button("open-web", "external", self.theme)
                     .on_click(|_, _, cx| cx.open_url("https://music.youtube.com")),
+            )
+            .child(
+                div()
+                    .id("refresh")
+                    .cursor_pointer()
+                    .text_color(self.theme.muted)
+                    .hover(|d| d.text_color(self.theme.text))
+                    .child("Refresh")
+                    .on_click(cx.listener(|view, _, _, cx| view.navigate(view.route.clone(), cx))),
             )
     }
     fn card(&mut self, item: Item, id: usize, cx: &Context<Self>) -> AnyElement {
@@ -1341,6 +1562,7 @@ impl Music {
             Item::Track(track) => {
                 let liked = self.is_liked(&track);
                 let like_track = track.clone();
+                let menu_track = track.clone();
                 row = row
                     .child(
                         div()
@@ -1368,10 +1590,30 @@ impl Music {
                                 view.enqueue(track.clone(), cx);
                             },
                         )),
+                    )
+                    .child(
+                        div()
+                            .id(("track-menu", index))
+                            .w(px(32.))
+                            .h(px(36.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(22.))
+                            .child("⋯")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&view.focus, cx);
+                                view.overlay = Some(Overlay::Track {
+                                    track: menu_track.clone(),
+                                    index: Some(index),
+                                });
+                                cx.notify();
+                            })),
                     );
             }
             Item::Collection(collection) => {
-                let saved = self.library.saved.iter().any(|c| c.id == collection.id);
+                let saved = self.is_saved(&collection);
                 row = row
                     .child(div().text_size(px(12.)).text_color(self.theme.muted).child(
                         if collection.id.starts_with("UC") {
@@ -1423,6 +1665,53 @@ impl Music {
                             .font_weight(FontWeight::BOLD)
                             .child(self.page.title.clone()),
                     )
+                    .when(
+                        self.account.is_some()
+                            && matches!(
+                                self.route,
+                                Route::Saved | Route::Library(Section::Playlists)
+                            ),
+                        |d| {
+                            d.child(
+                                div()
+                                    .id("new-playlist")
+                                    .cursor_pointer()
+                                    .text_size(px(13.))
+                                    .child("New playlist")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.playlist_form(false, None, window, cx)
+                                    })),
+                            )
+                        },
+                    )
+                    .when(self.account.is_some() && self.page.editable, |d| {
+                        d.child(
+                            div()
+                                .id("edit-playlist")
+                                .cursor_pointer()
+                                .text_size(px(13.))
+                                .child("Edit")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.playlist_form(true, None, window, cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("delete-playlist")
+                                .cursor_pointer()
+                                .text_size(px(13.))
+                                .child("Delete")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Route::Browse(id) = &view.route {
+                                        view.overlay = Some(Overlay::DeletePlaylist {
+                                            id: id.clone(),
+                                            title: view.page.title.clone(),
+                                        });
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
                     .when(!home && has_tracks, |d| {
                         d.child(
                             div()
@@ -1445,6 +1734,68 @@ impl Music {
                         )
                     }),
             );
+        if self.account.is_some()
+            && matches!(
+                self.route,
+                Route::Saved | Route::Liked | Route::Recent | Route::Library(_)
+            )
+        {
+            let selected = match self.route {
+                Route::Liked => Section::Liked,
+                Route::Recent => Section::History,
+                Route::Library(section) => section,
+                _ => Section::Songs,
+            };
+            content = content.child(
+                div()
+                    .id("library-sections")
+                    .mx(px(30.))
+                    .mb(px(20.))
+                    .flex()
+                    .gap(px(22.))
+                    .overflow_x_scroll()
+                    .children(
+                        [
+                            Section::Songs,
+                            Section::Albums,
+                            Section::Artists,
+                            Section::Subscriptions,
+                            Section::Playlists,
+                            Section::Liked,
+                            Section::History,
+                            Section::Podcasts,
+                            Section::Episodes,
+                            Section::Uploads,
+                            Section::UploadAlbums,
+                            Section::UploadArtists,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, section)| {
+                            div()
+                                .id(("library-section", index))
+                                .flex_shrink_0()
+                                .pb(px(9.))
+                                .border_b_2()
+                                .border_color(if section == selected {
+                                    self.theme.accent
+                                } else {
+                                    gpui::transparent_black()
+                                })
+                                .text_color(if section == selected {
+                                    self.theme.text
+                                } else {
+                                    self.theme.muted
+                                })
+                                .cursor_pointer()
+                                .child(section.title())
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.navigate(Route::Library(section), cx)
+                                }))
+                        }),
+                    ),
+            );
+        }
         if let Some(error) = &self.error {
             content = content.child(
                 div()
@@ -1933,8 +2284,58 @@ impl Music {
             )
             .into_any_element()
     }
-    fn overlay(&self, kind: Overlay, cx: &Context<Self>) -> AnyElement {
+    fn menu_action(
+        &self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        cx: &Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w_full()
+            .px(px(10.))
+            .py(px(11.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|d| d.bg(self.theme.raised))
+            .child(label.into())
+            .on_click(cx.listener(move |view, _, window, cx| action(view, window, cx)))
+    }
+    fn backdrop(&self, body: AnyElement, cx: &Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .bg(gpui::black().opacity(0.65))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, window, cx| view.close_overlay(window, cx)),
+            )
+            .child(body)
+            .into_any_element()
+    }
+    fn overlay(&self, kind: &Overlay, cx: &Context<Self>) -> AnyElement {
+        if let Overlay::PlaylistForm { form, .. } = kind {
+            let mut body = div().flex().flex_col().gap(px(12.)).child(form.clone());
+            if let Some(error) = &self.error {
+                body = body.child(
+                    div()
+                        .max_w(px(480.))
+                        .p(px(12.))
+                        .bg(self.theme.panel)
+                        .text_color(rgb(0xf1a6ae))
+                        .child(error.clone()),
+                );
+            }
+            return self.backdrop(body.into_any_element(), cx);
+        }
         let mut body = div()
+            .id("overlay-body")
+            .max_h(relative(0.9))
+            .overflow_y_scroll()
             .w(px(480.))
             .p(px(28.))
             .rounded(px(12.))
@@ -1952,22 +2353,20 @@ impl Music {
                         div()
                             .text_size(px(23.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(if kind == Overlay::Help {
-                                "Keyboard shortcuts"
-                            } else {
-                                "Settings"
+                            .child(match kind {
+                                Overlay::Help => "Keyboard shortcuts".to_owned(),
+                                Overlay::Settings => "Settings".into(),
+                                Overlay::Track { track, .. } => track.title.clone(),
+                                Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
+                                Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
+                                Overlay::PlaylistForm { .. } => unreachable!(),
                             }),
                     )
-                    .child(
-                        button("close-overlay", "close", self.theme).on_click(cx.listener(
-                            |view, _, _, cx| {
-                                view.overlay = None;
-                                cx.notify();
-                            },
-                        )),
-                    ),
+                    .child(button("close-overlay", "close", self.theme).on_click(
+                        cx.listener(|view, _, window, cx| view.close_overlay(window, cx)),
+                    )),
             );
-        if kind == Overlay::Help {
+        if matches!(kind, Overlay::Help) {
             for (key, action) in [
                 ("Ctrl K", "Search"),
                 ("Space", "Play or pause"),
@@ -1989,7 +2388,7 @@ impl Music {
                         .child(div().text_color(self.theme.muted).child(key)),
                 );
             }
-        } else {
+        } else if matches!(kind, Overlay::Settings) {
             let label = self
                 .account
                 .as_ref()
@@ -2000,25 +2399,344 @@ impl Music {
                     .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if self.account_operation.is_some(){"Connecting account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
                 .when(self.account.is_some(), |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Sign out").on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
-                .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Refresh to load changes made on the web."}else{"Guest likes and saved collections stay on this computer until you connect an account."}))
+                .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
-        }
-        div()
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.65))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, _, _, cx| {
+        } else if let Overlay::Track { track, index } = kind {
+            let song = track.clone();
+            body = body.child(self.menu_action(
+                "menu-like",
+                if self.is_liked(track) {
+                    "Remove like"
+                } else {
+                    "Like"
+                },
+                cx,
+                move |view, _, cx| {
+                    view.overlay = None;
+                    view.toggle_like(&song, cx);
+                },
+            ));
+            let song = track.clone();
+            body =
+                body.child(
+                    self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
+                        let index = view.library.queue.index.map_or(0, |i| i + 1);
+                        view.library.queue.tracks.insert(index, song.clone());
+                        view.overlay = None;
+                        view.save();
+                        cx.notify();
+                    }),
+                );
+            let song = track.clone();
+            body = body.child(self.menu_action(
+                "menu-enqueue",
+                "Add to queue",
+                cx,
+                move |view, _, cx| {
+                    view.overlay = None;
+                    view.enqueue(song.clone(), cx);
+                },
+            ));
+            if self.account.is_some() {
+                let song = track.clone();
+                let disliked = self
+                    .ratings
+                    .get(&track.id)
+                    .copied()
+                    .or(track.details.rating)
+                    == Some(Rating::Dislike);
+                body = body.child(self.menu_action(
+                    "menu-dislike",
+                    if disliked {
+                        "Remove dislike"
+                    } else {
+                        "Dislike"
+                    },
+                    cx,
+                    move |view, _, cx| {
+                        view.overlay = None;
+                        view.mutate(
+                            Mutation::RateSong {
+                                track: song.clone(),
+                                rating: if disliked {
+                                    Rating::Indifferent
+                                } else {
+                                    Rating::Dislike
+                                },
+                            },
+                            cx,
+                        );
+                    },
+                ));
+                if track.details.add_library.is_some() || track.details.remove_library.is_some() {
+                    let song = track.clone();
+                    let save = track.details.in_library != Some(true);
+                    body = body.child(self.menu_action(
+                        "menu-library",
+                        if save {
+                            "Save to library"
+                        } else {
+                            "Remove from library"
+                        },
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = None;
+                            view.mutate(
+                                Mutation::SongLibrary {
+                                    track: song.clone(),
+                                    save,
+                                },
+                                cx,
+                            );
+                        },
+                    ));
+                }
+                let song = track.clone();
+                body = body.child(self.menu_action(
+                    "menu-playlist",
+                    "Add to playlist",
+                    cx,
+                    move |view, _, cx| view.playlist_picker(song.clone(), cx),
+                ));
+                if let Some(token) = &track.details.remove_history {
+                    let token = token.clone();
+                    body = body.child(self.menu_action(
+                        "menu-history",
+                        "Remove from history",
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = None;
+                            view.mutate(
+                                Mutation::RemoveHistory {
+                                    token: token.clone(),
+                                },
+                                cx,
+                            );
+                        },
+                    ));
+                }
+                if self.page.editable
+                    && let Route::Browse(id) = &self.route
+                    && let Some(set_id) = &track.details.set_video_id
+                {
+                    let playlist = id.clone();
+                    let set = set_id.clone();
+                    let video_id = track.id.clone();
+                    body = body.child(self.menu_action(
+                        "menu-remove-occurrence",
+                        "Remove from playlist",
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = None;
+                            view.mutate(
+                                Mutation::RemoveFromPlaylist {
+                                    id: playlist.clone(),
+                                    video_id: video_id.clone(),
+                                    set_video_id: set.clone(),
+                                },
+                                cx,
+                            );
+                        },
+                    ));
+                    if let Some(index) = index {
+                        let tracks = self.page.tracks();
+                        for (key, label, before) in [
+                            (
+                                "menu-move-up",
+                                "Move up",
+                                index
+                                    .checked_sub(1)
+                                    .and_then(|i| tracks.get(i))
+                                    .and_then(|track| track.details.set_video_id.clone())
+                                    .map(Some),
+                            ),
+                            (
+                                "menu-move-down",
+                                "Move down",
+                                if index + 1 < tracks.len() {
+                                    Some(
+                                        tracks
+                                            .get(index + 2)
+                                            .and_then(|track| track.details.set_video_id.clone()),
+                                    )
+                                } else {
+                                    None
+                                },
+                            ),
+                        ] {
+                            if let Some(before) = before {
+                                let playlist = id.clone();
+                                let set = set_id.clone();
+                                body = body.child(self.menu_action(
+                                    key,
+                                    label,
+                                    cx,
+                                    move |view, _, cx| {
+                                        view.overlay = None;
+                                        view.mutate(
+                                            Mutation::MoveInPlaylist {
+                                                id: playlist.clone(),
+                                                set_video_id: set.clone(),
+                                                before: before.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            for (id, label, target) in [
+                ("menu-artist", "Go to artist", &track.details.artist_id),
+                ("menu-album", "Go to album", &track.details.album_id),
+            ] {
+                if let Some(target) = target {
+                    let target = target.clone();
+                    body = body.child(self.menu_action(id, label, cx, move |view, _, cx| {
+                        view.overlay = None;
+                        view.navigate(Route::Browse(target.clone()), cx);
+                    }));
+                }
+            }
+            let url = format!("https://music.youtube.com/watch?v={}", track.id);
+            body = body.child(self.menu_action(
+                "menu-share",
+                "Copy song link",
+                cx,
+                move |view, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                    view.overlay = None;
+                    view.notice = Some("Link copied".into());
+                    cx.notify();
+                },
+            ));
+        } else if let Overlay::PlaylistPicker {
+            track,
+            page,
+            duplicates,
+        } = kind
+        {
+            let song = track.clone();
+            body = body.child(self.menu_action(
+                "create-from-picker",
+                "New playlist",
+                cx,
+                move |view, window, cx| view.playlist_form(false, Some(song.clone()), window, cx),
+            ));
+            body = body.child(self.menu_action(
+                "allow-duplicates",
+                if *duplicates {
+                    "Allow duplicates: on"
+                } else {
+                    "Allow duplicates: off"
+                },
+                cx,
+                |view, _, cx| {
+                    if let Some(Overlay::PlaylistPicker { duplicates, .. }) = &mut view.overlay {
+                        *duplicates = !*duplicates;
+                        cx.notify();
+                    }
+                },
+            ));
+            if let Some(page) = page {
+                let choices = page
+                    .shelves
+                    .iter()
+                    .flat_map(|shelf| &shelf.items)
+                    .filter_map(|item| match item {
+                        Item::Collection(collection) if collection.id.starts_with("VL") => {
+                            Some(collection)
+                        }
+                        _ => None,
+                    });
+                let mut list = div()
+                    .id("playlist-choices")
+                    .max_h(px(360.))
+                    .overflow_y_scroll();
+                for (index, playlist) in choices.enumerate() {
+                    let id = playlist.id.clone();
+                    let song = track.id.clone();
+                    let duplicates = *duplicates;
+                    list = list.child(self.menu_action(
+                        ("playlist-choice", index),
+                        playlist.title.clone(),
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = None;
+                            view.mutate(
+                                Mutation::AddToPlaylist {
+                                    id: id.clone(),
+                                    video_ids: vec![song.clone()],
+                                    duplicates,
+                                },
+                                cx,
+                            );
+                        },
+                    ));
+                }
+                body = body.child(list);
+                if let Some(token) = &page.continuation {
+                    let token = token.clone();
+                    body = body.child(self.menu_action(
+                        "more-playlist-choices",
+                        if self.loading {
+                            "Loading…"
+                        } else {
+                            "More playlists"
+                        },
+                        cx,
+                        move |view, _, cx| {
+                            if !view.loading {
+                                view.request(Query::PlaylistChoicesMore(token.clone()), cx);
+                            }
+                        },
+                    ));
+                }
+            } else {
+                body = body.child(
+                    div()
+                        .p(px(12.))
+                        .text_color(self.theme.muted)
+                        .child("Loading playlists…"),
+                );
+            }
+            if let Some(error) = &self.error {
+                body = body.child(
+                    div()
+                        .mt(px(12.))
+                        .text_color(rgb(0xf1a6ae))
+                        .child(error.clone()),
+                );
+            }
+        } else if let Overlay::DeletePlaylist { id, title } = kind {
+            body = body.child(div().mb(px(18.)).child(format!(
+                "Delete {title}? This removes the playlist from your YouTube Music account."
+            )));
+            let id = id.clone();
+            body = body.child(self.menu_action(
+                "confirm-delete",
+                "Delete playlist",
+                cx,
+                move |view, _, cx| view.mutate(Mutation::DeletePlaylist { id: id.clone() }, cx),
+            ));
+            body = body.child(
+                self.menu_action("cancel-delete", "Cancel", cx, |view, _, cx| {
                     view.overlay = None;
                     cx.notify();
                 }),
-            )
-            .child(body)
-            .into_any_element()
+            );
+            if let Some(error) = &self.error {
+                body = body.child(
+                    div()
+                        .mt(px(12.))
+                        .text_color(rgb(0xf1a6ae))
+                        .child(error.clone()),
+                );
+            }
+        }
+        self.backdrop(body.into_any_element(), cx)
     }
 }
 
@@ -2072,7 +2790,7 @@ impl Render for Music {
                     .children(queue),
             )
             .child(player)
-            .children(self.overlay.map(|kind| self.overlay(kind, cx)))
+            .children(self.overlay.as_ref().map(|kind| self.overlay(kind, cx)))
     }
 }
 fn icon(name: &'static str, edge: f32, color: Hsla) -> Svg {
