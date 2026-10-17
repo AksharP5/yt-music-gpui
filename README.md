@@ -34,7 +34,7 @@ bin/install
 
 The installer writes to `~/.local/bin` and `$XDG_DATA_HOME`, defaulting to `~/.local/share`. It does not install system dependencies. Alternatively, build an Arch package by running `makepkg` inside `packaging/`, then install that package with your package manager.
 
-Account sign-in, saved-session loading and explicit cookie import are currently disabled. The account connection being developed uses an isolated Google login window, the OS keyring, and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports or inspect existing browser profiles.
+Account sign-in and saved-session loading are currently disabled. Cookie imports are unsupported because they cannot identify the selected Google or brand account. The account connection being developed uses an isolated Google login window, the OS keyring, and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports or inspect existing browser profiles. Authenticated playback requires the reviewed yt-dlp version 2026.08.19 and matching account identity from the service.
 
 ## Controls
 
@@ -52,7 +52,7 @@ Account sign-in, saved-session loading and explicit cookie import are currently 
 | Escape | Close help or queue; leave search |
 | Ctrl Q | Quit |
 
-Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. The song menu offers play next, queue and sharing actions, plus available artist and album links. Shuffle changes upcoming songs and preserves the current track.
+Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. The song menu offers radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Shuffle changes upcoming songs and preserves the current track.
 
 ## Data and performance
 
@@ -88,7 +88,7 @@ bin/test -- --ignored --nocapture
 
 The ordinary tests cover catalog parsing, duration and video ID validation, queue transitions and shuffle, library write flushing, and stale playback events. The ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause and seek. They need network access, mpv, and yt-dlp.
 
-YouTube's internal API and stream extraction can change. Update yt-dlp if songs stop loading; catalog changes may require a client update. Complete account parity, downloads, lyrics, and other gaps are tracked in docs/parity.md. Account mutations are not yet verified against a signed-in account. GPUI's custom controls currently have limited screen-reader support.
+YouTube's internal API and stream extraction can change. Public guest playback may need an updated yt-dlp; authenticated playback deliberately rejects versions that have not been reviewed. Catalog changes may require a client update. Complete account parity and remaining verification are tracked in docs/parity.md. Account mutations are not yet verified against a signed-in account. GPUI's custom controls currently have limited screen-reader support.
 
 MIT licensed, with the adapted GPUI text input example under Apache-2.0. See NOTICE and LICENSE-APACHE.
 

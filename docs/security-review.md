@@ -2,16 +2,21 @@
 
 The source review covered every changed source file between e9cfcdf and 5899fb5. It found no reportable vulnerability in that gated build. This is a bounded review, not a guarantee that the application has no vulnerabilities.
 
-Subsequent hardening binds queued edits and catalog jobs to a verified session, preserves the previous session when verification fails, revokes playback credentials during sign-out, blocks authenticated redirects, and applies the disabled account gate to imports and saved sessions. Connection completion must match the active, uncancelled operation in both the worker and UI. Sign-out clears navigation history after resetting the page, and it supersedes an old queued edit if the command queue is full. Account feedback tokens, occurrence IDs and rating snapshots are excluded from device-state serialization. Playback uses an acknowledged stop before replacing or closing its private RAM cookie jar. Raw extractor diagnostics cannot reach user-facing playback errors.
+The subsequent hardening and playback checkpoint is 460b17f. The account gate is still off in that revision.
+
+Subsequent hardening binds queued edits, persistence, catalog and song-detail jobs to a verified session. Failed verification preserves the previous session. Connection completion must match the active, uncancelled operation in both the worker and UI. Persistence starts only after UI acceptance and playback credential allocation; revoked writes are removed. Closing during pending sign-out drains account cleanup, with bounded keyring child processes. Sign-out clears navigation history, overlays and in-memory action tokens. Account feedback tokens, occurrence IDs and rating snapshots are excluded from device-state serialization.
+
+Playback now carries the selected account index and full primary/brand identity through sealed RAM. The embedded extractor requires matching server identity before returning formats, rejects logout and conflicting player responses, and uses a single HTTP handler that refuses redirects before forwarding authorization. A missing plugin or different yt-dlp version fails closed. External plugins and user configuration are disabled. Playback uses an acknowledged stop before replacing or closing its private RAM files. Raw extractor diagnostics cannot reach user-facing playback errors. These later changes received a separate bounded source review; they are not covered by the earlier sealed scan.
 
 Validation passed:
 
-- 27 ordinary tests, including session binding, cancelled connection publication, failed verification, disabled imports, cookie filtering, request redaction, RAM file permissions/lifetimes and account metadata parsing.
+- 35 ordinary tests, including session binding, cancelled publication, failed verification, disabled imports, revoked storage, cleanup after UI closure, request redaction, RAM file permissions/lifetimes and account metadata parsing.
+- Nine offline extractor cases against installed yt-dlp 2026.08.19, covering multiple Google/brand accounts, returned identity, explicit logout, missing proof, redirects, private context, plugin failure and unsupported versions.
 - A live isolated Chromium transport check with no debugging TCP port or inherited extensions.
-- Live mpv playback with invented initial cookies, replacement cookies and cleared credentials.
+- Live public guest mpv playback, pause and seek. Invented credentials no longer have a live streaming test because authenticated playback must reject an unconfirmed account rather than fall back to guest playback.
 - A synthetic Secret Service store/read/remove round trip under unique test attributes. No existing credential entry was accessed.
 
-No real Google account was used. Account identity selection, authenticated playback and cross-client mutations remain unverified. New account sign-in, import and saved-session loading remain disabled.
+No real Google account was used. Authenticated compatibility and cross-client mutations remain unverified. New account sign-in and saved-session loading remain disabled; cookie imports are unsupported.
 
 ## Dependency maintenance
 
