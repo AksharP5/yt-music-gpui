@@ -1,0 +1,13 @@
+/target/
+/dist/
+*.log
+.env
+cookies*.txt
+auth*.json
+
+
+__pycache__/
+
+/packaging/pkg/
+/packaging/src/
+/packaging/*.pkg.tar.*

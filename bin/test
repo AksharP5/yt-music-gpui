@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+cargo test --locked --jobs "${CARGO_BUILD_JOBS:-2}" "$@"

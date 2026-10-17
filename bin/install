@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+if [[ ! -x target/release/yt-music-gpui ]]; then
+  printf '%s\n' 'Build the app first with bin/build.' >&2
+  exit 1
+fi
+music_bin_dir="${HOME}/.local/bin"
+music_data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"
+install -Dm755 target/release/yt-music-gpui "${music_bin_dir}/yt-music-gpui"
+install -Dm644 packaging/yt-music-gpui.svg "${music_data_dir}/icons/hicolor/scalable/apps/yt-music-gpui.svg"
+install -Dm644 packaging/yt-music-gpui.desktop "${music_data_dir}/applications/yt-music-gpui.desktop"
+if command -v update-desktop-database >/dev/null; then update-desktop-database "${music_data_dir}/applications"; fi
+printf '%s\n' 'YouTube Music is installed in your app launcher.'

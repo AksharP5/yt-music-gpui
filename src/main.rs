@@ -1,0 +1,68 @@
+mod app;
+mod artwork;
+mod assets;
+mod catalog;
+mod input;
+mod library;
+mod player;
+mod theme;
+
+use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use std::path::PathBuf;
+
+fn main() {
+    let mut cookies = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--cookies" => {
+                cookies = args.next().map(PathBuf::from);
+                if cookies.is_none() {
+                    eprintln!("--cookies requires a file path");
+                    std::process::exit(2);
+                }
+            }
+            "--help" | "-h" => {
+                println!(
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--cookies FILE]\n\n--cookies FILE   Netscape cookies file for playback\n\nCtrl K searches. Press ? in the app for all shortcuts."
+                );
+                return;
+            }
+            "--version" | "-V" => {
+                println!("yt-music-gpui {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            _ => {
+                eprintln!("Unknown argument: {arg}. Use --help for usage.");
+                std::process::exit(2);
+            }
+        }
+    }
+    gpui_platform::application()
+        .with_assets(assets::Assets)
+        .run(move |cx: &mut App| {
+            input::init(cx);
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let bounds = Bounds::centered(None, size(px(1320.), px(860.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(850.), px(560.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("YouTube Music".into()),
+                        ..Default::default()
+                    }),
+                    app_id: Some("yt-music-gpui".into()),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| app::Music::new(cookies, window, cx)),
+            )
+            .expect("open YouTube Music window");
+            cx.activate(true);
+        });
+}

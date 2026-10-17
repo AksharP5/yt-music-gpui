@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=YouTube Music
+Comment=Native music player built with GPUI
+Exec=yt-music-gpui
+Icon=yt-music-gpui
+Terminal=false
+Categories=AudioVideo;Audio;Music;Player;
+Keywords=YouTube;Music;GPUI;
+StartupWMClass=yt-music-gpui
+StartupNotify=true
