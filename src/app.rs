@@ -107,6 +107,12 @@ enum Playback {
     Paused,
     Buffering,
 }
+#[derive(Clone, Copy)]
+struct SeekIntent {
+    track_id: u64,
+    revision: u64,
+    seconds: f64,
+}
 impl Playback {
     fn is_paused(self) -> bool {
         matches!(self, Self::Paused | Self::Loading { paused: true, .. })
@@ -223,6 +229,7 @@ pub struct Music {
     history_track: Option<u64>,
     playback: Playback,
     position: f64,
+    pending_seek: Option<SeekIntent>,
     duration: f64,
     show_queue: bool,
     overlay: Option<Overlay>,
@@ -590,6 +597,7 @@ impl Music {
             history_track: None,
             playback: Playback::Stopped,
             position: 0.,
+            pending_seek: None,
             duration: 0.,
             show_queue: false,
             overlay: None,
@@ -1498,6 +1506,38 @@ impl Music {
             self.error = Some(error.to_string());
         }
     }
+    fn playback_position(&self) -> f64 {
+        self.pending_seek
+            .filter(|seek| Some(seek.track_id) == self.active_id)
+            .map_or(self.position, |seek| seek.seconds)
+    }
+    fn seek_current(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        let Some(track_id) = self.active_id else {
+            return;
+        };
+        if matches!(self.playback, Playback::Loading { .. }) {
+            let previous = self.position;
+            let pending = self.pending_seek.take();
+            self.position = seconds;
+            if let Err(error) = self.reload_stream() {
+                self.position = previous;
+                self.pending_seek = pending;
+                self.error = Some(error.to_string());
+            }
+        } else if let Some(player) = &self.player {
+            match player.seek(track_id, seconds) {
+                Ok(revision) => {
+                    self.pending_seek = Some(SeekIntent {
+                        track_id,
+                        revision,
+                        seconds,
+                    });
+                }
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
+        cx.notify();
+    }
     fn play_current(&mut self, cx: &mut Context<Self>) {
         self.play_current_at(0., cx);
     }
@@ -1573,17 +1613,7 @@ impl Music {
             .current()
             .is_some_and(|current| current.id == track.id);
         if current && self.active_id.is_some() && self.playback != Playback::Stopped {
-            if matches!(self.playback, Playback::Loading { .. }) {
-                let previous = self.position;
-                self.position = seconds as f64;
-                if let Err(error) = self.reload_stream() {
-                    self.position = previous;
-                    self.error = Some(error.to_string());
-                }
-            } else {
-                self.player_command(|player| player.seek(seconds as f64));
-            }
-            cx.notify();
+            self.seek_current(seconds as f64, cx);
             return;
         }
         if !current {
@@ -1621,12 +1651,13 @@ impl Music {
             .ok_or_else(|| anyhow::anyhow!("The audio player is unavailable. Restart the app."))?;
         let paused = self.playback.is_paused();
         let retried = matches!(self.playback, Playback::Loading { retried: true, .. });
+        let start = self.playback_position();
         let id = player.play(
             &track.id,
             &format!("{} - {}", track.artist, track.title),
             PlayOptions {
                 quality: self.library.quality,
-                start: self.position,
+                start,
                 paused,
             },
         )?;
@@ -1634,6 +1665,7 @@ impl Music {
             self.history_track = Some(id);
         }
         self.active_id = Some(id);
+        self.position = start;
         self.playback = Playback::Loading { paused, retried };
         self.error = None;
         Ok(())
@@ -1745,14 +1777,14 @@ impl Music {
     }
     fn previous(&mut self, cx: &mut Context<Self>) {
         if self.autoplay_waiting.take().is_some() || self.active_id.is_none() {
-            if self.position <= 3. {
+            if self.playback_position() <= 3. {
                 self.library.queue.previous();
             }
             self.play_current(cx);
             return;
         }
-        if self.position > 3. {
-            self.player_command(|p| p.seek(0.));
+        if self.playback_position() > 3. {
+            self.seek_current(0., cx);
         } else if self.library.queue.previous() {
             self.play_current(cx);
         }
@@ -1819,9 +1851,31 @@ impl Music {
                     }
                 }
             }
-            PlayerEvent::Position { track_id, seconds } if Some(track_id) == self.active_id => {
+            PlayerEvent::Position { track_id, seconds }
+                if Some(track_id) == self.active_id
+                    && !self
+                        .pending_seek
+                        .is_some_and(|seek| seek.track_id == track_id) =>
+            {
                 changed = self.position.floor() != seconds.floor();
                 self.position = seconds;
+            }
+            PlayerEvent::SeekFinished {
+                track_id,
+                revision,
+                result,
+            } if Some(track_id) == self.active_id => {
+                let latest = self
+                    .pending_seek
+                    .is_some_and(|seek| seek.track_id == track_id && seek.revision == revision);
+                if latest {
+                    self.pending_seek = None;
+                }
+                match result {
+                    Ok(seconds) => self.position = seconds,
+                    Err(error) if latest => self.error = Some(error),
+                    Err(_) => changed = false,
+                }
             }
             PlayerEvent::Duration { track_id, seconds } if Some(track_id) == self.active_id => {
                 self.duration = seconds
@@ -1942,7 +1996,7 @@ impl Music {
         if self.drag == Some(Drag::Seek)
             && let Some(seconds) = self.drag_position.take()
         {
-            self.player_command(|p| p.seek(seconds));
+            self.seek_current(seconds, cx);
         }
         if self.drag.take().is_some() {
             self.save();
@@ -1975,12 +2029,12 @@ impl Music {
             "right" if control => self.next(false, cx),
             "left" if control => self.previous(cx),
             "right" => {
-                let seconds = (self.position + 5.).min(self.duration);
-                self.player_command(|p| p.seek(seconds));
+                let seconds = (self.playback_position() + 5.).min(self.duration);
+                self.seek_current(seconds, cx);
             }
             "left" => {
-                let seconds = (self.position - 5.).max(0.);
-                self.player_command(|p| p.seek(seconds));
+                let seconds = (self.playback_position() - 5.).max(0.);
+                self.seek_current(seconds, cx);
             }
             "up" => {
                 self.set_volume(self.library.volume + 5., cx);
@@ -3394,7 +3448,11 @@ impl Music {
             );
         }
         let progress = if self.duration > 0. {
-            (self.drag_position.unwrap_or(self.position) / self.duration).clamp(0., 1.) as f32
+            (self
+                .drag_position
+                .unwrap_or_else(|| self.playback_position())
+                / self.duration)
+                .clamp(0., 1.) as f32
         } else {
             0.
         };
@@ -3489,11 +3547,10 @@ impl Music {
                             .text_size(px(11.))
                             .text_color(self.theme.muted)
                             .child(
-                                div()
-                                    .w(px(56.))
-                                    .flex_shrink_0()
-                                    .text_right()
-                                    .child(clock(self.drag_position.unwrap_or(self.position))),
+                                div().w(px(56.)).flex_shrink_0().text_right().child(clock(
+                                    self.drag_position
+                                        .unwrap_or_else(|| self.playback_position()),
+                                )),
                             )
                             .child(
                                 div()

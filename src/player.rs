@@ -130,6 +130,11 @@ pub enum PlayerEvent {
         track_id: u64,
         seconds: f64,
     },
+    SeekFinished {
+        track_id: u64,
+        revision: u64,
+        result: Result<f64, String>,
+    },
     Duration {
         track_id: u64,
         seconds: f64,
@@ -161,6 +166,7 @@ enum PlayerCommand {
         options: PlayOptions,
     },
     Pause(bool),
+    Seek(SeekRequest),
     Json(Value),
     Credentials(Option<PlaybackCredentials>),
     Stop,
@@ -236,11 +242,17 @@ impl Player {
     pub fn stop(&self) -> Result<()> {
         self.send(PlayerCommand::Stop)
     }
-    pub fn seek(&self, seconds: f64) -> Result<()> {
+    pub fn seek(&self, track_id: u64, seconds: f64) -> Result<u64> {
         if !seconds.is_finite() {
             bail!("Invalid seek position.");
         }
-        self.command(json!(["seek", seconds.max(0.), "absolute"]))
+        let revision = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.send(PlayerCommand::Seek(SeekRequest {
+            track_id,
+            revision,
+            seconds: seconds.max(0.),
+        }))?;
+        Ok(revision)
     }
     pub fn set_volume(&self, percent: f64) -> Result<()> {
         if !percent.is_finite() {
@@ -563,6 +575,7 @@ fn run(
                     title,
                     options,
                 }) => {
+                    state.invalidate_seeks();
                     state.desired = Some(track_id);
                     state.loaded = false;
                     state.paused = options.paused;
@@ -581,8 +594,10 @@ fn run(
                     state.pause_after_load = !state.loaded;
                     write_pause(&mut socket, paused, state.pause_revision)?;
                 }
+                Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Credentials(next)) => {
+                    state.invalidate_seeks();
                     state.desired = None;
                     state.loaded = false;
                     replace_playback_credentials(
@@ -595,6 +610,7 @@ fn run(
                     )?;
                 }
                 Ok(PlayerCommand::Stop) => {
+                    state.invalidate_seeks();
                     state.desired = None;
                     state.loaded = false;
                     write_command(&mut socket, json!(["stop"]), None)?;
@@ -606,6 +622,7 @@ fn run(
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
+        state.write_seek(&mut socket)?;
         match socket.read(&mut buffer) {
             Ok(0) => bail!("mpv closed its connection. Restart the app to reconnect."),
             Ok(size) => {
@@ -621,6 +638,7 @@ fn run(
                                 write_pause(&mut socket, paused, state.pause_revision)?;
                             }
                         }
+                        state.write_seek(&mut socket)?;
                     }
                 }
                 if pending.len() > 1024 * 1024 {
@@ -641,6 +659,29 @@ fn run(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SeekRequest {
+    track_id: u64,
+    revision: u64,
+    seconds: f64,
+}
+
+#[derive(PartialEq)]
+enum SeekPhase {
+    Seekability,
+    Command,
+    Acceptance,
+    Start,
+    Restart,
+    PositionRequest,
+    Position,
+}
+
+struct ActiveSeek {
+    request: SeekRequest,
+    phase: SeekPhase,
+}
+
 #[derive(Default)]
 struct PlaybackState {
     desired: Option<u64>,
@@ -651,10 +692,143 @@ struct PlaybackState {
     pause_target: Option<bool>,
     pause_after_load: bool,
     pause_revision: u64,
+    restarted: bool,
+    seek: Option<ActiveSeek>,
+    next_seek: Option<SeekRequest>,
+    position_observer: u64,
 }
 
 impl PlaybackState {
+    fn invalidate_seeks(&mut self) {
+        self.seek = None;
+        self.next_seek = None;
+        self.restarted = false;
+    }
+
+    fn queue_seek(&mut self, request: SeekRequest, events: &async_channel::Sender<PlayerEvent>) {
+        if self.loaded && self.current == Some(request.track_id) && self.current == self.desired {
+            self.next_seek = Some(request);
+        } else {
+            Self::seek_finished(
+                request,
+                Err("This track is no longer ready to seek.".into()),
+                events,
+            );
+        }
+    }
+
+    fn seek_finished(
+        request: SeekRequest,
+        result: Result<f64, String>,
+        events: &async_channel::Sender<PlayerEvent>,
+    ) {
+        let _ = events.send_blocking(PlayerEvent::SeekFinished {
+            track_id: request.track_id,
+            revision: request.revision,
+            result,
+        });
+    }
+
+    fn fail_seeks(&mut self, events: &async_channel::Sender<PlayerEvent>) {
+        for request in [
+            self.seek.take().map(|seek| seek.request),
+            self.next_seek.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            Self::seek_finished(
+                request,
+                Err("Playback ended before the seek completed.".into()),
+                events,
+            );
+        }
+        self.restarted = false;
+    }
+
+    fn write_seek(&mut self, socket: &mut UnixStream) -> Result<()> {
+        if self.seek.is_none()
+            && self.restarted
+            && let Some(request) = self.next_seek.take()
+        {
+            write_command(
+                socket,
+                json!(["get_property", "seekable"]),
+                Some(json!(format!("seekable:{}", request.revision))),
+            )?;
+            self.seek = Some(ActiveSeek {
+                request,
+                phase: SeekPhase::Seekability,
+            });
+        }
+        if let Some(seek) = &mut self.seek
+            && seek.phase == SeekPhase::Command
+        {
+            write_command(
+                socket,
+                json!(["seek", seek.request.seconds, "absolute"]),
+                Some(json!(seek.request.revision)),
+            )?;
+            seek.phase = SeekPhase::Acceptance;
+        }
+        if let Some(seek) = &mut self.seek
+            && seek.phase == SeekPhase::PositionRequest
+        {
+            // A fresh observer fences out cached position notifications from before the seek.
+            let old_observer = self.position_observer.max(1);
+            self.position_observer = old_observer + 6;
+            write_command(socket, json!(["unobserve_property", old_observer]), None)?;
+            write_command(
+                socket,
+                json!(["observe_property", self.position_observer, "time-pos"]),
+                Some(json!(format!("seek-position:{}", seek.request.revision))),
+            )?;
+            seek.phase = SeekPhase::Position;
+        }
+        Ok(())
+    }
+
     fn message(&mut self, value: Value, events: &async_channel::Sender<PlayerEvent>) {
+        if let Some(revision) = value["request_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("seekable:"))
+            .and_then(|revision| revision.parse::<u64>().ok())
+        {
+            if self.seek.as_ref().is_some_and(|seek| {
+                seek.request.revision == revision && seek.phase == SeekPhase::Seekability
+            }) {
+                if value["error"] == "success" && value["data"] == true {
+                    self.seek.as_mut().unwrap().phase = SeekPhase::Command;
+                } else {
+                    // mpv accepts a seek before demuxing it, and emits no completion if it cannot seek.
+                    let seek = self.seek.take().unwrap();
+                    Self::seek_finished(
+                        seek.request,
+                        Err("This stream does not support seeking.".into()),
+                        events,
+                    );
+                }
+            }
+            return;
+        }
+        if let Some(revision) = value["request_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("seek-position:"))
+            .and_then(|revision| revision.parse::<u64>().ok())
+        {
+            if self.seek.as_ref().is_some_and(|seek| {
+                seek.request.revision == revision && seek.phase == SeekPhase::Position
+            }) && value["error"] != "success"
+            {
+                let seek = self.seek.take().unwrap();
+                Self::seek_finished(
+                    seek.request,
+                    Err("mpv could not observe the seek position.".into()),
+                    events,
+                );
+            }
+            return;
+        }
         if let Some(revision) = value["request_id"]
             .as_str()
             .and_then(|id| id.strip_prefix("pause:"))
@@ -676,6 +850,21 @@ impl PlaybackState {
             return;
         }
         if let Some(id) = value["request_id"].as_u64().filter(|id| *id > 0) {
+            if self.seek.as_ref().is_some_and(|seek| {
+                seek.request.revision == id && seek.phase == SeekPhase::Acceptance
+            }) {
+                if value["error"] == "success" {
+                    self.seek.as_mut().unwrap().phase = SeekPhase::Start;
+                } else {
+                    let seek = self.seek.take().unwrap();
+                    Self::seek_finished(
+                        seek.request,
+                        Err("mpv could not seek in this track.".into()),
+                        events,
+                    );
+                }
+                return;
+            }
             if let Some(entry) = value
                 .pointer("/data/playlist_entry_id")
                 .and_then(Value::as_u64)
@@ -690,6 +879,22 @@ impl PlaybackState {
             }
         }
         match value["event"].as_str() {
+            Some("seek") if self.loaded && self.current == self.desired => {
+                self.restarted = false;
+                if let Some(seek) = &mut self.seek
+                    && seek.phase == SeekPhase::Start
+                {
+                    seek.phase = SeekPhase::Restart;
+                }
+            }
+            Some("playback-restart") if self.loaded && self.current == self.desired => {
+                self.restarted = true;
+                if let Some(seek) = &mut self.seek
+                    && seek.phase == SeekPhase::Restart
+                {
+                    seek.phase = SeekPhase::PositionRequest;
+                }
+            }
             Some("start-file") => {
                 self.current = value["playlist_entry_id"]
                     .as_u64()
@@ -707,6 +912,7 @@ impl PlaybackState {
                     .as_u64()
                     .and_then(|id| self.entries.remove(&id));
                 if let Some(track_id) = track_id.filter(|id| Some(*id) == self.desired) {
+                    self.fail_seeks(events);
                     match value["reason"].as_str() {
                         Some("eof") => {
                             let _ = events.send_blocking(PlayerEvent::Ended { track_id });
@@ -724,6 +930,22 @@ impl PlaybackState {
                 }
             }
             Some("property-change") => {
+                if value["name"] == "time-pos"
+                    && value["id"].as_u64() == Some(self.position_observer.max(1))
+                    && self
+                        .seek
+                        .as_ref()
+                        .is_some_and(|seek| seek.phase == SeekPhase::Position)
+                {
+                    // observe_property guarantees an initial notification, even for a no-op seek.
+                    let seek = self.seek.take().unwrap();
+                    let result = value["data"]
+                        .as_f64()
+                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
+                        .ok_or_else(|| "mpv could not confirm the seek position.".into());
+                    Self::seek_finished(seek.request, result, events);
+                    return;
+                }
                 if value["name"] == "volume" {
                     if let Some(volume) = value["data"].as_f64() {
                         let _ = events.send_blocking(PlayerEvent::Volume(volume));
@@ -756,9 +978,16 @@ impl PlaybackState {
                     return;
                 };
                 let event = match value["name"].as_str() {
-                    Some("time-pos") => value["data"]
-                        .as_f64()
-                        .map(|seconds| PlayerEvent::Position { track_id, seconds }),
+                    Some("time-pos")
+                        if self.seek.is_none()
+                            && self.next_seek.is_none()
+                            && value["id"].as_u64() == Some(self.position_observer.max(1)) =>
+                    {
+                        value["data"]
+                            .as_f64()
+                            .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
+                            .map(|seconds| PlayerEvent::Position { track_id, seconds })
+                    }
                     Some("duration") => value["data"]
                         .as_f64()
                         .map(|seconds| PlayerEvent::Duration { track_id, seconds }),
@@ -787,6 +1016,390 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seek_request(revision: u64, seconds: f64) -> SeekRequest {
+        SeekRequest {
+            track_id: 1,
+            revision,
+            seconds,
+        }
+    }
+
+    fn socket_message(socket: &mut UnixStream) -> Value {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        serde_json::from_slice(&line).unwrap()
+    }
+
+    fn accepted_seek_command(
+        state: &mut PlaybackState,
+        socket: &mut UnixStream,
+        mpv: &mut UnixStream,
+        events: &async_channel::Sender<PlayerEvent>,
+    ) -> Value {
+        state.write_seek(socket).unwrap();
+        let check = socket_message(mpv);
+        assert_eq!(check["command"], json!(["get_property", "seekable"]));
+        state.message(
+            json!({"request_id":check["request_id"],"error":"success","data":true}),
+            events,
+        );
+        state.write_seek(socket).unwrap();
+        socket_message(mpv)
+    }
+
+    #[test]
+    fn seek_has_a_validated_track_bound_revision() {
+        let (commands, received) = mpsc::channel();
+        let (_, events) = async_channel::unbounded();
+        let player = Player {
+            commands,
+            events,
+            next_id: AtomicU64::new(2),
+        };
+        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(player.seek(1, seconds).is_err());
+        }
+        assert!(received.try_recv().is_err());
+        let revision = player.seek(1, -10.).unwrap();
+        assert_eq!(revision, 2);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerCommand::Seek(SeekRequest {
+                track_id: 1,
+                revision: 2,
+                seconds: 0.
+            }))
+        ));
+    }
+
+    #[test]
+    fn seek_waits_for_restart_then_confirms_position_with_a_fresh_observer() {
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        mpv.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            current: Some(1),
+            loaded: true,
+            ..Default::default()
+        };
+        state.queue_seek(seek_request(2, 10.), &events);
+        state.queue_seek(seek_request(3, 20.), &events);
+        state.write_seek(&mut socket).unwrap();
+        assert!(
+            state.seek.is_none(),
+            "initial loading restart is a separate boundary"
+        );
+        state.message(json!({"event":"playback-restart"}), &events);
+        assert_eq!(
+            accepted_seek_command(&mut state, &mut socket, &mut mpv, &events),
+            json!({"command":["seek",20.,"absolute"],"request_id":3})
+        );
+        state.message(json!({"request_id":3,"error":"success"}), &events);
+        state.message(json!({"event":"playback-restart"}), &events);
+        assert!(matches!(
+            state.seek.as_ref().map(|seek| &seek.phase),
+            Some(SeekPhase::Start)
+        ));
+        state.message(json!({"event":"seek"}), &events);
+        state.message(
+            json!({"event":"property-change","id":1,"name":"time-pos","data":1.}),
+            &events,
+        );
+        state.message(json!({"event":"playback-restart"}), &events);
+        assert!(received.try_recv().is_err());
+        state.write_seek(&mut socket).unwrap();
+        assert_eq!(
+            socket_message(&mut mpv)["command"],
+            json!(["unobserve_property", 1])
+        );
+        assert_eq!(
+            socket_message(&mut mpv),
+            json!({"command":["observe_property",7,"time-pos"],"request_id":"seek-position:3"})
+        );
+        state.message(
+            json!({"request_id":"seek-position:2","error":"success","data":10.}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        state.message(
+            json!({"event":"property-change","id":7,"name":"time-pos","data":19.999}),
+            &events,
+        );
+        assert!(
+            matches!(received.try_recv(), Ok(PlayerEvent::SeekFinished { track_id:1, revision:3, result:Ok(seconds) }) if seconds == 19.999)
+        );
+        state.message(
+            json!({"request_id":"seek-position:3","error":"success"}),
+            &events,
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "the initial sample can precede registration acknowledgment"
+        );
+        state.message(
+            json!({"event":"property-change","id":1,"name":"time-pos","data":1.}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        state.message(
+            json!({"event":"property-change","id":7,"name":"time-pos","data":20.1}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Position {
+                track_id: 1,
+                seconds: 20.1
+            })
+        ));
+    }
+
+    #[test]
+    fn rapid_seeks_coalesce_behind_one_in_flight_seek_and_no_op_is_acknowledged() {
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            current: Some(1),
+            loaded: true,
+            restarted: true,
+            ..Default::default()
+        };
+        state.queue_seek(seek_request(2, 10.), &events);
+        assert_eq!(
+            accepted_seek_command(&mut state, &mut socket, &mut mpv, &events)["request_id"],
+            2
+        );
+        state.queue_seek(seek_request(3, 20.), &events);
+        state.queue_seek(seek_request(4, 10.), &events);
+        state.write_seek(&mut socket).unwrap();
+        assert_eq!(state.seek.as_ref().unwrap().request.revision, 2);
+        assert_eq!(state.next_seek.unwrap().revision, 4);
+        for value in [
+            json!({"request_id":2,"error":"success"}),
+            json!({"event":"seek"}),
+            json!({"event":"playback-restart"}),
+        ] {
+            state.message(value, &events);
+        }
+        state.write_seek(&mut socket).unwrap();
+        for _ in 0..2 {
+            socket_message(&mut mpv);
+        }
+        state.message(
+            json!({"request_id":"seek-position:2","error":"success"}),
+            &events,
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "registration alone does not confirm a position"
+        );
+        state.message(
+            json!({"event":"property-change","id":7,"name":"time-pos","data":10.}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::SeekFinished {
+                revision: 2,
+                result: Ok(10.),
+                ..
+            })
+        ));
+        assert_eq!(
+            accepted_seek_command(&mut state, &mut socket, &mut mpv, &events),
+            json!({"command":["seek",10.,"absolute"],"request_id":4})
+        );
+        for value in [
+            json!({"request_id":4,"error":"success"}),
+            json!({"event":"seek"}),
+            json!({"event":"playback-restart"}),
+        ] {
+            state.message(value, &events);
+        }
+        state.write_seek(&mut socket).unwrap();
+        for _ in 0..2 {
+            socket_message(&mut mpv);
+        }
+        state.message(
+            json!({"event":"property-change","id":13,"name":"time-pos","data":10.}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::SeekFinished {
+                revision: 4,
+                result: Ok(10.),
+                ..
+            })
+        ));
+        assert!(state.seek.is_none() && state.next_seek.is_none());
+    }
+
+    #[test]
+    fn seek_errors_end_of_file_and_invalidation_do_not_leave_pending_work() {
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            current: Some(1),
+            loaded: true,
+            restarted: true,
+            entries: HashMap::from([(10, 1)]),
+            ..Default::default()
+        };
+        state.queue_seek(seek_request(2, 10.), &events);
+        accepted_seek_command(&mut state, &mut socket, &mut mpv, &events);
+        state.message(
+            json!({"request_id":2,"error":"INVENTED_PRIVATE_DIAGNOSTIC"}),
+            &events,
+        );
+        assert!(
+            matches!(received.try_recv(),Ok(PlayerEvent::SeekFinished{revision:2,result:Err(message),..}) if !message.contains("INVENTED_PRIVATE_DIAGNOSTIC"))
+        );
+        state.queue_seek(seek_request(3, 10.), &events);
+        accepted_seek_command(&mut state, &mut socket, &mut mpv, &events);
+        state.queue_seek(seek_request(4, 20.), &events);
+        state.message(
+            json!({"event":"end-file","playlist_entry_id":10,"reason":"eof"}),
+            &events,
+        );
+        for revision in [3, 4] {
+            assert!(
+                matches!(received.try_recv(),Ok(PlayerEvent::SeekFinished{revision:id,result:Err(_),..}) if id == revision)
+            );
+        }
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Ended { track_id: 1 })
+        ));
+        assert!(state.seek.is_none() && state.next_seek.is_none() && !state.restarted);
+
+        state.loaded = true;
+        state.restarted = true;
+        state.queue_seek(seek_request(5, 10.), &events);
+        accepted_seek_command(&mut state, &mut socket, &mut mpv, &events);
+        state.invalidate_seeks();
+        state.desired = Some(6);
+        state.message(json!({"request_id":5,"error":"error"}), &events);
+        state.message(
+            json!({"request_id":"seek-position:5","error":"success","data":10.}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        assert!(state.seek.is_none() && state.next_seek.is_none());
+        state.queue_seek(seek_request(7, 10.), &events);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::SeekFinished {
+                revision: 7,
+                result: Err(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn seek_observer_registration_and_unavailable_initial_sample_fail_explicitly() {
+        for response in [
+            json!({"request_id":"seek-position:2","error":"INVENTED_PRIVATE_DIAGNOSTIC"}),
+            json!({"event":"property-change","id":7,"name":"time-pos","data":null}),
+            json!({"event":"property-change","id":7,"name":"time-pos","data":-1.}),
+        ] {
+            let (events, received) = async_channel::unbounded();
+            let mut state = PlaybackState {
+                desired: Some(1),
+                current: Some(1),
+                loaded: true,
+                restarted: true,
+                position_observer: 7,
+                seek: Some(ActiveSeek {
+                    request: seek_request(2, 10.),
+                    phase: SeekPhase::Position,
+                }),
+                ..Default::default()
+            };
+            state.message(response, &events);
+            assert!(
+                matches!(received.try_recv(),Ok(PlayerEvent::SeekFinished{revision:2,result:Err(message),..}) if !message.contains("INVENTED_PRIVATE_DIAGNOSTIC"))
+            );
+            assert!(state.seek.is_none());
+            state.message(
+                json!({"event":"property-change","id":7,"name":"time-pos","data":10.}),
+                &events,
+            );
+            assert!(!matches!(
+                received.try_recv(),
+                Ok(PlayerEvent::SeekFinished { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn unseekable_or_unknown_streams_fail_before_seeking_and_cancelled_checks_are_ignored() {
+        for response in [
+            json!({"error":"success","data":false}),
+            json!({"error":"property unavailable"}),
+        ] {
+            let (events, received) = async_channel::unbounded();
+            let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+            let mut state = PlaybackState {
+                desired: Some(1),
+                current: Some(1),
+                loaded: true,
+                restarted: true,
+                ..Default::default()
+            };
+            state.queue_seek(seek_request(2, 10.), &events);
+            state.write_seek(&mut socket).unwrap();
+            assert_eq!(
+                socket_message(&mut mpv)["command"],
+                json!(["get_property", "seekable"])
+            );
+            let mut response = response;
+            response["request_id"] = json!("seekable:2");
+            state.message(response, &events);
+            assert!(matches!(
+                received.try_recv(),
+                Ok(PlayerEvent::SeekFinished {
+                    revision: 2,
+                    result: Err(_),
+                    ..
+                })
+            ));
+            assert!(state.seek.is_none());
+        }
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            current: Some(1),
+            loaded: true,
+            restarted: true,
+            ..Default::default()
+        };
+        state.queue_seek(seek_request(2, 10.), &events);
+        state.write_seek(&mut socket).unwrap();
+        socket_message(&mut mpv);
+        state.invalidate_seeks();
+        state.desired = Some(3);
+        state.message(
+            json!({"request_id":"seekable:2","error":"success","data":true}),
+            &events,
+        );
+        assert!(state.seek.is_none() && state.next_seek.is_none());
+        assert!(received.try_recv().is_err());
+    }
 
     #[test]
     fn every_play_has_its_own_validated_options_and_track_id() {
@@ -1325,6 +1938,91 @@ assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
     }
 
     #[test]
+    #[ignore = "requires installed mpv and yt-dlp; uses only private synthetic local audio"]
+    fn local_seek_completion_handles_rapid_no_op_and_end_of_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("silence.wav");
+        let sample_bytes = 120_u32 * 8000 * 2;
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(36 + sample_bytes).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt ").unwrap();
+        file.write_all(&16_u32.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&8000_u32.to_le_bytes()).unwrap();
+        file.write_all(&16000_u32.to_le_bytes()).unwrap();
+        file.write_all(&2_u16.to_le_bytes()).unwrap();
+        file.write_all(&16_u16.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&sample_bytes.to_le_bytes()).unwrap();
+        file.write_all(&vec![0; sample_bytes as usize]).unwrap();
+        drop(file);
+        let player = Player::new(PlayerOptions {
+            audio_output: Some("null".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let track_id = player
+            .play_url(
+                path.to_string_lossy().into_owned(),
+                "Synthetic silence",
+                PlayOptions {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let wait_for = |predicate: &dyn Fn(&PlayerEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline {
+                if let Some(event) = player.try_recv() {
+                    if predicate(&event) {
+                        return event;
+                    }
+                    if let PlayerEvent::Error { message, .. } = event {
+                        panic!("{message}");
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            panic!("mpv did not complete the synthetic seek boundary");
+        };
+        wait_for(
+            &|event| matches!(event,PlayerEvent::Started{track_id:id,paused:true} if *id == track_id),
+        );
+        player.seek(track_id, 10.).unwrap();
+        let revision = player.seek(track_id, 50.).unwrap();
+        let event = wait_for(
+            &|event| matches!(event,PlayerEvent::SeekFinished{revision:id,..} if *id == revision),
+        );
+        assert!(
+            matches!(event,PlayerEvent::SeekFinished{result:Ok(seconds),..} if (49.9..50.1).contains(&seconds))
+        );
+        let revision = player.seek(track_id, 50.).unwrap();
+        let event = wait_for(
+            &|event| matches!(event,PlayerEvent::SeekFinished{revision:id,..} if *id == revision),
+        );
+        assert!(
+            matches!(event,PlayerEvent::SeekFinished{result:Ok(seconds),..} if (49.9..50.1).contains(&seconds))
+        );
+        let revision = player.seek(track_id, 500.).unwrap();
+        wait_for(
+            &|event| matches!(event,PlayerEvent::SeekFinished{revision:id,..} if *id == revision),
+        );
+        wait_for(&|event| matches!(event,PlayerEvent::Ended{track_id:id} if *id == track_id));
+        let revision = player.seek(track_id, 10.).unwrap();
+        let event = wait_for(
+            &|event| matches!(event,PlayerEvent::SeekFinished{revision:id,..} if *id == revision),
+        );
+        assert!(matches!(
+            event,
+            PlayerEvent::SeekFinished { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
     #[ignore = "requires mpv, yt-dlp, and network access"]
     fn live_playback() {
         let player = Player::new(PlayerOptions {
@@ -1367,7 +2065,7 @@ assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
         let speed = PlaybackSpeed::try_from(1.5).unwrap();
         player.set_speed(speed).unwrap();
         player.pause(true).unwrap();
-        player.seek(30.).unwrap();
+        let seek_revision = player.seek(id, 30.).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut paused = false;
         let mut sought = false;
@@ -1375,7 +2073,14 @@ assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
         while Instant::now() < deadline && !(paused && sought && sped_up) {
             match player.try_recv() {
                 Some(PlayerEvent::Paused { paused: true, .. }) => paused = true,
-                Some(PlayerEvent::Position { seconds, .. }) if seconds >= 29. => sought = true,
+                Some(PlayerEvent::SeekFinished {
+                    track_id,
+                    revision,
+                    result,
+                }) if track_id == id && revision == seek_revision => {
+                    assert!(result.unwrap() >= 29.);
+                    sought = true;
+                }
                 Some(PlayerEvent::Speed(value)) if value == speed => sped_up = true,
                 _ => thread::sleep(Duration::from_millis(50)),
             }
