@@ -9,7 +9,7 @@ This is an independent client. The public-catalog player is working. Account int
 - Home and Explore, search suggestions and category filters, and artist, album, and playlist browsing.
 - Streaming audio, pause, seek, previous/next, volume, mute, and playback speed.
 - A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
-- Radio, continued autoplay, lyrics and related music when the service provides them.
+- Radio, continued autoplay, lyrics, song credits and related music when the service provides them.
 - Local liked songs, saved collections, and recently played songs.
 - Keyboard controls, native text input, and a compact sidebar on narrow windows.
 - Media keys and desktop playback controls when `mpv-mpris` is installed.
@@ -53,9 +53,9 @@ Connect from Settings or launch with `--connect`. Sign in only in the dedicated 
 | Escape | Close help or queue; leave search |
 | Ctrl Q | Quit |
 
-Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. Search categories keep their filter while loading more results. Library and uploads search require a connected account.
+Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. Search keeps its query, category and scope while loading more results or navigating back. Library search supports category filters; uploads search covers all uploads. Both scopes require a connected account.
 
-The song menu offers radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
+The song menu offers credits, radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Credits retain the service's roles and names. Lyrics and credits load independently of radio and autoplay. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
 
 Settings changes playback speed from 0.25× to 2×. The selected speed applies immediately and is saved on this device.
 
@@ -80,7 +80,14 @@ Measured on the development Omarchy desktop on 2026-10-15, using the optimized b
 | Paused | 0.27% | 0.00% | 242.6 MiB |
 | Playing | 0.53% | 0.87% | 253.0 MiB |
 
-The current stripped release executable is 33.9 MiB. The CPU and memory samples above predate account integration, search suggestions and continued autoplay, so those need fresh measurements. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
+Fresh guest measurements on 2026-10-17 at 1916 × 1050 used the current release after artwork loaded. Each sample lasted 30 seconds. Playback used muted audio at 1.5× speed; autoplay was off. These still do not establish a comparison with the web client.
+
+| State | GUI CPU | mpv CPU | Combined PSS |
+| --- | ---: | ---: | ---: |
+| Idle after search, credits and queue checks | 0.20% | 0.03% | 174.5 MiB |
+| Playing at 1.5× | 0.87% | 1.43% | 211.7 MiB |
+
+The current stripped release executable is 33.9 MiB. Connected playback still needs fresh measurements. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
 
 ## Validation
 
@@ -91,7 +98,7 @@ bin/test
 bin/test -- --ignored --nocapture
 ```
 
-The ordinary tests cover account isolation, catalog and search parsing, stale suggestions, radio continuation, queue reordering and autoplay transitions, library write flushing, and stale playback events. The ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause and seek. They need network access, mpv, and yt-dlp. Public search categories, suggestions and radio continuation have passed live service checks. The newest native search and queue controls still need an interactive desktop check; signed-in search scopes and account sync remain unverified.
+The ordinary tests cover account isolation, catalog and search parsing, stale suggestions and song text, radio continuation, queue reordering and autoplay transitions, library write flushing, and stale playback events. The ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause, seek and speed changes. They need network access, mpv, and yt-dlp. Public search categories, suggestions, credits and radio continuation have passed live service checks. An interactive XWayland check passed suggestions, category search, Back navigation, credits, speed selection, queue add/reorder/clear and autoplay settings. Signed-in search scopes and account sync remain unverified.
 
 YouTube's internal API and stream extraction can change. Public guest playback may need an updated yt-dlp; authenticated playback deliberately rejects versions that have not been reviewed. Catalog changes may require a client update. Complete account parity and remaining verification are tracked in docs/parity.md. Account mutations are not yet verified against a signed-in account. GPUI's custom controls currently have limited screen-reader support.
 
