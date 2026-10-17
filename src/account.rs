@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, thread};
+use std::{sync::Arc, thread};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -169,10 +169,7 @@ pub enum Command {
         session: Arc<Session>,
         mutation: Box<Mutation>,
     },
-    Restore {
-        path: Option<PathBuf>,
-        operation: Operation,
-    },
+    Restore(Operation),
     Disconnect(Operation),
     Persist(Arc<Session>),
 }
@@ -236,14 +233,11 @@ pub fn start(
                         })().map_err(|e| format!("{e:#}"));
                         Event::Connected { operation, result, save_session: true }
                     }
-                    Command::Restore { path, operation } => {
+                    Command::Restore(operation) => {
                         let result = (|| {
                             ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
                             ensure!(!operation.is_cancelled(), "Account connection cancelled");
-                            let candidate = match path {
-                                Some(path) => Some(Session::from_cookie_file(&path)?),
-                                None => Session::load()?,
-                            };
+                            let candidate = Session::load()?;
                             candidate.map(|candidate| {
                                 let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                                 Connection::verify(candidate, catalog)?.publish(&session, &operation)
@@ -572,28 +566,6 @@ mod tests {
         assert!(fresh.matches(&fresh.clone()));
     }
     #[test]
-    fn disabled_accounts_reject_import_before_reading_credentials() {
-        if auth::ACCOUNT_LOGIN_ENABLED {
-            return;
-        }
-        let (commands, events, worker) = start(auth::shared(None));
-        commands
-            .send_blocking(Command::Restore {
-                path: Some(PathBuf::from("/nonexistent-synthetic-cookie-file")),
-                operation: Operation::default(),
-            })
-            .unwrap();
-        match events.recv_blocking().unwrap() {
-            Event::Connected {
-                result: Err(error), ..
-            } => {
-                assert!(error.contains("disabled until the security review"))
-            }
-            _ => panic!("account import must fail closed"),
-        }
-        worker.finish().unwrap();
-    }
-    #[test]
     fn revoked_persistence_is_cleared_even_after_a_partial_store_failure() {
         use std::cell::Cell;
         for store_succeeds in [true, false] {
@@ -627,10 +599,7 @@ mod tests {
         operation.cancel();
         for _ in 0..2 {
             commands
-                .send_blocking(Command::Restore {
-                    path: None,
-                    operation: operation.clone(),
-                })
+                .send_blocking(Command::Restore(operation.clone()))
                 .unwrap();
         }
         worker.finish().unwrap();

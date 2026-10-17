@@ -12,7 +12,6 @@ mod theme;
 mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
-use std::path::PathBuf;
 
 fn main() {
     // A crash dump must not persist reusable account credentials.
@@ -24,18 +23,15 @@ fn main() {
         eprintln!("Could not disable credential-bearing crash dumps.");
         std::process::exit(1);
     }
-    let mut cookies = None;
     let mut connect = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+    for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--connect" => connect = true,
             "--cookies" => {
-                cookies = args.next().map(PathBuf::from);
-                if cookies.is_none() {
-                    eprintln!("--cookies requires a file path");
-                    std::process::exit(2);
-                }
+                eprintln!(
+                    "Cookie imports cannot identify the selected Google account. Use --connect."
+                );
+                std::process::exit(2);
             }
             "--help" | "-h" => {
                 println!(
@@ -53,10 +49,17 @@ fn main() {
             }
         }
     }
-    if (connect || cookies.is_some()) && !auth::ACCOUNT_LOGIN_ENABLED {
+    if connect && !auth::ACCOUNT_LOGIN_ENABLED {
         eprintln!("Account connection is disabled until the security review is complete.");
         std::process::exit(1);
     }
+    let _instance = match auth::lock_instance() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+    };
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
@@ -79,7 +82,7 @@ fn main() {
                     app_id: Some("yt-music-gpui".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| app::Music::new(cookies, connect, window, cx)),
+                |window, cx| cx.new(|cx| app::Music::new(connect, window, cx)),
             )
             .expect("open YouTube Music window");
             cx.activate(true);

@@ -14,7 +14,6 @@ use gpui::{prelude::*, *};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
-    path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
@@ -177,12 +176,7 @@ pub struct Music {
 }
 
 impl Music {
-    pub fn new(
-        cookies: Option<PathBuf>,
-        connect: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(connect: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(SearchInput::new);
         let (store, library, error) = match Store::load() {
             Ok((s, l)) => (Some(s), l, None),
@@ -213,10 +207,7 @@ impl Music {
             let command = if connect {
                 account::Command::Connect(operation.clone())
             } else {
-                account::Command::Restore {
-                    path: cookies,
-                    operation: operation.clone(),
-                }
+                account::Command::Restore(operation.clone())
             };
             let _ = account_commands.try_send(command);
             AccountOperation::Connecting(operation)

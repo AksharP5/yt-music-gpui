@@ -6,7 +6,7 @@ The initial release implements public catalog browsing, search, audio playback a
 
 ## Required work
 
-Prepared for signed-in verification: account library categories, song ratings and separate library feedback, playlist create/edit/privacy/delete/add/remove/reorder with occurrence IDs, history removal, and account switching/sign-out. The native controls are wired to service requests and refresh after acknowledgement. Account pages also refresh when the window regains focus; Ctrl R refreshes explicitly. None of this is marked complete until tested with an authenticated account against the web client. Sign-in remains gated.
+Prepared for signed-in verification: account library categories, song ratings and separate library feedback, playlist create/edit/privacy/delete/add/remove/reorder with occurrence IDs, history removal, and account switching/sign-out. The native controls are wired to service requests and refresh after acknowledgement. Account pages also refresh when the window regains focus; Ctrl R refreshes explicitly. None of this is marked complete until tested with an authenticated account against the web client. The reviewed sign-in flow is available so these checks can proceed.
 
 Native radio, current-song account metadata, lyrics and related-music controls are wired to a separate bounded worker. Public next/lyrics requests have passed a live service check. Radio preserves the server's queue order and repeated occurrences. Authenticated behavior and the new controls still need an interactive desktop check; the current desktop automation backend refuses input because its Hyprland plugin is unavailable.
 

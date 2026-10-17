@@ -2,7 +2,7 @@
 
 A native Linux music client built in Rust with GPUI. It browses YouTube Music's live catalog and plays audio through mpv and yt-dlp. The interface follows the current Omarchy theme and runs on Wayland or X11.
 
-This is an independent client. The public-catalog player is working. Account integration is under development, and sign-in is disabled until its security review and account verification are complete. See [the parity checklist](docs/parity.md) for the remaining work.
+This is an independent client. The public-catalog player is working. Account integration is under development. The reviewed Google connection is available for live verification, but account sync and authenticated playback have not yet passed the cross-client checks. See [the parity checklist](docs/parity.md) for the remaining work.
 
 ## What works
 
@@ -34,7 +34,7 @@ bin/install
 
 The installer writes to `~/.local/bin` and `$XDG_DATA_HOME`, defaulting to `~/.local/share`. It does not install system dependencies. Alternatively, build an Arch package by running `makepkg` inside `packaging/`, then install that package with your package manager.
 
-Account sign-in and saved-session loading are currently disabled. Cookie imports are unsupported because they cannot identify the selected Google or brand account. The account connection being developed uses an isolated Google login window, the OS keyring, and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports or inspect existing browser profiles. Authenticated playback requires the reviewed yt-dlp version 2026.08.19 and matching account identity from the service.
+Connect from Settings or launch with `--connect`. Sign in only in the dedicated Google window. Cookie imports are unsupported because they cannot identify the selected Google or brand account. The connection uses the OS keyring and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports or inspect existing browser profiles. Authenticated playback requires the reviewed yt-dlp version 2026.08.19 and matching account identity from the service. The desktop runtime directory must be private and RAM-backed. Only one app instance may run at a time to protect shared account and library state.
 
 ## Controls
 

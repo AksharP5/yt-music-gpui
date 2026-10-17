@@ -1,14 +1,18 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::UnixStream,
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -20,7 +24,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const ACCOUNT_LOGIN_ENABLED: bool = false;
+pub const ACCOUNT_LOGIN_ENABLED: bool = true;
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
@@ -133,11 +137,6 @@ impl Session {
             "Could not remove the saved account from the keyring"
         );
         Ok(())
-    }
-    pub fn from_cookie_file(_path: &Path) -> Result<Self> {
-        bail!(
-            "Cookie files do not identify the selected Google account. Connect through the dedicated sign-in window."
-        )
     }
     pub fn validate_playback_identity(&self) -> Result<()> {
         ensure!(
@@ -382,19 +381,11 @@ impl BrowserPipe {
     }
 }
 
-fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe)> {
-    // Bypass distribution launch scripts so flags/extensions from another profile
-    // cannot be inherited by the sign-in window.
-    let binary = ["/usr/lib/chromium/chromium", "/opt/google/chrome/chrome"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
-        .context("Account connection needs Chromium or Google Chrome")?;
+fn private_runtime() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("A private desktop runtime directory is required for account connection")?;
     let metadata = fs::symlink_metadata(&runtime)?;
-    use std::os::unix::fs::MetadataExt;
     ensure!(
         metadata.is_dir()
             && metadata.uid() == unsafe { libc::geteuid() }
@@ -411,9 +402,54 @@ fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe
         unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC,
         "Sign-in requires a RAM-backed private runtime directory"
     );
+    Ok(runtime)
+}
+
+pub fn lock_instance() -> Result<File> {
+    lock_file(&private_runtime()?.join("yt-music-gpui.lock"))
+}
+
+fn lock_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context("Could not open the private music application lock")?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o777 == 0o600
+            && metadata.nlink() == 1,
+        "The music application lock must be a private regular file"
+    );
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(anyhow::anyhow!(
+                "YouTube Music is already running. Close its window before opening another instance."
+            ));
+        }
+        return Err(error).context("Could not lock the music application");
+    }
+    Ok(file)
+}
+
+fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe)> {
+    // Bypass distribution launch scripts so flags/extensions from another profile
+    // cannot be inherited by the sign-in window.
+    let binary = ["/usr/lib/chromium/chromium", "/opt/google/chrome/chrome"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .context("Account connection needs Chromium or Google Chrome")?;
     let profile = tempfile::Builder::new()
         .prefix("yt-music-login-")
-        .tempdir_in(runtime)?;
+        .tempdir_in(private_runtime()?)?;
     let (parent, child) = UnixStream::pair()?;
     parent.set_read_timeout(Some(Duration::from_secs(5)))?;
     parent.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -583,6 +619,19 @@ fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Ac
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_one_instance_can_own_account_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("application.lock");
+        let owner = lock_file(&path).unwrap();
+        assert!(lock_file(&path).is_err());
+        drop(owner);
+        assert!(lock_file(&path).is_ok());
+
+        let link = directory.path().join("linked.lock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(lock_file(&link).is_err());
+    }
     fn session(cookie: &str) -> Session {
         Session {
             cookie: cookie.into(),
@@ -624,8 +673,7 @@ mod tests {
         );
     }
     #[test]
-    fn cookie_imports_cannot_guess_an_account_identity() {
-        assert!(Session::from_cookie_file(Path::new("/not-read")).is_err());
+    fn cookies_are_restricted_to_youtube_domains() {
         for domain in ["youtube.com", ".youtube.com", "music.youtube.com"] {
             assert!(youtube_domain(domain));
         }
