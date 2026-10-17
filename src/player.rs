@@ -1,10 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{ErrorKind, Read, Write},
-    os::fd::AsRawFd,
+    fs::{self, File},
+    io::{ErrorKind, Read, Seek, Write},
+    os::fd::{AsRawFd, FromRawFd},
+    os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
     path::PathBuf,
@@ -76,7 +77,7 @@ enum PlayerCommand {
         title: String,
     },
     Json(Value),
-    Cookies(File),
+    Cookies(Option<File>),
     Stop,
     Quit,
 }
@@ -133,7 +134,10 @@ impl Player {
     }
 
     pub fn set_cookies(&self, file: File) -> Result<()> {
-        self.send(PlayerCommand::Cookies(file))
+        self.send(PlayerCommand::Cookies(Some(file)))
+    }
+    pub fn clear_cookies(&self) -> Result<()> {
+        self.send(PlayerCommand::Cookies(None))
     }
     pub fn toggle_pause(&self) -> Result<()> {
         self.command(json!(["cycle", "pause"]))
@@ -200,6 +204,85 @@ fn write_command(socket: &mut UnixStream, command: Value, request_id: Option<u64
         .context("Could not send the command to mpv")
 }
 
+fn writable_playback_cookies(mut source: File) -> Result<File> {
+    // yt-dlp rewrites its cookie jar on exit, so give it a disposable RAM copy.
+    let fd = unsafe { libc::memfd_create(c"yt-music-playback".as_ptr(), libc::MFD_CLOEXEC) };
+    ensure!(fd >= 0, "Could not create private playback credentials");
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    source.rewind()?;
+    std::io::copy(&mut source, &mut file)?;
+    Ok(file)
+}
+
+fn request(
+    socket: &mut UnixStream,
+    pending: &mut Vec<u8>,
+    command: Value,
+    mut on_event: impl FnMut(Value),
+) -> Result<Value> {
+    // Track requests start at one. Zero is reserved for synchronous control changes.
+    write_command(socket, command, Some(0))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        while let Some(end) = pending.iter().position(|c| *c == b'\n') {
+            let line: Vec<_> = pending.drain(..=end).collect();
+            let value: Value = serde_json::from_slice(&line).context("Invalid mpv response")?;
+            if value["request_id"] == 0 {
+                ensure!(
+                    value["error"] == "success",
+                    "mpv could not update playback credentials"
+                );
+                return Ok(value["data"].clone());
+            }
+            on_event(value);
+        }
+        ensure!(Instant::now() < deadline, "mpv stopped responding");
+        let mut bytes = [0; 16384];
+        match socket.read(&mut bytes) {
+            Ok(0) => bail!("mpv closed its connection"),
+            Ok(size) => {
+                pending.extend_from_slice(&bytes[..size]);
+                ensure!(pending.len() <= 1024 * 1024, "Oversized mpv response");
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error).context("Lost the connection to mpv"),
+        }
+    }
+}
+
+fn replace_playback_cookies(
+    socket: &mut UnixStream,
+    pending: &mut Vec<u8>,
+    current: &mut Option<File>,
+    source: Option<File>,
+    mut on_event: impl FnMut(Value),
+) -> Result<()> {
+    let next = source.map(writable_playback_cookies).transpose()?;
+    // Await stop before closing the jar an active extractor may still be using.
+    request(socket, pending, json!(["stop"]), &mut on_event)?;
+    let mut options = json!({"ignore-config":""});
+    if let Some(file) = &next {
+        options["cookies"] = json!(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ));
+    }
+    request(
+        socket,
+        pending,
+        json!(["set_property", "options/ytdl-raw-options", options]),
+        on_event,
+    )?;
+    *current = next;
+    Ok(())
+}
+
 fn run(
     options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
@@ -252,25 +335,16 @@ fn run(
     {
         cmd.arg("--script=/usr/lib/mpv-mpris/mpris.so");
     }
-    let mut cookie_file = options.cookie_file;
-    let ram_path = cookie_file.as_ref().map(|file| {
-        PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            file.as_raw_fd()
-        ))
-    });
-    let raw_options = if let Some(path) = ram_path.as_ref().or(options.cookies.as_ref()) {
-        if !path.is_file() {
-            bail!("The selected cookies file no longer exists.");
-        }
-        // mpv's string-list option uses a length-prefixed value so spaces and commas stay literal.
-        let value = path.to_string_lossy();
-        format!("ignore-config=,cookies=%{}%{}", value.len(), value)
-    } else {
-        "ignore-config=".to_owned()
+    let source = match options.cookie_file {
+        Some(file) => Some(file),
+        None => options
+            .cookies
+            .map(File::open)
+            .transpose()
+            .context("Could not read the selected cookies file")?,
     };
-    cmd.arg(format!("--ytdl-raw-options={raw_options}"));
+    let mut cookie_file = None;
+    cmd.arg("--ytdl-raw-options=ignore-config=");
     let parent = std::process::id() as libc::pid_t;
     // Linux must also reap the audio process when the GUI aborts before Drop can run.
     unsafe {
@@ -303,6 +377,15 @@ fn run(
     };
     socket.set_read_timeout(Some(Duration::from_millis(80)))?;
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut state = PlaybackState::default();
+    let mut pending = Vec::new();
+    replace_playback_cookies(
+        &mut socket,
+        &mut pending,
+        &mut cookie_file,
+        source,
+        |value| state.message(value, events),
+    )?;
     for (id, name) in [
         "time-pos",
         "duration",
@@ -315,9 +398,6 @@ fn run(
     {
         write_command(&mut socket, json!(["observe_property", id + 1, name]), None)?;
     }
-    write_command(&mut socket, json!(["request_log_messages", "warn"]), None)?;
-    let mut state = PlaybackState::default();
-    let mut pending = Vec::new();
     let mut buffer = [0_u8; 16384];
     loop {
         loop {
@@ -329,7 +409,6 @@ fn run(
                 }) => {
                     state.desired = Some(track_id);
                     state.loaded = false;
-                    state.last_error.clear();
                     let _ = events.send_blocking(PlayerEvent::Loading { track_id });
                     write_command(
                         &mut socket,
@@ -340,13 +419,15 @@ fn run(
                 }
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Cookies(file)) => {
-                    let path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
-                    write_command(
+                    state.desired = None;
+                    state.loaded = false;
+                    replace_playback_cookies(
                         &mut socket,
-                        json!(["set_property","options/ytdl-raw-options",{"ignore-config":"","cookies":path}]),
-                        None,
+                        &mut pending,
+                        &mut cookie_file,
+                        file,
+                        |value| state.message(value, events),
                     )?;
-                    cookie_file = Some(file);
                 }
                 Ok(PlayerCommand::Stop) => {
                     state.desired = None;
@@ -394,7 +475,6 @@ struct PlaybackState {
     current: Option<u64>,
     entries: HashMap<u64, u64>,
     loaded: bool,
-    last_error: String,
 }
 
 impl PlaybackState {
@@ -408,10 +488,8 @@ impl PlaybackState {
             } else if value["error"].as_str() != Some("success") && self.desired == Some(id) {
                 let _ = events.send_blocking(PlayerEvent::Error {
                     track_id: Some(id),
-                    message: format!(
-                        "mpv could not load this track: {}",
-                        value["error"].as_str().unwrap_or("unknown error")
-                    ),
+                    message: "mpv could not load this track. Try another track or update yt-dlp."
+                        .into(),
                 });
             }
         }
@@ -437,29 +515,15 @@ impl PlaybackState {
                             let _ = events.send_blocking(PlayerEvent::Ended { track_id });
                         }
                         Some("error") => {
-                            let detail = if self.last_error.is_empty() {
-                                "YouTube could not provide an audio stream. Try another track or update yt-dlp."
-                            } else {
-                                &self.last_error
-                            };
                             let _ = events.send_blocking(PlayerEvent::Error {
                                 track_id: Some(track_id),
-                                message: detail.to_owned(),
+                                message: "YouTube could not provide an audio stream. Try another track or update yt-dlp."
+                                    .into(),
                             });
                         }
                         _ => {}
                     }
                     self.loaded = false;
-                }
-            }
-            Some("log-message") => {
-                let prefix = value["prefix"].as_str().unwrap_or("");
-                if matches!(prefix, "ytdl_hook" | "ffmpeg" | "cplayer")
-                    && let Some(message) = value["text"]
-                        .as_str()
-                        .filter(|m| !m.contains("https://") && !m.contains("http://"))
-                {
-                    self.last_error = message.trim().chars().take(500).collect();
                 }
             }
             Some("property-change") => {
@@ -507,6 +571,149 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed_cookies(value: &str) -> File {
+        let fd = unsafe {
+            libc::memfd_create(
+                c"yt-music-synthetic".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+        write!(
+            file,
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tYT_MUSIC_SYNTHETIC\t{value}\n"
+        )
+        .unwrap();
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) }, 0);
+        file
+    }
+
+    #[test]
+    fn extractor_cookie_copy_is_private_writable_ram() {
+        let mut source = sealed_cookies("INVENTED_FIRST");
+        let mut file = writable_playback_cookies(source.try_clone().unwrap()).unwrap();
+        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("INVENTED_FIRST")
+        );
+        assert!(
+            fs::read_link(&path)
+                .unwrap()
+                .to_string_lossy()
+                .contains("memfd:")
+        );
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        file.set_len(0).unwrap();
+        file.rewind().unwrap();
+        file.write_all(b"extractor rewrote its jar").unwrap();
+        assert!(source.write_all(b"source remains sealed").is_err());
+        drop(file);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn credential_changes_wait_for_stop_and_revoke_old_ram_files() {
+        use std::io::{BufRead, BufReader};
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .unwrap();
+        let mut current =
+            Some(writable_playback_cookies(sealed_cookies("INVENTED_FIRST")).unwrap());
+        let first_path = format!("/proc/self/fd/{}", current.as_ref().unwrap().as_raw_fd());
+        let old_path = first_path.clone();
+        let worker = thread::spawn(move || {
+            let mut server = BufReader::new(server);
+            let mut active_path = old_path;
+            for replacing in [true, false] {
+                for stopping in [true, false] {
+                    let mut line = String::new();
+                    server.read_line(&mut line).unwrap();
+                    assert!(!line.contains("INVENTED_"));
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    assert!(std::path::Path::new(&active_path).exists());
+                    if stopping {
+                        assert_eq!(message["command"], json!(["stop"]));
+                    } else {
+                        assert_eq!(message["command"][0], "set_property");
+                        assert_eq!(message["command"][1], "options/ytdl-raw-options");
+                        let options = &message["command"][2];
+                        assert_eq!(options["ignore-config"], "");
+                        if replacing {
+                            let path = options["cookies"].as_str().unwrap();
+                            assert!(
+                                fs::read_to_string(path)
+                                    .unwrap()
+                                    .contains("INVENTED_SECOND")
+                            );
+                            active_path = path.to_owned();
+                        } else {
+                            assert!(options.get("cookies").is_none());
+                        }
+                    }
+                    server
+                        .get_mut()
+                        .write_all(b"{\"request_id\":0,\"error\":\"success\"}\n")
+                        .unwrap();
+                }
+            }
+        });
+        let mut pending = Vec::new();
+        replace_playback_cookies(
+            &mut client,
+            &mut pending,
+            &mut current,
+            Some(sealed_cookies("INVENTED_SECOND")),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!std::path::Path::new(&first_path).exists());
+        let second_path = format!("/proc/self/fd/{}", current.as_ref().unwrap().as_raw_fd());
+        replace_playback_cookies(&mut client, &mut pending, &mut current, None, |_| {}).unwrap();
+        assert!(current.is_none());
+        assert!(!std::path::Path::new(&second_path).exists());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn subprocess_diagnostics_cannot_enter_playback_errors() {
+        let (tx, rx) = async_channel::unbounded();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            ..Default::default()
+        };
+        state.message(
+            json!({"request_id":1,"error":"success","data":{"playlist_entry_id":10}}),
+            &tx,
+        );
+        state.message(json!({"event":"log-message","prefix":"ytdl_hook","text":"Cookie: SAPISID=INVENTED_SECRET"}), &tx);
+        state.message(
+            json!({"event":"end-file","playlist_entry_id":10,"reason":"error"}),
+            &tx,
+        );
+        match rx.try_recv().unwrap() {
+            PlayerEvent::Error { message, .. } => assert!(!message.contains("INVENTED_SECRET")),
+            event => panic!("unexpected event: {event:?}"),
+        }
+        state.message(json!({"request_id":1,"error":"INVENTED_SECRET"}), &tx);
+        match rx.try_recv().unwrap() {
+            PlayerEvent::Error { message, .. } => assert!(!message.contains("INVENTED_SECRET")),
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
 
     #[test]
     fn replacing_track_does_not_finish_the_new_track() {
@@ -590,5 +797,47 @@ mod tests {
             }
         }
         assert!(paused && sought, "pause and seek must reach mpv");
+    }
+
+    #[test]
+    #[ignore = "requires mpv, yt-dlp, and network access; uses invented cookies only"]
+    fn live_playback_with_cookie_replacement_and_removal() {
+        let player = Player::new(PlayerOptions {
+            cookie_file: Some(sealed_cookies("INVENTED_INITIAL")),
+            audio_output: Some("null".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        for step in 0..3 {
+            if step == 1 {
+                player
+                    .set_cookies(sealed_cookies("INVENTED_REPLACEMENT"))
+                    .unwrap();
+            }
+            if step == 2 {
+                player.clear_cookies().unwrap();
+            }
+            let id = player.play("csILUDfmtqM", "Public playback test").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(55);
+            let mut started = false;
+            let mut progressed = false;
+            while Instant::now() < deadline {
+                match player.try_recv() {
+                    Some(PlayerEvent::Started { track_id }) if track_id == id => started = true,
+                    Some(PlayerEvent::Position { track_id, seconds })
+                        if track_id == id && seconds > 1. =>
+                    {
+                        progressed = true;
+                        break;
+                    }
+                    Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                    _ => thread::sleep(Duration::from_millis(50)),
+                }
+            }
+            assert!(
+                started && progressed,
+                "playback stage {step} must begin and progress"
+            );
+        }
     }
 }

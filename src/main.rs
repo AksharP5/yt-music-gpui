@@ -51,6 +51,10 @@ fn main() {
             }
         }
     }
+    if (connect || cookies.is_some()) && !auth::ACCOUNT_LOGIN_ENABLED {
+        eprintln!("Account connection is disabled until the security review is complete.");
+        std::process::exit(1);
+    }
     if connect {
         eprintln!(
             "Sign in to YouTube Music in the Google account window. It will close when the connection is ready."

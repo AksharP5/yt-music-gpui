@@ -1,9 +1,12 @@
-use crate::auth::{self, SharedSession};
+use crate::auth::{self, Session, SharedSession};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
@@ -47,11 +50,17 @@ impl Rating {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrackDetails {
+    #[serde(skip)]
     pub rating: Option<Rating>,
+    #[serde(skip)]
     pub in_library: Option<bool>,
+    #[serde(skip)]
     pub add_library: Option<String>,
+    #[serde(skip)]
     pub remove_library: Option<String>,
+    #[serde(skip)]
     pub remove_history: Option<String>,
+    #[serde(skip)]
     pub set_video_id: Option<String>,
     pub artist_id: Option<String>,
     pub album_id: Option<String>,
@@ -156,7 +165,15 @@ impl Catalog {
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36")
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(25))
+            .redirect(reqwest::redirect::Policy::none())
             .build()? })
+    }
+
+    pub fn for_session(&self, session: Option<Arc<Session>>) -> Self {
+        Self {
+            client: self.client.clone(),
+            session: Arc::new(RwLock::new(session)),
+        }
     }
 
     pub fn account(&self) -> Result<Account> {
@@ -411,13 +428,54 @@ fn parse_item(value: &Value) -> Option<Item> {
             .find(|s| !s.is_empty())
             .unwrap_or_default(),
         thumbnail: thumbnail(row),
-        details: CollectionDetails {
-            playlist_id: id.strip_prefix("VL").map(str::to_owned),
-            saved: find(row, "likeStatus")
-                .and_then(Value::as_str)
-                .map(|s| s == "LIKE"),
-        },
+        details: collection_details(row, id),
     }))
+}
+
+fn item_rating(row: &Value) -> Option<Rating> {
+    let menu = row.pointer("/menu/menuRenderer")?;
+    if let Some(rating) = menu["topLevelButtons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|button| button.pointer("/likeButtonRenderer/likeStatus"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        return Some(rating);
+    }
+    menu["items"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("toggleMenuServiceItemRenderer"))
+        .find_map(|toggle| {
+            let status = toggle
+                .pointer("/defaultServiceEndpoint/likeEndpoint/status")?
+                .as_str()?;
+            match status {
+                "LIKE" if toggle["isToggled"] == true => Some(Rating::Like),
+                "LIKE" => Some(Rating::Indifferent),
+                "INDIFFERENT" => Some(Rating::Like),
+                _ => None,
+            }
+        })
+}
+
+fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
+    let playlist_id = browse_id.strip_prefix("VL").or_else(|| {
+        row.pointer("/menu/menuRenderer/items")?
+            .as_array()?
+            .iter()
+            .filter_map(|item| item.get("toggleMenuServiceItemRenderer"))
+            .find_map(|toggle| {
+                toggle
+                    .pointer("/defaultServiceEndpoint/likeEndpoint/target/playlistId")?
+                    .as_str()
+            })
+    });
+    CollectionDetails {
+        playlist_id: playlist_id.map(str::to_owned),
+        saved: item_rating(row).map(|rating| rating == Rating::Like),
+    }
 }
 
 fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
@@ -431,8 +489,9 @@ fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
             .map(str::to_owned)
     };
     let mut details = TrackDetails {
-        rating: find(row, "likeStatus").and_then(|v| serde_json::from_value(v.clone()).ok()),
-        set_video_id: find(row, "setVideoId")
+        rating: item_rating(row),
+        set_video_id: row
+            .pointer("/playlistItemData/setVideoId")
             .and_then(Value::as_str)
             .map(str::to_owned),
         artist_id: browse_id("UC"),
@@ -458,10 +517,21 @@ fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
             .unwrap_or("");
         let token = |key: &str| {
             menu.get(key)
-                .and_then(|v| find(v, "feedbackToken"))
+                .and_then(|v| v.pointer("/feedbackEndpoint/feedbackToken"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         };
+        if let Some(action) = menu
+            .pointer("/serviceEndpoint/playlistEditEndpoint/actions")
+            .and_then(Value::as_array)
+            .and_then(|actions| {
+                actions
+                    .iter()
+                    .find(|action| action["action"] == "ACTION_REMOVE_VIDEO")
+            })
+        {
+            details.set_video_id = action["setVideoId"].as_str().map(str::to_owned);
+        }
         match icon {
             "BOOKMARK_BORDER" => {
                 details.in_library = Some(menu["isToggled"].as_bool().unwrap_or(false));
@@ -553,15 +623,30 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
 pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     let mut shelves = Vec::new();
     parse_shelves(data, &mut shelves);
-    let title = [
+    let editable_header = find(data, "musicEditablePlaylistDetailHeaderRenderer");
+    let edit_metadata = editable_header
+        .and_then(|header| header.pointer("/editHeader/musicPlaylistEditHeaderRenderer"));
+    let header = [
         "musicResponsiveHeaderRenderer",
         "musicDetailHeaderRenderer",
         "musicImmersiveHeaderRenderer",
     ]
     .iter()
-    .find_map(|key| find(data, key).map(|header| text(&header["title"])))
-    .filter(|s| !s.is_empty())
-    .unwrap_or_else(|| fallback_title.to_owned());
+    .find_map(|key| find(editable_header.unwrap_or(data), key));
+    let title = header
+        .map(|header| text(&header["title"]))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback_title.to_owned());
+    let description = edit_metadata
+        .and_then(|header| header.get("description"))
+        .or_else(|| {
+            let description = header?.get("description")?;
+            description
+                .pointer("/musicDescriptionShelfRenderer/description")
+                .or(Some(description))
+        })
+        .map(text)
+        .unwrap_or_default();
     let continuation = find(data, "nextContinuationData")
         .and_then(|v| v["continuation"].as_str())
         .or_else(|| find(data, "continuationCommand").and_then(|v| v["token"].as_str()))
@@ -573,11 +658,11 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         title,
         shelves,
         continuation,
-        editable: find(data, "musicEditablePlaylistDetailHeaderRenderer").is_some()
-            || find(data, "editablePlaylistId").is_some(),
-        description: find(data, "description").map(text).unwrap_or_default(),
-        privacy: find(data, "musicPlaylistEditHeaderRenderer")
+        editable: editable_header.is_some(),
+        description,
+        privacy: edit_metadata
             .and_then(|v| v["privacy"].as_str())
+            .filter(|privacy| matches!(*privacy, "PRIVATE" | "UNLISTED" | "PUBLIC"))
             .map(str::to_owned),
     })
 }
@@ -619,9 +704,183 @@ mod tests {
     fn playlist_navigation_is_not_its_shuffle_endpoint() {
         let item = json!({"musicTwoRowItemRenderer": {
             "title":{"runs":[{"text":"My mix","navigationEndpoint":{"browseEndpoint":{"browseId":"VLplaylist"}}}]},
-            "menu":{"watchEndpoint":{"videoId":"abcdefghijk"}}
+            "menu":{"menuRenderer":{"items":[
+                {"menuNavigationItemRenderer":{"navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk","playlistId":"RDwrong"}}}},
+                {"toggleMenuServiceItemRenderer":{"defaultServiceEndpoint":{"likeEndpoint":{"status":"INDIFFERENT","target":{"playlistId":"playlist"}}}}}
+            ]}}
         }});
-        assert!(matches!(parse_item(&item), Some(Item::Collection(c)) if c.id == "VLplaylist"));
+        let Some(Item::Collection(collection)) = parse_item(&item) else {
+            panic!("expected a collection")
+        };
+        assert_eq!(collection.id, "VLplaylist");
+        assert_eq!(collection.details.playlist_id.as_deref(), Some("playlist"));
+        assert_eq!(collection.details.saved, Some(true));
+
+        let mut album = item;
+        album["musicTwoRowItemRenderer"]["title"]["runs"][0]["navigationEndpoint"]["browseEndpoint"]
+            ["browseId"] = json!("MPREalbum");
+        album["musicTwoRowItemRenderer"]["menu"]["menuRenderer"]["items"][1]["toggleMenuServiceItemRenderer"]
+            ["defaultServiceEndpoint"]["likeEndpoint"]["target"]["playlistId"] = json!("OLAKalbum");
+        assert!(
+            matches!(parse_item(&album), Some(Item::Collection(c)) if c.details.playlist_id.as_deref() == Some("OLAKalbum"))
+        );
+    }
+
+    #[test]
+    fn duplicate_playlist_occurrences_keep_their_own_ids() {
+        let row = |set_id| {
+            json!({"musicResponsiveListItemRenderer":{
+                "playlistItemData":{"videoId":"abcdefghijk"},
+                "flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Repeated song"}]}}}],
+                "menu":{"menuRenderer":{"items":[{"menuServiceItemRenderer":{
+                    "serviceEndpoint":{"playlistEditEndpoint":{"playlistId":"playlist","actions":[{
+                        "action":"ACTION_REMOVE_VIDEO","removedVideoId":"abcdefghijk","setVideoId":set_id
+                    }]}}
+                }}]}}
+            }})
+        };
+        let page = parse_page(
+            &json!({"contents":{"musicPlaylistShelfRenderer":{
+                "contents":[row("occurrence-1"),row("occurrence-2")]
+            }}}),
+            "Playlist",
+        )
+        .unwrap();
+        let tracks = page.tracks();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, tracks[1].id);
+        assert_eq!(
+            tracks[0].details.set_video_id.as_deref(),
+            Some("occurrence-1")
+        );
+        assert_eq!(
+            tracks[1].details.set_video_id.as_deref(),
+            Some("occurrence-2")
+        );
+    }
+
+    #[test]
+    fn owned_playlist_metadata_comes_from_its_editable_header() {
+        let mut response = json!({"contents":{"twoColumnBrowseResultsRenderer":{
+            "tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{"contents":[{
+                "musicEditablePlaylistDetailHeaderRenderer":{
+                    "playlistId":"owned-playlist",
+                    "header":{"musicResponsiveHeaderRenderer":{
+                        "title":{"runs":[{"text":"My playlist"}]},
+                        "description":{"musicDescriptionShelfRenderer":{"description":{"runs":[{"text":"Display description"}]}}}
+                    }},
+                    "editHeader":{"musicPlaylistEditHeaderRenderer":{
+                        "title":{"runs":[{"text":"My playlist"}]},
+                        "description":{"runs":[{"text":"Full editable description"}]},
+                        "privacy":"UNLISTED"
+                    }}
+                }
+            }]}}}}],
+            "secondaryContents":{"sectionListRenderer":{"contents":[]}}
+        }}});
+        let page = parse_page(&response, "Playlist").unwrap();
+        assert!(page.editable);
+        assert_eq!(page.title, "My playlist");
+        assert_eq!(page.description, "Full editable description");
+        assert_eq!(page.privacy.as_deref(), Some("UNLISTED"));
+
+        let section = &mut response["contents"]["twoColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]
+            ["content"]["sectionListRenderer"]["contents"][0];
+        *section = json!({"musicResponsiveHeaderRenderer":{
+            "title":{"runs":[{"text":"Someone else's playlist"}]},
+            "description":{"musicDescriptionShelfRenderer":{"description":{"runs":[{"text":"Public description"}]}}},
+            "menu":{"editablePlaylistId":"an-unrelated-playlist"}
+        }});
+        let page = parse_page(&response, "Playlist").unwrap();
+        assert!(!page.editable);
+        assert_eq!(page.description, "Public description");
+        assert_eq!(page.privacy, None);
+    }
+
+    #[test]
+    fn library_feedback_is_separate_from_song_rating() {
+        let mut row = json!({"menu":{"menuRenderer":{
+            "topLevelButtons":[{"likeButtonRenderer":{"likeStatus":"DISLIKE"}}],
+            "items":[
+                {"toggleMenuServiceItemRenderer":{
+                    "defaultIcon":{"iconType":"BOOKMARK_BORDER"},"isToggled":true,
+                    "defaultServiceEndpoint":{"feedbackEndpoint":{"feedbackToken":"add-song"}},
+                    "toggledServiceEndpoint":{"feedbackEndpoint":{"feedbackToken":"remove-song"}}
+                }},
+                {"menuServiceItemRenderer":{
+                    "icon":{"iconType":"REMOVE_FROM_HISTORY"},
+                    "serviceEndpoint":{"feedbackEndpoint":{"feedbackToken":"remove-history"}}
+                }}
+            ]
+        }}});
+        let details = track_details(&row, &[]);
+        assert_eq!(details.rating, Some(Rating::Dislike));
+        assert_eq!(details.in_library, Some(true));
+        assert_eq!(details.add_library.as_deref(), Some("add-song"));
+        assert_eq!(details.remove_library.as_deref(), Some("remove-song"));
+        assert_eq!(details.remove_history.as_deref(), Some("remove-history"));
+
+        let toggle = &mut row["menu"]["menuRenderer"]["items"][0]["toggleMenuServiceItemRenderer"];
+        toggle["defaultIcon"]["iconType"] = json!("BOOKMARK");
+        toggle["defaultServiceEndpoint"]["feedbackEndpoint"]["feedbackToken"] =
+            json!("remove-song");
+        toggle["toggledServiceEndpoint"]["feedbackEndpoint"]["feedbackToken"] = json!("add-song");
+        let details = track_details(&row, &[]);
+        assert_eq!(details.add_library.as_deref(), Some("add-song"));
+        assert_eq!(details.remove_library.as_deref(), Some("remove-song"));
+    }
+
+    #[test]
+    fn toggle_actions_are_not_current_ratings() {
+        let mut row = json!({"menu":{"menuRenderer":{"items":[{
+            "toggleMenuServiceItemRenderer":{
+                "defaultIcon":{"iconType":"FAVORITE"},
+                "defaultServiceEndpoint":{"likeEndpoint":{"status":"LIKE","target":{"videoId":"abcdefghijk"}}},
+                "toggledServiceEndpoint":{"likeEndpoint":{"status":"INDIFFERENT","target":{"videoId":"abcdefghijk"}}}
+            }
+        }]}}});
+        assert_eq!(track_details(&row, &[]).rating, Some(Rating::Indifferent));
+        row["menu"]["menuRenderer"]["items"][0]["toggleMenuServiceItemRenderer"]["isToggled"] =
+            json!(true);
+        assert_eq!(track_details(&row, &[]).rating, Some(Rating::Like));
+        let toggle = &mut row["menu"]["menuRenderer"]["items"][0]["toggleMenuServiceItemRenderer"];
+        toggle["isToggled"] = json!(false);
+        toggle["defaultServiceEndpoint"]["likeEndpoint"]["status"] = json!("INDIFFERENT");
+        assert_eq!(track_details(&row, &[]).rating, Some(Rating::Like));
+    }
+
+    #[test]
+    fn persisted_metadata_excludes_account_state_and_occurrence_tokens() {
+        let details = TrackDetails {
+            rating: Some(Rating::Like),
+            in_library: Some(true),
+            add_library: Some("add-song".into()),
+            remove_library: Some("remove-song".into()),
+            remove_history: Some("remove-history".into()),
+            set_video_id: Some("occurrence-1".into()),
+            artist_id: Some("UCartist".into()),
+            album_id: Some("MPREalbum".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&details).unwrap(),
+            json!({
+                "artist_id":"UCartist","album_id":"MPREalbum"
+            })
+        );
+        let restored: TrackDetails = serde_json::from_value(json!({
+            "rating":"LIKE","in_library":true,"add_library":"stale-add-song",
+            "remove_library":"stale-remove-song","remove_history":"stale-history",
+            "set_video_id":"stale-occurrence","artist_id":"UCartist","album_id":"MPREalbum"
+        }))
+        .unwrap();
+        assert_eq!(
+            restored,
+            TrackDetails {
+                artist_id: Some("UCartist".into()),
+                album_id: Some("MPREalbum".into()),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

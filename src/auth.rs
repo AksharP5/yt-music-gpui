@@ -22,7 +22,7 @@ use std::{
 
 pub const ACCOUNT_LOGIN_ENABLED: bool = false;
 pub const ORIGIN: &str = "https://music.youtube.com";
-pub type SharedSession = Arc<RwLock<Option<Session>>>;
+pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 const KEYRING_ATTRIBUTES: [&str; 4] = [
     "application",
     "yt-music-gpui",
@@ -221,7 +221,7 @@ impl Session {
 }
 
 pub fn shared(session: Option<Session>) -> SharedSession {
-    Arc::new(RwLock::new(session))
+    Arc::new(RwLock::new(session.map(Arc::new)))
 }
 fn timestamp() -> u64 {
     SystemTime::now()
@@ -398,7 +398,7 @@ fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe
 }
 
 /// Explicit user action only. Credentials stay in the OS keyring and RAM.
-pub fn connect(cancelled: &AtomicBool) -> Result<Session> {
+pub fn connect(cancelled: &AtomicBool) -> Result<(Session, crate::catalog::Account)> {
     ensure!(
         ACCOUNT_LOGIN_ENABLED,
         "Account connection is disabled until the security review is complete."
@@ -422,16 +422,16 @@ pub fn connect(cancelled: &AtomicBool) -> Result<Session> {
             Instant::now() < deadline,
             "Account connection timed out. Try again when you are ready to sign in."
         );
-        if let Some(session) = capture(&mut pipe)? {
+        if let Some((session, account)) = capture(&mut pipe)? {
             session.save()?;
             let _ = pipe.call("Browser.close", json!({}), None);
-            return Ok(session);
+            return Ok((session, account));
         }
         thread::sleep(Duration::from_secs(2));
     }
 }
 
-fn capture(pipe: &mut BrowserPipe) -> Result<Option<Session>> {
+fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Account)>> {
     let targets = pipe.call("Target.getTargets", json!({}), None)?;
     let target = targets["targetInfos"]
         .as_array()
@@ -499,8 +499,9 @@ fn capture(pipe: &mut BrowserPipe) -> Result<Option<Session>> {
             client_version: account.client_version,
         };
         session.validate()?;
-        crate::catalog::Catalog::with_session(shared(Some(session.clone())))?.account()?;
-        Ok(Some(session))
+        let account =
+            crate::catalog::Catalog::with_session(shared(Some(session.clone())))?.account()?;
+        Ok(Some((session, account)))
     })();
     let _ = pipe.call("Target.detachFromTarget", json!({"sessionId":id}), None);
     result

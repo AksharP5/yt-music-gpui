@@ -1,8 +1,8 @@
 use crate::{
-    account::{self, Effect, Mutation, Section},
+    account::{self, Connection, Effect, Mutation, Section},
     artwork::Artwork,
     auth::{self, Session, SharedSession},
-    catalog::{Account, Catalog, Collection, Item, Page, Rating, Shelf, Track},
+    catalog::{Catalog, Collection, Item, Page, Rating, Shelf, Track},
     input::{InputEvent, SearchInput},
     library::{Library, LibraryWriter, Repeat, Store},
     player::{Player, PlayerEvent, PlayerOptions},
@@ -45,6 +45,7 @@ enum Query {
 struct Job {
     id: u64,
     query: Query,
+    session: Option<Arc<Session>>,
 }
 struct CatalogResult {
     id: u64,
@@ -73,7 +74,7 @@ enum Drag {
 pub struct Music {
     theme: Theme,
     session: SharedSession,
-    account: Option<Account>,
+    account: Option<Connection>,
     account_commands: async_channel::Sender<account::Command>,
     login: Option<Arc<AtomicBool>>,
     pending_mutations: HashSet<String>,
@@ -133,27 +134,11 @@ impl Music {
             .detach();
             writer
         });
-        let (session, error) = match cookies
-            .as_deref()
-            .map(Session::from_cookie_file)
-            .transpose()
-        {
-            Ok(Some(session)) => (Some(session), error),
-            Ok(None) => (None, error),
-            Err(e) => (None, Some(format!("{e:#}"))),
-        };
-        let has_session = session.is_some();
-        let (cookie_file, error) = match session.as_ref().map(Session::playback_file).transpose() {
-            Ok(file) => (file, error),
-            Err(e) => (None, Some(format!("{e:#}"))),
-        };
-        let session = auth::shared(session);
+        let session = auth::shared(None);
         let (account_commands, account_events) = account::start(session.clone());
-        let _ = account_commands.try_send(if has_session {
-            account::Command::Verify
-        } else {
-            account::Command::LoadSaved
-        });
+        if auth::ACCOUNT_LOGIN_ENABLED {
+            let _ = account_commands.try_send(account::Command::Restore(cookies));
+        }
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = account_events.recv().await {
                 if view
@@ -167,7 +152,7 @@ impl Music {
         .detach();
         let (player, error) = match Player::new(PlayerOptions {
             cookies: None,
-            cookie_file,
+            cookie_file: None,
             volume: library.volume,
             ..Default::default()
         }) {
@@ -194,15 +179,18 @@ impl Music {
                         let append = matches!(job.query, Query::More { .. });
                         let result = match &catalog {
                             Err(e) => Err(format!("{e:#}")),
-                            Ok(catalog) => match &job.query {
-                                Query::Home => catalog.home(),
-                                Query::Explore => catalog.explore(),
-                                Query::Library(section) => catalog.library(*section),
-                                Query::Search(q) => catalog.search(q),
-                                Query::Browse(id) => catalog.browse(id),
-                                Query::More { token, search } => catalog.more(token, *search),
+                            Ok(catalog) => {
+                                let catalog = catalog.for_session(job.session);
+                                match &job.query {
+                                    Query::Home => catalog.home(),
+                                    Query::Explore => catalog.explore(),
+                                    Query::Library(section) => catalog.library(*section),
+                                    Query::Search(q) => catalog.search(q),
+                                    Query::Browse(id) => catalog.browse(id),
+                                    Query::More { token, search } => catalog.more(token, *search),
+                                }
+                                .map_err(|e| format!("{e:#}"))
                             }
-                            .map_err(|e| format!("{e:#}")),
                         };
                         if results
                             .send_blocking(CatalogResult {
@@ -341,7 +329,11 @@ impl Music {
     fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let id = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.pending_jobs.try_recv();
-        if self.jobs.try_send(Job { id, query }).is_err() {
+        let session = self
+            .account
+            .as_ref()
+            .map(|connection| connection.session.clone());
+        if self.jobs.try_send(Job { id, query, session }).is_err() {
             self.error = Some("The music connection stopped. Restart the app to reconnect.".into());
         } else {
             self.loading = true;
@@ -525,6 +517,13 @@ impl Music {
         }
     }
     fn connect_account(&mut self, cx: &mut Context<Self>) {
+        if !auth::ACCOUNT_LOGIN_ENABLED {
+            self.error = Some(
+                "Account connection is disabled until the security review is complete.".into(),
+            );
+            cx.notify();
+            return;
+        }
         if self.login.is_some() {
             return;
         }
@@ -542,14 +541,22 @@ impl Music {
         cx.notify();
     }
     fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
+        if self.login.is_some() {
+            self.error = Some("Finish or cancel account sign-in before saving changes.".into());
+            cx.notify();
+            return;
+        }
+        let Some(connection) = &self.account else {
+            return;
+        };
         let key = mutation.key();
         if self.pending_mutations.contains(&key) {
             return;
         }
-        match self
-            .account_commands
-            .try_send(account::Command::Apply(mutation))
-        {
+        match self.account_commands.try_send(account::Command::Apply {
+            session: connection.session.clone(),
+            mutation,
+        }) {
             Ok(()) => {
                 self.pending_mutations.insert(key);
                 self.notice = Some("Saving to YouTube Music…".into());
@@ -557,6 +564,30 @@ impl Music {
             Err(_) => {
                 self.error = Some("Too many pending changes. Wait for them to finish.".into())
             }
+        }
+        cx.notify();
+    }
+    fn disconnect_account(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancelled) = self.login.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+        if let Ok(mut session) = self.session.write() {
+            *session = None;
+        }
+        self.account = None;
+        self.ratings.clear();
+        self.pending_mutations.clear();
+        self.back.clear();
+        self.player_command(Player::clear_cookies);
+        self.active_id = None;
+        self.playback = Playback::Stopped;
+        self.navigate(Route::Home, cx);
+        if self
+            .account_commands
+            .try_send(account::Command::Disconnect)
+            .is_err()
+        {
+            self.error = Some("Playback and account access stopped. The account worker could not remove the saved keyring entry.".into());
         }
         cx.notify();
     }
@@ -575,39 +606,57 @@ impl Music {
     }
     fn account_event(&mut self, event: account::Event, cx: &mut Context<Self>) {
         match event {
-            account::Event::Disconnected(result) => match result {
-                Ok(()) => {
-                    self.account = None;
-                    self.ratings.clear();
-                    self.notice = Some("Signed out of YouTube Music".into());
-                    self.navigate(Route::Home, cx);
+            account::Event::Disconnected(result) => {
+                self.account = None;
+                self.ratings.clear();
+                self.back.clear();
+                self.player_command(Player::clear_cookies);
+                self.active_id = None;
+                self.playback = Playback::Stopped;
+                self.navigate(Route::Home, cx);
+                match result {
+                    Ok(()) => {
+                        self.notice = Some("Signed out of YouTube Music".into());
+                    }
+                    Err(error) => self.error = Some(error),
                 }
-                Err(error) => self.error = Some(error),
-            },
+            }
             account::Event::Connected(result) => {
                 self.login = None;
                 match result {
-                    Ok(account) => {
-                        let file = self
-                            .session
-                            .read()
-                            .ok()
-                            .and_then(|s| s.as_ref().map(Session::playback_file));
-                        if let Some(result) = file {
-                            match result {
-                                Ok(file) => self.player_command(|p| p.set_cookies(file)),
-                                Err(error) => self.error = Some(format!("{error:#}")),
-                            }
+                    Ok(connection) => {
+                        self.player_command(Player::clear_cookies);
+                        self.active_id = None;
+                        self.playback = Playback::Stopped;
+                        match connection.session.playback_file() {
+                            Ok(file) => self.player_command(|p| p.set_cookies(file)),
+                            Err(error) => self.error = Some(format!("{error:#}")),
                         }
-                        self.notice = Some(format!("Connected as {}", account.name));
-                        self.account = Some(account);
+                        self.notice = Some(format!("Connected as {}", connection.account.name));
+                        self.account = Some(connection);
                         self.ratings.clear();
+                        self.pending_mutations.clear();
+                        self.back.clear();
+                        self.page.shelves.clear();
+                        self.rows.clear();
+                        self.page.continuation = None;
                         self.refresh_remote(cx);
                     }
                     Err(error) => self.error = Some(error),
                 }
             }
-            account::Event::Applied { mutation, result } => {
+            account::Event::Applied {
+                session,
+                mutation,
+                result,
+            } => {
+                if !self
+                    .account
+                    .as_ref()
+                    .is_some_and(|connection| Arc::ptr_eq(&connection.session, &session))
+                {
+                    return;
+                }
                 self.pending_mutations.remove(&mutation.key());
                 match result {
                     Ok(effect) => {
@@ -1915,12 +1964,13 @@ impl Music {
             let label = self
                 .account
                 .as_ref()
-                .map(|a| format!("{} {}", a.name, a.handle))
+                .map(|a| format!("{} {}", a.account.name, a.account.handle))
                 .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
             body=body.child(div().text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(if self.login.is_some(){"Waiting for Google sign-in…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
+                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if self.login.is_some(){"Waiting for Google sign-in…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
+                .when(self.account.is_some(), |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Sign out").on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Refresh to load changes made on the web."}else{"Guest likes and saved collections stay on this computer until you connect an account."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
         }
@@ -1940,6 +1990,14 @@ impl Music {
             )
             .child(body)
             .into_any_element()
+    }
+}
+
+impl Drop for Music {
+    fn drop(&mut self) {
+        if let Some(cancelled) = &self.login {
+            cancelled.store(true, Ordering::Release);
+        }
     }
 }
 

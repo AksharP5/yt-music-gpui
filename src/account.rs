@@ -1,10 +1,11 @@
 use crate::{
-    auth::{self, SharedSession},
+    auth::{self, Session, SharedSession},
     catalog::{Account, Catalog, Collection, Page, Rating, Track, find, parse_page},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     thread,
 };
@@ -142,17 +143,42 @@ pub enum Effect {
     Changed,
     CreatedPlaylist(String),
 }
+#[derive(Clone)]
+pub struct Connection {
+    pub account: Account,
+    pub session: Arc<Session>,
+}
+
+impl Connection {
+    fn verify(session: Session, catalog: &Catalog) -> Result<Self> {
+        let session = Arc::new(session);
+        let account = catalog.for_session(Some(session.clone())).account()?;
+        Ok(Self { account, session })
+    }
+
+    fn publish(self, shared: &SharedSession) -> Result<Self> {
+        *shared
+            .write()
+            .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))? =
+            Some(self.session.clone());
+        Ok(self)
+    }
+}
+
 pub enum Command {
     Connect(Arc<AtomicBool>),
-    Apply(Mutation),
-    Verify,
-    LoadSaved,
+    Apply {
+        session: Arc<Session>,
+        mutation: Mutation,
+    },
+    Restore(Option<PathBuf>),
     Disconnect,
 }
 pub enum Event {
-    Connected(Result<Account, String>),
+    Connected(Result<Connection, String>),
     Disconnected(Result<(), String>),
     Applied {
+        session: Arc<Session>,
         mutation: Mutation,
         result: Result<Effect, String>,
     },
@@ -174,53 +200,42 @@ pub fn start(
                 let event = match command {
                     Command::Connect(cancelled) => Event::Connected(
                         (|| {
-                            let connected = auth::connect(&cancelled)?;
-                            *session.write().map_err(|_| {
-                                anyhow::anyhow!("Account connection is unavailable")
-                            })? = Some(connected);
-                            catalog
-                                .as_ref()
-                                .map_err(|e| anyhow::anyhow!("{e:#}"))?
-                                .account()
+                            let (candidate, account) = auth::connect(&cancelled)?;
+                            Connection { session: Arc::new(candidate), account }.publish(&session)
                         })()
                         .map_err(|e| format!("{e:#}")),
                     ),
-                    Command::LoadSaved => match auth::Session::load() {
-                        Ok(Some(saved)) => {
-                            if let Ok(mut current) = session.write() {
-                                *current = Some(saved);
-                            }
-                            Event::Connected(
-                                catalog
-                                    .as_ref()
-                                    .map_err(|e| format!("{e:#}"))
-                                    .and_then(|c| c.account().map_err(|e| format!("{e:#}"))),
-                            )
+                    Command::Restore(path) => {
+                        let result = (|| {
+                            ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
+                            let candidate = match path {
+                                Some(path) => Some(Session::from_cookie_file(&path)?),
+                                None => Session::load()?,
+                            };
+                            candidate.map(|candidate| {
+                                let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                                Connection::verify(candidate, catalog)?.publish(&session)
+                            }).transpose()
+                        })();
+                        match result {
+                            Ok(Some(connection)) => Event::Connected(Ok(connection)),
+                            Ok(None) => continue,
+                            Err(error) => Event::Connected(Err(format!("{error:#}"))),
                         }
-                        Ok(None) => continue,
-                        Err(error) => Event::Connected(Err(format!("{error:#}"))),
-                    },
+                    }
                     Command::Disconnect => {
+                        // End in-memory authority even if keyring removal needs another attempt.
+                        if let Ok(mut current) = session.write() { *current = None; }
                         let result = auth::Session::disconnect().map_err(|e| format!("{e:#}"));
-                        if result.is_ok()
-                            && let Ok(mut current) = session.write()
-                        {
-                            *current = None;
-                        }
                         Event::Disconnected(result)
                     }
-                    Command::Verify => Event::Connected(
-                        catalog
-                            .as_ref()
-                            .map_err(|e| format!("{e:#}"))
-                            .and_then(|c| c.account().map_err(|e| format!("{e:#}"))),
-                    ),
-                    Command::Apply(mutation) => {
-                        let result = catalog
-                            .as_ref()
-                            .map_err(|e| format!("{e:#}"))
-                            .and_then(|c| c.mutate(&mutation).map_err(|e| format!("{e:#}")));
-                        Event::Applied { mutation, result }
+                    Command::Apply { session: expected, mutation } => {
+                        let result = (|| {
+                            require_current_session(&session, &expected)?;
+                            catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?
+                                .for_session(Some(expected.clone())).mutate(&mutation)
+                        })().map_err(|e| format!("{e:#}"));
+                        Event::Applied { session: expected, mutation, result }
                     }
                 };
                 if events.send_blocking(event).is_err() {
@@ -230,6 +245,19 @@ pub fn start(
         })
         .expect("start account sync worker");
     (requests, completed)
+}
+
+fn require_current_session(shared: &SharedSession, expected: &Arc<Session>) -> Result<()> {
+    let current = shared
+        .read()
+        .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?;
+    ensure!(
+        current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected)),
+        "The account changed before this edit could be saved. Refresh and try again."
+    );
+    Ok(())
 }
 
 impl Catalog {
@@ -433,6 +461,54 @@ fn confirm_mutation(endpoint: &str, response: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn synthetic_session() -> Session {
+        serde_json::from_value(json!({
+            "cookie":"SAPISID=synthetic-test-value",
+            "playback_cookie":"# Netscape HTTP Cookie File\n",
+            "authuser":"0", "delegated_session_id":null, "client_version":"test"
+        }))
+        .unwrap()
+    }
+    #[test]
+    fn queued_writes_require_the_exact_verified_session() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        assert!(require_current_session(&shared, &expected).is_ok());
+        // Even equal cookie bytes restored later represent a different connection.
+        *shared.write().unwrap() = Some(Arc::new(synthetic_session()));
+        assert!(require_current_session(&shared, &expected).is_err());
+        *shared.write().unwrap() = None;
+        assert!(require_current_session(&shared, &expected).is_err());
+    }
+    #[test]
+    fn rejected_candidate_preserves_the_previous_verified_session() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let catalog = Catalog::with_session(shared.clone()).unwrap();
+        let mut candidate = synthetic_session();
+        // An invalid request header fails before any network connection is made.
+        candidate.client_version = "invalid\nclient".into();
+        assert!(Connection::verify(candidate, &catalog).is_err());
+        assert!(require_current_session(&shared, &expected).is_ok());
+    }
+    #[test]
+    fn disabled_accounts_reject_import_before_reading_credentials() {
+        if auth::ACCOUNT_LOGIN_ENABLED {
+            return;
+        }
+        let (commands, events) = start(auth::shared(None));
+        commands
+            .send_blocking(Command::Restore(Some(PathBuf::from(
+                "/nonexistent-synthetic-cookie-file",
+            ))))
+            .unwrap();
+        match events.recv_blocking().unwrap() {
+            Event::Connected(Err(error)) => {
+                assert!(error.contains("disabled until the security review"))
+            }
+            _ => panic!("account import must fail closed"),
+        }
+    }
     #[test]
     fn failed_or_missing_acknowledgements_are_not_success() {
         for response in [

@@ -34,13 +34,7 @@ bin/install
 
 The installer writes to `~/.local/bin` and `$XDG_DATA_HOME`, defaulting to `~/.local/share`. It does not install system dependencies. Alternatively, build an Arch package by running `makepkg` inside `packaging/`, then install that package with your package manager.
 
-For an explicitly supplied playback session, you can import a Netscape-format cookie file:
-
-```sh
-yt-music-gpui --cookies /absolute/path/to/cookies.txt
-```
-
-Imported cookies are restricted to YouTube domains and used for account requests and playback. They are supplied by the user and are never read from existing browser profiles. Keep source cookie files outside this repository. The account connection being developed uses an isolated Google login window, the OS keyring, and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports.
+Account sign-in, saved-session loading and explicit cookie import are currently disabled. The account connection being developed uses an isolated Google login window, the OS keyring, and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports or inspect existing browser profiles.
 
 ## Controls
 
