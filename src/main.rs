@@ -1,6 +1,7 @@
 mod app;
 mod artwork;
 mod assets;
+mod auth;
 mod catalog;
 mod input;
 mod library;
@@ -12,9 +13,11 @@ use std::path::PathBuf;
 
 fn main() {
     let mut cookies = None;
+    let mut connect = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--connect" => connect = true,
             "--cookies" => {
                 cookies = args.next().map(PathBuf::from);
                 if cookies.is_none() {
@@ -24,7 +27,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--cookies FILE]\n\n--cookies FILE   Netscape cookies file for playback\n\nCtrl K searches. Press ? in the app for all shortcuts."
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--connect] [--cookies FILE]\n\n--connect        Connect your Google account in a dedicated sign-in window\n--cookies FILE   Import a Netscape-format YouTube account session\n\nCtrl K searches. Press ? in the app for all shortcuts."
                 );
                 return;
             }
@@ -36,6 +39,15 @@ fn main() {
                 eprintln!("Unknown argument: {arg}. Use --help for usage.");
                 std::process::exit(2);
             }
+        }
+    }
+    if connect {
+        eprintln!(
+            "Sign in to YouTube Music in the Google account window. It will close when the connection is ready."
+        );
+        if let Err(error) = auth::connect(&std::sync::atomic::AtomicBool::new(false)) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
         }
     }
     gpui_platform::application()

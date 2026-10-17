@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use crate::auth::{self, SharedSession};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -6,6 +7,12 @@ use std::{collections::HashSet, time::Duration};
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
+
+#[derive(Clone)]
+pub struct Account {
+    pub name: String,
+    pub handle: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Track {
@@ -90,15 +97,33 @@ impl Page {
 #[derive(Clone)]
 pub struct Catalog {
     client: Client,
+    session: SharedSession,
 }
 
 impl Catalog {
     pub fn new() -> Result<Self> {
-        Ok(Self { client: Client::builder()
+        Self::with_session(auth::shared(None))
+    }
+
+    pub fn with_session(session: SharedSession) -> Result<Self> {
+        Ok(Self {
+            session, client: Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36")
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(25))
             .build()? })
+    }
+
+    pub fn account(&self) -> Result<Account> {
+        let data = self.request("account/account_menu", json!({}))?;
+        let header = find(&data, "activeAccountHeaderRenderer")
+            .context("Google did not accept the account session. Connect again.")?;
+        let name = text(&header["accountName"]);
+        ensure!(!name.is_empty(), "Google returned no signed-in account");
+        Ok(Account {
+            name,
+            handle: text(&header["channelHandle"]),
+        })
     }
 
     pub fn home(&self) -> Result<Page> {
@@ -143,18 +168,34 @@ impl Catalog {
         parse_page(&data, "More music")
     }
 
-    fn request(&self, endpoint: &str, mut body: Value) -> Result<Value> {
+    pub fn request(&self, endpoint: &str, mut body: Value) -> Result<Value> {
         body["context"] = json!({"client": {
             "clientName": "WEB_REMIX", "clientVersion": CLIENT_VERSION, "hl": "en", "gl": "US"
         }});
-        let response = self
+        let session = self
+            .session
+            .read()
+            .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?;
+        if let Some(session) = session.as_ref() {
+            body["context"]["client"]["clientVersion"] = json!(session.client_version);
+            if let Some(delegated) = &session.delegated_session_id {
+                body["context"]["user"] = json!({"onBehalfOfUser":delegated});
+            }
+        }
+        let request = self
             .client
             .post(format!("{ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false"))
             .header("Origin", ORIGIN)
             .header("Referer", format!("{ORIGIN}/"))
             .header("X-YouTube-Client-Name", "67")
             .header("X-YouTube-Client-Version", CLIENT_VERSION)
-            .json(&body)
+            .json(&body);
+        let request = match session.as_ref() {
+            Some(session) => session.apply(request)?,
+            None => request,
+        };
+        drop(session);
+        let response = request
             .send()
             .context("Could not reach YouTube Music. Check your connection and try again.")?
             .error_for_status()
@@ -172,7 +213,7 @@ impl Catalog {
     }
 }
 
-fn text(value: &Value) -> String {
+pub fn text(value: &Value) -> String {
     if let Some(s) = value["simpleText"].as_str() {
         return s.to_owned();
     }
@@ -182,7 +223,7 @@ fn text(value: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn find<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+pub fn find<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     match value {
         Value::Object(map) => map
             .get(key)
