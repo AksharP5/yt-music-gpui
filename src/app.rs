@@ -2,7 +2,7 @@ use crate::{
     account::{self, Connection, Effect, Mutation, Privacy, Section},
     artwork::Artwork,
     auth::{self, Operation, Session, SharedSession},
-    catalog::{Catalog, Collection, Item, Page, Rating, Shelf, Track},
+    catalog::{BrowseLink, Catalog, Collection, Item, Page, Rating, Shelf, Track},
     library::{Library, LibraryWriter, Repeat, Store},
     player::{AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
     playlist_form::{PlaylistForm, PlaylistFormEvent},
@@ -37,7 +37,7 @@ enum Route {
     Home,
     Explore,
     Search(Search),
-    Browse(String),
+    Browse(BrowseLink),
     Liked,
     Recent,
     Saved,
@@ -48,7 +48,7 @@ enum Query {
     Home,
     Explore,
     Search(Search),
-    Browse(String),
+    Browse(BrowseLink),
     More {
         token: String,
         search: Option<Search>,
@@ -321,7 +321,7 @@ impl Music {
                                         search.filter,
                                         search.scope,
                                     ),
-                                    Query::Browse(id) => catalog.browse(id),
+                                    Query::Browse(link) => catalog.browse(link),
                                     Query::More {
                                         token,
                                         search: Some(search),
@@ -876,9 +876,9 @@ impl Music {
                     .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
                 self.request(Query::Search(search), cx);
             }
-            Route::Browse(id) => {
-                self.page.title = "Loading collection".into();
-                self.request(Query::Browse(id), cx);
+            Route::Browse(link) => {
+                self.page.title = link.title.clone();
+                self.request(Query::Browse(link), cx);
             }
             Route::Library(section) => {
                 self.page.title = section.title().into();
@@ -1135,7 +1135,7 @@ impl Music {
             Route::Home => Query::Home,
             Route::Explore => Query::Explore,
             Route::Search(search) => Query::Search(search.clone()),
-            Route::Browse(id) => Query::Browse(id.clone()),
+            Route::Browse(link) => Query::Browse(link.clone()),
             Route::Liked => Query::Library(Section::Liked),
             Route::Recent => Query::Library(Section::History),
             Route::Saved => Query::Library(Section::Songs),
@@ -1151,7 +1151,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         let (id, title, description, privacy) = if edit {
-            let Route::Browse(id) = &self.route else {
+            let Route::Browse(link) = &self.route else {
                 return;
             };
             if !self.page.editable {
@@ -1170,7 +1170,7 @@ impl Music {
                 }
             };
             (
-                Some(id.clone()),
+                Some(link.id.clone()),
                 self.page.title.clone(),
                 self.page.description.clone(),
                 privacy,
@@ -1356,7 +1356,10 @@ impl Music {
                                         cx,
                                     );
                                 }
-                                self.navigate(Route::Browse(format!("VL{id}")), cx)
+                                self.navigate(
+                                    Route::Browse(BrowseLink::new(format!("VL{id}"), "Playlist")),
+                                    cx,
+                                )
                             }
                             Effect::Changed => {
                                 if matches!(
@@ -1591,7 +1594,11 @@ impl Music {
     }
     fn play_item(&mut self, item: Item, cx: &mut Context<Self>) {
         match item {
-            Item::Collection(collection) => self.navigate(Route::Browse(collection.id), cx),
+            Item::Navigation(link) => self.navigate(Route::Browse(link), cx),
+            Item::Collection(collection) => self.navigate(
+                Route::Browse(BrowseLink::new(collection.id, collection.title)),
+                cx,
+            ),
             Item::Track(track) => {
                 let tracks = self.page.tracks();
                 if let Some(index) = tracks.iter().position(|t| {
@@ -2159,6 +2166,13 @@ impl Music {
             )
     }
     fn card(&mut self, item: Item, id: usize, cx: &Context<Self>) -> AnyElement {
+        if let Item::Navigation(link) = item {
+            return self
+                .navigation(link, ("shelf-link", id), cx)
+                .w(px(240.))
+                .h(px(44.))
+                .into_any_element();
+        }
         let art = self.art(item.thumbnail(), 164.);
         let title = item.title().to_owned();
         let subtitle = item.subtitle().to_owned();
@@ -2193,8 +2207,70 @@ impl Music {
             }))
             .into_any_element()
     }
+    fn navigation(
+        &self,
+        link: BrowseLink,
+        id: impl Into<ElementId>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(15.))
+            .cursor_pointer()
+            .hover(|d| d.text_color(self.theme.accent))
+            .child(div().flex_1().child(link.title.clone()))
+            .child(icon("forward", 17., self.theme.muted))
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&view.focus, cx);
+                view.navigate(Route::Browse(link.clone()), cx);
+            }))
+    }
     fn shelf(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let shelf = self.page.shelves[index].clone();
+        let mut contents = div()
+            .id(("carousel", index))
+            .flex()
+            .gap(px(20.))
+            .overflow_x_scroll()
+            .pb(px(10.));
+        if shelf
+            .items
+            .iter()
+            .all(|item| matches!(item, Item::Navigation(_)))
+        {
+            for (column, items) in shelf.items.chunks(4).enumerate() {
+                contents = contents.child(
+                    div()
+                        .w(px(240.))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .children(
+                            items
+                                .iter()
+                                .cloned()
+                                .enumerate()
+                                .map(|(row, item)| {
+                                    self.card(item, index * 1000 + column * 4 + row, cx)
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                );
+            }
+        } else {
+            contents = contents.children(
+                shelf
+                    .items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, item)| self.card(item, index * 1000 + i, cx))
+                    .collect::<Vec<_>>(),
+            );
+        }
         div()
             .id(("shelf", index))
             .h(px(308.))
@@ -2208,22 +2284,7 @@ impl Music {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(shelf.title),
             )
-            .child(
-                div()
-                    .id(("carousel", index))
-                    .flex()
-                    .gap(px(20.))
-                    .overflow_x_scroll()
-                    .pb(px(10.))
-                    .children(
-                        shelf
-                            .items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, item)| self.card(item, index * 1000 + i, cx))
-                            .collect::<Vec<_>>(),
-                    ),
-            )
+            .child(contents)
             .into_any_element()
     }
     fn row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -2278,6 +2339,15 @@ impl Music {
                     ),
             );
         match item {
+            Item::Navigation(link) => {
+                return self
+                    .navigation(link, ("browse-link", index), cx)
+                    .w_full()
+                    .h(px(68.))
+                    .px(px(30.))
+                    .hover(|d| d.bg(self.theme.raised))
+                    .into_any_element();
+            }
             Item::Track(track) => {
                 let liked = self.is_liked(&track);
                 let like_track = track.clone();
@@ -2421,9 +2491,9 @@ impl Music {
                                 .text_size(px(13.))
                                 .child("Delete")
                                 .on_click(cx.listener(|view, _, _, cx| {
-                                    if let Route::Browse(id) = &view.route {
+                                    if let Route::Browse(link) = &view.route {
                                         view.overlay = Some(Overlay::DeletePlaylist {
-                                            id: id.clone(),
+                                            id: link.id.clone(),
                                             title: view.page.title.clone(),
                                         });
                                         cx.notify();
@@ -2662,17 +2732,56 @@ impl Music {
                 .into_any_element();
         }
         content = if home {
-            content.child(
-                uniform_list(
-                    ("home-shelves", self.list_id),
-                    self.page.shelves.len(),
-                    cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
-                        range.map(|i| view.shelf(i, cx)).collect::<Vec<_>>()
-                    }),
+            let mut links = Vec::new();
+            let mut shelves = Vec::new();
+            for (index, shelf) in self.page.shelves.iter().enumerate() {
+                if shelf.title.is_empty()
+                    && shelf
+                        .items
+                        .iter()
+                        .all(|item| matches!(item, Item::Navigation(_)))
+                {
+                    for (i, item) in shelf.items.iter().enumerate() {
+                        if let Item::Navigation(link) = item {
+                            links.push(
+                                self.navigation(
+                                    link.clone(),
+                                    ("discovery-link", index * 1000 + i),
+                                    cx,
+                                )
+                                .py(px(10.)),
+                            );
+                        }
+                    }
+                } else {
+                    shelves.push(index);
+                }
+            }
+            content
+                .when(!links.is_empty(), |content| {
+                    content.child(
+                        div()
+                            .mx(px(30.))
+                            .mb(px(12.))
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(28.))
+                            .children(links),
+                    )
+                })
+                .child(
+                    uniform_list(
+                        ("home-shelves", self.list_id),
+                        shelves.len(),
+                        cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                            range
+                                .map(|i| view.shelf(shelves[i], cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .flex_1()
+                    .min_h_0(),
                 )
-                .flex_1()
-                .min_h_0(),
-            )
         } else {
             content.child(
                 uniform_list(
@@ -3470,7 +3579,10 @@ impl Music {
                         cx,
                         move |view, _, cx| {
                             view.overlay = None;
-                            view.navigate(Route::Browse(id.clone()), cx);
+                            view.navigate(
+                                Route::Browse(BrowseLink::new(id.clone(), "Related music")),
+                                cx,
+                            );
                         },
                     ));
                 }
@@ -3601,10 +3713,10 @@ impl Music {
                     ));
                 }
                 if self.page.editable
-                    && let Route::Browse(id) = &self.route
+                    && let Route::Browse(link) = &self.route
                     && let Some(set_id) = &track.details.set_video_id
                 {
-                    let playlist = id.clone();
+                    let playlist = link.id.clone();
                     let set = set_id.clone();
                     let video_id = track.id.clone();
                     body = body.child(self.menu_action(
@@ -3650,7 +3762,7 @@ impl Music {
                             ),
                         ] {
                             if let Some(before) = before {
-                                let playlist = id.clone();
+                                let playlist = link.id.clone();
                                 let set = set_id.clone();
                                 body = body.child(self.menu_action(
                                     key,
@@ -3673,15 +3785,25 @@ impl Music {
                     }
                 }
             }
-            for (id, label, target) in [
-                ("menu-artist", "Go to artist", &track.details.artist_id),
-                ("menu-album", "Go to album", &track.details.album_id),
+            for (id, label, title, target) in [
+                (
+                    "menu-artist",
+                    "Go to artist",
+                    "Artist",
+                    &track.details.artist_id,
+                ),
+                (
+                    "menu-album",
+                    "Go to album",
+                    "Album",
+                    &track.details.album_id,
+                ),
             ] {
                 if let Some(target) = target {
                     let target = target.clone();
                     body = body.child(self.menu_action(id, label, cx, move |view, _, cx| {
                         view.overlay = None;
-                        view.navigate(Route::Browse(target.clone()), cx);
+                        view.navigate(Route::Browse(BrowseLink::new(target.clone(), title)), cx);
                     }));
                 }
             }

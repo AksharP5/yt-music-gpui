@@ -30,6 +30,8 @@ One native High-quality load failed. Public diagnosis found intermittent HTTP 40
 
 The final native check passed High playback, paused High/Normal changes at 22 seconds, resumption, unchanged queue selection and quality preference restoration after restarting the app. The preceding build also passed a playing switch to Low. These checks used a muted guest fixture; they did not access a real Google account or verify signed-in history.
 
+The discovery checkpoint passes 62 ordinary tests and strict all-target Clippy. Navigation targets keep their validated browse IDs and bounded encoded parameters in the existing fixed-endpoint, session-bound request path. Malformed links are rejected, and navigation items have no collection-save controls. Focused parsing tests, live public destinations and native category/Refresh/Back checks passed. This adds no credential path and does not extend the earlier sealed scan or establish authenticated parity.
+
 ## Dependency maintenance
 
 687 locked packages were checked against RustSec advisory database commit 999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b. Version requirements were matched using Rust's semver implementation, excluding withdrawn advisories. No current vulnerability or unsoundness advisory matched. Six active transitive dependencies matched unmaintained advisories, with no patched versions listed:

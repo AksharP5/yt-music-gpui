@@ -101,10 +101,58 @@ pub struct Collection {
     pub details: CollectionDetails,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowseLink {
+    pub title: String,
+    pub id: String,
+    pub params: Option<String>,
+}
+
+impl BrowseLink {
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            id: id.into(),
+            params: None,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.id.is_empty()
+                && self.id.len() <= 256
+                && self
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)),
+            "This page has an invalid YouTube Music ID"
+        );
+        ensure!(!self.title.trim().is_empty(), "This page has no name");
+        if let Some(params) = &self.params {
+            ensure!(
+                params.len() <= 8192,
+                "YouTube Music returned an invalid page link"
+            );
+            let mut bytes = params.bytes();
+            while let Some(byte) = bytes.next() {
+                let valid = if byte == b'%' {
+                    bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                        && bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                } else {
+                    byte.is_ascii_alphanumeric() || b"_-+=/.~".contains(&byte)
+                };
+                ensure!(valid, "YouTube Music returned an invalid page link");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Item {
     Track(Track),
     Collection(Collection),
+    Navigation(BrowseLink),
 }
 
 impl Item {
@@ -112,24 +160,28 @@ impl Item {
         match self {
             Self::Track(t) => &t.id,
             Self::Collection(c) => &c.id,
+            Self::Navigation(link) => &link.id,
         }
     }
     pub fn title(&self) -> &str {
         match self {
             Self::Track(t) => &t.title,
             Self::Collection(c) => &c.title,
+            Self::Navigation(link) => &link.title,
         }
     }
     pub fn subtitle(&self) -> &str {
         match self {
             Self::Track(t) => &t.artist,
             Self::Collection(c) => &c.subtitle,
+            Self::Navigation(_) => "",
         }
     }
     pub fn thumbnail(&self) -> Option<&str> {
         match self {
             Self::Track(t) => t.thumbnail.as_deref(),
             Self::Collection(c) => c.thumbnail.as_deref(),
+            Self::Navigation(_) => None,
         }
     }
 }
@@ -207,28 +259,21 @@ impl Catalog {
     }
 
     pub fn home(&self) -> Result<Page> {
-        self.browse_named("FEmusic_home", "Home")
+        self.browse(&BrowseLink::new("FEmusic_home", "Home"))
     }
 
     pub fn explore(&self) -> Result<Page> {
-        self.browse_named("FEmusic_explore", "Explore")
+        self.browse(&BrowseLink::new("FEmusic_explore", "Explore"))
     }
 
-    pub fn browse(&self, id: &str) -> Result<Page> {
-        if id.is_empty()
-            || id.len() > 256
-            || !id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-        {
-            bail!("This collection has an invalid YouTube Music ID.");
+    pub fn browse(&self, link: &BrowseLink) -> Result<Page> {
+        link.validate()?;
+        let mut body = json!({"browseId":link.id});
+        if let Some(params) = &link.params {
+            body["params"] = json!(params);
         }
-        self.browse_named(id, "Playlist")
-    }
-
-    fn browse_named(&self, id: &str, title: &str) -> Result<Page> {
-        let data = self.request("browse", json!({"browseId": id}))?;
-        parse_page(&data, title)
+        let data = self.request("browse", body)?;
+        parse_page(&data, &link.title)
     }
 
     pub fn more(&self, continuation: &str, search: bool) -> Result<Page> {
@@ -346,6 +391,19 @@ pub(crate) fn valid_video_id(id: &str) -> bool {
 }
 
 fn parse_item(value: &Value) -> Option<Item> {
+    if let Some(button) = value.get("musicNavigationButtonRenderer") {
+        let endpoint = button.pointer("/clickCommand/browseEndpoint")?;
+        let link = BrowseLink {
+            title: text(&button["buttonText"]),
+            id: endpoint["browseId"].as_str()?.to_owned(),
+            params: match endpoint.get("params") {
+                Some(params) => Some(params.as_str()?.to_owned()),
+                None => None,
+            },
+        };
+        link.validate().ok()?;
+        return Some(Item::Navigation(link));
+    }
     let row = value
         .get("musicResponsiveListItemRenderer")
         .or_else(|| value.get("musicTwoRowItemRenderer"))
@@ -577,10 +635,13 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                 "musicPlaylistShelfContinuation",
                 "musicShelfContinuation",
                 "musicGridRenderer",
+                "gridRenderer",
             ] {
                 if let Some(shelf) = map.get(key) {
                     let title = if key == "musicCarouselShelfRenderer" {
                         text(&shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"])
+                    } else if key == "gridRenderer" {
+                        text(&shelf["header"]["gridHeaderRenderer"]["title"])
                     } else {
                         text(&shelf["title"])
                     };
@@ -685,6 +746,112 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn navigation(title: &str, params: &str) -> Value {
+        json!({"musicNavigationButtonRenderer":{
+            "buttonText":{"runs":[{"text":title}]},
+            "clickCommand":{"browseEndpoint":{
+                "browseId":"FEmusic_moods_and_genres_category", "params":params
+            }}
+        }})
+    }
+
+    #[test]
+    fn navigation_grids_preserve_parameter_identity_and_server_order() {
+        let data = json!({"contents":{"sectionListRenderer":{"contents":[{
+            "gridRenderer":{
+                "header":{"gridHeaderRenderer":{"title":{"simpleText":"Moods & moments"}}},
+                "items":[navigation("Chill", "first%3D%3D"), navigation("Commute", "second_-/+=")]
+            }
+        }]}}});
+        let page = parse_page(&data, "Moods & genres").unwrap();
+        assert_eq!(page.title, "Moods & genres");
+        assert_eq!(page.shelves.len(), 1);
+        assert_eq!(page.shelves[0].title, "Moods & moments");
+        let [Item::Navigation(first), Item::Navigation(second)] = page.shelves[0].items.as_slice()
+        else {
+            panic!("expected two navigation links")
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.title, "Chill");
+        assert_eq!(second.title, "Commute");
+        assert_eq!(first.params.as_deref(), Some("first%3D%3D"));
+        assert_eq!(second.params.as_deref(), Some("second_-/+="));
+        let different_params = BrowseLink {
+            title: first.title.clone(),
+            ..second.clone()
+        };
+        assert_ne!(first, &different_params);
+        assert!(page.tracks().is_empty());
+        assert_eq!(page.shelves[0].items[0].subtitle(), "");
+        assert_eq!(page.shelves[0].items[0].thumbnail(), None);
+    }
+
+    #[test]
+    fn malformed_navigation_is_not_actionable() {
+        let valid = navigation("Chill", "filter%3D");
+        for (path, value) in [
+            ("/musicNavigationButtonRenderer/buttonText", Value::Null),
+            (
+                "/musicNavigationButtonRenderer/buttonText",
+                json!({"simpleText":"  "}),
+            ),
+            ("/musicNavigationButtonRenderer/clickCommand", Value::Null),
+            (
+                "/musicNavigationButtonRenderer/clickCommand/browseEndpoint",
+                json!({"url":"https://example.invalid"}),
+            ),
+            (
+                "/musicNavigationButtonRenderer/clickCommand/browseEndpoint/browseId",
+                json!("https://example.invalid"),
+            ),
+            (
+                "/musicNavigationButtonRenderer/clickCommand/browseEndpoint/params",
+                json!({"filter":"not a string"}),
+            ),
+            (
+                "/musicNavigationButtonRenderer/clickCommand/browseEndpoint/params",
+                json!("filter&other=value"),
+            ),
+            (
+                "/musicNavigationButtonRenderer/clickCommand/browseEndpoint/params",
+                json!("filter%3"),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(parse_item(&invalid).is_none());
+        }
+        let without_params = json!({"musicNavigationButtonRenderer":{
+            "buttonText":{"simpleText":"New releases"},
+            "clickCommand":{"browseEndpoint":{"browseId":"FEmusic_new_releases"}}
+        }});
+        assert!(
+            matches!(parse_item(&without_params), Some(Item::Navigation(link)) if link.params.is_none())
+        );
+
+        let catalog = Catalog::new().unwrap();
+        for link in [
+            BrowseLink::new("https://example.invalid", "Invalid"),
+            BrowseLink::new("A".repeat(257), "Invalid"),
+            BrowseLink {
+                params: Some("A".repeat(8193)),
+                ..BrowseLink::new("FEmusic_home", "Invalid")
+            },
+            BrowseLink {
+                params: Some("filter\nvalue".into()),
+                ..BrowseLink::new("FEmusic_home", "Invalid")
+            },
+        ] {
+            assert!(
+                catalog
+                    .browse(&link)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid")
+            );
+        }
+    }
 
     #[test]
     fn parses_durations_without_accepting_metadata() {
@@ -948,7 +1115,12 @@ mod tests {
                 }
             })
             .unwrap();
-        let page = api.browse(&collection.id).unwrap();
+        let page = api
+            .browse(&BrowseLink::new(
+                collection.id.clone(),
+                collection.title.clone(),
+            ))
+            .unwrap();
         assert!(!page.tracks().is_empty());
         println!(
             "Home: {} shelves; search: {} tracks; {}: {} tracks",
@@ -957,5 +1129,73 @@ mod tests {
             page.title,
             page.tracks().len()
         );
+    }
+
+    #[test]
+    #[ignore = "uses public YouTube Music discovery pages without an account"]
+    fn live_public_discovery_navigation() {
+        let catalog = Catalog::new().unwrap();
+        let explore = catalog.explore().unwrap();
+        let links: Vec<_> = explore
+            .shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .filter_map(|item| {
+                if let Item::Navigation(link) = item {
+                    Some(link)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in [
+            "FEmusic_new_releases",
+            "FEmusic_charts",
+            "FEmusic_moods_and_genres",
+        ] {
+            let link = links
+                .iter()
+                .find(|link| link.id == id)
+                .expect("Explore must expose the destination");
+            let page = catalog.browse(link).unwrap();
+            if id != "FEmusic_moods_and_genres" {
+                assert!(
+                    page.shelves
+                        .iter()
+                        .flat_map(|shelf| &shelf.items)
+                        .any(|item| matches!(item, Item::Track(_) | Item::Collection(_)))
+                );
+                println!("{}: {} shelves", link.title, page.shelves.len());
+                continue;
+            }
+            let category = page
+                .shelves
+                .iter()
+                .flat_map(|shelf| &shelf.items)
+                .find_map(|item| {
+                    if let Item::Navigation(link) = item {
+                        (link.id == "FEmusic_moods_and_genres_category" && link.params.is_some())
+                            .then_some(link)
+                    } else {
+                        None
+                    }
+                })
+                .expect("Moods must expose a category with its own parameters");
+            let playlists = catalog.browse(category).unwrap();
+            assert!(
+                playlists
+                    .shelves
+                    .iter()
+                    .flat_map(|shelf| &shelf.items)
+                    .any(|item| matches!(item, Item::Collection(_)))
+            );
+            println!(
+                "{}: {} category shelves; {}: {} playlist shelves",
+                link.title,
+                page.shelves.len(),
+                category.title,
+                playlists.shelves.len()
+            );
+        }
     }
 }

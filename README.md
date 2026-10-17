@@ -6,7 +6,7 @@ This is an independent client. The public-catalog player is working. Account int
 
 ## What works
 
-- Home and Explore, search suggestions and category filters, and artist, album, and playlist browsing.
+- Home and Explore, new releases, charts, mood and genre pages, search suggestions and category filters, and artist, album, and playlist browsing.
 - Streaming audio, pause, seek, previous/next, volume, mute, audio quality and playback speed.
 - A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
 - Radio, continued autoplay, lyrics, song credits and related music when the service provides them.
@@ -55,6 +55,8 @@ Connect from Settings or launch with `--connect`. Sign in only in the dedicated 
 
 Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. Search keeps its query, category and scope while loading more results or navigating back. Library search supports category filters; uploads search covers all uploads. Both scopes require a connected account.
 
+Explore keeps the service's main navigation and mood section. Mood and genre links retain their exact category parameters through navigation, Back and Refresh. Navigation links open pages; collection rows retain their separate save controls.
+
 The song menu offers credits, radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Credits retain the service's roles and names. Lyrics and credits load independently of radio and autoplay. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
 
 Settings changes playback speed from 0.25× to 2× and audio quality between Low, Normal and High. Both preferences are saved on this device. Normal is the default quality. Changing quality reloads the current stream at its playback position, keeping its pause state, queue and existing history report.
@@ -102,7 +104,7 @@ bin/test
 bin/test -- --ignored --nocapture
 ```
 
-The ordinary tests cover account isolation, catalog and search parsing, stale suggestions and song text, radio continuation, queue reordering and autoplay transitions, library write flushing, and stale playback events. Player checks also cover pause confirmation and stream replacement. An ignored offline test checks quality selectors using yt-dlp. The live ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause, seek, speed changes and a paused quality reload at 30 seconds. They need network access, mpv, and yt-dlp. Public search categories, suggestions, credits and radio continuation have passed live service checks. An interactive XWayland check passed suggestions, category search, Back navigation, credits, speed and quality selection, quality preference restoration after restart, queue add/reorder/clear and autoplay settings. Signed-in search scopes and account sync remain unverified.
+The ordinary tests cover account isolation, catalog and search parsing, stale suggestions and song text, radio continuation, queue reordering and autoplay transitions, library write flushing, and stale playback events. Player checks also cover pause confirmation and stream replacement. An ignored offline test checks quality selectors using yt-dlp. The live ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause, seek, speed changes and a paused quality reload at 30 seconds. They need network access, mpv, and yt-dlp. Public search categories, suggestions, credits, discovery links and radio continuation have passed live service checks. Interactive XWayland checks passed New releases, Charts, mood categories, category Refresh, suggestions, category search, Back navigation, credits, speed and quality selection, quality preference restoration after restart, queue add/reorder/clear and autoplay settings. Signed-in search scopes and account sync remain unverified.
 
 YouTube's internal API and stream extraction can change. Public guest playback may need an updated yt-dlp; authenticated playback deliberately rejects versions that have not been reviewed. Catalog changes may require a client update. Complete account parity and remaining verification are tracked in docs/parity.md. Account mutations are not yet verified against a signed-in account. GPUI's custom controls currently have limited screen-reader support.
 
