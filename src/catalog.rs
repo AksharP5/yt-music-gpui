@@ -33,10 +33,36 @@ pub struct Track {
 
 impl Track {
     pub fn credits_id(&self) -> Option<String> {
+        if self.details.episode.is_some() {
+            return None;
+        }
         self.details
             .credits_id
             .clone()
             .or_else(|| valid_video_id(&self.id).then(|| format!("MPTC{}", self.id)))
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EpisodeContext {
+    pub show_id: Option<String>,
+    pub description: String,
+    pub subtitle: String,
+    pub duration_text: String,
+    #[serde(skip)]
+    pub(crate) watch_params: Option<String>,
+}
+
+impl fmt::Debug for EpisodeContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EpisodeContext")
+            .field("show_id", &self.show_id)
+            .field("description", &self.description)
+            .field("subtitle", &self.subtitle)
+            .field("duration_text", &self.duration_text)
+            .finish_non_exhaustive()
     }
 }
 
@@ -76,6 +102,8 @@ pub struct TrackDetails {
     pub artist_id: Option<String>,
     pub album_id: Option<String>,
     pub credits_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode: Option<Box<EpisodeContext>>,
 }
 
 impl TrackDetails {
@@ -86,6 +114,9 @@ impl TrackDetails {
         self.remove_library = None;
         self.remove_history = None;
         self.set_video_id = None;
+        if let Some(episode) = &mut self.episode {
+            episode.watch_params = None;
+        }
     }
 }
 
@@ -135,21 +166,17 @@ impl BrowseLink {
             "This page has an invalid YouTube Music ID"
         );
         ensure!(!self.title.trim().is_empty(), "This page has no name");
+        if let Some(video_id) = self.id.strip_prefix("MPED") {
+            ensure!(
+                valid_video_id(video_id),
+                "This episode has an invalid video ID"
+            );
+        }
         if let Some(params) = &self.params {
             ensure!(
-                params.len() <= 8192,
+                valid_service_params(params),
                 "YouTube Music returned an invalid page link"
             );
-            let mut bytes = params.bytes();
-            while let Some(byte) = bytes.next() {
-                let valid = if byte == b'%' {
-                    bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
-                        && bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
-                } else {
-                    byte.is_ascii_alphanumeric() || b"_-+=/.~".contains(&byte)
-                };
-                ensure!(valid, "YouTube Music returned an invalid page link");
-            }
         }
         if let Some(country) = &self.chart_country {
             ensure!(
@@ -243,6 +270,7 @@ pub struct Continuation {
     token: String,
     visitor: Option<HeaderValue>,
     session: Option<Arc<Session>>,
+    show: Option<(String, String)>,
 }
 
 impl Continuation {
@@ -251,6 +279,7 @@ impl Continuation {
             token: token.to_owned(),
             visitor: None,
             session: None,
+            show: None,
         }
     }
 
@@ -367,6 +396,7 @@ impl Catalog {
             "FEmusic_charts" => page.countries = chart_choices(&data, link)?,
             _ => {}
         }
+        apply_episode_page(&mut page, &data, &link.id)?;
         self.bind_page(page, &data, None)
     }
 
@@ -402,6 +432,9 @@ impl Catalog {
                     })
                     .transpose()?,
             };
+        }
+        if let Some((id, title)) = previous.and_then(|continuation| continuation.show.as_ref()) {
+            associate_show(&mut page, id, title);
         }
         Ok(page)
     }
@@ -538,6 +571,182 @@ pub(crate) fn valid_video_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
 
+pub(crate) fn valid_service_params(params: &str) -> bool {
+    if params.len() > 8192 {
+        return false;
+    }
+    let mut bytes = params.bytes();
+    while let Some(byte) = bytes.next() {
+        let valid = if byte == b'%' {
+            bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                && bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+        } else {
+            byte.is_ascii_alphanumeric() || b"_-+=/.~".contains(&byte)
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) const PODCAST_EPISODE: &str = "MUSIC_VIDEO_TYPE_PODCAST_EPISODE";
+
+fn valid_show_id(id: &str) -> bool {
+    id.starts_with("MPSP")
+        && id.len() > 4
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+pub(crate) fn episode_context(
+    row: &Value,
+    video_id: &str,
+    runs: &[&Value],
+) -> Result<Option<Box<EpisodeContext>>> {
+    let endpoint = [
+        row.pointer("/onTap/watchEndpoint"),
+        row.pointer("/navigationEndpoint/watchEndpoint"),
+        row.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint"),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        row["buttons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|button| button.pointer("/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint")),
+    )
+    .find(|endpoint| {
+        endpoint.pointer("/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
+            .and_then(Value::as_str) == Some(PODCAST_EPISODE)
+    });
+    let Some(endpoint) = endpoint else {
+        return Ok(None);
+    };
+    ensure!(
+        valid_video_id(video_id) && endpoint["videoId"].as_str() == Some(video_id),
+        "YouTube Music returned playback details for a different episode"
+    );
+    let watch_params = endpoint
+        .get("params")
+        .map(|params| {
+            params
+                .as_str()
+                .filter(|params| !params.is_empty() && valid_service_params(params))
+                .map(str::to_owned)
+                .context("YouTube Music returned invalid episode playback parameters")
+        })
+        .transpose()?;
+    let show_id = runs.iter().find_map(|run| {
+        run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .filter(|id| valid_show_id(id))
+            .map(str::to_owned)
+    });
+    let progress = row
+        .pointer("/playbackProgress/musicPlaybackProgressRenderer")
+        .or_else(|| row.pointer("/progress/musicPlaybackProgressRenderer"));
+    let duration_text = progress
+        .map(|progress| text(&progress["durationText"]))
+        .filter(|duration| !duration.is_empty())
+        .unwrap_or_else(|| text(&row["lengthText"]))
+        .trim_start_matches([' ', '•'])
+        .to_owned();
+    Ok(Some(Box::new(EpisodeContext {
+        show_id,
+        description: text(&row["description"]),
+        subtitle: text(&row["subtitle"]),
+        duration_text,
+        watch_params,
+    })))
+}
+
+pub(crate) fn episode_header(data: &Value, video_id: &str) -> Result<Track> {
+    ensure!(
+        valid_video_id(video_id),
+        "This episode has an invalid video ID"
+    );
+    let header = data.pointer("/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer")
+        .context("YouTube Music returned no episode header")?;
+    let runs: Vec<_> = header["straplineTextOne"]["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut episode = episode_context(header, video_id, &runs)?
+        .context("YouTube Music returned no podcast episode playback details")?;
+    episode.description = data
+        .pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents")
+        .and_then(Value::as_array)
+        .and_then(|sections| sections.iter().find_map(|section| {
+            section.pointer("/musicDescriptionShelfRenderer/description")
+        }))
+        .map(text)
+        .unwrap_or_default();
+    let title = text(&header["title"]);
+    ensure!(
+        !title.trim().is_empty(),
+        "YouTube Music returned an unnamed episode"
+    );
+    let artist = text(&header["straplineTextOne"]);
+    let mut details = track_details(header, &runs);
+    details.episode = Some(episode);
+    Ok(Track {
+        id: video_id.to_owned(),
+        title,
+        artist: if artist.is_empty() {
+            "Podcast".into()
+        } else {
+            artist
+        },
+        album: None,
+        duration: details
+            .episode
+            .as_ref()
+            .and_then(|episode| duration(&episode.duration_text)),
+        thumbnail: thumbnail(&header["thumbnail"]),
+        details,
+    })
+}
+
+fn apply_episode_page(page: &mut Page, data: &Value, browse_id: &str) -> Result<()> {
+    if let Some(video_id) = browse_id.strip_prefix("MPED") {
+        let track = episode_header(data, video_id)?;
+        page.title = track.title.clone();
+        page.description = track.details.episode.as_ref().unwrap().description.clone();
+        page.shelves = vec![Shelf {
+            title: String::new(),
+            items: vec![Item::Track(track)],
+        }];
+        page.continuation = None;
+        page.editable = false;
+        return Ok(());
+    }
+    if valid_show_id(browse_id) {
+        associate_show(page, browse_id, &page.title.clone());
+    }
+    Ok(())
+}
+
+fn associate_show(page: &mut Page, show_id: &str, title: &str) {
+    for item in page.shelves.iter_mut().flat_map(|shelf| &mut shelf.items) {
+        if let Item::Track(track) = item
+            && let Some(episode) = &mut track.details.episode
+            && episode.show_id.is_none()
+        {
+            episode.show_id = Some(show_id.to_owned());
+            track.artist = title.to_owned();
+        }
+    }
+    if let Some(continuation) = &mut page.continuation {
+        continuation.show = Some((show_id.to_owned(), title.to_owned()));
+    }
+}
+
 fn parse_item(value: &Value) -> Option<Item> {
     if let Some(button) = value.get("musicNavigationButtonRenderer") {
         let endpoint = button.pointer("/clickCommand/browseEndpoint")?;
@@ -567,12 +776,14 @@ fn parse_item(value: &Value) -> Option<Item> {
         .or_else(|| row.get("navigationEndpoint"));
     let video_id = row.pointer("/playlistItemData/videoId").and_then(Value::as_str)
         .or_else(|| endpoint?.pointer("/watchEndpoint/videoId")?.as_str())
+        .or_else(|| row.pointer("/onTap/watchEndpoint/videoId")?.as_str())
         .or_else(|| row.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId")?.as_str());
     let metadata: Vec<&Value> = columns
         .iter()
         .skip(1)
         .copied()
         .chain(std::iter::once(&row["subtitle"]))
+        .chain(std::iter::once(&row["secondTitle"]))
         .chain(
             row["fixedColumns"]
                 .as_array()
@@ -586,21 +797,41 @@ fn parse_item(value: &Value) -> Option<Item> {
             .iter()
             .flat_map(|v| v["runs"].as_array().into_iter().flatten())
             .collect();
-        let artist =
-            runs.iter()
-                .find(|r| {
+        let episode = episode_context(row, id, &runs).ok()?;
+        let show = episode.as_ref().and_then(|episode| {
+            runs.iter().find(|run| {
+                run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                    .and_then(Value::as_str)
+                    == episode.show_id.as_deref()
+                    && episode.show_id.is_some()
+            })
+        });
+        let artist = show
+            .or_else(|| {
+                runs.iter().find(|r| {
                     r.pointer("/navigationEndpoint/browseEndpoint/browseId")
                         .and_then(Value::as_str)
                         .is_some_and(|id| id.starts_with("UC"))
                 })
-                .and_then(|r| r["text"].as_str())
-                .map(str::to_owned)
-                .or_else(|| {
-                    metadata.iter().map(|v| text(v)).find(|s| {
-                        !s.is_empty() && !s.starts_with("Song") && !s.starts_with("Video")
-                    })
-                })
-                .unwrap_or_else(|| "YouTube Music".to_owned());
+            })
+            .and_then(|r| r["text"].as_str())
+            .map(str::to_owned)
+            .or_else(|| {
+                if episode.is_some() {
+                    return None;
+                }
+                metadata
+                    .iter()
+                    .map(|v| text(v))
+                    .find(|s| !s.is_empty() && !s.starts_with("Song") && !s.starts_with("Video"))
+            })
+            .unwrap_or_else(|| {
+                if episode.is_some() {
+                    "Podcast".into()
+                } else {
+                    "YouTube Music".into()
+                }
+            });
         let album = runs
             .iter()
             .find(|r| {
@@ -613,7 +844,14 @@ fn parse_item(value: &Value) -> Option<Item> {
         let duration = runs
             .iter()
             .filter_map(|r| r["text"].as_str().and_then(duration))
-            .next();
+            .next()
+            .or_else(|| {
+                episode
+                    .as_ref()
+                    .and_then(|episode| duration(&episode.duration_text))
+            });
+        let mut details = track_details(row, &runs);
+        details.episode = episode;
         return Some(Item::Track(Track {
             id: id.to_owned(),
             title,
@@ -621,7 +859,7 @@ fn parse_item(value: &Value) -> Option<Item> {
             album,
             duration,
             thumbnail: thumbnail(row),
-            details: track_details(row, &runs),
+            details,
         }));
     }
     let id = endpoint?.pointer("/browseEndpoint/browseId")?.as_str()?;
@@ -1098,6 +1336,260 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn episode_row() -> Value {
+        json!({"musicMultiRowListItemRenderer":{
+            "title":{"runs":[{"text":"An episode","navigationEndpoint":{
+                "browseEndpoint":{"browseId":"MPEDabcdefghijk"}
+            }}]},
+            "onTap":{"watchEndpoint":{
+                "videoId":"abcdefghijk","params":"issued-params%3D",
+                "watchEndpointMusicSupportedConfigs":{"watchEndpointMusicConfig":{"musicVideoType":PODCAST_EPISODE}}
+            }},
+            "subtitle":{"runs":[{"text":"42K views"},{"text":" • "},{"text":"2d ago"}]},
+            "description":{"runs":[{"text":"Episode summary"}]},
+            "playbackProgress":{"musicPlaybackProgressRenderer":{
+                "durationText":{"runs":[{"text":" • "},{"text":"2 hr 32 min"}]},
+                "playbackProgressPercentage":37,
+                "videoPlaybackPositionFeedbackToken":"synthetic-progress-secret"
+            }}
+        }})
+    }
+
+    fn episode_response() -> Value {
+        json!({"contents":{"twoColumnBrowseResultsRenderer":{
+            "tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{"contents":[{
+                "musicResponsiveHeaderRenderer":{
+                    "title":{"runs":[{"text":"An episode"}]},
+                    "straplineTextOne":{"runs":[{"text":"The show","navigationEndpoint":{
+                        "browseEndpoint":{"browseId":"MPSPPLshow"}
+                    }}]},
+                    "subtitle":{"runs":[{"text":"42K views • 2d ago"}]},
+                    "progress":{"musicPlaybackProgressRenderer":{
+                        "durationText":{"runs":[{"text":" • "},{"text":"2 hr 32 min"}]},
+                        "playbackProgressPercentage":37
+                    }},
+                    "buttons":[{"musicPlayButtonRenderer":{"playNavigationEndpoint":{
+                        "watchEndpoint":{
+                            "videoId":"abcdefghijk","params":"issued-params%3D",
+                            "watchEndpointMusicSupportedConfigs":{"watchEndpointMusicConfig":{"musicVideoType":PODCAST_EPISODE}}
+                        }
+                    }}}]
+                }
+            }]}}}}],
+            "secondaryContents":{"sectionListRenderer":{"contents":[{
+                "musicDescriptionShelfRenderer":{"description":{"runs":[
+                    {"text":"The full episode description.\n"},
+                    {"text":"04:05","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk","startTimeSeconds":245}}},
+                    {"text":" First topic"}
+                ]}}
+            }]}}
+        }},"frameworkUpdates":{"musicDescriptionShelfRenderer":{"description":{"simpleText":"Unrelated description"}}}})
+    }
+
+    #[test]
+    fn episodes_keep_public_metadata_and_known_show_association() {
+        let row = episode_row();
+        let mut page = parse_page(
+            &json!({"contents":[{"musicShelfRenderer":{"contents":[row.clone()]}}]}),
+            "The show",
+        )
+        .unwrap();
+        apply_episode_page(&mut page, &json!({}), "MPSPPLshow").unwrap();
+        let track = page.tracks().pop().unwrap();
+        let episode = track.details.episode.as_ref().unwrap();
+        assert_eq!(track.id, "abcdefghijk");
+        assert_eq!(track.artist, "The show");
+        assert_eq!(track.duration, None);
+        assert_eq!(episode.show_id.as_deref(), Some("MPSPPLshow"));
+        assert_eq!(episode.description, "Episode summary");
+        assert_eq!(episode.subtitle, "42K views • 2d ago");
+        assert_eq!(episode.duration_text, "2 hr 32 min");
+        assert_eq!(episode.watch_params.as_deref(), Some("issued-params%3D"));
+        assert_eq!(track.credits_id(), None);
+
+        let mut linked = row;
+        linked["musicMultiRowListItemRenderer"]["secondTitle"] = json!({"runs":[{
+            "text":"A different show","navigationEndpoint":{"browseEndpoint":{"browseId":"MPSPPLother"}}
+        }]});
+        let Some(Item::Track(track)) = parse_item(&linked) else {
+            panic!("expected an episode")
+        };
+        assert_eq!(track.artist, "A different show");
+        assert_eq!(
+            track.details.episode.unwrap().show_id.as_deref(),
+            Some("MPSPPLother")
+        );
+    }
+
+    #[test]
+    fn episode_pages_use_the_matching_header_and_scoped_description() {
+        let response = episode_response();
+        let mut page = parse_page(&response, "Episode").unwrap();
+        apply_episode_page(&mut page, &response, "MPEDabcdefghijk").unwrap();
+        assert_eq!(page.title, "An episode");
+        assert_eq!(page.tracks().len(), 1);
+        assert_eq!(page.tracks()[0].artist, "The show");
+        assert_eq!(
+            page.description,
+            "The full episode description.\n04:05 First topic"
+        );
+        assert_eq!(
+            page.tracks()[0]
+                .details
+                .episode
+                .as_ref()
+                .unwrap()
+                .description,
+            page.description
+        );
+        assert!(!page.editable && page.continuation.is_none());
+        assert!(episode_header(&response, "lmnopqrstuv").is_err());
+
+        let mut unrelated = response.clone();
+        unrelated["contents"]["twoColumnBrowseResultsRenderer"]["secondaryContents"] = json!({});
+        assert!(
+            episode_header(&unrelated, "abcdefghijk")
+                .unwrap()
+                .details
+                .episode
+                .unwrap()
+                .description
+                .is_empty()
+        );
+        assert!(BrowseLink::new("MPEDinvalid", "Episode").body().is_err());
+    }
+
+    #[test]
+    fn malformed_episode_playback_is_not_downgraded_to_music() {
+        for params in [
+            json!("untrusted\nparams"),
+            json!("%XY"),
+            json!(42),
+            json!("A".repeat(8193)),
+        ] {
+            let mut row = episode_row();
+            row["musicMultiRowListItemRenderer"]["onTap"]["watchEndpoint"]["params"] = params;
+            assert!(parse_item(&row).is_none());
+        }
+        let mut row = episode_row();
+        row["musicMultiRowListItemRenderer"]["playlistItemData"] = json!({"videoId":"lmnopqrstuv"});
+        assert!(parse_item(&row).is_none());
+        let mut response = episode_response();
+        *response.pointer_mut("/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer/buttons/0/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType").unwrap() = json!("MUSIC_VIDEO_TYPE_ATV");
+        assert!(episode_header(&response, "abcdefghijk").is_err());
+    }
+
+    #[test]
+    fn episode_metadata_persists_without_playback_params_or_account_progress() {
+        let Some(Item::Track(mut track)) = parse_item(&episode_row()) else {
+            panic!("expected an episode")
+        };
+        let serialized = serde_json::to_value(&track).unwrap();
+        let encoded = serialized.to_string();
+        assert!(
+            !encoded.contains("issued-params") && !encoded.contains("synthetic-progress-secret")
+        );
+        assert!(!encoded.contains("playbackProgressPercentage"));
+        assert!(!format!("{:?}", track).contains("issued-params"));
+        let restored: Track = serde_json::from_value(serialized).unwrap();
+        assert!(
+            restored
+                .details
+                .episode
+                .as_ref()
+                .unwrap()
+                .watch_params
+                .is_none()
+        );
+        assert_eq!(
+            restored.details.episode.as_ref().unwrap().description,
+            "Episode summary"
+        );
+        track.details.clear_account_state();
+        assert_eq!(track, restored);
+    }
+
+    #[test]
+    fn show_continuations_inherit_association_without_overwriting_linked_shows() {
+        let catalog = Catalog::new().unwrap();
+        let first = json!({"contents":[{"musicShelfRenderer":{
+            "contents":[episode_row()],
+            "continuations":[{"nextContinuationData":{"continuation":"first-show-page"}}]
+        }}]});
+        let mut page = parse_page(&first, "The show").unwrap();
+        apply_episode_page(&mut page, &first, "MPSPPLshow").unwrap();
+        let first = catalog
+            .bind_page(page, &first, None)
+            .unwrap()
+            .continuation
+            .unwrap();
+        assert_eq!(first.show, Some(("MPSPPLshow".into(), "The show".into())));
+        let mut linked = episode_row();
+        linked["musicMultiRowListItemRenderer"]["secondTitle"] = json!({"runs":[{
+            "text":"A linked show","navigationEndpoint":{"browseEndpoint":{"browseId":"MPSPPLother"}}
+        }]});
+        let response = json!({"continuationContents":{"musicShelfContinuation":{
+            "contents":[episode_row(), linked],
+            "continuations":[{"nextContinuationData":{"continuation":"next-show-page"}}]
+        }}});
+        let continued = catalog
+            .bind_page(
+                parse_page(&response, "More music").unwrap(),
+                &response,
+                Some(&first),
+            )
+            .unwrap();
+        let tracks = continued.tracks();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].artist, "The show");
+        assert_eq!(
+            tracks[0]
+                .details
+                .episode
+                .as_ref()
+                .unwrap()
+                .show_id
+                .as_deref(),
+            Some("MPSPPLshow")
+        );
+        assert_eq!(tracks[1].artist, "A linked show");
+        assert_eq!(
+            tracks[1]
+                .details
+                .episode
+                .as_ref()
+                .unwrap()
+                .show_id
+                .as_deref(),
+            Some("MPSPPLother")
+        );
+        let next = continued.continuation.unwrap();
+        assert_eq!(next.show, first.show);
+        assert_eq!(next.token(), "next-show-page");
+        let terminal = json!({"continuationContents":{"musicShelfContinuation":{
+            "contents":[episode_row()]
+        }}});
+        let final_page = catalog
+            .bind_page(
+                parse_page(&terminal, "More music").unwrap(),
+                &terminal,
+                Some(&next),
+            )
+            .unwrap();
+        assert!(final_page.continuation.is_none());
+        assert_eq!(final_page.tracks()[0].artist, "The show");
+        assert_eq!(
+            final_page.tracks()[0]
+                .details
+                .episode
+                .as_ref()
+                .unwrap()
+                .show_id
+                .as_deref(),
+            Some("MPSPPLshow")
+        );
+    }
 
     fn continued_page(visitor: Value, token: &str) -> Value {
         json!({
@@ -1717,6 +2209,7 @@ mod tests {
             artist_id: Some("UCartist".into()),
             album_id: Some("MPREalbum".into()),
             credits_id: Some("MPTCabcdefghijk".into()),
+            ..Default::default()
         };
         assert_eq!(
             serde_json::to_value(&details).unwrap(),

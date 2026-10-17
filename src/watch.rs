@@ -1,6 +1,9 @@
 use crate::{
     auth::Session,
-    catalog::{Catalog, Track, duration, text, thumbnail, track_details, valid_video_id},
+    catalog::{
+        Catalog, EpisodeContext, PODCAST_EPISODE, Track, duration, episode_context, episode_header,
+        text, thumbnail, track_details, valid_service_params, valid_video_id,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -28,10 +31,32 @@ pub struct WatchPage {
 }
 
 impl Catalog {
-    pub fn watch(&self, video_id: &str, radio: bool) -> Result<Watch> {
-        let request = watch_request(video_id, radio)?;
+    pub fn watch(&self, track: &Track, radio: bool) -> Result<Watch> {
+        ensure!(
+            valid_video_id(&track.id),
+            "This item has an invalid YouTube Music ID"
+        );
+        ensure!(
+            !radio || track.details.episode.is_none(),
+            "Radio is not available for podcast episodes"
+        );
+        let refreshed;
+        let track = if track
+            .details
+            .episode
+            .as_ref()
+            .is_some_and(|episode| episode.watch_params.is_none())
+        {
+            let response =
+                self.request("browse", json!({"browseId":format!("MPED{}",track.id)}))?;
+            refreshed = episode_header(&response, &track.id)?;
+            &refreshed
+        } else {
+            track
+        };
+        let request = watch_request(&track.id, track.details.episode.as_deref(), radio)?;
         let response = self.request("next", request.clone())?;
-        parse_watch(&response, video_id, request, self.session.clone())
+        parse_watch(&response, track, request, self.session.clone())
     }
 
     pub fn watch_more(&self, continuation: &WatchContinuation) -> Result<WatchPage> {
@@ -62,11 +87,28 @@ impl Catalog {
     }
 }
 
-fn watch_request(video_id: &str, radio: bool) -> Result<Value> {
+fn watch_request(video_id: &str, episode: Option<&EpisodeContext>, radio: bool) -> Result<Value> {
     ensure!(
         valid_video_id(video_id),
         "This song has an invalid YouTube Music ID"
     );
+    if let Some(episode) = episode {
+        ensure!(!radio, "Radio is not available for podcast episodes");
+        let params = episode
+            .watch_params
+            .as_deref()
+            .filter(|params| !params.is_empty() && valid_service_params(params))
+            .context("Refresh this episode before loading its playback details")?;
+        return Ok(json!({
+            "videoId":video_id,
+            "params":params,
+            "enablePersistentPlaylistPanel":true,
+            "isAudioOnly":true,
+            "watchEndpointMusicSupportedConfigs":{
+                "watchEndpointMusicConfig":{"musicVideoType":PODCAST_EPISODE}
+            }
+        }));
+    }
     let mut body = json!({
         "videoId": video_id,
         "playlistId": format!("RDAMVM{video_id}"),
@@ -89,7 +131,7 @@ fn watch_request(video_id: &str, radio: bool) -> Result<Value> {
 
 fn parse_watch(
     response: &Value,
-    video_id: &str,
+    seed: &Track,
     request: Value,
     session: Option<Arc<Session>>,
 ) -> Result<Watch> {
@@ -106,11 +148,21 @@ fn parse_watch(
     let contents = panel["contents"]
         .as_array()
         .context("YouTube Music returned an unreadable playback queue")?;
-    let (queue, current_index) = parse_queue(contents, video_id);
+    let (mut queue, current_index) = parse_queue(contents, &seed.id);
     ensure!(
         !queue.is_empty(),
         "YouTube Music returned no playable songs"
     );
+    if let Some(episode) = &seed.details.episode {
+        let current = current_index
+            .map(|index| &mut queue[index])
+            .context("YouTube Music did not include the requested episode in its playback queue")?;
+        current.details.episode = Some(episode.clone());
+        if episode.show_id.is_some() {
+            current.artist = seed.artist.clone();
+        }
+        current.duration = current.duration.or(seed.duration);
+    }
     let mut lyrics = None;
     let mut related = None;
     for tab in tabs {
@@ -248,6 +300,7 @@ fn parse_track(row: &Value, current_id: &str) -> Option<Track> {
         run["text"].as_str().map(str::to_owned)
     });
     let mut details = track_details(row, &runs);
+    details.episode = episode_context(row, id, &runs).ok()?;
     if id != current_id {
         details.clear_account_state();
     }
@@ -280,19 +333,64 @@ fn parse_lyrics(response: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::Rating;
+    use crate::catalog::{BrowseLink, Rating};
+
+    fn track(id: &str) -> Track {
+        Track {
+            id: id.into(),
+            title: "A song".into(),
+            artist: "An artist".into(),
+            album: None,
+            duration: None,
+            thumbnail: None,
+            details: Default::default(),
+        }
+    }
 
     #[test]
     fn playback_requests_separate_track_details_from_radio() {
-        let details = watch_request("abcdefghijk", false).unwrap();
+        let details = watch_request("abcdefghijk", None, false).unwrap();
         assert_eq!(details["videoId"], "abcdefghijk");
         assert_eq!(details["playlistId"], "RDAMVMabcdefghijk");
         assert!(details.get("params").is_none());
         assert_eq!(details.pointer("/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/hasPersistentPlaylistPanel"), Some(&json!(true)));
-        let radio = watch_request("abcdefghijk", true).unwrap();
+        let radio = watch_request("abcdefghijk", None, true).unwrap();
         assert_eq!(radio["params"], "wAEB");
         assert!(radio.get("watchEndpointMusicSupportedConfigs").is_none());
-        assert!(watch_request("not a video ID", true).is_err());
+        assert!(watch_request("not a video ID", None, true).is_err());
+    }
+
+    #[test]
+    fn episode_requests_preserve_issued_params_without_music_radio_context() {
+        let mut episode = EpisodeContext {
+            watch_params: Some("issued-params%3D".into()),
+            ..Default::default()
+        };
+        let request = watch_request("abcdefghijk", Some(&episode), false).unwrap();
+        assert_eq!(request["params"], "issued-params%3D");
+        assert_eq!(
+            request.pointer(
+                "/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType"
+            ),
+            Some(&json!(PODCAST_EPISODE))
+        );
+        assert!(request.get("playlistId").is_none());
+        assert!(request.get("tunerSettingValue").is_none());
+        assert!(watch_request("abcdefghijk", Some(&episode), true).is_err());
+        for params in [
+            None,
+            Some(String::new()),
+            Some("%bad%XX".into()),
+            Some("unsafe\nvalue".into()),
+        ] {
+            episode.watch_params = params;
+            assert!(watch_request("abcdefghijk", Some(&episode), false).is_err());
+        }
+
+        let mut seed = track("abcdefghijk");
+        seed.details.episode = Some(Box::new(episode));
+        let error = Catalog::new().unwrap().watch(&seed, true).err().unwrap();
+        assert!(error.to_string().contains("Radio is not available"));
     }
 
     fn watch_response(rows: Value) -> Value {
@@ -354,8 +452,8 @@ mod tests {
         ]));
         let watch = parse_watch(
             &response,
-            "abcdefghijk",
-            watch_request("abcdefghijk", false).unwrap(),
+            &track("abcdefghijk"),
+            watch_request("abcdefghijk", None, false).unwrap(),
             None,
         )
         .unwrap();
@@ -400,8 +498,8 @@ mod tests {
         tabs[2]["tabRenderer"]["unselectable"] = json!(true);
         let watch = parse_watch(
             &response,
-            "abcdefghijk",
-            watch_request("abcdefghijk", false).unwrap(),
+            &track("abcdefghijk"),
+            watch_request("abcdefghijk", None, false).unwrap(),
             None,
         )
         .unwrap();
@@ -414,6 +512,50 @@ mod tests {
     }
 
     #[test]
+    fn current_episode_keeps_its_detail_metadata_without_copying_to_other_rows() {
+        let mut seed = track("abcdefghijk");
+        seed.artist = "The show".into();
+        seed.details.episode = Some(Box::new(EpisodeContext {
+            show_id: Some("MPSPPLshow".into()),
+            description: "Complete episode description".into(),
+            subtitle: "Yesterday".into(),
+            duration_text: "2 hr 32 min".into(),
+            watch_params: Some("issued-params".into()),
+        }));
+        let mut episode_row = row("lmnopqrstuv", false);
+        episode_row["playlistPanelVideoRenderer"]["navigationEndpoint"]["watchEndpoint"] = json!({
+            "videoId":"lmnopqrstuv", "params":"other-params",
+            "watchEndpointMusicSupportedConfigs":{"watchEndpointMusicConfig":{"musicVideoType":PODCAST_EPISODE}}
+        });
+        let response = watch_response(json!([
+            row("abcdefghijk", false),
+            episode_row,
+            row("abcdefghijk", true)
+        ]));
+        let watch = parse_watch(
+            &response,
+            &seed,
+            watch_request(&seed.id, seed.details.episode.as_deref(), false).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(watch.current_index, Some(2));
+        assert_eq!(watch.queue.len(), 3);
+        let current = watch.current.unwrap();
+        assert_eq!(current.details.episode, seed.details.episode);
+        assert_eq!(current.artist, "The show");
+        assert_eq!(current.duration, Some(207));
+        assert_eq!(current.details.rating, Some(Rating::Like));
+        assert!(watch.queue[0].details.episode.is_none());
+        let other = watch.queue[1].details.episode.as_ref().unwrap();
+        assert!(
+            other.show_id.is_none() && other.description.is_empty() && other.watch_params.is_none()
+        );
+        let mismatch = watch_response(json!([row("lmnopqrstuv", true)]));
+        assert!(parse_watch(&mismatch, &seed, json!({}), None).is_err());
+    }
+
+    #[test]
     fn continuation_preserves_order_duplicates_and_request_context() {
         let mut response = watch_response(json!([row("abcdefghijk", true)]));
         let panel = response.pointer_mut("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs/1/tabRenderer/content/musicQueueRenderer/content/playlistPanelRenderer").unwrap();
@@ -421,8 +563,8 @@ mod tests {
             json!([{"nextRadioContinuationData":{"continuation":"first-token"}}]);
         let watch = parse_watch(
             &response,
-            "abcdefghijk",
-            watch_request("abcdefghijk", true).unwrap(),
+            &track("abcdefghijk"),
+            watch_request("abcdefghijk", None, true).unwrap(),
             None,
         )
         .unwrap();
@@ -479,7 +621,7 @@ mod tests {
         let catalog = Catalog::with_session(Some(current)).unwrap();
         for expected in [None, Some(Arc::new(session))] {
             let continuation = WatchContinuation {
-                request: watch_request("abcdefghijk", true).unwrap(),
+                request: watch_request("abcdefghijk", None, true).unwrap(),
                 session: expected,
             };
             let error = catalog.watch_more(&continuation).err().unwrap();
@@ -503,8 +645,8 @@ mod tests {
         assert!(
             parse_watch(
                 &json!({}),
-                "abcdefghijk",
-                watch_request("abcdefghijk", false).unwrap(),
+                &track("abcdefghijk"),
+                watch_request("abcdefghijk", None, false).unwrap(),
                 None
             )
             .is_err()
@@ -515,7 +657,7 @@ mod tests {
     #[ignore = "uses the public YouTube Music next and lyrics endpoints"]
     fn live_public_watch() {
         let catalog = Catalog::new().unwrap();
-        let watch = catalog.watch("dQw4w9WgXcQ", false).unwrap();
+        let watch = catalog.watch(&track("dQw4w9WgXcQ"), false).unwrap();
         assert_eq!(
             watch.current.as_ref().map(|track| track.id.as_str()),
             Some("dQw4w9WgXcQ")
@@ -530,11 +672,89 @@ mod tests {
     #[ignore = "uses the public YouTube Music radio continuation endpoint"]
     fn live_public_radio_continuation() {
         let catalog = Catalog::new().unwrap();
-        let watch = catalog.watch("dQw4w9WgXcQ", true).unwrap();
+        let watch = catalog.watch(&track("dQw4w9WgXcQ"), true).unwrap();
         let first = catalog.watch_more(&watch.continuation.unwrap()).unwrap();
         assert!(!first.queue.is_empty());
         let second = catalog.watch_more(&first.continuation.unwrap()).unwrap();
         assert!(!second.queue.is_empty());
         assert!(second.queue.iter().all(|track| valid_video_id(&track.id)));
+    }
+
+    #[test]
+    #[ignore = "uses public podcast discovery, episode/show browse and next without an account"]
+    fn live_public_podcast_details_and_watch() {
+        let catalog = Catalog::new().unwrap();
+        let explore = catalog.explore().unwrap();
+        let episode = explore
+            .tracks()
+            .into_iter()
+            .find(|track| track.details.episode.is_some())
+            .expect("Explore must expose a public episode");
+        let page = catalog
+            .browse(&BrowseLink::new(format!("MPED{}", episode.id), "Episode"))
+            .unwrap();
+        let selected = page
+            .tracks()
+            .pop()
+            .expect("Episode header must be playable");
+        assert_eq!(selected.id, episode.id);
+        let details = selected.details.episode.as_ref().unwrap();
+        assert!(!details.duration_text.is_empty() && !page.description.is_empty());
+        assert_eq!(details.description, page.description);
+        let show_id = details
+            .show_id
+            .as_ref()
+            .expect("Episode must link to its show");
+        let show = catalog
+            .browse(&BrowseLink::new(show_id, "Podcast"))
+            .unwrap();
+        assert!(show.tracks().iter().any(|track| {
+            track
+                .details
+                .episode
+                .as_ref()
+                .and_then(|episode| episode.show_id.as_ref())
+                == Some(show_id)
+        }));
+        if let Some(continuation) = &show.continuation {
+            let more = catalog.more(continuation).unwrap();
+            let tracks = more.tracks();
+            assert!(!tracks.is_empty());
+            println!("Podcast show continuation: {} rows", tracks.len());
+            assert!(tracks.iter().all(|track| {
+                track
+                    .details
+                    .episode
+                    .as_ref()
+                    .and_then(|episode| episode.show_id.as_ref())
+                    == Some(show_id)
+            }));
+        }
+        let restored: Track =
+            serde_json::from_value(serde_json::to_value(&selected).unwrap()).unwrap();
+        assert!(
+            restored
+                .details
+                .episode
+                .as_ref()
+                .unwrap()
+                .watch_params
+                .is_none()
+        );
+        let watch = catalog.watch(&restored, false).unwrap();
+        let current = watch.current.unwrap();
+        assert_eq!(current.id, episode.id);
+        assert_eq!(
+            current.details.episode.as_ref().unwrap().show_id.as_ref(),
+            Some(show_id)
+        );
+        assert_eq!(
+            current.details.episode.as_ref().unwrap().description,
+            page.description
+        );
+        println!(
+            "Podcast browse/detail/restore passed; {} watch queue rows",
+            watch.queue.len()
+        );
     }
 }

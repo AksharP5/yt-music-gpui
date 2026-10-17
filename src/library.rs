@@ -65,6 +65,13 @@ impl Library {
             ..Default::default()
         }
     }
+    pub fn music_autoplay(&self) -> bool {
+        self.autoplay
+            && self
+                .queue
+                .current()
+                .is_some_and(|track| track.details.episode.is_none())
+    }
     pub fn toggle_like(&mut self, track: &Track) {
         if let Some(i) = self.liked.iter().position(|t| t.id == track.id) {
             self.liked.remove(i);
@@ -277,6 +284,41 @@ impl Drop for LibraryWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn episodes_advance_and_repeat_without_consuming_music_recommendations() {
+        let mut episode = track("episode");
+        episode.details.episode = Some(Box::default());
+        for natural in [false, true] {
+            let mut library = Library::default();
+            library
+                .queue
+                .replace(vec![episode.clone(), episode.clone()], 0);
+            let mut recommendations = VecDeque::from([track("music")]);
+            let autoplay = library.music_autoplay();
+            assert!(library.queue.advance_with_autoplay(
+                Repeat::Off,
+                natural,
+                autoplay,
+                &mut recommendations
+            ));
+            assert_eq!(library.queue.index, Some(1));
+            assert!(!library.queue.advance_with_autoplay(
+                Repeat::Off,
+                natural,
+                autoplay,
+                &mut recommendations
+            ));
+            assert_eq!(library.queue.tracks.len(), 2);
+            assert_eq!(recommendations.front().unwrap().id, "music");
+            assert!(library.queue.advance_with_autoplay(
+                Repeat::All,
+                natural,
+                autoplay,
+                &mut recommendations
+            ));
+            assert_eq!(library.queue.index, Some(0));
+        }
+    }
     fn track(id: &str) -> Track {
         Track {
             id: id.into(),

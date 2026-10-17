@@ -10,6 +10,7 @@ This is an independent client. The public-catalog player is working. Account int
 - Streaming audio, pause, seek, previous/next, volume, mute, audio quality and playback speed.
 - A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
 - Radio, continued autoplay, lyrics, song credits and related music when the service provides them.
+- Podcast show and episode pages, full descriptions, show navigation and episode duration labels.
 - Local liked songs, saved collections, and recently played songs.
 - Keyboard controls, native text input, and a compact sidebar on narrow windows.
 - Media keys and desktop playback controls when `mpv-mpris` is installed.

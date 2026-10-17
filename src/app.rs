@@ -80,7 +80,7 @@ enum CatalogTarget {
     PlaylistPicker,
 }
 enum PlaybackQuery {
-    Watch { video_id: String, radio: bool },
+    Watch { track: Box<Track>, radio: bool },
     More(WatchContinuation),
 }
 struct PlaybackJob {
@@ -136,13 +136,17 @@ enum Overlay {
     Help,
     Settings,
     CountryPicker(Entity<CountryPicker>),
+    Description {
+        title: String,
+        text: String,
+    },
     Track {
         track: Track,
         index: Option<usize>,
     },
     PlaylistPicker {
         track: Track,
-        page: Option<Page>,
+        page: Option<Box<Page>>,
         duplicates: bool,
     },
     PlaylistForm {
@@ -398,12 +402,12 @@ impl Music {
                         .map(|catalog| catalog.for_session(job.session))
                         .map_err(|error| format!("{error:#}"));
                     let result = match job.query {
-                        PlaybackQuery::Watch { video_id, radio } => PlaybackResult::Watch {
+                        PlaybackQuery::Watch { track, radio } => PlaybackResult::Watch {
                             id: job.id,
                             radio,
                             result: catalog.and_then(|catalog| {
                                 catalog
-                                    .watch(&video_id, radio)
+                                    .watch(&track, radio)
                                     .map(Box::new)
                                     .map_err(|error| format!("{error:#}"))
                             }),
@@ -655,7 +659,7 @@ impl Music {
     }
 
     fn extend_autoplay(&mut self, cx: &mut Context<Self>) {
-        if !self.library.autoplay {
+        if !self.library.music_autoplay() {
             return;
         }
         if self.autoplay_tracks.len() > 3 {
@@ -704,10 +708,11 @@ impl Music {
         let Some(natural) = self.autoplay_waiting else {
             return;
         };
+        let autoplay = self.library.music_autoplay();
         if self.library.queue.advance_with_autoplay(
             self.library.repeat,
             natural,
-            self.library.autoplay,
+            autoplay,
             &mut self.autoplay_tracks,
         ) {
             self.autoplay_waiting = None;
@@ -759,9 +764,23 @@ impl Music {
                             current.details.set_video_id = occurrence;
                             current.details.credits_id =
                                 track.details.credits_id.clone().or(credits);
+                            if track.details.episode.is_some() {
+                                current.artist = track.artist.clone();
+                            }
                             if let Some(rating) = track.details.rating {
                                 self.ratings.insert(track.id.clone(), rating);
                             }
+                        }
+                        if self
+                            .library
+                            .queue
+                            .current()
+                            .is_some_and(|track| track.details.episode.is_some())
+                        {
+                            if self.autoplay_waiting.is_some() {
+                                self.playback = Playback::Stopped;
+                            }
+                            self.reset_radio();
                         }
                         self.now_playing = Some(watch);
                         if radio {
@@ -780,7 +799,7 @@ impl Music {
                         if self.autoplay_waiting.take().is_some() {
                             self.playback = Playback::Stopped;
                         }
-                        self.notice = Some(format!("Song details are unavailable: {error}"))
+                        self.notice = Some(format!("Playback details are unavailable: {error}"))
                     }
                 }
             }
@@ -1010,7 +1029,7 @@ impl Music {
                             current.continuation = choices.continuation;
                             current.shelves.extend(choices.shelves);
                         } else {
-                            *page = Some(choices);
+                            *page = Some(Box::new(choices));
                         }
                     }
                     Err(error) => self.error = Some(error),
@@ -1482,6 +1501,9 @@ impl Music {
         let Some(track) = self.library.queue.current().cloned() else {
             return;
         };
+        if track.details.episode.is_some() {
+            self.reset_radio();
+        }
         self.autoplay_waiting = None;
         self.notice = None;
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
@@ -1525,7 +1547,7 @@ impl Music {
                     }
                     self.playback_request(
                         PlaybackQuery::Watch {
-                            video_id: track.id,
+                            track: Box::new(track),
                             radio: false,
                         },
                         cx,
@@ -1667,10 +1689,11 @@ impl Music {
         }
     }
     fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
+        let autoplay = self.library.music_autoplay();
         if self.library.queue.advance_with_autoplay(
             self.library.repeat,
             natural,
-            self.library.autoplay,
+            autoplay,
             &mut self.autoplay_tracks,
         ) {
             self.play_current(cx);
@@ -1679,7 +1702,7 @@ impl Music {
             self.active_id = None;
             self.playback = Playback::Stopped;
             self.position = self.duration;
-            if self.library.autoplay && self.library.queue.current().is_some() {
+            if autoplay {
                 self.autoplay_waiting = Some(natural);
                 self.extend_autoplay(cx);
                 self.resume_autoplay(cx);
@@ -2394,10 +2417,21 @@ impl Music {
                 row = row
                     .child(
                         div()
-                            .w(px(48.))
+                            .w(px(if track.details.episode.is_some() {
+                                100.
+                            } else {
+                                48.
+                            }))
                             .text_size(px(12.))
                             .text_color(self.theme.muted)
-                            .child(track.duration.map(|s| clock(s as f64)).unwrap_or_default()),
+                            .child(track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
+                                track
+                                    .details
+                                    .episode
+                                    .as_ref()
+                                    .map(|episode| episode.duration_text.clone())
+                                    .unwrap_or_default()
+                            })),
                     )
                     .child(
                         button(
@@ -2469,6 +2503,8 @@ impl Music {
     fn content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let has_tracks = self.rows.iter().any(|i| matches!(i, Item::Track(_)));
+        let single_episode =
+            matches!(self.rows.as_slice(), [Item::Track(track)] if track.details.episode.is_some());
         let mut content = div()
             .flex_1()
             .min_w_0()
@@ -2493,6 +2529,24 @@ impl Music {
                             .font_weight(FontWeight::BOLD)
                             .child(self.page.title.clone()),
                     )
+                    .when(!self.page.description.is_empty(), |heading| {
+                        heading.child(
+                            div()
+                                .id("page-description")
+                                .py(px(10.))
+                                .text_size(px(13.))
+                                .cursor_pointer()
+                                .child("Description")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    window.focus(&view.focus, cx);
+                                    view.overlay = Some(Overlay::Description {
+                                        title: view.page.title.clone(),
+                                        text: view.page.description.clone(),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(!self.page.countries.is_empty(), |heading| {
                         let label = self
                             .page
@@ -2578,7 +2632,7 @@ impl Music {
                                 .gap(px(8.))
                                 .cursor_pointer()
                                 .child(icon("play", 17., self.theme.text))
-                                .child("Play all")
+                                .child(if single_episode { "Play" } else { "Play all" })
                                 .on_click(cx.listener(|view, _, _, cx| {
                                     view.replace_queue(view.page.tracks(), 0, cx);
                                 })),
@@ -2928,6 +2982,21 @@ impl Music {
         content.into_any_element()
     }
     fn queue(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.library.queue.tracks.len();
+        let episodes = self
+            .library
+            .queue
+            .tracks
+            .iter()
+            .filter(|track| track.details.episode.is_some())
+            .count();
+        let label = match (count, episodes) {
+            (1, 1) => "1 episode".into(),
+            (1, 0) => "1 song".into(),
+            (_, 0) => format!("{count} songs"),
+            _ if episodes == count => format!("{count} episodes"),
+            _ => format!("{count} items"),
+        };
         div()
             .w(px(304.))
             .h_full()
@@ -2977,10 +3046,7 @@ impl Music {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(match self.library.queue.tracks.len() {
-                        1 => "1 song".to_owned(),
-                        count => format!("{count} songs"),
-                    })
+                    .child(label)
                     .child(
                         div()
                             .id("autoplay-toggle")
@@ -3364,7 +3430,8 @@ impl Music {
                             .text_color(self.theme.muted)
                             .child(
                                 div()
-                                    .w(px(38.))
+                                    .w(px(56.))
+                                    .flex_shrink_0()
                                     .text_right()
                                     .child(clock(self.drag_position.unwrap_or(self.position))),
                             )
@@ -3383,7 +3450,7 @@ impl Music {
                                     )
                                     .child(slider(progress, seek_bounds, self.theme)),
                             )
-                            .child(div().w(px(38.)).child(clock(self.duration))),
+                            .child(div().w(px(56.)).flex_shrink_0().child(clock(self.duration))),
                     ),
             )
             .child(div().flex_1().max_w(px(30.)))
@@ -3507,13 +3574,18 @@ impl Music {
                     .items_center()
                     .justify_between()
                     .mb(px(24.))
+                    .gap(px(12.))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(23.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(match kind {
                                 Overlay::Help => "Keyboard shortcuts".to_owned(),
                                 Overlay::Settings => "Settings".into(),
+                                Overlay::Description { .. } => "Description".into(),
                                 Overlay::Track { track, .. } => track.title.clone(),
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
@@ -3629,32 +3701,75 @@ impl Music {
                 .when(self.account.is_some(), |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Sign out").on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
+        } else if let Overlay::Description { title, text } = kind {
+            body = body
+                .child(
+                    div()
+                        .text_size(px(18.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.clone()),
+                )
+                .child(div().mt(px(18.)).text_size(px(14.)).child(text.clone()));
         } else if let Overlay::Track { track, index } = kind {
-            let song = track.clone();
-            body = body.child(self.menu_action(
-                "menu-radio",
-                "Start radio",
-                cx,
-                move |view, _, cx| {
-                    view.overlay = None;
-                    view.reset_radio();
-                    view.player_command(Player::stop);
-                    view.active_id = None;
-                    view.playback = Playback::Loading {
-                        paused: false,
-                        retried: false,
-                    };
-                    view.now_playing = None;
-                    view.notice = Some("Loading radio…".into());
-                    view.playback_request(
-                        PlaybackQuery::Watch {
-                            video_id: song.id.clone(),
-                            radio: true,
-                        },
-                        cx,
+            if let Some(episode) = &track.details.episode {
+                if !episode.subtitle.is_empty() {
+                    body = body.child(
+                        div()
+                            .mb(px(16.))
+                            .text_color(self.theme.muted)
+                            .child(episode.subtitle.clone()),
                     );
-                },
-            ));
+                }
+                let target = BrowseLink::new(format!("MPED{}", track.id), track.title.clone());
+                body = body.child(self.menu_action(
+                    "menu-episode",
+                    "Episode details",
+                    cx,
+                    move |view, _, cx| {
+                        view.overlay = None;
+                        view.navigate(Route::Browse(target.clone()), cx);
+                    },
+                ));
+                if let Some(id) = &episode.show_id {
+                    let target = BrowseLink::new(id.clone(), track.artist.clone());
+                    body = body.child(self.menu_action(
+                        "menu-show",
+                        "Go to podcast",
+                        cx,
+                        move |view, _, cx| {
+                            view.overlay = None;
+                            view.navigate(Route::Browse(target.clone()), cx);
+                        },
+                    ));
+                }
+            }
+            if track.details.episode.is_none() {
+                let song = track.clone();
+                body = body.child(self.menu_action(
+                    "menu-radio",
+                    "Start radio",
+                    cx,
+                    move |view, _, cx| {
+                        view.overlay = None;
+                        view.reset_radio();
+                        view.player_command(Player::stop);
+                        view.active_id = None;
+                        view.playback = Playback::Loading {
+                            paused: false,
+                            retried: false,
+                        };
+                        view.now_playing = None;
+                        view.notice = Some("Loading radio…".into());
+                        view.playback_request(
+                            PlaybackQuery::Watch {
+                                track: Box::new(song.clone()),
+                                radio: true,
+                            },
+                            cx,
+                        );
+                    },
+                ));
+            }
             if let Some(watch) = &self.now_playing
                 && watch
                     .current
@@ -3890,7 +4005,11 @@ impl Music {
             for (id, label, title, target) in [
                 (
                     "menu-artist",
-                    "Go to artist",
+                    if track.details.episode.is_some() {
+                        "Go to creator"
+                    } else {
+                        "Go to artist"
+                    },
                     "Artist",
                     &track.details.artist_id,
                 ),
@@ -3912,7 +4031,11 @@ impl Music {
             let url = format!("https://music.youtube.com/watch?v={}", track.id);
             body = body.child(self.menu_action(
                 "menu-share",
-                "Copy song link",
+                if track.details.episode.is_some() {
+                    "Copy episode link"
+                } else {
+                    "Copy song link"
+                },
                 cx,
                 move |view, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
