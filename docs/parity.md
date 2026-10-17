@@ -12,7 +12,11 @@ Native radio, current-song account metadata, lyrics and related-music controls u
 
 Search has debounced native suggestions with keyboard selection, public category filters, and pagination that retains the query and filter. Live public checks covered all eight public categories, suggestions and song pagination. Library and uploads scopes are wired but unverified. Combined category/scope filters and search-history deletion remain missing.
 
-Authenticated behavior and the newest search, radio and queue controls still need an interactive desktop check; the current desktop automation backend refuses input because its Hyprland plugin is unavailable. The user deferred Google sign-in, so real account checks remain pending.
+Connected playback now queues remote history reporting after mpv starts the track. Reports require matching full server account identity, the requested video ID, a validated YouTube history destination and HTTP 204 acknowledgement. Missing account proof fails closed. Reports and their replies are bound to the exact selected session. Guest playback keeps local history; connected plays are not copied into that guest history. A public player inspection returned a valid tracking destination without submitting history. Actual history persistence on a signed-in account remains unverified.
+
+Settings has a saved 0.25× to 2× playback-speed control. A live guest mpv check passed playback, pause, seek and changing speed to 1.5×. Video selection, fullscreen and quality settings remain missing.
+
+Authenticated behavior and the newest search, radio, queue and Settings controls still need an interactive desktop check; the current desktop automation backend refuses input because its Hyprland plugin is unavailable. The user deferred Google sign-in, so real account checks remain pending.
 
 - [ ] Google account connection, reconnect, account identity and account switching.
 - [ ] Personalized home, mixes and discovery, moods, genres, charts and new releases.

@@ -4,6 +4,7 @@ mod artwork;
 mod assets;
 mod auth;
 mod catalog;
+mod history;
 mod input;
 mod library;
 mod player;

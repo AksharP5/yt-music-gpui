@@ -167,6 +167,54 @@ impl Session {
         );
         Ok(())
     }
+    pub fn verify_server_identity(&self, response: &Value) -> Result<()> {
+        self.validate_playback_identity()?;
+        ensure!(
+            response["LOGGED_IN"] != false
+                && response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+                    != Some(&json!(true)),
+            "YouTube Music did not accept the account session. Connect again."
+        );
+        let identities = [
+            response.get("DATASYNC_ID"),
+            response.pointer("/responseContext/mainAppWebResponseContext/datasyncId"),
+        ];
+        ensure!(
+            identities
+                .iter()
+                .flatten()
+                .all(|value| value.as_str() == Some(self.data_sync_id.as_str())),
+            "YouTube Music returned a different account"
+        );
+        ensure!(
+            identities.iter().any(Option::is_some),
+            "YouTube Music did not confirm the selected account"
+        );
+        if let Some(index) = response.get("SESSION_INDEX") {
+            ensure!(
+                index.as_str() == Some(self.authuser.as_str())
+                    || index.as_u64() == self.authuser.parse().ok(),
+                "YouTube Music returned a different account"
+            );
+        }
+        let (first, second) = self
+            .data_sync_id
+            .split_once("||")
+            .expect("validated playback identity");
+        let user = if second.is_empty() { first } else { second };
+        for (key, expected) in [
+            ("USER_SESSION_ID", json!(user)),
+            ("DELEGATED_SESSION_ID", json!(self.delegated_session_id)),
+        ] {
+            if let Some(value) = response.get(key) {
+                ensure!(
+                    value == &expected,
+                    "YouTube Music returned a different account"
+                );
+            }
+        }
+        Ok(())
+    }
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.cookie.contains(['\r', '\n']) && self.cookie.len() <= 64 * 1024,

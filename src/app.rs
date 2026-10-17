@@ -4,7 +4,7 @@ use crate::{
     auth::{self, Operation, Session, SharedSession},
     catalog::{Catalog, Collection, Item, Page, Rating, Shelf, Track},
     library::{Library, LibraryWriter, Repeat, Store},
-    player::{Player, PlayerEvent, PlayerOptions},
+    player::{PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
     playlist_form::{PlaylistForm, PlaylistFormEvent},
     search::SearchFilter,
     search_box::{SearchBox, SearchBoxEvent},
@@ -178,6 +178,7 @@ pub struct Music {
     store: Option<LibraryWriter>,
     player: Option<Player>,
     active_id: Option<u64>,
+    history_track: Option<u64>,
     playback: Playback,
     position: f64,
     duration: f64,
@@ -242,6 +243,7 @@ impl Music {
         let (player, error) = match Player::new(PlayerOptions {
             credentials: None,
             volume: library.volume,
+            speed: library.speed,
             ..Default::default()
         }) {
             Ok(p) => (Some(p), error),
@@ -511,6 +513,7 @@ impl Music {
             store,
             player,
             active_id: None,
+            history_track: None,
             playback: Playback::Stopped,
             position: 0.,
             duration: 0.,
@@ -746,6 +749,7 @@ impl Music {
         self.search
             .update(cx, |search, cx| search.set_session(session, cx));
         self.ratings.clear();
+        self.history_track = None;
         self.pending_mutations.clear();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
         self.watch_pending = false;
@@ -1302,6 +1306,44 @@ impl Music {
                     ));
                 }
             }
+            account::Event::PlaybackReported {
+                session,
+                video_id,
+                result,
+            } => {
+                if !self
+                    .account
+                    .as_ref()
+                    .is_some_and(|connection| Arc::ptr_eq(&connection.session, &session))
+                {
+                    return;
+                }
+                match result {
+                    Ok(())
+                        if self.overlay.is_none()
+                            && !self.loading
+                            && matches!(
+                                self.route,
+                                Route::Recent | Route::Library(Section::History)
+                            ) =>
+                    {
+                        self.request(Query::Library(Section::History), cx);
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        let title = self
+                            .library
+                            .queue
+                            .tracks
+                            .iter()
+                            .find(|track| track.id == video_id)
+                            .map_or("this song", |track| track.title.as_str());
+                        self.error = Some(format!(
+                            "Could not save {title} to YouTube Music history: {error}"
+                        ));
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -1473,6 +1515,13 @@ impl Music {
                 changed = self.library.volume.round() != volume.round();
                 self.library.volume = volume.clamp(0., 100.);
             }
+            PlayerEvent::Speed(speed) => {
+                changed = self.library.speed != speed;
+                self.library.speed = speed;
+                if changed {
+                    self.save();
+                }
+            }
             PlayerEvent::Error { track_id, message }
                 if track_id.is_none() || track_id == self.active_id =>
             {
@@ -1483,9 +1532,28 @@ impl Music {
             }
             PlayerEvent::Started { track_id } if Some(track_id) == self.active_id => {
                 self.playback = Playback::Playing;
-                if let Some(track) = self.library.queue.current().cloned() {
-                    self.library.record_play(&track);
-                    self.save();
+                if self.history_track != Some(track_id)
+                    && let Some(track) = self.library.queue.current().cloned()
+                {
+                    self.history_track = Some(track_id);
+                    if let Some(connection) = &self.account {
+                        if self
+                            .account_commands
+                            .try_send(account::Command::ReportPlayback {
+                                session: connection.session.clone(),
+                                video_id: track.id,
+                            })
+                            .is_err()
+                        {
+                            self.error = Some(
+                                "Could not queue playback history. Restart the app to reconnect."
+                                    .into(),
+                            );
+                        }
+                    } else {
+                        self.library.record_play(&track);
+                        self.save();
+                    }
                 }
             }
             PlayerEvent::Loading { track_id } if Some(track_id) == self.active_id => {
@@ -3073,12 +3141,44 @@ impl Music {
                 );
             }
         } else if matches!(kind, Overlay::Settings) {
+            let mut speeds = div().mt(px(12.)).flex().flex_wrap().gap(px(4.));
+            for (index, speed) in PlaybackSpeed::ALL.into_iter().enumerate() {
+                speeds = speeds.child(
+                    div()
+                        .id(("playback-speed", index))
+                        .w(px(44.))
+                        .py(px(10.))
+                        .text_center()
+                        .text_size(px(13.))
+                        .border_b_2()
+                        .border_color(if self.library.speed == speed {
+                            self.theme.accent
+                        } else {
+                            self.theme.panel
+                        })
+                        .when(self.library.speed == speed, |button| {
+                            button.text_color(self.theme.accent)
+                        })
+                        .hover(|button| button.bg(self.theme.raised))
+                        .cursor_pointer()
+                        .child(format!("{}×", f64::from(speed)))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.library.speed = speed;
+                            view.player_command(|player| player.set_speed(speed));
+                            view.save();
+                            cx.notify();
+                        })),
+                );
+            }
+            body = body
+                .child(div().text_size(px(15.)).child("Playback speed"))
+                .child(speeds);
             let label = self
                 .account
                 .as_ref()
                 .map(|a| format!("{} {}", a.account.name, a.account.handle))
                 .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
-            body=body.child(div().text_size(px(15.)).child(label))
+            body=body.child(div().mt(px(28.)).text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
                     .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if self.account_operation.is_some(){"Connecting account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))

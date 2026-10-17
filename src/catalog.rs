@@ -158,7 +158,7 @@ impl Page {
 
 #[derive(Clone)]
 pub struct Catalog {
-    client: Client,
+    pub(crate) client: Client,
     pub(crate) session: Option<Arc<Session>>,
 }
 
@@ -259,11 +259,14 @@ impl Catalog {
         };
         let response = request
             .send()
+            .map_err(reqwest::Error::without_url)
             .context("Could not reach YouTube Music. Check your connection and try again.")?
             .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .context("YouTube Music rejected the request")?;
         let value: Value = response
             .json()
+            .map_err(reqwest::Error::without_url)
             .context("YouTube Music returned an unreadable response")?;
         if let Some(error) = value.get("error") {
             bail!(

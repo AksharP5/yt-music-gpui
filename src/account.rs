@@ -172,6 +172,10 @@ pub enum Command {
     Restore(Operation),
     Disconnect(Operation),
     Persist(Arc<Session>),
+    ReportPlayback {
+        session: Arc<Session>,
+        video_id: String,
+    },
 }
 pub enum Event {
     Connected {
@@ -190,6 +194,11 @@ pub enum Event {
     },
     Persisted {
         session: Arc<Session>,
+        result: Result<(), String>,
+    },
+    PlaybackReported {
+        session: Arc<Session>,
+        video_id: String,
         result: Result<(), String>,
     },
 }
@@ -267,6 +276,13 @@ pub fn start(
                         })().map_err(|error| format!("{error:#}"));
                         Event::Persisted { session: expected, result }
                     }
+                    Command::ReportPlayback { session: expected, video_id } => {
+                        let result = (|| {
+                            catalog.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?
+                                .for_session(Some(expected.clone())).report_playback(&video_id, &session)
+                        })().map_err(|error| format!("{error:#}"));
+                        Event::PlaybackReported { session: expected, video_id, result }
+                    }
                 };
                 // Closing the UI must not discard a queued sign-out behind this event.
                 let _ = events.send_blocking(event);
@@ -299,7 +315,10 @@ fn persist_current_session(
     saved
 }
 
-fn require_current_session(shared: &SharedSession, expected: &Arc<Session>) -> Result<()> {
+pub(crate) fn require_current_session(
+    shared: &SharedSession,
+    expected: &Arc<Session>,
+) -> Result<()> {
     let current = shared
         .read()
         .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?;
@@ -307,7 +326,7 @@ fn require_current_session(shared: &SharedSession, expected: &Arc<Session>) -> R
         current
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, expected)),
-        "The account changed before this edit could be saved. Refresh and try again."
+        "The connected account changed. Refresh and try again."
     );
     Ok(())
 }

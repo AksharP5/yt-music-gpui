@@ -7,7 +7,7 @@ This is an independent client. The public-catalog player is working. Account int
 ## What works
 
 - Home and Explore, search suggestions and category filters, and artist, album, and playlist browsing.
-- Streaming audio, pause, seek, previous/next, volume, and mute.
+- Streaming audio, pause, seek, previous/next, volume, mute, and playback speed.
 - A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
 - Radio, continued autoplay, lyrics and related music when the service provides them.
 - Local liked songs, saved collections, and recently played songs.
@@ -57,6 +57,8 @@ Click an album, artist, or playlist to open it. Click a song to play from that p
 
 The song menu offers radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
 
+Settings changes playback speed from 0.25× to 2×. The selected speed applies immediately and is saved on this device.
+
 ## Data and performance
 
 The library is stored at `$XDG_DATA_HOME/yt-music-gpui/library.json`, or `~/.local/share/yt-music-gpui/library.json`. Writes use an atomic replacement on a dedicated worker. Closing the app flushes the last pending write. An unreadable library is preserved and reported instead of overwritten.
@@ -78,7 +80,7 @@ Measured on the development Omarchy desktop on 2026-10-15, using the optimized b
 | Paused | 0.27% | 0.00% | 242.6 MiB |
 | Playing | 0.53% | 0.87% | 253.0 MiB |
 
-The current stripped release executable is 33.8 MiB. The CPU and memory samples above predate account integration, search suggestions and continued autoplay, so those need fresh measurements. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
+The current stripped release executable is 33.9 MiB. The CPU and memory samples above predate account integration, search suggestions and continued autoplay, so those need fresh measurements. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
 
 ## Validation
 

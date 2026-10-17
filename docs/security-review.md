@@ -20,6 +20,8 @@ No real Google account was used by the checks above. Authenticated compatibility
 
 The search and autoplay checkpoint passes 47 ordinary tests and strict all-target Clippy. Suggestions reject replies from a previous query, generation or exact account session. Radio continuation carries its original account identity and rejects another session before making a request. These checks supplement the earlier review; they do not extend the sealed security scan to newer commits. The user deferred sign-in, and no authenticated cross-client check has run.
 
+The history and playback-speed checkpoint passes 53 ordinary tests and strict all-target Clippy, including five history contracts and a validated speed boundary. A separate source review found that the first history implementation checked the video but lacked server account proof. A regression reproduced that gap before it was fixed. Reporting now requires the full selected primary/brand identity and rejects conflicting account hints before accepting the tracking URL. The bounded recheck found no remaining concrete defect in that fix. Public player inspection validated a history destination without submitting it; live guest playback passed pause, seek and speed changes. Actual signed-in history remains unverified.
+
 ## Dependency maintenance
 
 687 locked packages were checked against RustSec advisory database commit 999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b. Version requirements were matched using Rust's semver implementation, excluding withdrawn advisories. No current vulnerability or unsoundness advisory matched. Six active transitive dependencies matched unmaintained advisories, with no patched versions listed:

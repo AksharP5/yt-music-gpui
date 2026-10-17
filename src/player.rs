@@ -1,5 +1,6 @@
 use crate::auth::{PlaybackCredentials, sealed_file};
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -19,9 +20,50 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct PlaybackSpeed(f64);
+
+impl PlaybackSpeed {
+    pub const ALL: [Self; 8] = [
+        Self(0.25),
+        Self(0.5),
+        Self(0.75),
+        Self(1.),
+        Self(1.25),
+        Self(1.5),
+        Self(1.75),
+        Self(2.),
+    ];
+}
+
+impl Default for PlaybackSpeed {
+    fn default() -> Self {
+        Self(1.)
+    }
+}
+
+impl TryFrom<f64> for PlaybackSpeed {
+    type Error = &'static str;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if !value.is_finite() || !(0.25..=2.).contains(&value) {
+            return Err("Playback speed must be between 0.25 and 2");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<PlaybackSpeed> for f64 {
+    fn from(value: PlaybackSpeed) -> Self {
+        value.0
+    }
+}
+
 pub struct PlayerOptions {
     pub credentials: Option<PlaybackCredentials>,
     pub volume: f64,
+    pub speed: PlaybackSpeed,
     pub audio_output: Option<String>,
 }
 
@@ -30,6 +72,7 @@ impl Default for PlayerOptions {
         Self {
             credentials: None,
             volume: 60.,
+            speed: PlaybackSpeed::default(),
             audio_output: None,
         }
     }
@@ -67,6 +110,7 @@ pub enum PlayerEvent {
         message: String,
     },
     Volume(f64),
+    Speed(PlaybackSpeed),
 }
 
 enum PlayerCommand {
@@ -159,6 +203,9 @@ impl Player {
             bail!("Invalid volume.");
         }
         self.command(json!(["set_property", "volume", percent.clamp(0., 100.)]))
+    }
+    pub fn set_speed(&self, speed: PlaybackSpeed) -> Result<()> {
+        self.command(json!(["set_property", "speed", f64::from(speed)]))
     }
     #[cfg(test)]
     pub fn try_recv(&self) -> Option<PlayerEvent> {
@@ -368,6 +415,7 @@ fn run(
         "--demuxer-max-back-bytes=8MiB",
     ])
     .arg(format!("--volume={}", options.volume.clamp(0., 100.)))
+    .arg(format!("--speed={}", f64::from(options.speed)))
     .arg(format!(
         "--script-opts=ytdl_hook-ytdl_path=%{}%{}",
         ytdlp.as_os_str().len(),
@@ -436,6 +484,7 @@ fn run(
         "pause",
         "paused-for-cache",
         "volume",
+        "speed",
     ]
     .iter()
     .enumerate()
@@ -578,6 +627,15 @@ impl PlaybackState {
                     }
                     return;
                 }
+                if value["name"] == "speed" {
+                    if let Some(speed) = value["data"]
+                        .as_f64()
+                        .and_then(|value| PlaybackSpeed::try_from(value).ok())
+                    {
+                        let _ = events.send_blocking(PlayerEvent::Speed(speed));
+                    }
+                    return;
+                }
                 let Some(track_id) = self
                     .current
                     .filter(|id| self.loaded && Some(*id) == self.desired)
@@ -616,6 +674,29 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_speed_is_validated_before_it_can_reach_mpv() {
+        assert_eq!(f64::from(PlaybackSpeed::default()), 1.);
+        for invalid in [f64::NAN, f64::INFINITY, -1., 0., 0.24, 2.01] {
+            assert!(PlaybackSpeed::try_from(invalid).is_err());
+        }
+        assert!(serde_json::from_value::<PlaybackSpeed>(json!(0.1)).is_err());
+        let speed = serde_json::from_value::<PlaybackSpeed>(json!(1.5)).unwrap();
+        assert_eq!(serde_json::to_value(speed).unwrap(), json!(1.5));
+        let (events, received) = async_channel::unbounded();
+        let mut state = PlaybackState::default();
+        state.message(
+            json!({"event":"property-change","name":"speed","data":1.5}),
+            &events,
+        );
+        assert!(matches!(received.try_recv(), Ok(PlayerEvent::Speed(value)) if value == speed));
+        state.message(
+            json!({"event":"property-change","name":"speed","data":0}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+    }
 
     fn file_identity(path: &str) -> Option<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
@@ -924,18 +1005,25 @@ mod tests {
             }
         }
         assert!(started && progressed, "stream must begin and progress");
+        let speed = PlaybackSpeed::try_from(1.5).unwrap();
+        player.set_speed(speed).unwrap();
         player.pause(true).unwrap();
         player.seek(30.).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut paused = false;
         let mut sought = false;
-        while Instant::now() < deadline && !(paused && sought) {
+        let mut sped_up = false;
+        while Instant::now() < deadline && !(paused && sought && sped_up) {
             match player.try_recv() {
                 Some(PlayerEvent::Paused { paused: true, .. }) => paused = true,
                 Some(PlayerEvent::Position { seconds, .. }) if seconds >= 29. => sought = true,
+                Some(PlayerEvent::Speed(value)) if value == speed => sped_up = true,
                 _ => thread::sleep(Duration::from_millis(50)),
             }
         }
-        assert!(paused && sought, "pause and seek must reach mpv");
+        assert!(
+            paused && sought && sped_up,
+            "pause, seek and playback speed must reach mpv"
+        );
     }
 }

@@ -1,4 +1,5 @@
 use crate::catalog::{Collection, Track};
+use crate::player::PlaybackSpeed;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,6 +38,7 @@ pub struct Library {
     pub repeat: Repeat,
     pub autoplay: bool,
     pub volume: f64,
+    pub speed: PlaybackSpeed,
 }
 
 impl Default for Library {
@@ -49,6 +51,7 @@ impl Default for Library {
             repeat: Repeat::default(),
             autoplay: true,
             volume: 0.,
+            speed: PlaybackSpeed::default(),
         }
     }
 }
@@ -309,6 +312,7 @@ mod tests {
         }))
         .unwrap();
         assert!(migrated.autoplay);
+        assert_eq!(migrated.speed, PlaybackSpeed::default());
         assert_eq!(migrated.volume, 37.);
         assert_eq!(migrated.repeat, Repeat::All);
         assert_eq!(migrated.liked[0].id, "saved");
