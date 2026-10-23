@@ -2822,11 +2822,14 @@ impl Music {
                 cx.notify();
             }
             "escape" => {
-                if self.video_open && window.is_fullscreen() && self.overlay.is_none() {
+                if self.overlay.is_some() {
+                    self.close_overlay(window, cx);
+                    return;
+                }
+                if self.video_open && window.is_fullscreen() {
                     self.toggle_video_fullscreen(window, cx);
                     return;
                 }
-                self.close_overlay(window, cx);
                 self.show_queue = false;
                 cx.notify();
             }

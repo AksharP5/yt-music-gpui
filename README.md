@@ -58,6 +58,8 @@ Launch with `--guest` to skip restoring a saved account from the keyring. This d
 | Escape | Close a dialog, exit video fullscreen, close queue or leave search |
 | Ctrl Q | Quit |
 
+Escape dismisses the current dialog without closing the queue behind it.
+
 Click an album, artist, or playlist to open it. Click a song to play from that point in the current results. The plus adds a song to the queue or saves a collection. Search keeps its query, category and scope while loading more results or navigating back. Library search supports category filters; uploads search covers all uploads. Both scopes require a connected account.
 
 The video button in the playback bar opens the native video view. Click the picture to pause or resume; double-click it or press F for fullscreen. Audio returns to audio playback. The quality button opens Settings, with limits from 144p through 2160p and a default of 720p. These are maximum heights, not a promise that every recording offers that resolution. Video formats retain the selected audio quality and never fall back to an above-limit stream. Quality and Audio/Video changes preserve position and pause state. When YouTube Music provides an exact Song/Video pair, switching selects that recording; otherwise video plays the current recording. Closing the view keeps playback running. Dialogs temporarily detach the video so their controls remain accessible.
