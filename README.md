@@ -92,30 +92,16 @@ bin/profile APP_PID 30
 
 This samples CPU and resident memory for the app and its existing child processes. CPU is a percentage of one core. PSS apportions shared mappings; GPU memory is not included. Measure after artwork loads, and start playback before sampling playback performance so temporary yt-dlp startup work is excluded.
 
-Measured on the development Omarchy desktop on 2026-10-15, using the optimized build under XWayland at 956 × 1050. Each steady-state sample lasted 30 seconds; playback used muted audio. These are local measurements, not a comparison with the web client.
-
-| State | GUI CPU | mpv CPU | Combined PSS |
-| --- | ---: | ---: | ---: |
-| Paused | 0.27% | 0.00% | 242.6 MiB |
-| Playing | 0.53% | 0.87% | 253.0 MiB |
-
-Fresh guest measurements on 2026-10-17 at 1916 × 1050 used the current release after artwork loaded. Each sample lasted 30 seconds. Playback used muted audio at 1.5× speed; autoplay was off. These still do not establish a comparison with the web client.
-
-| State | GUI CPU | mpv CPU | Combined PSS |
-| --- | ---: | ---: | ---: |
-| Idle after search, credits and queue checks | 0.20% | 0.03% | 174.5 MiB |
-| Playing at 1.5× | 0.87% | 1.43% | 211.7 MiB |
-
-Those measurements predate the in-process libmpv renderer. Audio and video now run in the app process; the old GUI/mpv split does not describe the current build.
-
-Native video measurements on 2026-10-17 used the release build under XWayland at 1916 × 1050, muted public playback at 1× speed, Low audio quality and autoplay off. Each steady sample lasted 30 seconds. The playing stream was 1280 × 720 with NVDEC and no observed dropped frames; the paused sample followed a change to 1920 × 1080. GPU memory is excluded and these are not web-client comparisons.
+Measured on the development Omarchy desktop on 2026-10-23 with release `4191ff3`, under XWayland at 1920 × 1080 fullscreen. Public guest playback used Muse's "Uprising" at 1280 × 720 with NVDEC, Low audio quality, 1× speed, muted volume and autoplay off. The queue contained 200 tracks after the playlist continuation check. Each steady sample lasted 30 seconds after loading finished.
 
 | State | App CPU | App PSS |
 | --- | ---: | ---: |
-| Playing 720p video | 2.30% | 512.6 MiB |
-| Paused 1080p video | 0.33% | 568.2 MiB |
+| Playing 720p video | 3.87% | 522.7 MiB |
+| Paused 720p video | 0.37% | 526.3 MiB |
 
-Connected playback still needs measurements. `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
+Both samples recorded zero dropped frames; the paused position stayed unchanged. PSS excludes GPU memory. Matched web-client comparisons and connected-account measurements remain pending. An earlier rendering stall and the current verification limits are recorded in [docs/parity.md](docs/parity.md). `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
+
+A separate native Wayland guest session at 956 × 523 recorded 2.87% of one CPU core and 579.0 MiB PSS during 30 seconds of the same 720p stream, with zero dropped frames. That session also passed Stop, renderer detachment, Play and renderer reattachment.
 
 ## Validation
 

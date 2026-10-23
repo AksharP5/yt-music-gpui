@@ -48,6 +48,8 @@ The native-video checkpoint adds a single in-process libmpv core and a renderer 
 
 Song/Video pairs come only from validated service wrappers. Review found stale queue matching, delayed-mode application, loss of reverse-switch metadata and failed-enqueue playback ownership defects. Membership checks, transient account-cleared pair retention, exact-current response binding and retiring the old load before enqueueing corrected them. Inactive autoplay results keep their existing advance path, and async metadata cannot reopen the video view after navigation. A bounded recheck found no remaining concrete issue in these changes. No real account or authenticated sync was tested.
 
+Production Wayland checks passed Stop/Play through renderer detachment and reattachment. The GPUI Wayland event source releases its prepared-read guard before dispatching UI callbacks, so the proposed wait cycle through that guard was not established. Uninstrumented 30-second samples on both display backends recorded zero dropped frames. An earlier XWayland rendering stall remains unresolved; these samples do not establish driver-failure recovery or audible A/V synchronization.
+
 ## Dependency maintenance
 
 687 locked packages were checked against RustSec advisory database commit 999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b. Version requirements were matched using Rust's semver implementation, excluding withdrawn advisories. No current vulnerability or unsoundness advisory matched. Six active transitive dependencies matched unmaintained advisories, with no patched versions listed:
