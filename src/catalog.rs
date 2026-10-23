@@ -397,7 +397,7 @@ impl Catalog {
         if matches!(link.id.as_str(), "FEmusic_home" | "FEmusic_explore") {
             page.continuation = data
                 .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer")
-                .and_then(section_continuation);
+                .and_then(owned_continuation);
         }
         match link.id.as_str() {
             "FEmusic_home" => page.chips = home_choices(&data)?,
@@ -1132,14 +1132,24 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
     }
 }
 
-fn section_continuation(owner: &Value) -> Option<Continuation> {
+fn owned_continuation(owner: &Value) -> Option<Continuation> {
     owner["continuations"]
-        .as_array()?
-        .iter()
+        .as_array()
+        .into_iter()
+        .flatten()
         .find_map(|entry| {
             entry
                 .pointer("/nextContinuationData/continuation")
                 .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            owner["contents"].as_array()?.iter().find_map(|entry| {
+                entry
+                    .pointer(
+                        "/continuationItemRenderer/continuationEndpoint/continuationCommand/token",
+                    )
+                    .and_then(Value::as_str)
+            })
         })
         .filter(|token| !token.is_empty())
         .map(Continuation::new)
@@ -1172,11 +1182,12 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         })
         .map(text)
         .unwrap_or_default();
-    let continuation = match data
-        .pointer("/continuationContents/sectionListContinuation")
+    let continuation = match find(data, "musicPlaylistShelfRenderer")
+        .or_else(|| find(data, "musicPlaylistShelfContinuation"))
+        .or_else(|| data.pointer("/continuationContents/sectionListContinuation"))
         .or_else(|| data.get("sectionListContinuation"))
     {
-        Some(owner) => section_continuation(owner),
+        Some(owner) => owned_continuation(owner),
         None => find(data, "nextContinuationData")
             .and_then(|v| v["continuation"].as_str())
             .or_else(|| find(data, "continuationCommand").and_then(|v| v["token"].as_str()))
@@ -1803,6 +1814,48 @@ mod tests {
     }
 
     #[test]
+    fn playlist_pages_follow_the_track_list_instead_of_the_recommendation_feed() {
+        let mut response = json!({"contents":{"twoColumnBrowseResultsRenderer":{
+            "secondaryContents":{"sectionListRenderer":{
+                "contents":[{"musicPlaylistShelfRenderer":{"contents":[
+                    {"musicResponsiveListItemRenderer":{
+                        "playlistItemData":{"videoId":"abcdefghijk"},
+                        "flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{
+                            "text":{"runs":[{"text":"A song"}]}
+                        }}]
+                    }},
+                    {"continuationItemRenderer":{"continuationEndpoint":{
+                        "continuationCommand":{"token":"playlist-tail"}
+                    }}}
+                ]}}],
+                "continuations":[{"nextContinuationData":{"continuation":"recommendations"}}]
+            }}
+        }}});
+        let page = parse_page(&response, "Playlist").unwrap();
+        assert_eq!(page.tracks().len(), 1);
+        assert_eq!(page.continuation.unwrap().token(), "playlist-tail");
+
+        response.pointer_mut("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer/contents")
+            .unwrap().as_array_mut().unwrap().pop();
+        let page = parse_page(&response, "Playlist").unwrap();
+        assert_eq!(page.tracks().len(), 1);
+        assert!(page.continuation.is_none());
+
+        let continued = json!({"continuationContents":{"musicPlaylistShelfContinuation":{
+            "contents":[],
+            "continuations":[{"nextContinuationData":{"continuation":"later-tracks"}}]
+        }}});
+        assert_eq!(
+            parse_page(&continued, "More music")
+                .unwrap()
+                .continuation
+                .unwrap()
+                .token(),
+            "later-tracks"
+        );
+    }
+
+    #[test]
     fn a_finished_section_list_does_not_use_a_nested_shelf_continuation() {
         let mut response = continued_page(json!("visitor"), "page-token");
         response["continuationContents"]["sectionListContinuation"]
@@ -1816,7 +1869,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            section_continuation(&response["continuationContents"]["sectionListContinuation"])
+            owned_continuation(&response["continuationContents"]["sectionListContinuation"])
                 .is_none()
         );
         let shelf = json!({"continuationContents":{"musicShelfContinuation":{
@@ -2451,6 +2504,27 @@ mod tests {
             results.tracks().len(),
             page.title,
             page.tracks().len()
+        );
+    }
+
+    #[test]
+    #[ignore = "reads a public playlist and its continuation without an account"]
+    fn live_public_playlist_continuation() {
+        let api = Catalog::new().unwrap();
+        let first = api
+            .browse(&BrowseLink::new(
+                "VLPL_yH9Q5syvqggJSHEZsd4itCiA42Q6vJr",
+                "LAS 1000 MEJORES CANCIONES DE LA HISTORIA",
+            ))
+            .unwrap();
+        let second = api.more(first.continuation.as_ref().unwrap()).unwrap();
+        assert!(!first.tracks().is_empty());
+        assert!(!second.tracks().is_empty());
+        assert!(second.continuation.is_some());
+        println!(
+            "Playlist: {} initial tracks, {} continued tracks with another page",
+            first.tracks().len(),
+            second.tracks().len()
         );
     }
 
