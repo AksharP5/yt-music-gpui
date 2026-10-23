@@ -19,6 +19,20 @@ pub struct Account {
     pub handle: String,
 }
 
+impl Account {
+    fn from_response(data: &Value, session: &Session) -> Result<Self> {
+        session.verify_server_identity(data)?;
+        let header = find(data, "activeAccountHeaderRenderer")
+            .context("Google did not accept the account session. Connect again.")?;
+        let name = text(&header["accountName"]);
+        ensure!(!name.is_empty(), "Google returned no signed-in account");
+        Ok(Self {
+            name,
+            handle: text(&header["channelHandle"]),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Track {
     pub id: String,
@@ -372,15 +386,12 @@ impl Catalog {
     }
 
     pub fn account(&self) -> Result<Account> {
+        let session = self
+            .session
+            .as_ref()
+            .context("Connect your Google account first")?;
         let data = self.request("account/account_menu", json!({}))?;
-        let header = find(&data, "activeAccountHeaderRenderer")
-            .context("Google did not accept the account session. Connect again.")?;
-        let name = text(&header["accountName"]);
-        ensure!(!name.is_empty(), "Google returned no signed-in account");
-        Ok(Account {
-            name,
-            handle: text(&header["channelHandle"]),
-        })
+        Account::from_response(&data, session)
     }
 
     pub fn home(&self) -> Result<Page> {
@@ -1405,6 +1416,32 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_activation_requires_matching_primary_or_brand_identity() {
+        for (identity, delegated) in [("user||", None), ("brand||user", Some("brand"))] {
+            let session: Session = serde_json::from_value(json!({
+                "cookie":"SAPISID=synthetic", "playback_cookie":"", "authuser":"2",
+                "delegated_session_id":delegated, "data_sync_id":identity, "client_version":"test"
+            }))
+            .unwrap();
+            let mut response = json!({
+                "responseContext":{"mainAppWebResponseContext":{"datasyncId":identity}},
+                "activeAccountHeaderRenderer":{
+                    "accountName":{"simpleText":"Test account"},
+                    "channelHandle":{"simpleText":"@test"}
+                }
+            });
+            let account = Account::from_response(&response, &session).unwrap();
+            assert_eq!(account.name, "Test account");
+            assert_eq!(account.handle, "@test");
+            response["responseContext"]["mainAppWebResponseContext"]["datasyncId"] =
+                json!("another||");
+            assert!(Account::from_response(&response, &session).is_err());
+            response.as_object_mut().unwrap().remove("responseContext");
+            assert!(Account::from_response(&response, &session).is_err());
+        }
+    }
 
     fn episode_row() -> Value {
         json!({"musicMultiRowListItemRenderer":{

@@ -1,4 +1,20 @@
-# Account review, 2026-10-17
+# Account security reviews
+
+## 2026-10-23
+
+A whole-repository source review covered the 74 tracked paths at `4fb9970`. It reported one low-severity CWE-459 issue: normal quit during pending sign-in could detach the account worker and leave its temporary browser profile behind. A native test with no credentials reproduced the retained profile. The review did not establish a remote or cross-user disclosure, and its source findings do not certify real account compatibility.
+
+Shutdown now cancels and joins pending account work. Restore lookup uses the existing owned keyring child guard with cancellation and a deadline; private RAM output files avoid pipe-capacity deadlocks. Ordinary quit preserves saved credentials. Failed sign-out keeps a retry control and prevents reconnecting until cleanup succeeds. Repeated removal succeeds when the keyring item is already absent, including after rollback of a revoked save. A synthetic Secret Service store/read/remove/remove test verifies this without accessing the application's credential entry.
+
+A controlled installed-mpv check also showed that a stop acknowledgement and `idle-active` can precede extractor termination. Credential replacement now consumes an event-queue marker after stopping, waits for any started file to end, resets extractor options and closes the old descriptors before acknowledging completion. The marker catches a `start-file` event that has not reached the client yet. Sign-out waits for that acknowledgement and keyring removal. Synthetic local extractors exercise replacement, clearing, fatal exit and shutdown without network access or real credentials. A regression reproduced premature cleanup before the marker fix. Another installed-libmpv check passed 100 immediate Play/clear cycles without waiting for extractor readiness.
+
+Account activation now requires matching stable primary or brand identity from the account-menu response. Synthetic tests reject missing and conflicting identity; compatibility with real Google account responses still requires signed-in verification.
+
+Native release verification repeated the original quit-during-sign-in trigger with an empty dedicated profile. The app and Chromium exited, and the temporary profile was removed. No real Google credentials were used. This proves normal cancellation cleanup, not forced-exit cleanup or authenticated compatibility.
+
+Final validation passed all 121 ordinary tests, all 22 optional guest/offline integration tests, formatting, strict all-target Clippy and the release build. The integration checks include isolated Chromium transport, synthetic keyring entries and extractor credentials, public catalog requests, and guest playback through the null audio output. The user chose to finish with real Google sign-in, authenticated playback and cross-client account checks unverified.
+
+## 2026-10-17 and subsequent checkpoints
 
 The source review covered every changed source file between e9cfcdf and 5899fb5. It found no reportable vulnerability in that gated build. This is a bounded review, not a guarantee that the application has no vulnerabilities.
 
@@ -52,7 +68,7 @@ Production Wayland checks passed Stop/Play through renderer detachment and reatt
 
 ## Dependency maintenance
 
-687 locked packages were checked against RustSec advisory database commit 999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b. Version requirements were matched using Rust's semver implementation, excluding withdrawn advisories. No current vulnerability or unsoundness advisory matched. Six active transitive dependencies matched unmaintained advisories, with no patched versions listed:
+On October 23, 687 locked packages were checked against RustSec advisory database commit `f7b2f6bc663452200bbe639ebb75e0c762b3422b`. Version requirements were matched using Rust's semver implementation, excluding withdrawn advisories. The check found [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html) in `webpki-roots 1.0.9` and [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html) in `rustls-webpki 0.103.15`. These concern acceptance of distrusted certificate intermediates. The lockfile now uses patched versions `1.0.10` and `0.103.16`. A repeat check found no matching active vulnerability or unsoundness advisory. Six transitive dependencies still match unmaintained advisories, with no patched versions listed:
 
 - [zvariant 5.15.0, RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html)
 - [zvariant_derive 5.15.0, RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html)

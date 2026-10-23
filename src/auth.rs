@@ -84,15 +84,15 @@ struct Cookie {
 
 impl Session {
     /// Called on the account worker. The OS keyring may ask the user to unlock it.
-    pub fn load() -> Result<Option<Self>> {
-        let output = Command::new("/usr/bin/secret-tool")
+    pub fn load(operation: &Operation) -> Result<Option<Self>> {
+        let mut command = Command::new("/usr/bin/secret-tool");
+        command
             .arg("lookup")
             .args(KEYRING_ATTRIBUTES)
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .context("The OS keyring is unavailable")?;
-        if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
+            .stdin(Stdio::null());
+        let output =
+            KeyringProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
+        if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
             return Ok(None);
         }
         ensure!(
@@ -118,25 +118,13 @@ impl Session {
             .stderr(Stdio::null());
         let mut process = KeyringProcess::spawn(&mut command)?;
         ensure!(
-            process.wait(Duration::from_secs(30))?.success(),
+            process.wait(Duration::from_secs(30), None)?.success(),
             "The OS keyring could not save the account. No plaintext fallback is used."
         );
         Ok(())
     }
     pub fn disconnect() -> Result<()> {
-        let mut command = Command::new("/usr/bin/secret-tool");
-        command
-            .arg("clear")
-            .args(KEYRING_ATTRIBUTES)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut process = KeyringProcess::spawn(&mut command)?;
-        ensure!(
-            process.wait(Duration::from_secs(30))?.success(),
-            "Could not remove the saved account from the keyring"
-        );
-        Ok(())
+        clear_keyring(&KEYRING_ATTRIBUTES)
     }
     pub fn validate_playback_identity(&self) -> Result<()> {
         ensure!(
@@ -280,16 +268,21 @@ impl Session {
     }
 }
 
-pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
+fn private_file() -> Result<File> {
     let fd = unsafe {
         libc::memfd_create(
             c"yt-music-session".as_ptr(),
             libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
         )
     };
-    ensure!(fd >= 0, "Could not create private playback credentials");
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    ensure!(fd >= 0, "Could not create private account storage");
+    let file = unsafe { File::from_raw_fd(fd) };
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
+    let mut file = private_file()?;
     file.write_all(bytes)?;
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     ensure!(
@@ -300,7 +293,55 @@ pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
 }
 
 struct KeyringProcess(Child);
+
+fn clear_keyring(attributes: &[&str]) -> Result<()> {
+    let mut command = Command::new("/usr/bin/secret-tool");
+    command.arg("clear").args(attributes).stdin(Stdio::null());
+    let output = KeyringProcess::output(&mut command, None, Duration::from_secs(30))?;
+    // secret-tool returns a silent status 1 when a previous cleanup removed the item.
+    let absent =
+        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
+    ensure!(
+        output.status.success() || absent,
+        "Could not remove the saved account from the keyring"
+    );
+    Ok(())
+}
+
 impl KeyringProcess {
+    fn output(
+        command: &mut Command,
+        operation: Option<&Operation>,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
+        ensure!(
+            !operation.is_some_and(Operation::is_cancelled),
+            "Account connection cancelled"
+        );
+        // A keyring response can exceed pipe capacity while the user unlocks it.
+        let stdout = private_file()?;
+        let stderr = private_file()?;
+        command
+            .stdout(stdout.try_clone()?)
+            .stderr(stderr.try_clone()?);
+        let mut process = Self::spawn(command)?;
+        let status = process.wait(timeout, operation)?;
+        let read_output = |mut file: File| -> Result<Vec<u8>> {
+            ensure!(
+                file.metadata()?.len() <= 1024 * 1024,
+                "The OS keyring returned oversized account data"
+            );
+            file.rewind()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: read_output(stdout)?,
+            stderr: read_output(stderr)?,
+        })
+    }
     fn spawn(command: &mut Command) -> Result<Self> {
         let parent = std::process::id() as libc::pid_t;
         unsafe {
@@ -318,9 +359,17 @@ impl KeyringProcess {
             command.spawn().context("The OS keyring is unavailable")?,
         ))
     }
-    fn wait(&mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
+    fn wait(
+        &mut self,
+        timeout: Duration,
+        operation: Option<&Operation>,
+    ) -> Result<std::process::ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
+            ensure!(
+                !operation.is_some_and(Operation::is_cancelled),
+                "Account connection cancelled"
+            );
             if let Some(status) = self.0.try_wait()? {
                 return Ok(status);
             }
@@ -558,6 +607,7 @@ fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe
 
 /// Explicit user action only. Credentials stay in the OS keyring and RAM.
 pub fn connect(operation: &Operation) -> Result<(Session, crate::catalog::Account)> {
+    ensure!(!operation.is_cancelled(), "Account connection cancelled");
     ensure!(
         ACCOUNT_LOGIN_ENABLED,
         "Account connection is disabled until the security review is complete."
@@ -696,7 +746,7 @@ mod tests {
         command.arg("30");
         let mut process = KeyringProcess::spawn(&mut command).unwrap();
         let pid = process.0.id() as libc::pid_t;
-        assert!(process.wait(Duration::from_millis(20)).is_err());
+        assert!(process.wait(Duration::from_millis(20), None).is_err());
         drop(process);
         assert_eq!(
             unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
@@ -706,6 +756,106 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+    #[test]
+    fn keyring_capture_handles_large_output_and_preserves_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "head -c 131072 /dev/zero; printf 'synthetic error' >&2; exit 7",
+        ]);
+        let output = KeyringProcess::output(
+            &mut command,
+            Some(&Operation::default()),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, vec![0; 131072]);
+        assert_eq!(output.stderr, b"synthetic error");
+
+        let mut command = Command::new("/usr/bin/head");
+        command.args(["-c", "1048577", "/dev/zero"]);
+        let error = KeyringProcess::output(
+            &mut command,
+            Some(&Operation::default()),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("oversized"));
+    }
+    #[test]
+    fn keyring_cancellation_terminates_and_reaps_the_child() {
+        let operation = Operation::default();
+        let mut command = Command::new("/usr/bin/sleep");
+        command.arg("30");
+        let mut process = KeyringProcess::spawn(&mut command).unwrap();
+        let pid = process.0.id() as libc::pid_t;
+        operation.cancel();
+        assert!(
+            process
+                .wait(Duration::from_secs(30), Some(&operation))
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        drop(process);
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(
+            KeyringProcess::output(&mut command, Some(&operation), Duration::from_secs(30))
+                .is_err()
+        );
+    }
+    #[test]
+    #[ignore = "requires the desktop Secret Service; uses only a unique synthetic test entry"]
+    fn live_keyring_removal_is_idempotent() {
+        let id = format!("synthetic-{}-{}", std::process::id(), timestamp());
+        let attributes = ["application", "yt-music-gpui-tests", "credential", &id];
+        let result = (|| -> Result<()> {
+            clear_keyring(&attributes)?;
+            let mut input = sealed_file(b"invented-test-value")?;
+            input.rewind()?;
+            let mut store = Command::new("/usr/bin/secret-tool");
+            store
+                .args(["store", "--label=YouTube Music synthetic test"])
+                .args(attributes)
+                .stdin(input)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            ensure!(
+                KeyringProcess::spawn(&mut store)?
+                    .wait(Duration::from_secs(30), None)?
+                    .success(),
+                "Synthetic store failed"
+            );
+            let mut lookup = Command::new("/usr/bin/secret-tool");
+            lookup.arg("lookup").args(attributes).stdin(Stdio::null());
+            let output = KeyringProcess::output(&mut lookup, None, Duration::from_secs(30))?;
+            ensure!(
+                output.status.success() && output.stdout == b"invented-test-value",
+                "Synthetic lookup failed"
+            );
+            clear_keyring(&attributes)?;
+            clear_keyring(&attributes)?;
+            let output = KeyringProcess::output(&mut lookup, None, Duration::from_secs(30))?;
+            ensure!(
+                output.status.code() == Some(1)
+                    && output.stdout.is_empty()
+                    && output.stderr.is_empty(),
+                "Synthetic item remains"
+            );
+            Ok(())
+        })();
+        let cleanup = clear_keyring(&attributes);
+        result.unwrap();
+        cleanup.unwrap();
     }
     #[test]
     fn exact_cookie_names_and_fresh_authorization() {

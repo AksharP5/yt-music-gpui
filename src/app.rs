@@ -292,6 +292,7 @@ enum Drag {
 enum AccountOperation {
     Connecting(Operation),
     Disconnecting(Operation),
+    DisconnectFailed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,13 +300,6 @@ pub enum Startup {
     Restore,
     Connect,
     Guest,
-}
-impl AccountOperation {
-    fn token(&self) -> &Operation {
-        match self {
-            Self::Connecting(token) | Self::Disconnecting(token) => token,
-        }
-    }
 }
 
 pub struct Music {
@@ -1439,15 +1433,22 @@ impl Music {
         ) {
             return;
         }
-        if let Some(operation) = self.account_operation.take() {
-            operation.token().cancel();
+        if let Some(AccountOperation::Connecting(operation)) = self.account_operation.take() {
+            operation.cancel();
         }
         if let Ok(mut session) = self.session.write() {
             *session = None;
         }
         self.account = None;
         self.clear_account_state(cx);
-        self.player_command(Player::clear_cookies);
+        self.notice = Some("Signing out…".into());
+        self.error = None;
+        let playback = self
+            .player
+            .as_ref()
+            .map(Player::clear_credentials)
+            .transpose()
+            .map_err(|error| format!("{error:#}"));
         self.active_id = None;
         self.playback = Playback::Stopped;
         self.navigate(Route::Home, cx);
@@ -1456,10 +1457,15 @@ impl Music {
         if self
             .account_commands
             // Sign-out supersedes a queued edit if the bounded queue is full.
-            .force_send(account::Command::Disconnect(operation.clone()))
+            .force_send(account::Command::Disconnect {
+                operation: operation.clone(),
+                playback,
+            })
             .is_err()
         {
-            self.error = Some("Playback and account access stopped. The account worker could not remove the saved keyring entry.".into());
+            self.account_operation = Some(AccountOperation::DisconnectFailed);
+            self.notice = None;
+            self.error = Some("Account access stopped. The account worker could not confirm sign-out cleanup. Restart the app and try again.".into());
         } else {
             self.account_operation = Some(AccountOperation::Disconnecting(operation));
         }
@@ -1643,11 +1649,15 @@ impl Music {
                     return;
                 }
                 self.account_operation = None;
+                self.notice = None;
                 match result {
                     Ok(()) => {
                         self.notice = Some("Signed out of YouTube Music".into());
                     }
-                    Err(error) => self.error = Some(error),
+                    Err(error) => {
+                        self.account_operation = Some(AccountOperation::DisconnectFailed);
+                        self.error = Some(error);
+                    }
                 }
             }
             account::Event::Connected {
@@ -4821,11 +4831,15 @@ impl Music {
                 .as_ref()
                 .map(|a| format!("{} {}", a.account.name, a.account.handle))
                 .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
+            let disconnect_failed = matches!(
+                self.account_operation,
+                Some(AccountOperation::DisconnectFailed)
+            );
             body=body.child(div().mt(px(28.)).text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if self.account_operation.is_some(){"Connecting account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
+                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if disconnect_failed {"Sign-out incomplete"}else if self.account_operation.is_some(){"Connecting account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
-                .when(self.account.is_some(), |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Sign out").on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
+                .when(self.account.is_some() || disconnect_failed, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
         } else if let Overlay::Description { title, text } = kind {
@@ -5424,13 +5438,11 @@ impl Drop for Music {
         if let Some(AccountOperation::Connecting(operation)) = &self.account_operation {
             operation.cancel();
         }
-        if matches!(
-            self.account_operation,
-            Some(AccountOperation::Disconnecting(_))
-        ) && let Some(worker) = self.account_worker.take()
+        if self.account_operation.is_some()
+            && let Some(worker) = self.account_worker.take()
             && let Err(error) = worker.finish()
         {
-            eprintln!("Could not finish account sign-out: {error:#}");
+            eprintln!("Could not finish account cleanup: {error:#}");
         }
     }
 }

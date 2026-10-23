@@ -174,7 +174,10 @@ pub enum Command {
         mutation: Box<Mutation>,
     },
     Restore(Operation),
-    Disconnect(Operation),
+    Disconnect {
+        operation: Operation,
+        playback: Result<Option<async_channel::Receiver<Result<(), String>>>, String>,
+    },
     Persist(Arc<Session>),
     ReportPlayback {
         session: Arc<Session>,
@@ -213,7 +216,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Finish pending sign-out work before the process can exit.
+    /// Finish pending account cleanup before the process can exit.
     pub fn finish(self) -> Result<()> {
         self.commands.close();
         self.thread
@@ -250,7 +253,8 @@ pub fn start(
                         let result = (|| {
                             ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
                             ensure!(!operation.is_cancelled(), "Account connection cancelled");
-                            let candidate = Session::load()?;
+                            let candidate = Session::load(&operation)?;
+                            ensure!(!operation.is_cancelled(), "Account connection cancelled");
                             candidate.map(|candidate| {
                                 let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                                 Connection::verify(candidate, catalog)?.publish(&session, &operation)
@@ -258,10 +262,10 @@ pub fn start(
                         })();
                         Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")), save_session: false }
                     }
-                    Command::Disconnect(operation) => {
+                    Command::Disconnect { operation, playback } => {
                         // End in-memory authority even if keyring removal needs another attempt.
                         if let Ok(mut current) = session.write() { *current = None; }
-                        let result = auth::Session::disconnect().map_err(|e| format!("{e:#}"));
+                        let result = finish_disconnect(playback, auth::Session::disconnect);
                         cleanup_error = result.as_ref().err().cloned();
                         Event::Disconnected { operation, result }
                     }
@@ -302,6 +306,24 @@ pub fn start(
         thread: worker,
     };
     (requests, completed, worker)
+}
+
+fn finish_disconnect(
+    playback: Result<Option<async_channel::Receiver<Result<(), String>>>, String>,
+    remove_saved: impl FnOnce() -> Result<()>,
+) -> Result<(), String> {
+    let saved = remove_saved().map_err(|error| format!("{error:#}"));
+    let playback = playback.and_then(|response| match response {
+        Some(response) => response.recv_blocking().unwrap_or_else(|_| {
+            Err("The player stopped before confirming credential cleanup. Restart the app.".into())
+        }),
+        None => Ok(()),
+    });
+    match (saved, playback) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(saved), Err(playback)) => Err(format!("{saved}. {playback}")),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 
 fn persist_current_session(
@@ -651,15 +673,54 @@ mod tests {
         drop(events);
         let operation = Operation::default();
         operation.cancel();
-        for _ in 0..2 {
-            commands
-                .send_blocking(Command::Restore(operation.clone()))
-                .unwrap();
+        for command in [
+            Command::Restore(operation.clone()),
+            Command::Connect(operation),
+        ] {
+            commands.send_blocking(command).unwrap();
         }
         worker.finish().unwrap();
         assert!(commands.is_closed());
         assert!(commands.is_empty());
         assert!(require_current_session(&shared, &expected).is_ok());
+    }
+    #[test]
+    fn sign_out_waits_for_playback_cleanup_and_preserves_failures() {
+        for result in [Ok(()), Err("Synthetic player cleanup failure".to_owned())] {
+            let expected = result.clone();
+            let (reply, response) = async_channel::bounded(1);
+            let (removed, removal) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                finish_disconnect(Ok(Some(response)), || {
+                    removed.send(()).unwrap();
+                    Ok(())
+                })
+            });
+            removal
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(!worker.is_finished());
+            reply.send_blocking(result).unwrap();
+            assert_eq!(worker.join().unwrap(), expected);
+        }
+        let (reply, response) = async_channel::bounded(1);
+        drop(reply);
+        let error = finish_disconnect(Ok(Some(response)), || {
+            anyhow::bail!("Synthetic keyring failure")
+        })
+        .unwrap_err();
+        assert!(error.contains("Synthetic keyring failure"));
+        assert!(error.contains("player stopped"));
+
+        let removed = std::cell::Cell::new(false);
+        let error = finish_disconnect(Err("Player unavailable".into()), || {
+            removed.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(removed.get());
+        assert_eq!(error, "Player unavailable");
+        assert!(finish_disconnect(Ok(None), || Ok(())).is_ok());
     }
     #[test]
     fn failed_or_missing_acknowledgements_are_not_success() {

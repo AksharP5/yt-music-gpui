@@ -121,3 +121,5 @@ YouTube's internal API and stream extraction can change. Public guest playback m
 MIT licensed, with the adapted GPUI text input example under Apache-2.0. See NOTICE and LICENSE-APACHE.
 
 The account security design and verification limits are documented in [docs/account-security.md](docs/account-security.md).
+
+The October 23 security pass fixed cleanup when quitting during sign-in, bounded and made keyring lookup cancellable, and made sign-out wait for player and keyring cleanup. Account activation rejects missing or mismatched stable identity. Patched TLS dependencies address two certificate-validation advisories. Real Google sign-in and account sync remain unverified; see [the review](docs/security-review.md#2026-10-23).
