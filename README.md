@@ -64,7 +64,7 @@ The video button in the playback bar opens the native video view. Click the pict
 
 Explore keeps the service's main navigation and mood section. Mood and genre links retain their exact category parameters through navigation, Back and Refresh. Navigation links open pages; collection rows retain their separate save controls.
 
-The song menu offers credits, radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Credits retain the service's roles and names. Lyrics and credits load independently of radio and autoplay. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
+The song menu offers credits, radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Credits retain the service's roles and names. Lyrics and credits load independently of radio and autoplay. Pausing while radio loads keeps the returned selection paused. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
 
 Playing a playlist or search page loads its remaining pages as the queue approaches the loaded end. Repeated songs retain their order. A failed page can be retried with Next; recommendations and repeat-all wait until the source ends. Shuffle affects loaded upcoming songs. After restarting or changing accounts, reopen an unfinished playlist to load its remaining pages.
 
@@ -82,7 +82,7 @@ Selection uses YouTube's quality labels before bitrate because its variable-bitr
 
 The library is stored at `$XDG_DATA_HOME/yt-music-gpui/library.json`, or `~/.local/share/yt-music-gpui/library.json`. Writes use an atomic replacement on a dedicated worker. Closing the app flushes the last pending write. An unreadable library is preserved and reported instead of overwritten.
 
-Network requests, image decoding, audio extraction, and disk writes run off the UI thread. Lists render visible rows. Artwork is limited to 96 decoded images, each at most 320 pixels per edge, with three download workers. Catalog requests keep only the latest pending navigation. The UI redraws playback progress once per displayed second and has no continuous decorative animation. mpv's forward audio cache is capped at 32 MiB.
+Network requests, image decoding, audio extraction, and disk writes run off the UI thread. Lists render visible rows. Artwork is limited to 96 decoded images, each at most 320 pixels per edge, with three download workers. Catalog requests retain the latest pending navigation and playlist-picker request independently, with two workers and two pending slots. The UI redraws playback progress once per displayed second and has no continuous decorative animation. mpv's forward audio cache is capped at 32 MiB.
 
 To measure a running release build on Linux:
 

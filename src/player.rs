@@ -18,7 +18,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -708,14 +708,16 @@ fn request(
     command: Value,
     mut on_event: impl FnMut(Value),
 ) -> Result<Value> {
-    // Track requests start at one. Zero is reserved for synchronous control changes.
-    write_command(socket, command, Some(json!(0)))?;
+    // Positive IDs identify tracks and seeks; mpv uses zero for ID-less commands.
+    static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(-1);
+    let request_id = NEXT_REQUEST_ID.fetch_sub(1, Ordering::Relaxed);
+    write_command(socket, command, Some(json!(request_id)))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         while let Some(end) = pending.iter().position(|c| *c == b'\n') {
             let line: Vec<_> = pending.drain(..=end).collect();
             let value: Value = serde_json::from_slice(&line).context("Invalid mpv response")?;
-            if value["request_id"] == 0 {
+            if value["request_id"].as_i64() == Some(request_id) {
                 ensure!(
                     value["error"] == "success",
                     "mpv could not update playback credentials"
@@ -1008,42 +1010,7 @@ fn run(
             }
         }
         state.write_seek(&mut socket)?;
-        match socket.read(&mut buffer) {
-            Ok(0) => bail!("mpv closed its connection. Restart the app to reconnect."),
-            Ok(size) => {
-                pending.extend_from_slice(&buffer[..size]);
-                while let Some(end) = pending.iter().position(|c| *c == b'\n') {
-                    let line: Vec<_> = pending.drain(..=end).collect();
-                    if let Ok(message) = serde_json::from_slice(&line) {
-                        state.message(message, events);
-                        if state.loaded && state.pause_after_load {
-                            state.pause_after_load = false;
-                            if let Some(track_id) = state.current {
-                                write_command(
-                                    &mut socket,
-                                    json!(["get_property", "seekable"]),
-                                    Some(json!(format!("loaded-seekable:{track_id}"))),
-                                )?;
-                            }
-                            if let Some(paused) = state.pause_target {
-                                state.pause_revision += 1;
-                                write_pause(&mut socket, paused, state.pause_revision)?;
-                            }
-                        }
-                        state.write_seek(&mut socket)?;
-                    }
-                }
-                if pending.len() > 1024 * 1024 {
-                    bail!("mpv returned an oversized response.");
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
-            Err(error) => return Err(error).context("Lost the connection to mpv"),
-        }
+        state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
         let _ = &credentials;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
     }
@@ -1090,6 +1057,57 @@ struct PlaybackState {
 }
 
 impl PlaybackState {
+    fn read_messages(
+        &mut self,
+        socket: &mut UnixStream,
+        pending: &mut Vec<u8>,
+        buffer: &mut [u8],
+        events: &async_channel::Sender<PlayerEvent>,
+    ) -> Result<()> {
+        // A synchronous request can leave complete events after its reply.
+        if !pending.contains(&b'\n') {
+            match socket.read(buffer) {
+                Ok(0) => bail!("mpv closed its connection. Restart the app to reconnect."),
+                Ok(size) => pending.extend_from_slice(&buffer[..size]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("Lost the connection to mpv"),
+            }
+        }
+        while let Some(end) = pending.iter().position(|c| *c == b'\n') {
+            let line: Vec<_> = pending.drain(..=end).collect();
+            if let Ok(message) = serde_json::from_slice(&line) {
+                self.message(message, events);
+                if self.loaded && self.pause_after_load {
+                    self.pause_after_load = false;
+                    if let Some(track_id) = self.current {
+                        write_command(
+                            socket,
+                            json!(["get_property", "seekable"]),
+                            Some(json!(format!("loaded-seekable:{track_id}"))),
+                        )?;
+                    }
+                    if let Some(paused) = self.pause_target {
+                        self.pause_revision += 1;
+                        write_pause(socket, paused, self.pause_revision)?;
+                    }
+                }
+                self.write_seek(socket)?;
+            }
+        }
+        ensure!(
+            pending.len() <= 1024 * 1024,
+            "mpv returned an oversized response."
+        );
+        Ok(())
+    }
+
     fn invalidate_seeks(&mut self) {
         self.seek = None;
         self.next_seek = None;
@@ -1463,6 +1481,110 @@ mod tests {
             line.push(byte[0]);
         }
         serde_json::from_slice(&line).unwrap()
+    }
+
+    #[test]
+    fn synchronous_requests_ignore_zero_and_previous_request_replies() {
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .unwrap();
+        mpv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let worker = thread::spawn(move || {
+            let first_id = socket_message(&mut mpv)["request_id"].clone();
+            let replies = format!(
+                "{}\n{}\n{}\n",
+                json!({"request_id":0,"error":"success"}),
+                json!({"request_id":first_id,"error":"property unavailable"}),
+                json!({"request_id":first_id,"error":"success"}),
+            );
+            mpv.write_all(replies.as_bytes()).unwrap();
+            let second_id = socket_message(&mut mpv)["request_id"].clone();
+            writeln!(
+                mpv,
+                "{}",
+                json!({"request_id":second_id,"error":"property unavailable"})
+            )
+            .unwrap();
+            (first_id, second_id)
+        });
+        let mut pending = Vec::new();
+        let first = request(
+            &mut socket,
+            &mut pending,
+            json!(["set_property", "vid", "auto"]),
+            |_| {},
+        );
+        let second = request(
+            &mut socket,
+            &mut pending,
+            json!(["set_property", "vid", "no"]),
+            |_| {},
+        );
+        let (first_id, second_id) = worker.join().unwrap();
+        for result in [first, second] {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "mpv could not update playback credentials"
+            );
+        }
+        assert!(first_id.as_i64().unwrap() < 0);
+        assert!(second_id.as_i64().unwrap() < 0);
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn buffered_seek_completion_is_delivered_while_mpv_is_silent() {
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .unwrap();
+        mpv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let worker = thread::spawn(move || {
+            let command = socket_message(&mut mpv);
+            let replies = format!(
+                "{}\n{}\n",
+                json!({"request_id":command["request_id"],"error":"success"}),
+                json!({"event":"property-change","id":7,"name":"time-pos","data":20.}),
+            );
+            mpv.write_all(replies.as_bytes()).unwrap();
+            mpv
+        });
+        let mut state = PlaybackState {
+            desired: Some(1),
+            current: Some(1),
+            loaded: true,
+            position_observer: 7,
+            seek: Some(ActiveSeek {
+                request: seek_request(2, 20.),
+                phase: SeekPhase::Position,
+            }),
+            ..Default::default()
+        };
+        let mut pending = Vec::new();
+        request(
+            &mut socket,
+            &mut pending,
+            json!(["set_property", "vid", "auto"]),
+            |value| state.message(value, &events),
+        )
+        .unwrap();
+        let _mpv = worker.join().unwrap();
+        assert!(pending.contains(&b'\n'));
+        assert!(received.try_recv().is_err());
+
+        state
+            .read_messages(&mut socket, &mut pending, &mut [0; 16384], &events)
+            .unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::SeekFinished {
+                track_id: 1,
+                revision: 2,
+                result: Ok(20.),
+            })
+        ));
     }
 
     fn accepted_seek_command(
@@ -2288,10 +2410,12 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                             assert!(options.get("cookies").is_none());
                         }
                     }
-                    server
-                        .get_mut()
-                        .write_all(b"{\"request_id\":0,\"error\":\"success\"}\n")
-                        .unwrap();
+                    writeln!(
+                        server.get_mut(),
+                        "{}",
+                        json!({"request_id":message["request_id"],"error":"success"})
+                    )
+                    .unwrap();
                 }
             }
         });

@@ -70,6 +70,14 @@ enum Query {
     PlaylistChoices,
     PlaylistChoicesMore(Continuation),
 }
+impl Query {
+    fn target(&self) -> CatalogTarget {
+        match self {
+            Self::PlaylistChoices | Self::PlaylistChoicesMore(_) => CatalogTarget::PlaylistPicker,
+            _ => CatalogTarget::Page,
+        }
+    }
+}
 struct Job {
     id: u64,
     account_revision: u64,
@@ -83,9 +91,74 @@ struct CatalogResult {
     result: Result<Page, String>,
     target: CatalogTarget,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CatalogTarget {
     Page,
     PlaylistPicker,
+}
+struct CatalogRequests {
+    generations: Arc<[AtomicU64; 2]>,
+    loading: [bool; 2],
+    jobs: async_channel::Sender<Job>,
+    pending: async_channel::Receiver<Job>,
+}
+impl CatalogRequests {
+    fn new() -> Self {
+        let (jobs, pending) = async_channel::bounded(2);
+        Self {
+            generations: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
+            loading: [false; 2],
+            jobs,
+            pending,
+        }
+    }
+
+    fn request(
+        &mut self,
+        query: Query,
+        account_revision: u64,
+        session: Option<Arc<Session>>,
+    ) -> Result<(), String> {
+        let target = query.target();
+        self.cancel(target);
+        let id = self.generations[target as usize].load(Ordering::Relaxed);
+        let mut other = None;
+        while let Ok(job) = self.pending.try_recv() {
+            if job.query.target() != target {
+                other = Some(job);
+            }
+        }
+        // The two bounded slots retain the latest request for each destination.
+        for job in other.into_iter().chain(std::iter::once(Job {
+            id,
+            account_revision,
+            query,
+            session,
+        })) {
+            self.jobs.try_send(job).map_err(|_| {
+                "The music connection stopped. Restart the app to reconnect.".to_owned()
+            })?;
+        }
+        self.loading[target as usize] = true;
+        Ok(())
+    }
+
+    fn cancel(&mut self, target: CatalogTarget) {
+        self.generations[target as usize].fetch_add(1, Ordering::Relaxed);
+        self.loading[target as usize] = false;
+    }
+
+    fn finish(&mut self, target: CatalogTarget, id: u64) -> bool {
+        if id != self.generations[target as usize].load(Ordering::Relaxed) {
+            return false;
+        }
+        self.loading[target as usize] = false;
+        true
+    }
+
+    fn is_loading(&self, target: CatalogTarget) -> bool {
+        self.loading[target as usize]
+    }
 }
 enum PlaybackQuery {
     Watch { track: Box<Track>, radio: bool },
@@ -113,9 +186,7 @@ enum PlaybackResult {
 enum Playback {
     Stopped,
     Loading { paused: bool, retried: bool },
-    Playing,
-    Paused,
-    Buffering,
+    Loaded { paused: bool, buffering: bool },
 }
 #[derive(Clone, Copy)]
 struct SeekIntent {
@@ -131,15 +202,38 @@ struct QueueAdvance {
 }
 impl Playback {
     fn is_paused(self) -> bool {
-        matches!(self, Self::Paused | Self::Loading { paused: true, .. })
+        matches!(
+            self,
+            Self::Loaded { paused: true, .. } | Self::Loading { paused: true, .. }
+        )
     }
 
     fn with_pause(self, paused: bool) -> Self {
         match self {
             Self::Loading { retried, .. } => Self::Loading { paused, retried },
-            _ if paused => Self::Paused,
-            _ => Self::Playing,
+            Self::Loaded { buffering, .. } => Self::Loaded { paused, buffering },
+            Self::Stopped => Self::Loaded {
+                paused,
+                buffering: false,
+            },
         }
+    }
+
+    fn with_buffering(self, buffering: bool) -> Self {
+        match self {
+            Self::Loaded { paused, .. } => Self::Loaded { paused, buffering },
+            _ => self,
+        }
+    }
+
+    fn is_advancing(self) -> bool {
+        matches!(
+            self,
+            Self::Loaded {
+                paused: false,
+                buffering: false
+            }
+        )
     }
 
     fn toggled(self) -> Self {
@@ -175,6 +269,7 @@ enum Overlay {
         track: Track,
         page: Option<Box<Page>>,
         duplicates: bool,
+        error: Option<String>,
     },
     PlaylistForm {
         form: Entity<PlaylistForm>,
@@ -232,12 +327,9 @@ pub struct Music {
     rows: Vec<Item>,
     back: Vec<(Route, Option<Page>)>,
     list_id: usize,
-    loading: bool,
     error: Option<String>,
     notice: Option<String>,
-    generation: Arc<AtomicU64>,
-    jobs: async_channel::Sender<Job>,
-    pending_jobs: async_channel::Receiver<Job>,
+    catalog_requests: CatalogRequests,
     playback_jobs: async_channel::Sender<PlaybackJob>,
     pending_playback_jobs: async_channel::Receiver<PlaybackJob>,
     playback_generation: Arc<AtomicU64>,
@@ -343,33 +435,25 @@ impl Music {
             .as_ref()
             .map(|player| player.video_attachment(window, cx));
         let (artwork, loaded) = Artwork::new();
-        let (jobs, receiver) = async_channel::bounded::<Job>(1);
+        let catalog_requests = CatalogRequests::new();
         let (results, completed) = async_channel::unbounded::<CatalogResult>();
-        let generation = Arc::new(AtomicU64::new(0));
         for worker in 0..2 {
-            let receiver = receiver.clone();
+            let receiver = catalog_requests.pending.clone();
             let results = results.clone();
-            let generation = generation.clone();
+            let generations = catalog_requests.generations.clone();
             thread::Builder::new()
                 .name(format!("catalog-{worker}"))
                 .spawn(move || {
                     let catalog = Catalog::new();
                     while let Ok(job) = receiver.recv_blocking() {
-                        if generation.load(Ordering::Relaxed) != job.id {
+                        let target = job.query.target();
+                        if generations[target as usize].load(Ordering::Relaxed) != job.id {
                             continue;
                         }
                         let append = matches!(
                             job.query,
                             Query::More { .. } | Query::PlaylistChoicesMore(_)
                         );
-                        let target = if matches!(
-                            job.query,
-                            Query::PlaylistChoices | Query::PlaylistChoicesMore(_)
-                        ) {
-                            CatalogTarget::PlaylistPicker
-                        } else {
-                            CatalogTarget::Page
-                        };
                         let result = match &catalog {
                             Err(e) => Err(format!("{e:#}")),
                             Ok(catalog) => {
@@ -659,7 +743,7 @@ impl Music {
                 && view.account.is_some()
                 && view.account_operation.is_none()
                 && view.overlay.is_none()
-                && !view.loading
+                && !view.catalog_requests.is_loading(CatalogTarget::Page)
             {
                 view.refresh_remote(cx);
             }
@@ -692,12 +776,9 @@ impl Music {
             rows: Vec::new(),
             back: Vec::new(),
             list_id: 0,
-            loading: false,
             error,
             notice: None,
-            generation,
-            jobs,
-            pending_jobs: receiver,
+            catalog_requests,
             playback_jobs,
             pending_playback_jobs: playback_receiver,
             playback_generation,
@@ -953,10 +1034,11 @@ impl Music {
                         self.now_playing = Some(watch);
                         let video_open = self.video_open;
                         if radio {
+                            let paused = self.playback.is_paused();
                             if switch_mode {
                                 self.set_video_mode(self.library.video, cx);
                             }
-                            self.play_current(cx);
+                            self.play_current_at(0., paused, cx);
                         } else if switch_mode {
                             self.set_video_mode(self.library.video, cx);
                         } else {
@@ -1002,6 +1084,8 @@ impl Music {
     }
 
     fn clear_account_state(&mut self, cx: &mut Context<Self>) {
+        self.catalog_requests.cancel(CatalogTarget::Page);
+        self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.queue_source.cancel();
         self.queue_waiting = None;
         let session = self
@@ -1038,25 +1122,20 @@ impl Music {
     }
 
     fn request(&mut self, query: Query, cx: &mut Context<Self>) {
-        let id = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.pending_jobs.try_recv();
+        let target = query.target();
         let session = self
             .account
             .as_ref()
             .map(|connection| connection.session.clone());
-        if self
-            .jobs
-            .try_send(Job {
-                id,
-                account_revision: self.account_revision,
-                query,
-                session,
-            })
-            .is_err()
-        {
-            self.error = Some("The music connection stopped. Restart the app to reconnect.".into());
-        } else {
-            self.loading = true;
+        let result = self
+            .catalog_requests
+            .request(query, self.account_revision, session);
+        if target == CatalogTarget::PlaylistPicker {
+            if let Some(Overlay::PlaylistPicker { error, .. }) = &mut self.overlay {
+                *error = result.err();
+            }
+        } else if let Err(error) = result {
+            self.error = Some(error);
         }
         cx.notify();
     }
@@ -1064,8 +1143,10 @@ impl Music {
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         self.video_open = false;
         if self.route != route {
-            let cached = (self.account.is_none() && !self.loading && self.error.is_none())
-                .then(|| self.page.clone());
+            let cached = (self.account.is_none()
+                && !self.catalog_requests.is_loading(CatalogTarget::Page)
+                && self.error.is_none())
+            .then(|| self.page.clone());
             self.back.push((self.route.clone(), cached));
             if self.back.len() > 12 {
                 self.back.remove(0);
@@ -1116,8 +1197,7 @@ impl Music {
                 self.request(Query::Library(section), cx);
             }
             _ => {
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                self.loading = false;
+                self.catalog_requests.cancel(CatalogTarget::Page);
                 self.refresh_local();
                 cx.notify();
             }
@@ -1188,7 +1268,7 @@ impl Music {
                 self.navigate(route, cx);
                 return;
             };
-            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.catalog_requests.cancel(CatalogTarget::Page);
             self.list_id = self.list_id.wrapping_add(1);
             self.route = route;
             if let Route::Search(search) = &self.route {
@@ -1196,7 +1276,6 @@ impl Music {
                     .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
             }
             self.page = page;
-            self.loading = false;
             self.error = None;
             self.notice = None;
             self.rows = self
@@ -1211,12 +1290,11 @@ impl Music {
     }
 
     fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
-        if result.id != self.generation.load(Ordering::Relaxed) {
+        if !self.catalog_requests.finish(result.target, result.id) {
             return;
         }
-        self.loading = false;
         if matches!(result.target, CatalogTarget::PlaylistPicker) {
-            if let Some(Overlay::PlaylistPicker { page, .. }) = &mut self.overlay {
+            if let Some(Overlay::PlaylistPicker { page, error, .. }) = &mut self.overlay {
                 match result.result {
                     Ok(choices) => {
                         if result.append
@@ -1228,7 +1306,7 @@ impl Music {
                             *page = Some(Box::new(choices));
                         }
                     }
-                    Err(error) => self.error = Some(error),
+                    Err(message) => *error = Some(message),
                 }
                 cx.notify();
             }
@@ -1498,6 +1576,7 @@ impl Music {
             track,
             page: None,
             duplicates: false,
+            error: None,
         });
         self.request(Query::PlaylistChoices, cx);
     }
@@ -1524,6 +1603,7 @@ impl Music {
         cx.notify();
     }
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.song_text.cancel();
         self.overlay = None;
         self.overlay_subscription = None;
@@ -1709,7 +1789,7 @@ impl Music {
                 match result {
                     Ok(())
                         if self.overlay.is_none()
-                            && !self.loading
+                            && !self.catalog_requests.is_loading(CatalogTarget::Page)
                             && matches!(
                                 self.route,
                                 Route::Recent | Route::Library(Section::History)
@@ -2155,6 +2235,11 @@ impl Music {
             cx.notify();
             return;
         }
+        if self.waiting_for_radio() {
+            self.playback = self.playback.toggled();
+            cx.notify();
+            return;
+        }
         if self.active_id.is_some() && self.playback != Playback::Stopped {
             let playback = self.playback.toggled();
             if let Some(player) = &self.player {
@@ -2173,6 +2258,11 @@ impl Music {
             self.video_open = self.library.video;
             self.play_current(cx);
         }
+    }
+    fn waiting_for_radio(&self) -> bool {
+        self.watch_pending
+            && self.active_id.is_none()
+            && matches!(self.playback, Playback::Loading { .. })
     }
     fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
         let playback = self
@@ -2340,10 +2430,9 @@ impl Music {
                 self.playback = Playback::Stopped;
             }
             PlayerEvent::Started { track_id, paused } if Some(track_id) == self.active_id => {
-                self.playback = if paused {
-                    Playback::Paused
-                } else {
-                    Playback::Playing
+                self.playback = Playback::Loaded {
+                    paused,
+                    buffering: false,
                 };
                 if self.history_track != Some(track_id)
                     && let Some(track) = self.library.queue.current().cloned()
@@ -2411,11 +2500,7 @@ impl Music {
                 track_id,
                 buffering,
             } if Some(track_id) == self.active_id => {
-                if buffering && !self.playback.is_paused() {
-                    self.playback = Playback::Buffering;
-                } else if self.playback == Playback::Buffering {
-                    self.playback = Playback::Playing;
-                }
+                self.playback = self.playback.with_buffering(buffering);
             }
             PlayerEvent::Ended { track_id } if Some(track_id) == self.active_id => {
                 self.next(true, cx);
@@ -2462,7 +2547,9 @@ impl Music {
                     || self.watch_pending
                     || self.radio_loading
                     || seed_available));
-        let waiting = self.queue_waiting.is_some() || self.autoplay_waiting.is_some();
+        let waiting = self.queue_waiting.is_some()
+            || self.autoplay_waiting.is_some()
+            || self.waiting_for_radio();
         service.publish(mpris::State {
             playback: if self.playback == Playback::Stopped {
                 mpris::PlaybackStatus::Stopped
@@ -2476,7 +2563,7 @@ impl Music {
                 .map(|track| mpris::Metadata::new(track, self.duration)),
             track_id: self.active_id,
             position: self.position,
-            advancing: self.playback == Playback::Playing,
+            advancing: self.playback.is_advancing(),
             volume: self.library.volume,
             rate: self.library.speed,
             repeat: self.library.repeat,
@@ -3652,7 +3739,7 @@ impl Music {
                     .child(notice.clone()),
             );
         }
-        if self.loading && self.rows.is_empty() {
+        if self.catalog_requests.is_loading(CatalogTarget::Page) && self.rows.is_empty() {
             return content
                 .child(
                     div()
@@ -3755,13 +3842,13 @@ impl Music {
                     .justify_center()
                     .text_color(self.theme.muted)
                     .cursor_pointer()
-                    .child(if self.loading {
+                    .child(if self.catalog_requests.is_loading(CatalogTarget::Page) {
                         "Loading…"
                     } else {
                         "Load more"
                     })
                     .on_click(cx.listener(|view, _, _, cx| {
-                        if !view.loading
+                        if !view.catalog_requests.is_loading(CatalogTarget::Page)
                             && let Some(token) = view.page.continuation.clone()
                         {
                             view.request(
@@ -4247,7 +4334,10 @@ impl Music {
             let liked = self.is_liked(&track);
             let subtitle = match self.playback {
                 Playback::Loading { .. } => "Loading track…".into(),
-                Playback::Buffering => "Buffering…".into(),
+                Playback::Loaded {
+                    paused: false,
+                    buffering: true,
+                } => "Buffering…".into(),
                 _ => track.artist.clone(),
             };
             details = details
@@ -4853,6 +4943,9 @@ impl Music {
                         view.reset_radio();
                         view.player_command(Player::stop);
                         view.active_id = None;
+                        view.seekable = false;
+                        view.pending_seek = None;
+                        view.position = 0.;
                         view.playback = Playback::Loading {
                             paused: false,
                             retried: false,
@@ -5176,6 +5269,7 @@ impl Music {
             track,
             page,
             duplicates,
+            error,
         } = kind
         {
             let song = track.clone();
@@ -5239,30 +5333,48 @@ impl Music {
                 body = body.child(list);
                 if let Some(token) = &page.continuation {
                     let token = token.clone();
-                    body = body.child(self.menu_action(
-                        "more-playlist-choices",
-                        if self.loading {
-                            "Loading…"
-                        } else {
-                            "More playlists"
-                        },
-                        cx,
-                        move |view, _, cx| {
-                            if !view.loading {
-                                view.request(Query::PlaylistChoicesMore(token.clone()), cx);
-                            }
-                        },
-                    ));
+                    body = body.child(
+                        self.menu_action(
+                            "more-playlist-choices",
+                            if self
+                                .catalog_requests
+                                .is_loading(CatalogTarget::PlaylistPicker)
+                            {
+                                "Loading…"
+                            } else {
+                                "More playlists"
+                            },
+                            cx,
+                            move |view, _, cx| {
+                                if !view
+                                    .catalog_requests
+                                    .is_loading(CatalogTarget::PlaylistPicker)
+                                {
+                                    view.request(Query::PlaylistChoicesMore(token.clone()), cx);
+                                }
+                            },
+                        ),
+                    );
                 }
-            } else {
+            } else if self
+                .catalog_requests
+                .is_loading(CatalogTarget::PlaylistPicker)
+            {
                 body = body.child(
                     div()
                         .p(px(12.))
                         .text_color(self.theme.muted)
                         .child("Loading playlists…"),
                 );
+            } else {
+                body = body.child(self.menu_action(
+                    "retry-playlist-choices",
+                    "Retry",
+                    cx,
+                    |view, _, cx| view.request(Query::PlaylistChoices, cx),
+                ));
             }
-            if let Some(error) = &self.error {
+            if let Some(error) = error {
                 body = body.child(
                     div()
                         .mt(px(12.))
@@ -5585,12 +5697,71 @@ fn clock(seconds: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Playback, acknowledge_song_change, apply_track_details, playlist_move_down};
+    use super::{
+        CatalogRequests, CatalogTarget, Playback, Query, acknowledge_song_change,
+        apply_track_details, playlist_move_down,
+    };
     use crate::{
         account::Mutation,
         catalog::{Rating, Track},
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn page_refresh_keeps_the_pending_playlist_picker_and_rejects_older_pages() {
+        let mut requests = CatalogRequests::new();
+        requests.request(Query::Home, 0, None).unwrap();
+        let old_page = requests.pending.try_recv().unwrap();
+        requests.request(Query::PlaylistChoices, 0, None).unwrap();
+        requests.request(Query::Explore, 1, None).unwrap();
+        let picker = requests.pending.try_recv().unwrap();
+        let page = requests.pending.try_recv().unwrap();
+        assert!(matches!(picker.query, Query::PlaylistChoices));
+        assert!(matches!(page.query, Query::Explore));
+        assert!(requests.pending.try_recv().is_err());
+        assert!(!requests.finish(CatalogTarget::Page, old_page.id));
+        assert!(requests.is_loading(CatalogTarget::Page));
+        assert!(requests.finish(CatalogTarget::Page, page.id));
+        assert!(requests.is_loading(CatalogTarget::PlaylistPicker));
+        assert!(requests.finish(CatalogTarget::PlaylistPicker, picker.id));
+        assert!(!requests.is_loading(CatalogTarget::Page));
+        assert!(!requests.is_loading(CatalogTarget::PlaylistPicker));
+    }
+
+    #[test]
+    fn opening_or_closing_a_picker_does_not_cancel_navigation() {
+        let mut requests = CatalogRequests::new();
+        requests.request(Query::Home, 0, None).unwrap();
+        requests.request(Query::PlaylistChoices, 0, None).unwrap();
+        requests.request(Query::PlaylistChoices, 0, None).unwrap();
+        let page = requests.pending.try_recv().unwrap();
+        let picker = requests.pending.try_recv().unwrap();
+        assert!(matches!(page.query, Query::Home));
+        assert!(matches!(picker.query, Query::PlaylistChoices));
+        assert!(requests.pending.try_recv().is_err());
+        requests.cancel(CatalogTarget::PlaylistPicker);
+        assert!(!requests.finish(CatalogTarget::PlaylistPicker, picker.id));
+        assert!(requests.is_loading(CatalogTarget::Page));
+        assert!(requests.finish(CatalogTarget::Page, page.id));
+    }
+
+    #[test]
+    fn pause_and_resume_keep_the_clock_frozen_until_buffering_finishes() {
+        let playing = Playback::Loaded {
+            paused: false,
+            buffering: false,
+        };
+        let buffering = playing.with_buffering(true);
+        assert!(!buffering.is_advancing());
+        let paused = buffering.with_pause(true);
+        assert!(paused.is_paused());
+        assert!(!paused.is_advancing());
+        let resumed = paused.with_pause(false);
+        assert!(!resumed.is_paused());
+        assert!(!resumed.is_advancing());
+        assert!(resumed.with_buffering(false).is_advancing());
+        assert!(!paused.with_buffering(false).is_advancing());
+    }
 
     #[test]
     fn acknowledged_song_state_survives_old_reads_and_fresh_reads_can_remove_it() {
@@ -5691,9 +5862,18 @@ mod tests {
         }
         for mut playback in [
             Playback::Stopped,
-            Playback::Playing,
-            Playback::Paused,
-            Playback::Buffering,
+            Playback::Loaded {
+                paused: false,
+                buffering: false,
+            },
+            Playback::Loaded {
+                paused: true,
+                buffering: false,
+            },
+            Playback::Loaded {
+                paused: false,
+                buffering: true,
+            },
         ] {
             assert!(!playback.retry());
         }
@@ -5701,9 +5881,17 @@ mod tests {
 
     #[test]
     fn play_starts_a_stopped_wait_and_loading_toggles_preserve_the_retry_budget() {
-        assert_eq!(Playback::Stopped.toggled(), Playback::Playing);
-        assert_eq!(Playback::Paused.toggled(), Playback::Playing);
-        assert_eq!(Playback::Playing.toggled(), Playback::Paused);
+        let playing = Playback::Loaded {
+            paused: false,
+            buffering: false,
+        };
+        let paused = Playback::Loaded {
+            paused: true,
+            buffering: false,
+        };
+        assert_eq!(Playback::Stopped.toggled(), playing);
+        assert_eq!(paused.toggled(), playing);
+        assert_eq!(playing.toggled(), paused);
         let loading = Playback::Loading {
             paused: false,
             retried: true,
