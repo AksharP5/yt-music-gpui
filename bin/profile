@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample Linux CPU and resident memory for the app and its audio process."""
+"""Sample Linux CPU and resident memory for the app and existing child processes."""
 import json
 import os
 from pathlib import Path

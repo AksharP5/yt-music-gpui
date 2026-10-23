@@ -1,24 +1,32 @@
 use crate::auth::{PlaybackCredentials, sealed_file};
+use crate::video::NativeVideo;
 use anyhow::{Context, Result, bail, ensure};
+use gpui::{AnyWindowHandle, App, Bounds, Pixels, Subscription, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::HashMap,
+    ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File},
     io::{ErrorKind, Read, Seek, Write},
     os::fd::{AsRawFd, FromRawFd},
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream,
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    ptr::NonNull,
+    rc::Rc,
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
@@ -95,9 +103,83 @@ impl AudioQuality {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoQuality {
+    #[serde(rename = "144p")]
+    P144,
+    #[serde(rename = "240p")]
+    P240,
+    #[serde(rename = "360p")]
+    P360,
+    #[serde(rename = "480p")]
+    P480,
+    #[default]
+    #[serde(rename = "720p")]
+    P720,
+    #[serde(rename = "1080p")]
+    P1080,
+    #[serde(rename = "1440p")]
+    P1440,
+    #[serde(rename = "2160p")]
+    P2160,
+}
+
+impl VideoQuality {
+    pub const ALL: [Self; 8] = [
+        Self::P144,
+        Self::P240,
+        Self::P360,
+        Self::P480,
+        Self::P720,
+        Self::P1080,
+        Self::P1440,
+        Self::P2160,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::P144 => "144p",
+            Self::P240 => "240p",
+            Self::P360 => "360p",
+            Self::P480 => "480p",
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2160 => "2160p",
+        }
+    }
+
+    fn height(self) -> u16 {
+        match self {
+            Self::P144 => 144,
+            Self::P240 => 240,
+            Self::P360 => 360,
+            Self::P480 => 480,
+            Self::P720 => 720,
+            Self::P1080 => 1080,
+            Self::P1440 => 1440,
+            Self::P2160 => 2160,
+        }
+    }
+
+    fn selector(self, audio: AudioQuality) -> String {
+        let height = self.height();
+        let mut branches: Vec<_> = audio
+            .selector()
+            .split('/')
+            // Progressive `best` belongs only in the bounded fallback below.
+            .filter(|audio| *audio != "best")
+            .map(|audio| format!("bestvideo[height<={height}]+{audio}"))
+            .collect();
+        branches.push(format!("best[height<={height}]"));
+        branches.join("/")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlayOptions {
     pub quality: AudioQuality,
+    pub video: Option<VideoQuality>,
     pub start: f64,
     pub paused: bool,
 }
@@ -150,8 +232,19 @@ pub enum PlayerEvent {
     Ended {
         track_id: u64,
     },
+    Stopped {
+        track_id: u64,
+    },
+    Seekable {
+        track_id: u64,
+        seekable: bool,
+    },
     Error {
         track_id: Option<u64>,
+        message: String,
+    },
+    VideoChanged,
+    VideoError {
         message: String,
     },
     Volume(f64),
@@ -169,6 +262,14 @@ enum PlayerCommand {
     Seek(SeekRequest),
     Json(Value),
     Credentials(Option<PlaybackCredentials>),
+    AttachVideo {
+        video: Arc<NativeVideo>,
+        reply: Sender<Result<()>>,
+    },
+    DetachVideo {
+        video: Arc<NativeVideo>,
+        reply: Sender<()>,
+    },
     Stop,
     Quit,
 }
@@ -177,13 +278,14 @@ pub struct Player {
     commands: Sender<PlayerCommand>,
     events: async_channel::Receiver<PlayerEvent>,
     next_id: AtomicU64,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Player {
     pub fn new(options: PlayerOptions) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let (events, event_receiver) = async_channel::unbounded();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("music-player".into())
             .spawn(move || {
                 if let Err(error) = run(options, receiver, &events) {
@@ -197,6 +299,7 @@ impl Player {
             commands,
             events: event_receiver,
             next_id: AtomicU64::new(1),
+            worker: Some(worker),
         })
     }
 
@@ -263,6 +366,40 @@ impl Player {
     pub fn set_speed(&self, speed: PlaybackSpeed) -> Result<()> {
         self.command(json!(["set_property", "speed", f64::from(speed)]))
     }
+    /// Create with the view, before paint/input callbacks borrow the platform window.
+    pub fn video_attachment(&self, window: &mut Window, cx: &mut App) -> VideoAttachment {
+        let binding: Rc<RefCell<VideoState>> = Rc::new(RefCell::new(VideoState::Detached));
+        let weak = Rc::downgrade(&binding);
+        window.on_window_should_close(cx, move |_, _| {
+            if let Some(binding) = weak.upgrade() {
+                *binding.borrow_mut() = VideoState::Detached;
+            }
+            true
+        });
+        let weak = Rc::downgrade(&binding);
+        let quit = cx.on_app_quit(move |_| {
+            if let Some(binding) = weak.upgrade() {
+                *binding.borrow_mut() = VideoState::Detached;
+            }
+            async {}
+        });
+        VideoAttachment {
+            binding,
+            commands: self.commands.clone(),
+            window: window.window_handle(),
+            _quit: quit,
+        }
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        if let Some(worker) = self.worker.take() {
+            let _ = self.commands.send(PlayerCommand::Quit);
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("The player worker panicked during shutdown"))?;
+        }
+        Ok(())
+    }
     #[cfg(test)]
     pub fn try_recv(&self) -> Option<PlayerEvent> {
         self.events.try_recv().ok()
@@ -276,21 +413,246 @@ impl Player {
     fn send(&self, command: PlayerCommand) -> Result<()> {
         self.commands
             .send(command)
-            .map_err(|_| anyhow::anyhow!("The audio player stopped. Restart the app to reconnect."))
+            .map_err(|_| anyhow::anyhow!("The player stopped. Restart the app to reconnect."))
     }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
-        let _ = self.commands.send(PlayerCommand::Quit);
+        let _ = self.shutdown();
     }
 }
 
-struct Process(Child);
-impl Drop for Process {
+pub struct VideoAttachment {
+    binding: Rc<RefCell<VideoState>>,
+    commands: Sender<PlayerCommand>,
+    window: AnyWindowHandle,
+    _quit: Subscription,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoStatus {
+    Detached,
+    Loading,
+    Ready,
+    Failed,
+}
+
+enum VideoState {
+    Detached,
+    Attached(VideoBinding),
+    Failed(String),
+}
+
+impl VideoAttachment {
+    pub fn status(&self) -> VideoStatus {
+        match &*self.binding.borrow() {
+            VideoState::Detached => VideoStatus::Detached,
+            VideoState::Failed(_) => VideoStatus::Failed,
+            VideoState::Attached(binding) => match binding.video.ready() {
+                Ok(false) => VideoStatus::Loading,
+                Ok(true) => VideoStatus::Ready,
+                Err(_) => VideoStatus::Failed,
+            },
+        }
+    }
+
+    /// Attach if absent; otherwise update geometry at the window's current scale.
+    /// A failure stays latched until detach is called, so paint cannot retry it.
+    pub fn attach(&self, bounds: Bounds<Pixels>, window: &Window) -> Result<()> {
+        ensure!(
+            self.window == window.window_handle(),
+            "The video attachment belongs to another window"
+        );
+        let mut state = self.binding.borrow_mut();
+        if let VideoState::Failed(message) = &*state {
+            bail!("{message}");
+        }
+        if let VideoState::Attached(binding) = &*state {
+            let result = binding
+                .video
+                .ready()
+                .and_then(|_| binding.video.set_bounds(bounds, window.scale_factor()));
+            if let Err(error) = &result {
+                *state = VideoState::Failed(error.to_string());
+            }
+            return result;
+        }
+        let result: Result<VideoBinding> = (|| {
+            let video = Arc::new(NativeVideo::new(bounds, window)?);
+            let (reply, received) = mpsc::channel();
+            self.commands
+                .send(PlayerCommand::AttachVideo {
+                    video: video.clone(),
+                    reply,
+                })
+                .context("The player stopped")?;
+            // Keep the borrowed window alive until the actor accepts or rejects it.
+            received.recv().context("The player stopped")??;
+            Ok(VideoBinding {
+                video,
+                commands: self.commands.clone(),
+            })
+        })();
+        match result {
+            Ok(binding) => {
+                *state = VideoState::Attached(binding);
+                Ok(())
+            }
+            Err(error) => {
+                *state = VideoState::Failed(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Completes before returning. Call before programmatic window removal.
+    /// Also clears a previous failure to allow an explicit user retry.
+    pub fn detach(&self) {
+        *self.binding.borrow_mut() = VideoState::Detached;
+    }
+}
+
+impl Drop for VideoAttachment {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.detach();
+    }
+}
+
+struct VideoBinding {
+    video: Arc<NativeVideo>,
+    commands: Sender<PlayerCommand>,
+}
+
+impl Drop for VideoBinding {
+    fn drop(&mut self) {
+        let (reply, received) = mpsc::channel();
+        if self
+            .commands
+            .send(PlayerCommand::DetachVideo {
+                video: self.video.clone(),
+                reply,
+            })
+            .is_ok()
+        {
+            let _ = received.recv();
+        }
+        // Actor failure stops its renderer guard before dropping the core.
+        self.video.destroy();
+    }
+}
+
+struct AttachedVideo {
+    video: Arc<NativeVideo>,
+    ready: bool,
+}
+
+impl Drop for AttachedVideo {
+    fn drop(&mut self) {
+        self.video.stop();
+    }
+}
+
+#[repr(C)]
+struct MpvEvent {
+    event_id: c_int,
+    error: c_int,
+    reply_userdata: u64,
+    data: *mut c_void,
+}
+
+#[link(name = "mpv")]
+unsafe extern "C" {
+    fn mpv_create() -> *mut c_void;
+    fn mpv_set_option_string(
+        handle: *mut c_void,
+        name: *const c_char,
+        value: *const c_char,
+    ) -> c_int;
+    fn mpv_initialize(handle: *mut c_void) -> c_int;
+    fn mpv_wait_event(handle: *mut c_void, timeout: f64) -> *const MpvEvent;
+    fn mpv_terminate_destroy(handle: *mut c_void);
+}
+
+struct MpvCore(NonNull<c_void>);
+
+impl MpvCore {
+    fn new(options: &PlayerOptions, ytdlp: &Path, socket: &Path) -> Result<Self> {
+        let core = Self(NonNull::new(unsafe { mpv_create() }).context("Could not create mpv")?);
+        for (name, value) in [
+            (c"terminal", "no"),
+            (c"config", "no"),
+            (c"load-scripts", "no"),
+            (c"idle", "yes"),
+            (c"vid", "no"),
+            (c"vo", "libmpv"),
+            (c"hwdec", "auto-safe"),
+            (c"audio-display", "no"),
+            (c"osc", "no"),
+            (c"input-default-bindings", "no"),
+            (c"input-vo-keyboard", "no"),
+            (c"network-timeout", "20"),
+            (c"cache", "yes"),
+            (c"demuxer-max-bytes", "32MiB"),
+            (c"demuxer-max-back-bytes", "8MiB"),
+            (c"audio-client-name", "YouTube Music"),
+            (c"ytdl-raw-options", "ignore-config=,no-plugin-dirs="),
+        ] {
+            core.set_option(name, value)?;
+        }
+        core.set_option(c"volume", &options.volume.clamp(0., 100.).to_string())?;
+        core.set_option(c"speed", &f64::from(options.speed).to_string())?;
+        core.set_option(
+            c"script-opts",
+            &format!(
+                "ytdl_hook-ytdl_path=%{}%{}",
+                ytdlp.as_os_str().len(),
+                ytdlp.display()
+            ),
+        )?;
+        core.set_option(
+            c"input-ipc-server",
+            socket
+                .to_str()
+                .context("Invalid private playback directory")?,
+        )?;
+        if let Some(ao) = &options.audio_output {
+            core.set_option(c"ao", ao)?;
+        }
+        ensure!(
+            unsafe { mpv_initialize(core.0.as_ptr()) } >= 0,
+            "Could not initialize mpv"
+        );
+        Ok(core)
+    }
+
+    fn set_option(&self, name: &CStr, value: &str) -> Result<()> {
+        let value = CString::new(value).context("Invalid mpv startup option")?;
+        let result =
+            unsafe { mpv_set_option_string(self.0.as_ptr(), name.as_ptr(), value.as_ptr()) };
+        ensure!(
+            result >= 0,
+            "Could not set mpv startup option {} ({result})",
+            name.to_string_lossy()
+        );
+        Ok(())
+    }
+
+    fn is_shutdown(&self) -> bool {
+        loop {
+            let event = unsafe { mpv_wait_event(self.0.as_ptr(), 0.) };
+            match unsafe { (*event).event_id } {
+                0 => return false,
+                1 => return true,
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Drop for MpvCore {
+    fn drop(&mut self) {
+        unsafe { mpv_terminate_destroy(self.0.as_ptr()) };
     }
 }
 
@@ -317,9 +679,13 @@ fn write_pause(socket: &mut UnixStream, paused: bool, revision: u64) -> Result<(
 }
 
 fn load_command(url: &str, title: &str, options: PlayOptions) -> Value {
+    let selector = options
+        .video
+        .map(|video| video.selector(options.quality))
+        .unwrap_or_else(|| options.quality.selector().to_owned());
     json!(["loadfile", url, "replace", -1, {
         "force-media-title": title,
-        "ytdl-format": options.quality.selector(),
+        "ytdl-format": selector,
         "start": options.start.to_string(),
         "pause": if options.paused { "yes" } else { "no" },
     }])
@@ -472,69 +838,17 @@ fn run(
         .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/yt-dlp")))
         .find(|path| path.is_file())
         .context("Could not find yt-dlp. Install it, then restart the app.")?;
-    let mut cmd = Command::new("mpv");
-    cmd.args([
-        "--no-config",
-        "--load-scripts=no",
-        "--idle=yes",
-        "--no-video",
-        "--audio-display=no",
-        "--no-terminal",
-        "--no-osc",
-        "--no-input-default-bindings",
-        "--no-input-vo-keyboard",
-        "--network-timeout=20",
-        "--cache=yes",
-        "--demuxer-max-bytes=32MiB",
-        "--demuxer-max-back-bytes=8MiB",
-    ])
-    .arg(format!("--volume={}", options.volume.clamp(0., 100.)))
-    .arg(format!("--speed={}", f64::from(options.speed)))
-    .arg(format!(
-        "--script-opts=ytdl_hook-ytdl_path=%{}%{}",
-        ytdlp.as_os_str().len(),
-        ytdlp.display()
-    ))
-    .arg(format!("--input-ipc-server={}", socket_path.display()))
-    .arg("--audio-client-name=YouTube Music")
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-    if let Some(ao) = &options.audio_output {
-        cmd.arg(format!("--ao={ao}"));
-    }
-    if options.audio_output.is_none()
-        && std::path::Path::new("/usr/lib/mpv-mpris/mpris.so").exists()
-    {
-        cmd.arg("--script=/usr/lib/mpv-mpris/mpris.so");
-    }
     let mut credentials = None;
-    cmd.arg("--ytdl-raw-options=ignore-config=,no-plugin-dirs=");
-    let parent = std::process::id() as libc::pid_t;
-    // Linux must also reap the audio process when the GUI aborts before Drop can run.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent {
-                libc::_exit(0);
-            }
-            Ok(())
-        });
-    }
-    let mut child = Process(
-        cmd.spawn()
-            .context("Could not start mpv. Install mpv and yt-dlp, then restart the app.")?,
-    );
+    // Destroy the core before dropping the RAM credentials or private runtime.
+    let core = MpvCore::new(&options, &ytdlp, &socket_path)?;
+    // Every actor exit frees the renderer before destroying the core.
+    let mut video: Option<AttachedVideo> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket = loop {
         match UnixStream::connect(&socket_path) {
             Ok(socket) => break socket,
             Err(_) if Instant::now() < deadline => {
-                if let Some(status) = child.0.try_wait()? {
-                    bail!("mpv exited during startup ({status}).");
-                }
+                ensure!(!core.is_shutdown(), "mpv exited during startup");
                 thread::sleep(Duration::from_millis(25));
             }
             Err(error) => return Err(error).context("mpv did not open its control socket"),
@@ -565,6 +879,12 @@ fn run(
     {
         write_command(&mut socket, json!(["observe_property", id + 1, name]), None)?;
     }
+    // Position observers use 1 + 6n; reserve zero for seekability.
+    write_command(
+        &mut socket,
+        json!(["observe_property", 0, "seekable"]),
+        None,
+    )?;
     let mut buffer = [0_u8; 16384];
     loop {
         loop {
@@ -609,6 +929,49 @@ fn run(
                         |value| state.message(value, events),
                     )?;
                 }
+                Ok(PlayerCommand::AttachVideo { video: next, reply }) => {
+                    let result = (|| {
+                        ensure!(video.is_none(), "A video surface is already attached");
+                        next.start(core.0.as_ptr())?;
+                        let attached = AttachedVideo {
+                            video: next,
+                            ready: false,
+                        };
+                        request(
+                            &mut socket,
+                            &mut pending,
+                            json!(["set_property", "vid", "auto"]),
+                            |value| state.message(value, events),
+                        )
+                        .map_err(|_| anyhow::anyhow!("Could not enable the video track"))?;
+                        video = Some(attached);
+                        Ok(())
+                    })();
+                    let _ = reply.send(result);
+                }
+                Ok(PlayerCommand::DetachVideo {
+                    video: current,
+                    reply,
+                }) => {
+                    if video
+                        .as_ref()
+                        .is_some_and(|video| Arc::ptr_eq(&video.video, &current))
+                    {
+                        let result = request(
+                            &mut socket,
+                            &mut pending,
+                            json!(["set_property", "vid", "no"]),
+                            |value| state.message(value, events),
+                        );
+                        video.take();
+                        if result.is_err() {
+                            let _ = events.send_blocking(PlayerEvent::VideoError {
+                                message: "Could not disable the video track".into(),
+                            });
+                        }
+                    }
+                    let _ = reply.send(());
+                }
                 Ok(PlayerCommand::Stop) => {
                     state.invalidate_seeks();
                     state.desired = None;
@@ -622,6 +985,28 @@ fn run(
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
+        if let Some(attached) = &mut video {
+            match attached.video.ready() {
+                Ok(true) if !attached.ready => {
+                    attached.ready = true;
+                    let _ = events.send_blocking(PlayerEvent::VideoChanged);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = request(
+                        &mut socket,
+                        &mut pending,
+                        json!(["set_property", "vid", "no"]),
+                        |value| state.message(value, events),
+                    );
+                    video.take();
+                    let _ = events.send_blocking(PlayerEvent::VideoError {
+                        message: error.to_string(),
+                    });
+                    let _ = events.send_blocking(PlayerEvent::VideoChanged);
+                }
+            }
+        }
         state.write_seek(&mut socket)?;
         match socket.read(&mut buffer) {
             Ok(0) => bail!("mpv closed its connection. Restart the app to reconnect."),
@@ -633,6 +1018,13 @@ fn run(
                         state.message(message, events);
                         if state.loaded && state.pause_after_load {
                             state.pause_after_load = false;
+                            if let Some(track_id) = state.current {
+                                write_command(
+                                    &mut socket,
+                                    json!(["get_property", "seekable"]),
+                                    Some(json!(format!("loaded-seekable:{track_id}"))),
+                                )?;
+                            }
                             if let Some(paused) = state.pause_target {
                                 state.pause_revision += 1;
                                 write_pause(&mut socket, paused, state.pause_revision)?;
@@ -653,9 +1045,7 @@ fn run(
             Err(error) => return Err(error).context("Lost the connection to mpv"),
         }
         let _ = &credentials;
-        if let Some(status) = child.0.try_wait()? {
-            bail!("mpv stopped unexpectedly ({status}).");
-        }
+        ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
     }
 }
 
@@ -688,6 +1078,7 @@ struct PlaybackState {
     current: Option<u64>,
     entries: HashMap<u64, u64>,
     loaded: bool,
+    seekable: bool,
     paused: bool,
     pause_target: Option<bool>,
     pause_after_load: bool,
@@ -789,6 +1180,21 @@ impl PlaybackState {
     }
 
     fn message(&mut self, value: Value, events: &async_channel::Sender<PlayerEvent>) {
+        if let Some(track_id) = value["request_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("loaded-seekable:"))
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            if self.loaded && self.current == Some(track_id) && self.desired == Some(track_id) {
+                self.seekable =
+                    value["error"] == "success" && value["data"].as_bool().unwrap_or(false);
+                let _ = events.send_blocking(PlayerEvent::Seekable {
+                    track_id,
+                    seekable: self.seekable,
+                });
+            }
+            return;
+        }
         if let Some(revision) = value["request_id"]
             .as_str()
             .and_then(|id| id.strip_prefix("seekable:"))
@@ -896,6 +1302,7 @@ impl PlaybackState {
                 }
             }
             Some("start-file") => {
+                self.seekable = false;
                 self.current = value["playlist_entry_id"]
                     .as_u64()
                     .and_then(|id| self.entries.get(&id).copied());
@@ -906,6 +1313,12 @@ impl PlaybackState {
                     track_id: self.current.unwrap(),
                     paused: self.paused,
                 });
+                if self.seekable {
+                    let _ = events.send_blocking(PlayerEvent::Seekable {
+                        track_id: self.current.unwrap(),
+                        seekable: true,
+                    });
+                }
             }
             Some("end-file") => {
                 let track_id = value["playlist_entry_id"]
@@ -917,10 +1330,14 @@ impl PlaybackState {
                         Some("eof") => {
                             let _ = events.send_blocking(PlayerEvent::Ended { track_id });
                         }
+                        Some("stop") => {
+                            self.desired = None;
+                            let _ = events.send_blocking(PlayerEvent::Stopped { track_id });
+                        }
                         Some("error") => {
                             let _ = events.send_blocking(PlayerEvent::Error {
                                 track_id: Some(track_id),
-                                message: "YouTube could not provide an audio stream. Try another track or update yt-dlp."
+                                message: "YouTube could not provide this stream. Try another track or update yt-dlp."
                                     .into(),
                             });
                         }
@@ -961,6 +1378,12 @@ impl PlaybackState {
                     }
                     return;
                 }
+                if value["name"] == "seekable"
+                    && self.current.is_some()
+                    && self.current == self.desired
+                {
+                    self.seekable = value["data"].as_bool().unwrap_or(false);
+                }
                 if value["name"] == "pause"
                     && self.current.is_some()
                     && self.current == self.desired
@@ -991,6 +1414,10 @@ impl PlaybackState {
                     Some("duration") => value["data"]
                         .as_f64()
                         .map(|seconds| PlayerEvent::Duration { track_id, seconds }),
+                    Some("seekable") => Some(PlayerEvent::Seekable {
+                        track_id,
+                        seekable: self.seekable,
+                    }),
                     Some("pause") => value["data"]
                         .as_bool()
                         .map(|paused| PlayerEvent::Paused { track_id, paused }),
@@ -1063,6 +1490,7 @@ mod tests {
             commands,
             events,
             next_id: AtomicU64::new(2),
+            worker: None,
         };
         for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(player.seek(1, seconds).is_err());
@@ -1402,6 +1830,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires libmpv and yt-dlp; no network or display"]
+    fn headless_worker_shuts_down_after_ipc_controls() {
+        let (commands, receiver) = mpsc::channel();
+        let (events, received) = async_channel::unbounded();
+        let (finished, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = run(PlayerOptions::default(), receiver, &events);
+            finished.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ready = false;
+        while Instant::now() < deadline && !ready {
+            match received.try_recv() {
+                Ok(PlayerEvent::Speed(value)) if value == PlaybackSpeed::default() => ready = true,
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        commands.send(PlayerCommand::Quit).unwrap();
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(ready, "headless IPC must initialize before clean shutdown");
+    }
+
+    #[test]
     fn every_play_has_its_own_validated_options_and_track_id() {
         let (commands, received) = mpsc::channel();
         let (_, events) = async_channel::unbounded();
@@ -1409,6 +1864,7 @@ mod tests {
             commands,
             events,
             next_id: AtomicU64::new(1),
+            worker: None,
         };
         for start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.] {
             assert!(
@@ -1426,6 +1882,7 @@ mod tests {
         }
         assert!(received.try_recv().is_err());
         let options = PlayOptions {
+            video: None,
             quality: AudioQuality::Low,
             start: 32.5,
             paused: true,
@@ -1454,6 +1911,20 @@ mod tests {
         assert_eq!(defaults[4]["start"], "0");
         assert_eq!(defaults[4]["pause"], "no");
         assert_eq!(defaults[4]["ytdl-format"], AudioQuality::Normal.selector());
+        let video = load_command(
+            "unused",
+            "Track",
+            PlayOptions {
+                video: Some(VideoQuality::P720),
+                ..options
+            },
+        );
+        assert_eq!(
+            video[4]["ytdl-format"],
+            VideoQuality::P720.selector(AudioQuality::Low)
+        );
+        assert_eq!(video[4]["start"], "32.5");
+        assert_eq!(video[4]["pause"], "yes");
     }
 
     #[test]
@@ -1596,7 +2067,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires Python with yt-dlp; set YT_DLP_TEST_PYTHON if needed; no network"]
-    fn audio_quality_selectors_use_service_classes_before_bitrate() {
+    fn quality_selectors_respect_audio_classes_and_video_caps() {
         let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
         let selectors = AudioQuality::ALL.map(AudioQuality::selector);
         let output = Command::new(python)
@@ -1622,8 +2093,36 @@ assert [select(s, formats) for s in selectors] == ['250', '251', 'high']
 assert select(selectors[0], [dict(format_id='fallback', abr=48), dict(format_id='larger', abr=192)]) == 'fallback'
 assert select(selectors[1], [dict(format_id='fallback', abr=96), dict(format_id='larger', abr=192)]) == 'fallback'
 assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
+
+video_selectors = json.loads(sys.argv[2])
+cap_selectors = json.loads(sys.argv[3])
+def media(kind, id, **values):
+    base = dict(url='https://example.invalid/media', ext='mp4', format_id=id)
+    base.update(acodec='mp4a' if kind != 'video' else 'none',
+                vcodec='h264' if kind != 'audio' else 'none')
+    return dict(base, **values)
+def choose(selector, formats):
+    with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+        result = list(ydl.build_format_selector(selector)({'formats': formats,
+            'has_merged_format': False, 'incomplete_formats': False}))
+        return result[0]['format_id'] if result else None
+
+heights = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+videos = [media('video', 'v'+str(h), height=h) for h in heights]
+audio = [media('audio', f.pop('format_id'), **f) for f in formats]
+assert [choose(s, audio + videos) for s in video_selectors] == ['v720+250', 'v720+251', 'v720+high']
+assert [choose(s, audio + videos) for s in cap_selectors] == ['v'+str(h)+'+high' for h in heights]
+assert choose(video_selectors[0], [media('audio', 'fallback', abr=48), media('audio', 'larger', abr=192)] + videos) == 'v720+fallback'
+assert choose(video_selectors[1], [media('audio', 'fallback', abr=96), media('audio', 'larger', abr=192)] + videos) == 'v720+fallback'
+progressive = [media('both', 'p720', height=720), media('both', 'p1080', height=1080)]
+assert all(choose(s, progressive) == 'p720' for s in video_selectors)
+assert all(choose(s, [videos[4], progressive[1]]) is None for s in video_selectors)
+assert all(choose(s, audio) is None for s in video_selectors)
+assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
 "#])
             .arg(serde_json::to_string(&selectors).unwrap())
+            .arg(serde_json::to_string(&AudioQuality::ALL.map(|audio| VideoQuality::P720.selector(audio))).unwrap())
+            .arg(serde_json::to_string(&VideoQuality::ALL.map(|video| video.selector(AudioQuality::High))).unwrap())
             .output()
             .unwrap();
         assert!(
@@ -1895,6 +2394,113 @@ assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
     }
 
     #[test]
+    fn external_stop_reports_the_current_load_without_finishing_or_stopping_a_replacement() {
+        for desired in [Some(1), Some(2), None] {
+            let (events, received) = async_channel::unbounded();
+            let mut state = PlaybackState {
+                desired,
+                current: Some(1),
+                entries: HashMap::from([(10, 1)]),
+                loaded: true,
+                restarted: true,
+                ..Default::default()
+            };
+            state.message(
+                json!({"event":"end-file","playlist_entry_id":10,"reason":"stop"}),
+                &events,
+            );
+            if desired == Some(1) {
+                assert!(matches!(
+                    received.try_recv(),
+                    Ok(PlayerEvent::Stopped { track_id: 1 })
+                ));
+                assert!(!state.loaded && !state.restarted);
+                assert_eq!(state.desired, None);
+            } else {
+                assert!(state.loaded);
+                assert_eq!(state.desired, desired);
+            }
+            assert!(received.try_recv().is_err());
+            state.message(
+                json!({"event":"property-change","id":1,"name":"time-pos","data":30.}),
+                &events,
+            );
+            assert!(received.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn seekability_is_published_for_the_loaded_track_and_resets_for_replacement() {
+        let (events, received) = async_channel::unbounded();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            entries: HashMap::from([(10, 1), (11, 2)]),
+            ..Default::default()
+        };
+        state.message(
+            json!({"event":"start-file","playlist_entry_id":10}),
+            &events,
+        );
+        state.message(
+            json!({"event":"property-change","id":0,"name":"seekable","data":true}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        state.message(json!({"event":"file-loaded"}), &events);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Started { track_id: 1, .. })
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Seekable {
+                track_id: 1,
+                seekable: true
+            })
+        ));
+        state.message(
+            json!({"event":"property-change","id":0,"name":"seekable","data":false}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Seekable {
+                track_id: 1,
+                seekable: false
+            })
+        ));
+        state.desired = Some(2);
+        state.loaded = false;
+        state.message(
+            json!({"event":"start-file","playlist_entry_id":11}),
+            &events,
+        );
+        assert!(!state.seekable);
+        state.message(json!({"event":"file-loaded"}), &events);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Started { track_id: 2, .. })
+        ));
+        assert!(received.try_recv().is_err());
+        state.message(
+            json!({"request_id":"loaded-seekable:1","error":"success","data":true}),
+            &events,
+        );
+        assert!(received.try_recv().is_err());
+        state.message(
+            json!({"request_id":"loaded-seekable:2","error":"success","data":true}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Seekable {
+                track_id: 2,
+                seekable: true
+            })
+        ));
+    }
+
+    #[test]
     fn replacing_track_does_not_finish_the_new_track() {
         for reason in ["eof", "error", "stop"] {
             let (tx, rx) = async_channel::unbounded();
@@ -2095,6 +2701,7 @@ assert all(select(s, [dict(format_id='only')]) == 'only' for s in selectors)
                 "csILUDfmtqM",
                 "Khruangbin - Hold Me Up",
                 PlayOptions {
+                    video: None,
                     quality: AudioQuality::Low,
                     start: 30.,
                     paused: true,

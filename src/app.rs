@@ -5,13 +5,19 @@ use crate::{
     catalog::{BrowseLink, Catalog, Collection, Continuation, Item, Page, Rating, Shelf, Track},
     country_picker::{CountryPicker, CountryPickerEvent},
     library::{Library, LibraryWriter, Repeat, Store},
-    player::{AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions},
+    mpris,
+    player::{
+        AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions,
+        VideoAttachment, VideoQuality, VideoStatus,
+    },
     playlist_form::{PlaylistForm, PlaylistFormEvent},
+    queue_source::{self, PageRequest},
     search::{SearchFilter, SearchScope},
     search_box::{SearchBox, SearchBoxEvent},
     song_text::{self, Content as SongText, Query as TextQuery},
     theme::Theme,
-    watch::{Watch, WatchContinuation, WatchPage},
+    track_state,
+    watch::{MediaPair, Watch, WatchContinuation, WatchPage},
 };
 use gpui::{prelude::*, *};
 use std::{
@@ -66,11 +72,13 @@ enum Query {
 }
 struct Job {
     id: u64,
+    account_revision: u64,
     query: Query,
     session: Option<Arc<Session>>,
 }
 struct CatalogResult {
     id: u64,
+    account_revision: u64,
     append: bool,
     result: Result<Page, String>,
     target: CatalogTarget,
@@ -85,12 +93,14 @@ enum PlaybackQuery {
 }
 struct PlaybackJob {
     id: u64,
+    account_revision: u64,
     query: PlaybackQuery,
     session: Option<Arc<Session>>,
 }
 enum PlaybackResult {
     Watch {
         id: u64,
+        account_revision: u64,
         radio: bool,
         result: Result<Box<Watch>, String>,
     },
@@ -99,7 +109,7 @@ enum PlaybackResult {
         result: Result<WatchPage, String>,
     },
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Playback {
     Stopped,
     Loading { paused: bool, retried: bool },
@@ -113,6 +123,12 @@ struct SeekIntent {
     revision: u64,
     seconds: f64,
 }
+
+#[derive(Clone, Copy)]
+struct QueueAdvance {
+    natural: bool,
+    playback: Playback,
+}
 impl Playback {
     fn is_paused(self) -> bool {
         matches!(self, Self::Paused | Self::Loading { paused: true, .. })
@@ -124,6 +140,10 @@ impl Playback {
             _ if paused => Self::Paused,
             _ => Self::Playing,
         }
+    }
+
+    fn toggled(self) -> Self {
+        self.with_pause(self != Self::Stopped && !self.is_paused())
     }
 
     fn retry(&mut self) -> bool {
@@ -158,7 +178,6 @@ enum Overlay {
     },
     PlaylistForm {
         form: Entity<PlaylistForm>,
-        track: Option<Track>,
     },
     DeletePlaylist {
         id: String,
@@ -179,6 +198,13 @@ enum AccountOperation {
     Connecting(Operation),
     Disconnecting(Operation),
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    Restore,
+    Connect,
+    Guest,
+}
 impl AccountOperation {
     fn token(&self) -> &Operation {
         match self {
@@ -196,6 +222,9 @@ pub struct Music {
     account_operation: Option<AccountOperation>,
     pending_mutations: HashSet<String>,
     ratings: HashMap<String, Rating>,
+    account_revision: u64,
+    track_state: track_state::Worker,
+    track_state_id: Option<u64>,
     focus: FocusHandle,
     search: Entity<SearchBox>,
     route: Route,
@@ -213,11 +242,14 @@ pub struct Music {
     pending_playback_jobs: async_channel::Receiver<PlaybackJob>,
     playback_generation: Arc<AtomicU64>,
     now_playing: Option<Watch>,
+    media_pair: Option<Box<MediaPair>>,
     radio: Option<WatchContinuation>,
     radio_generation: Arc<AtomicU64>,
     radio_loading: bool,
     autoplay_seeded: bool,
-    autoplay_waiting: Option<bool>,
+    autoplay_waiting: Option<QueueAdvance>,
+    queue_source: queue_source::Worker,
+    queue_waiting: Option<QueueAdvance>,
     autoplay_tracks: VecDeque<Track>,
     watch_pending: bool,
     song_text: song_text::Worker,
@@ -225,6 +257,14 @@ pub struct Music {
     library: Library,
     store: Option<LibraryWriter>,
     player: Option<Player>,
+    mpris: Option<mpris::Mpris>,
+    seekable: bool,
+    video: Option<VideoAttachment>,
+    video_open: bool,
+    video_fullscreen: bool,
+    video_transparent: bool,
+    video_error: Option<String>,
+    video_click: Option<Task<()>>,
     active_id: Option<u64>,
     history_track: Option<u64>,
     playback: Playback,
@@ -242,7 +282,7 @@ pub struct Music {
 }
 
 impl Music {
-    pub fn new(connect: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(startup: Startup, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| SearchBox::new(window, cx));
         let (store, library, error) = match Store::load() {
             Ok((s, l)) => (Some(s), l, None),
@@ -268,16 +308,17 @@ impl Music {
         });
         let session = auth::shared(None);
         let (account_commands, account_events, account_worker) = account::start(session.clone());
-        let account_operation = auth::ACCOUNT_LOGIN_ENABLED.then(|| {
-            let operation = Operation::default();
-            let command = if connect {
-                account::Command::Connect(operation.clone())
-            } else {
-                account::Command::Restore(operation.clone())
-            };
-            let _ = account_commands.try_send(command);
-            AccountOperation::Connecting(operation)
-        });
+        let account_operation =
+            (auth::ACCOUNT_LOGIN_ENABLED && startup != Startup::Guest).then(|| {
+                let operation = Operation::default();
+                let command = if startup == Startup::Connect {
+                    account::Command::Connect(operation.clone())
+                } else {
+                    account::Command::Restore(operation.clone())
+                };
+                let _ = account_commands.try_send(command);
+                AccountOperation::Connecting(operation)
+            });
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = account_events.recv().await {
                 if view
@@ -289,7 +330,7 @@ impl Music {
             }
         })
         .detach();
-        let (player, error) = match Player::new(PlayerOptions {
+        let (player, mut error) = match Player::new(PlayerOptions {
             credentials: None,
             volume: library.volume,
             speed: library.speed,
@@ -298,6 +339,9 @@ impl Music {
             Ok(p) => (Some(p), error),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
+        let video = player
+            .as_ref()
+            .map(|player| player.video_attachment(window, cx));
         let (artwork, loaded) = Artwork::new();
         let (jobs, receiver) = async_channel::bounded::<Job>(1);
         let (results, completed) = async_channel::unbounded::<CatalogResult>();
@@ -362,6 +406,7 @@ impl Music {
                         if results
                             .send_blocking(CatalogResult {
                                 id: job.id,
+                                account_revision: job.account_revision,
                                 append,
                                 result,
                                 target,
@@ -412,6 +457,7 @@ impl Music {
                     let result = match job.query {
                         PlaybackQuery::Watch { track, radio } => PlaybackResult::Watch {
                             id: job.id,
+                            account_revision: job.account_revision,
                             radio,
                             result: catalog.and_then(|catalog| {
                                 catalog
@@ -439,6 +485,57 @@ impl Music {
             while let Ok(result) = playback_completed.recv().await {
                 if view
                     .update_in(cx, |view, _, cx| view.playback_result(result, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let (queue_source, queue_events) = queue_source::Worker::start();
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(event) = queue_events.recv().await {
+                if view
+                    .update_in(cx, |view, _, cx| view.queue_source_result(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let (track_state, track_events) = track_state::Worker::start();
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(event) = track_events.recv().await {
+                if view
+                    .update_in(cx, |view, _, cx| {
+                        if view.track_state_id != Some(event.id) {
+                            return;
+                        }
+                        view.track_state_id = None;
+                        match event.result {
+                            Ok(track)
+                                if view
+                                    .library
+                                    .queue
+                                    .current()
+                                    .is_some_and(|current| current.id == track.id) =>
+                            {
+                                apply_track_details(
+                                    &mut view.library.queue.tracks,
+                                    &mut view.ratings,
+                                    &track,
+                                    true,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                view.error =
+                                    Some(format!("Could not refresh the current song: {error}"))
+                            }
+                        }
+                        cx.notify();
+                    })
                     .is_err()
                 {
                     break;
@@ -487,6 +584,27 @@ impl Music {
                 while let Ok(event) = events.recv().await {
                     if view
                         .update_in(cx, |view, _, cx| view.player_event(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        let mpris = match mpris::Mpris::new() {
+            Ok(service) => Some(service),
+            Err(failure) => {
+                error.get_or_insert_with(|| failure.to_string());
+                None
+            }
+        };
+        if let Some(service) = &mpris {
+            let events = service.events();
+            cx.spawn_in(window, async move |view, cx| {
+                while let Ok(event) = events.recv().await {
+                    if view
+                        .update_in(cx, |view, _, cx| view.desktop_event(event, cx))
                         .is_err()
                     {
                         break;
@@ -555,6 +673,9 @@ impl Music {
             account_operation,
             pending_mutations: HashSet::new(),
             ratings: HashMap::new(),
+            account_revision: 0,
+            track_state,
+            track_state_id: None,
             focus: cx.focus_handle(),
             search,
             route: Route::Home,
@@ -581,11 +702,14 @@ impl Music {
             pending_playback_jobs: playback_receiver,
             playback_generation,
             now_playing: None,
+            media_pair: None,
             radio: None,
             radio_generation,
             radio_loading: false,
             autoplay_seeded: false,
             autoplay_waiting: None,
+            queue_source,
+            queue_waiting: None,
             autoplay_tracks: VecDeque::new(),
             watch_pending: false,
             song_text,
@@ -593,6 +717,14 @@ impl Music {
             library,
             store,
             player,
+            mpris,
+            seekable: false,
+            video,
+            video_open: false,
+            video_fullscreen: false,
+            video_transparent: false,
+            video_error: None,
+            video_click: None,
             active_id: None,
             history_track: None,
             playback: Playback::Stopped,
@@ -631,7 +763,12 @@ impl Music {
             .map(|connection| connection.session.clone());
         if self
             .playback_jobs
-            .try_send(PlaybackJob { id, query, session })
+            .try_send(PlaybackJob {
+                id,
+                account_revision: self.account_revision,
+                query,
+                session,
+            })
             .is_err()
         {
             self.radio_loading = false;
@@ -714,21 +851,21 @@ impl Music {
     }
 
     fn resume_autoplay(&mut self, cx: &mut Context<Self>) {
-        let Some(natural) = self.autoplay_waiting else {
+        let Some(intent) = self.autoplay_waiting else {
             return;
         };
         let autoplay = self.library.music_autoplay();
         if self.library.queue.advance_with_autoplay(
             self.library.repeat,
-            natural,
+            intent.natural,
             autoplay,
             &mut self.autoplay_tracks,
         ) {
             self.autoplay_waiting = None;
-            self.play_current(cx);
+            self.follow_queue_selection(intent.playback, cx);
         } else if self.radio_loading || self.watch_pending {
             self.playback = Playback::Loading {
-                paused: false,
+                paused: intent.playback.is_paused(),
                 retried: false,
             };
         } else {
@@ -739,14 +876,25 @@ impl Music {
 
     fn playback_result(&mut self, result: PlaybackResult, cx: &mut Context<Self>) {
         match result {
-            PlaybackResult::Watch { id, radio, result } => {
+            PlaybackResult::Watch {
+                id,
+                account_revision,
+                radio,
+                result,
+            } => {
                 if id != self.playback_generation.load(Ordering::Relaxed) {
                     return;
                 }
                 self.watch_pending = false;
                 match result {
                     Ok(watch) => {
-                        let watch = *watch;
+                        let mut watch = *watch;
+                        let fresh = account_revision == self.account_revision;
+                        if !fresh {
+                            for track in watch.current.iter_mut().chain(&mut watch.queue) {
+                                track.details.clear_account_state();
+                            }
+                        }
                         if radio {
                             let Some(index) = watch.current_index else {
                                 self.playback = Playback::Stopped;
@@ -756,29 +904,20 @@ impl Music {
                                 return;
                             };
                             self.reset_radio();
+                            self.queue_source.cancel();
+                            self.queue_waiting = None;
                             self.library.queue.replace(watch.queue.clone(), index);
                             self.radio = watch.continuation.clone();
                             self.autoplay_seeded = true;
                             self.notice = Some("Radio started".into());
                         }
-                        if let Some(track) = &watch.current
-                            && let Some(index) = self.library.queue.index
-                            && let Some(current) = self.library.queue.tracks.get_mut(index)
-                            && current.id == track.id
-                        {
-                            // Keep the selected playlist occurrence when refreshing song metadata.
-                            let occurrence = current.details.set_video_id.clone();
-                            let credits = current.details.credits_id.clone();
-                            current.details = track.details.clone();
-                            current.details.set_video_id = occurrence;
-                            current.details.credits_id =
-                                track.details.credits_id.clone().or(credits);
-                            if track.details.episode.is_some() {
-                                current.artist = track.artist.clone();
-                            }
-                            if let Some(rating) = track.details.rating {
-                                self.ratings.insert(track.id.clone(), rating);
-                            }
+                        if let Some(track) = &watch.current {
+                            apply_track_details(
+                                &mut self.library.queue.tracks,
+                                &mut self.ratings,
+                                track,
+                                fresh,
+                            );
                         }
                         if self
                             .library
@@ -791,13 +930,40 @@ impl Music {
                             }
                             self.reset_radio();
                         }
+                        let current = self.library.queue.current();
+                        if watch
+                            .current
+                            .as_ref()
+                            .zip(current)
+                            .is_some_and(|(issued, current)| issued.id == current.id)
+                            && let Some(pair) = &watch.alternatives
+                        {
+                            let mut pair = pair.clone();
+                            pair.song.details.clear_account_state();
+                            pair.video.details.clear_account_state();
+                            self.media_pair = Some(pair);
+                        }
+                        let switch_mode = (radio || self.active_id.is_some())
+                            && current.is_some_and(|current| {
+                                self.media_pair
+                                    .as_ref()
+                                    .and_then(|pair| pair.target(&current.id, self.library.video))
+                                    .is_some_and(|target| target.id != current.id)
+                            });
                         self.now_playing = Some(watch);
+                        let video_open = self.video_open;
                         if radio {
+                            if switch_mode {
+                                self.set_video_mode(self.library.video, cx);
+                            }
                             self.play_current(cx);
+                        } else if switch_mode {
+                            self.set_video_mode(self.library.video, cx);
                         } else {
                             self.extend_autoplay(cx);
                             self.resume_autoplay(cx);
                         }
+                        self.video_open = video_open;
                     }
                     Err(error) if radio => {
                         self.playback = Playback::Stopped;
@@ -836,6 +1002,8 @@ impl Music {
     }
 
     fn clear_account_state(&mut self, cx: &mut Context<Self>) {
+        self.queue_source.cancel();
+        self.queue_waiting = None;
         let session = self
             .account
             .as_ref()
@@ -843,6 +1011,9 @@ impl Music {
         self.search
             .update(cx, |search, cx| search.set_session(session, cx));
         self.ratings.clear();
+        self.account_revision = self.account_revision.wrapping_add(1);
+        self.track_state.cancel();
+        self.track_state_id = None;
         self.history_track = None;
         self.song_text.cancel();
         self.pending_mutations.clear();
@@ -851,6 +1022,7 @@ impl Music {
         self.reset_radio();
         let _ = self.pending_playback_jobs.try_recv();
         self.now_playing = None;
+        self.media_pair = None;
         self.overlay = None;
         self.overlay_subscription = None;
         for track in self
@@ -872,7 +1044,16 @@ impl Music {
             .account
             .as_ref()
             .map(|connection| connection.session.clone());
-        if self.jobs.try_send(Job { id, query, session }).is_err() {
+        if self
+            .jobs
+            .try_send(Job {
+                id,
+                account_revision: self.account_revision,
+                query,
+                session,
+            })
+            .is_err()
+        {
             self.error = Some("The music connection stopped. Restart the app to reconnect.".into());
         } else {
             self.loading = true;
@@ -881,6 +1062,7 @@ impl Music {
     }
 
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.video_open = false;
         if self.route != route {
             let cached = (self.account.is_none() && !self.loading && self.error.is_none())
                 .then(|| self.page.clone());
@@ -995,6 +1177,11 @@ impl Music {
     }
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.video_open {
+            self.video_open = false;
+            cx.notify();
+            return;
+        }
         if let Some((route, page)) = self.back.pop() {
             let Some(page) = page.filter(|_| self.account.is_none()) else {
                 self.route = route.clone();
@@ -1048,7 +1235,23 @@ impl Music {
             return;
         }
         match result.result {
-            Ok(page) => {
+            Ok(mut page) => {
+                if result.account_revision != self.account_revision {
+                    for track in page
+                        .shelves
+                        .iter_mut()
+                        .flat_map(|shelf| &mut shelf.items)
+                        .filter_map(|item| {
+                            if let Item::Track(track) = item {
+                                Some(track)
+                            } else {
+                                None
+                            }
+                        })
+                    {
+                        track.details.clear_account_state();
+                    }
+                }
                 if result.append {
                     self.page.continuation = page.continuation;
                     self.page.shelves.extend(page.shelves);
@@ -1056,6 +1259,15 @@ impl Music {
                     self.page = page;
                 }
                 for track in self.page.tracks() {
+                    if self.account.is_some()
+                        && self
+                            .library
+                            .queue
+                            .current()
+                            .is_some_and(|current| current.id == track.id)
+                    {
+                        continue;
+                    }
                     if let Some(rating) = track.details.rating {
                         self.ratings.insert(track.id, rating);
                     }
@@ -1112,32 +1324,35 @@ impl Music {
         }
         cx.notify();
     }
-    fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
+    fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) -> bool {
         if self.account_operation.is_some() {
             self.error = Some("Finish the account change before saving edits.".into());
             cx.notify();
-            return;
+            return false;
         }
         let Some(connection) = &self.account else {
-            return;
+            return false;
         };
         let key = mutation.key();
         if self.pending_mutations.contains(&key) {
-            return;
+            return false;
         }
-        match self.account_commands.try_send(account::Command::Apply {
+        let submitted = match self.account_commands.try_send(account::Command::Apply {
             session: connection.session.clone(),
             mutation: Box::new(mutation),
         }) {
             Ok(()) => {
                 self.pending_mutations.insert(key);
                 self.notice = Some("Saving to YouTube Music…".into());
+                true
             }
             Err(_) => {
-                self.error = Some("Too many pending changes. Wait for them to finish.".into())
+                self.error = Some("Too many pending changes. Wait for them to finish.".into());
+                false
             }
-        }
+        };
         cx.notify();
+        submitted
     }
     fn disconnect_account(&mut self, cx: &mut Context<Self>) {
         if matches!(
@@ -1173,6 +1388,7 @@ impl Music {
         cx.notify();
     }
     fn refresh_remote(&mut self, cx: &mut Context<Self>) {
+        self.account_revision = self.account_revision.wrapping_add(1);
         let query = match &self.route {
             Route::Home => Query::Home,
             Route::Explore => Query::Explore,
@@ -1184,6 +1400,22 @@ impl Music {
             Route::Library(section) => Query::Library(*section),
         };
         self.request(query, cx);
+        self.refresh_current_account(cx);
+    }
+
+    fn refresh_current_account(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = &self.account else { return };
+        let Some(track) = self.library.queue.current().cloned() else {
+            return;
+        };
+        match self.track_state.load(track, account.session.clone()) {
+            Ok(id) => self.track_state_id = Some(id),
+            Err(error) => {
+                self.track_state_id = None;
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
     }
     fn playlist_form(
         &mut self,
@@ -1222,6 +1454,7 @@ impl Music {
         };
         let form = cx.new(|cx| PlaylistForm::new(title, description, privacy, cx));
         let edit_id = id.clone();
+        let initial_video_id = track.as_ref().map(|track| track.id.clone());
         self.overlay_subscription = Some(cx.subscribe_in(
             &form,
             window,
@@ -1242,9 +1475,12 @@ impl Music {
                             title: title.clone(),
                             description: description.clone(),
                             privacy: *privacy,
+                            initial_video_id: initial_video_id.clone(),
                         },
                     };
-                    view.mutate(mutation, cx);
+                    if view.mutate(mutation, cx) {
+                        view.close_overlay(window, cx);
+                    }
                 }
                 PlaylistFormEvent::Cancel => {
                     view.close_overlay(window, cx);
@@ -1253,7 +1489,7 @@ impl Music {
         ));
         window.focus(&form.focus_handle(cx), cx);
         self.error = None;
-        self.overlay = Some(Overlay::PlaylistForm { form, track });
+        self.overlay = Some(Overlay::PlaylistForm { form });
         cx.notify();
     }
     fn playlist_picker(&mut self, track: Track, cx: &mut Context<Self>) {
@@ -1377,6 +1613,7 @@ impl Music {
                             self.error = Some("Connected for this session, but the account could not be queued for keyring storage.".into());
                         }
                         self.notice = Some(label);
+                        self.refresh_current_account(cx);
                     }
                     Ok(None) => {}
                     Err(error) => self.error = Some(error),
@@ -1399,39 +1636,38 @@ impl Music {
                 match result {
                     Ok(effect) => {
                         let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
-                        if let Mutation::RateSong { track, rating } = &mutation {
-                            self.ratings.insert(track.id.clone(), *rating);
-                        }
+                        acknowledge_song_change(
+                            &mut self.library.queue.tracks,
+                            &mut self.ratings,
+                            &mutation,
+                        );
                         self.notice = Some("Saved to YouTube Music".into());
                         match effect {
-                            Effect::CreatedPlaylist(id) => {
-                                let track = match self.overlay.take() {
-                                    Some(Overlay::PlaylistForm { track, .. }) => track,
-                                    _ => None,
-                                };
-                                self.close_overlay(window, cx);
-                                if let Some(track) = track {
+                            Effect::CreatedPlaylist {
+                                id,
+                                initial_video_id,
+                            } => {
+                                if let Some(video_id) = initial_video_id {
                                     self.mutate(
                                         Mutation::AddToPlaylist {
                                             id: id.clone(),
-                                            video_ids: vec![track.id],
+                                            video_ids: vec![video_id],
                                             duplicates: false,
                                         },
                                         cx,
                                     );
                                 }
-                                self.navigate(
-                                    Route::Browse(BrowseLink::new(format!("VL{id}"), "Playlist")),
-                                    cx,
-                                )
+                                if self.overlay.is_none() {
+                                    self.navigate(
+                                        Route::Browse(BrowseLink::new(
+                                            format!("VL{id}"),
+                                            "Playlist",
+                                        )),
+                                        cx,
+                                    );
+                                }
                             }
                             Effect::Changed => {
-                                if matches!(
-                                    mutation,
-                                    Mutation::EditPlaylist { .. } | Mutation::DeletePlaylist { .. }
-                                ) {
-                                    self.close_overlay(window, cx);
-                                }
                                 if deleting {
                                     self.navigate(Route::Library(Section::Playlists), cx);
                                 } else {
@@ -1539,12 +1775,22 @@ impl Music {
         cx.notify();
     }
     fn play_current(&mut self, cx: &mut Context<Self>) {
-        self.play_current_at(0., cx);
+        self.play_current_at(0., false, cx);
     }
-    fn play_current_at(&mut self, start: f64, cx: &mut Context<Self>) {
+    fn play_current_at(&mut self, start: f64, paused: bool, cx: &mut Context<Self>) {
+        self.queue_waiting = None;
         let Some(track) = self.library.queue.current().cloned() else {
             return;
         };
+        self.track_state.cancel();
+        self.track_state_id = None;
+        if !self
+            .media_pair
+            .as_ref()
+            .is_some_and(|pair| pair.target(&track.id, self.library.video).is_some())
+        {
+            self.media_pair = None;
+        }
         if track.details.episode.is_some() {
             self.reset_radio();
         }
@@ -1553,6 +1799,13 @@ impl Music {
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
         self.watch_pending = false;
         self.discard_pending_playback();
+        // The queue may already name a different recording. Retire the old load
+        // before enqueueing, including when the player has stopped accepting work.
+        self.active_id = None;
+        self.seekable = false;
+        self.pending_seek = None;
+        self.playback = Playback::Stopped;
+        self.position = start;
         let Some(player) = &self.player else {
             self.playback = Playback::Stopped;
             self.error =
@@ -1565,24 +1818,26 @@ impl Music {
             &format!("{} - {}", track.artist, track.title),
             PlayOptions {
                 quality: self.library.quality,
+                video: self.library.video.then_some(self.library.video_quality),
                 start,
-                ..Default::default()
+                paused,
             },
         ) {
             Ok(id) => {
                 self.active_id = Some(id);
                 self.playback = Playback::Loading {
-                    paused: false,
+                    paused,
                     retried: false,
                 };
                 self.position = start;
                 self.duration = track.duration.unwrap_or(0) as f64;
                 self.error = None;
-                if !self
-                    .now_playing
-                    .as_ref()
-                    .and_then(|watch| watch.current.as_ref())
-                    .is_some_and(|current| current.id == track.id)
+                if self.account.is_some()
+                    || !self
+                        .now_playing
+                        .as_ref()
+                        .and_then(|watch| watch.current.as_ref())
+                        .is_some_and(|current| current.id == track.id)
                 {
                     self.now_playing = None;
                     self.autoplay_seeded = false;
@@ -1602,6 +1857,7 @@ impl Music {
             Err(error) => self.error = Some(error.to_string()),
         }
         self.extend_autoplay(cx);
+        self.prefetch_queue(cx);
         self.save();
         cx.notify();
     }
@@ -1617,11 +1873,13 @@ impl Music {
             return;
         }
         if !current {
+            self.queue_source.cancel();
+            self.queue_waiting = None;
             self.reset_radio();
             self.now_playing = None;
             self.library.queue.replace(vec![track], 0);
         }
-        self.play_current_at(seconds as f64, cx);
+        self.play_current_at(seconds as f64, false, cx);
     }
     fn set_audio_quality(&mut self, quality: AudioQuality, cx: &mut Context<Self>) {
         if self.library.quality == quality {
@@ -1637,6 +1895,69 @@ impl Music {
             }
         }
         self.save();
+        cx.notify();
+    }
+    fn set_video_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.video_open = enabled;
+        self.video_error = None;
+        let changed = self.library.video != enabled;
+        let position = self.playback_position();
+        let paused = self.playback.is_paused();
+        self.library.video = enabled;
+        let alternative = self
+            .media_pair
+            .as_ref()
+            .and_then(|pair| {
+                let current = self.library.queue.current()?;
+                pair.target(&current.id, enabled)
+                    .filter(|target| target.id != current.id)
+            })
+            .cloned();
+        if let Some(track) = alternative
+            && let Some(current) = self
+                .library
+                .queue
+                .index
+                .and_then(|index| self.library.queue.tracks.get_mut(index))
+        {
+            *current = track;
+            self.reset_radio();
+            self.now_playing = None;
+            if self.active_id.is_some() {
+                self.play_current_at(position, paused, cx);
+            }
+        } else if changed
+            && self.active_id.is_some()
+            && self.playback != Playback::Stopped
+            && let Err(error) = self.reload_stream()
+        {
+            self.error = Some(error.to_string());
+        }
+        self.save();
+        cx.notify();
+    }
+    fn set_video_quality(&mut self, quality: VideoQuality, cx: &mut Context<Self>) {
+        if self.library.video_quality == quality {
+            return;
+        }
+        self.library.video_quality = quality;
+        if self.library.video && self.active_id.is_some() && self.playback != Playback::Stopped {
+            if let Playback::Loading { retried, .. } = &mut self.playback {
+                *retried = false;
+            }
+            if let Err(error) = self.reload_stream() {
+                self.error = Some(error.to_string());
+            }
+        }
+        self.save();
+        cx.notify();
+    }
+    fn toggle_video_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.video_open {
+            return;
+        }
+        self.video_fullscreen = !window.is_fullscreen();
+        window.toggle_fullscreen();
         cx.notify();
     }
     fn reload_stream(&mut self) -> anyhow::Result<()> {
@@ -1657,6 +1978,7 @@ impl Music {
             &format!("{} - {}", track.artist, track.title),
             PlayOptions {
                 quality: self.library.quality,
+                video: self.library.video.then_some(self.library.video_quality),
                 start,
                 paused,
             },
@@ -1665,16 +1987,95 @@ impl Music {
             self.history_track = Some(id);
         }
         self.active_id = Some(id);
+        self.seekable = false;
         self.position = start;
         self.playback = Playback::Loading { paused, retried };
         self.error = None;
         Ok(())
     }
     fn replace_queue(&mut self, tracks: Vec<Track>, selected: usize, cx: &mut Context<Self>) {
+        self.queue_source.cancel();
+        self.queue_waiting = None;
+        self.video_open = self.library.video;
         self.reset_radio();
         self.now_playing = None;
         self.library.queue.replace(tracks, selected);
         self.play_current(cx);
+    }
+
+    fn replace_page_queue(&mut self, selected: usize, cx: &mut Context<Self>) {
+        self.video_open = self.library.video;
+        self.queue_waiting = None;
+        self.reset_radio();
+        self.now_playing = None;
+        let request = match &self.route {
+            Route::Search(search) => PageRequest::Search {
+                query: search.query.clone(),
+                filter: search.filter,
+                scope: search.scope,
+            },
+            _ => PageRequest::Browse,
+        };
+        let session = self.account.as_ref().map(|account| account.session.clone());
+        self.queue_source.replace_queue(
+            &mut self.library.queue,
+            &self.page,
+            selected,
+            request,
+            session,
+        );
+        self.play_current(cx);
+    }
+
+    fn prefetch_queue(&mut self, cx: &mut Context<Self>) {
+        if !self.library.queue.incomplete {
+            return;
+        }
+        let remaining = self
+            .library
+            .queue
+            .tracks
+            .len()
+            .saturating_sub(self.library.queue.index.map_or(0, |index| index + 1));
+        if remaining > 3 {
+            return;
+        }
+        let session = self.account.as_ref().map(|account| &account.session);
+        if let Err(error) = self.queue_source.load(session, false) {
+            self.error = Some(error);
+            cx.notify();
+        }
+    }
+
+    fn queue_source_result(&mut self, event: queue_source::Event, cx: &mut Context<Self>) {
+        let session = self.account.as_ref().map(|account| &account.session);
+        match self
+            .queue_source
+            .apply(event, &mut self.library.queue, session)
+        {
+            Ok(false) => return,
+            Ok(true) => {
+                if self.library.queue.tracks.is_empty() && !self.library.queue.incomplete {
+                    self.clear_queue(cx);
+                    return;
+                }
+                self.save();
+                if let Some(intent) = self.queue_waiting.take() {
+                    self.advance_queue(intent, cx);
+                } else {
+                    self.prefetch_queue(cx);
+                    self.extend_autoplay(cx);
+                }
+            }
+            Err(error) => {
+                if self.queue_waiting.take().is_some() {
+                    self.playback = Playback::Stopped;
+                    self.notice = None;
+                }
+                self.error = Some(error);
+            }
+        }
+        cx.notify();
     }
     fn play_recommendation(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(track) = self.autoplay_tracks.remove(index) else {
@@ -1687,14 +2088,20 @@ impl Music {
         self.play_current(cx);
     }
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.queue_source.cancel();
+        self.queue_waiting = None;
+        self.track_state.cancel();
+        self.track_state_id = None;
         self.player_command(Player::stop);
         self.active_id = None;
+        self.seekable = false;
         self.playback = Playback::Stopped;
         self.position = 0.;
         self.duration = 0.;
         self.notice = None;
         self.library.queue = Default::default();
         self.now_playing = None;
+        self.media_pair = None;
         self.reset_radio();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
         self.watch_pending = false;
@@ -1727,7 +2134,7 @@ impl Music {
                 if let Some(index) = tracks.iter().position(|t| {
                     t.id == track.id && t.details.set_video_id == track.details.set_video_id
                 }) {
-                    self.replace_queue(tracks, index, cx);
+                    self.replace_page_queue(index, cx);
                 } else {
                     self.replace_queue(vec![track], 0, cx);
                 }
@@ -1735,12 +2142,25 @@ impl Music {
         }
     }
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        if let Some(intent) = self
+            .queue_waiting
+            .as_mut()
+            .or(self.autoplay_waiting.as_mut())
+        {
+            intent.playback = intent.playback.toggled();
+            self.playback = Playback::Loading {
+                paused: intent.playback.is_paused(),
+                retried: false,
+            };
+            cx.notify();
+            return;
+        }
         if self.active_id.is_some() && self.playback != Playback::Stopped {
-            let paused = !self.playback.is_paused();
+            let playback = self.playback.toggled();
             if let Some(player) = &self.player {
-                match player.pause(paused) {
+                match player.pause(playback.is_paused()) {
                     Ok(()) => {
-                        self.playback = self.playback.with_pause(paused);
+                        self.playback = playback;
                     }
                     Err(error) => self.error = Some(error.to_string()),
                 }
@@ -1750,25 +2170,61 @@ impl Music {
             if self.library.queue.index.is_none() {
                 self.library.queue.select(0);
             }
+            self.video_open = self.library.video;
             self.play_current(cx);
         }
     }
     fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
+        let playback = self
+            .queue_waiting
+            .take()
+            .or(self.autoplay_waiting.take())
+            .map_or(self.playback, |intent| intent.playback);
+        self.advance_queue(QueueAdvance { natural, playback }, cx);
+    }
+
+    fn advance_queue(&mut self, intent: QueueAdvance, cx: &mut Context<Self>) {
         let autoplay = self.library.music_autoplay();
         if self.library.queue.advance_with_autoplay(
             self.library.repeat,
-            natural,
+            intent.natural,
             autoplay,
             &mut self.autoplay_tracks,
         ) {
-            self.play_current(cx);
+            self.follow_queue_selection(intent.playback, cx);
         } else {
             self.player_command(Player::stop);
             self.active_id = None;
+            self.seekable = false;
+            self.pending_seek = None;
             self.playback = Playback::Stopped;
             self.position = self.duration;
+            self.notice = None;
+            if self.library.queue.incomplete {
+                self.autoplay_waiting = None;
+                let session = self.account.as_ref().map(|account| &account.session);
+                match self.queue_source.load(session, !intent.natural) {
+                    Ok(true) => {
+                        self.queue_waiting = Some(intent);
+                        if intent.playback != Playback::Stopped {
+                            self.playback = Playback::Loading {
+                                paused: intent.playback.is_paused(),
+                                retried: false,
+                            };
+                        }
+                        self.notice = Some("Loading more queued songs".into());
+                    }
+                    Ok(false) => {
+                        self.error =
+                            Some("Open the playlist again to load the rest of this queue.".into())
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                cx.notify();
+                return;
+            }
             if autoplay {
-                self.autoplay_waiting = Some(natural);
+                self.autoplay_waiting = Some(intent);
                 self.extend_autoplay(cx);
                 self.resume_autoplay(cx);
             }
@@ -1776,22 +2232,82 @@ impl Music {
         }
     }
     fn previous(&mut self, cx: &mut Context<Self>) {
-        if self.autoplay_waiting.take().is_some() || self.active_id.is_none() {
+        let playback = self
+            .queue_waiting
+            .take()
+            .or(self.autoplay_waiting.take())
+            .map_or(self.playback, |intent| intent.playback);
+        if self.active_id.is_none() {
             if self.playback_position() <= 3. {
                 self.library.queue.previous();
             }
-            self.play_current(cx);
+            self.follow_queue_selection(playback, cx);
             return;
         }
         if self.playback_position() > 3. {
             self.seek_current(0., cx);
         } else if self.library.queue.previous() {
-            self.play_current(cx);
+            self.follow_queue_selection(playback, cx);
         }
+    }
+
+    fn follow_queue_selection(&mut self, playback: Playback, cx: &mut Context<Self>) {
+        if playback != Playback::Stopped {
+            self.play_current_at(0., playback.is_paused(), cx);
+            return;
+        }
+        self.stop_playback(cx);
+        self.duration = self
+            .library
+            .queue
+            .current()
+            .and_then(|track| track.duration)
+            .unwrap_or(0) as f64;
+        self.refresh_current_account(cx);
+        self.prefetch_queue(cx);
+        self.save();
+    }
+
+    fn stop_playback(&mut self, cx: &mut Context<Self>) {
+        self.player_command(Player::stop);
+        self.active_id = None;
+        self.seekable = false;
+        self.pending_seek = None;
+        self.playback = Playback::Stopped;
+        self.position = 0.;
+        self.notice = None;
+        self.queue_waiting = None;
+        self.reset_radio();
+        self.playback_generation.fetch_add(1, Ordering::Relaxed);
+        self.watch_pending = false;
+        self.discard_pending_playback();
+        self.now_playing = None;
+        self.video_click = None;
+        cx.notify();
     }
     fn player_event(&mut self, event: PlayerEvent, cx: &mut Context<Self>) {
         let mut changed = true;
+        let mut seeked = None;
         match event {
+            PlayerEvent::Stopped { track_id } if Some(track_id) == self.active_id => {
+                self.stop_playback(cx);
+            }
+            PlayerEvent::Seekable { track_id, seekable } if Some(track_id) == self.active_id => {
+                changed = self.seekable != seekable;
+                self.seekable = seekable;
+            }
+            PlayerEvent::VideoChanged => {}
+            PlayerEvent::VideoError { message } => {
+                if self
+                    .video
+                    .as_ref()
+                    .is_some_and(|video| video.status() == VideoStatus::Failed)
+                {
+                    self.video_error = Some(message);
+                } else {
+                    changed = false;
+                }
+            }
             PlayerEvent::Volume(volume) => {
                 changed = self.library.volume.round() != volume.round();
                 self.library.volume = volume.clamp(0., 100.);
@@ -1818,7 +2334,9 @@ impl Music {
                 }
                 self.error = Some(message);
                 self.autoplay_waiting = None;
+                self.queue_waiting = None;
                 self.active_id = None;
+                self.seekable = false;
                 self.playback = Playback::Stopped;
             }
             PlayerEvent::Started { track_id, paused } if Some(track_id) == self.active_id => {
@@ -1859,6 +2377,9 @@ impl Music {
             {
                 changed = self.position.floor() != seconds.floor();
                 self.position = seconds;
+                if let Some(service) = &self.mpris {
+                    service.position_sample(track_id, seconds);
+                }
             }
             PlayerEvent::SeekFinished {
                 track_id,
@@ -1872,7 +2393,10 @@ impl Music {
                     self.pending_seek = None;
                 }
                 match result {
-                    Ok(seconds) => self.position = seconds,
+                    Ok(seconds) => {
+                        self.position = seconds;
+                        seeked = Some((track_id, seconds));
+                    }
                     Err(error) if latest => self.error = Some(error),
                     Err(_) => changed = false,
                 }
@@ -1900,8 +2424,121 @@ impl Music {
             _ => changed = false,
         }
         if changed {
+            self.publish_desktop();
             cx.notify();
         }
+        if let Some((track_id, seconds)) = seeked
+            && let Some(service) = &self.mpris
+        {
+            service.seeked(track_id, seconds);
+        }
+    }
+
+    fn publish_desktop(&self) {
+        let Some(service) = &self.mpris else { return };
+        let queue = &self.library.queue;
+        let loaded_next = queue.index.map_or(!queue.tracks.is_empty(), |index| {
+            index + 1 < queue.tracks.len()
+        });
+        let seed_available = !self.autoplay_seeded
+            && self.now_playing.as_ref().is_some_and(|watch| {
+                watch
+                    .current
+                    .as_ref()
+                    .zip(queue.current())
+                    .is_some_and(|(issued, current)| issued.id == current.id)
+                    && watch.current_index.is_some_and(|index| {
+                        index + 1 < watch.queue.len() || watch.continuation.is_some()
+                    })
+            });
+        let can_go_next = loaded_next
+            || (queue.incomplete && self.queue_source.can_continue())
+            || (!queue.incomplete
+                && self.library.repeat != Repeat::Off
+                && !queue.tracks.is_empty())
+            || (self.library.music_autoplay()
+                && (!self.autoplay_tracks.is_empty()
+                    || self.radio.is_some()
+                    || self.watch_pending
+                    || self.radio_loading
+                    || seed_available));
+        let waiting = self.queue_waiting.is_some() || self.autoplay_waiting.is_some();
+        service.publish(mpris::State {
+            playback: if self.playback == Playback::Stopped {
+                mpris::PlaybackStatus::Stopped
+            } else if self.playback.is_paused() {
+                mpris::PlaybackStatus::Paused
+            } else {
+                mpris::PlaybackStatus::Playing
+            },
+            metadata: queue
+                .current()
+                .map(|track| mpris::Metadata::new(track, self.duration)),
+            track_id: self.active_id,
+            position: self.position,
+            advancing: self.playback == Playback::Playing,
+            volume: self.library.volume,
+            rate: self.library.speed,
+            repeat: self.library.repeat,
+            can_play: self.player.is_some() && (!queue.tracks.is_empty() || waiting),
+            can_pause: self.active_id.is_some() || waiting,
+            can_go_next: self.player.is_some() && can_go_next,
+            can_go_previous: self.player.is_some()
+                && (queue.index.is_some_and(|index| index > 0) || self.position > 3.),
+            can_seek: self.seekable
+                && self.active_id.is_some()
+                && !matches!(self.playback, Playback::Stopped | Playback::Loading { .. }),
+        });
+    }
+
+    fn desktop_event(&mut self, event: mpris::Event, cx: &mut Context<Self>) {
+        match event {
+            mpris::Event::Next => self.next(false, cx),
+            mpris::Event::Previous => self.previous(cx),
+            mpris::Event::Play
+                if self.playback == Playback::Stopped || self.playback.is_paused() =>
+            {
+                self.toggle_play(cx)
+            }
+            mpris::Event::Pause
+                if self.playback != Playback::Stopped && !self.playback.is_paused() =>
+            {
+                self.toggle_play(cx)
+            }
+            mpris::Event::Play | mpris::Event::Pause => {}
+            mpris::Event::PlayPause => self.toggle_play(cx),
+            mpris::Event::Stop => self.stop_playback(cx),
+            mpris::Event::Seek { track_id, offset }
+                if Some(track_id) == self.active_id && self.seekable =>
+            {
+                let seconds = (self.playback_position() + offset).max(0.);
+                if self.duration > 0. && seconds > self.duration {
+                    self.next(false, cx);
+                } else {
+                    self.seek_current(seconds, cx);
+                }
+            }
+            mpris::Event::SetPosition { track_id, seconds }
+                if Some(track_id) == self.active_id
+                    && self.seekable
+                    && (self.duration <= 0. || seconds <= self.duration) =>
+            {
+                self.seek_current(seconds, cx)
+            }
+            mpris::Event::Seek { .. } | mpris::Event::SetPosition { .. } => {}
+            mpris::Event::Volume(volume) => {
+                self.set_volume(volume, cx);
+                self.save();
+            }
+            mpris::Event::Rate(speed) => self.player_command(|player| player.set_speed(speed)),
+            mpris::Event::LoopStatus(repeat) => {
+                self.library.repeat = repeat;
+                self.save();
+            }
+            mpris::Event::Error(error) => self.error = Some(error),
+        }
+        self.publish_desktop();
+        cx.notify();
     }
     fn toggle_like(&mut self, track: &Track, cx: &mut Context<Self>) {
         if self.account.is_some() {
@@ -1927,9 +2564,45 @@ impl Music {
     fn enqueue(&mut self, track: Track, cx: &mut Context<Self>) {
         self.notice = Some(format!("Added {} to the queue", track.title));
         self.library.queue.tracks.push(track);
-        self.resume_autoplay(cx);
+        self.queue_changed(cx);
+    }
+
+    fn queue_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(intent) = self.queue_waiting.take() {
+            self.advance_queue(intent, cx);
+        } else {
+            self.resume_autoplay(cx);
+        }
+        self.prefetch_queue(cx);
         self.save();
         cx.notify();
+    }
+
+    fn remove_queue_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        let playback = self
+            .queue_waiting
+            .or(self.autoplay_waiting)
+            .map_or(self.playback, |intent| intent.playback);
+        let unloaded_next =
+            self.library.queue.incomplete && index + 1 == self.library.queue.tracks.len();
+        if self.library.queue.remove(index) {
+            self.stop_playback(cx);
+            if unloaded_next {
+                self.advance_queue(
+                    QueueAdvance {
+                        natural: false,
+                        playback,
+                    },
+                    cx,
+                );
+            } else if self.library.queue.current().is_some() {
+                self.follow_queue_selection(playback, cx);
+            }
+        }
+        if self.library.queue.tracks.is_empty() && !self.library.queue.incomplete {
+            self.clear_queue(cx);
+        }
+        self.queue_changed(cx);
     }
     fn save_collection(&mut self, collection: Collection, cx: &mut Context<Self>) {
         if self.account.is_some() {
@@ -2014,11 +2687,18 @@ impl Music {
             return;
         }
         if control && key == "k" {
+            if self.video_open && window.is_fullscreen() {
+                self.toggle_video_fullscreen(window, cx);
+            }
             window.focus(&self.search.focus_handle(cx), cx);
             return;
         }
         if control && key == "r" {
-            self.navigate(self.route.clone(), cx);
+            if self.account.is_some() {
+                self.refresh_remote(cx);
+            } else {
+                self.navigate(self.route.clone(), cx);
+            }
             return;
         }
         if self.search.focus_handle(cx).is_focused(window) {
@@ -2026,6 +2706,7 @@ impl Music {
         }
         match key {
             "space" => self.toggle_play(cx),
+            "f" if self.video_open => self.toggle_video_fullscreen(window, cx),
             "right" if control => self.next(false, cx),
             "left" if control => self.previous(cx),
             "right" => {
@@ -2054,6 +2735,10 @@ impl Music {
                 cx.notify();
             }
             "escape" => {
+                if self.video_open && window.is_fullscreen() && self.overlay.is_none() {
+                    self.toggle_video_fullscreen(window, cx);
+                    return;
+                }
                 self.close_overlay(window, cx);
                 self.show_queue = false;
                 cx.notify();
@@ -2748,7 +3433,7 @@ impl Music {
                                 .child(icon("play", 17., self.theme.text))
                                 .child(if single_episode { "Play" } else { "Play all" })
                                 .on_click(cx.listener(|view, _, _, cx| {
-                                    view.replace_queue(view.page.tracks(), 0, cx);
+                                    view.replace_page_queue(0, cx);
                                 })),
                         )
                     }),
@@ -3312,8 +3997,7 @@ impl Music {
                                                                 .queue
                                                                 .move_track(index, target)
                                                         {
-                                                            view.save();
-                                                            cx.notify();
+                                                            view.queue_changed(cx);
                                                         }
                                                     }))
                                             },
@@ -3324,29 +4008,7 @@ impl Music {
                                             .w(px(26.))
                                             .on_click(cx.listener(move |view, _, _, cx| {
                                                 cx.stop_propagation();
-                                                let playing = matches!(
-                                                    view.playback,
-                                                    Playback::Playing
-                                                        | Playback::Buffering
-                                                        | Playback::Loading { paused: false, .. }
-                                                );
-                                                let current = view.library.queue.remove(index);
-                                                if current {
-                                                    view.autoplay_waiting = None;
-                                                    view.player_command(Player::stop);
-                                                    view.active_id = None;
-                                                    view.playback = Playback::Stopped;
-                                                    view.position = 0.;
-                                                    view.duration = 0.;
-                                                    if playing {
-                                                        view.play_current(cx);
-                                                    }
-                                                }
-                                                if view.library.queue.tracks.is_empty() {
-                                                    view.clear_queue(cx);
-                                                }
-                                                view.save();
-                                                cx.notify();
+                                                view.remove_queue_track(index, cx);
                                             })),
                                     )
                                     .into_any_element()
@@ -3366,6 +4028,208 @@ impl Music {
                         .child("Play a song or add one with +."),
                 )
             })
+            .into_any_element()
+    }
+    fn video_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let fullscreen = window.is_fullscreen();
+        let current = self.library.queue.current();
+        let title = current
+            .map_or("Now playing", |track| track.title.as_str())
+            .to_owned();
+        let native = self.overlay.is_none()
+            && self.active_id.is_some()
+            && self.playback != Playback::Stopped
+            && self.video_error.is_none()
+            && self.video.is_some();
+        let ready = native
+            && self
+                .video
+                .as_ref()
+                .is_some_and(|video| video.status() == VideoStatus::Ready);
+        let view = cx.entity().downgrade();
+        let mut viewport = div()
+            .id("video-viewport")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .when(!ready, |viewport| viewport.bg(gpui::black()))
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        view.update(cx, |view, cx| {
+                            if !native {
+                                return false;
+                            }
+                            let Some(video) = &view.video else {
+                                return false;
+                            };
+                            if let Err(error) = video.attach(bounds, window) {
+                                view.video_error = Some(error.to_string());
+                                cx.notify();
+                                return false;
+                            }
+                            video.status() == VideoStatus::Ready
+                        })
+                        .unwrap_or(false)
+                    },
+                    |bounds, ready, window, _| {
+                        if !ready {
+                            window.paint_quad(fill(bounds, gpui::black()));
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .on_click(cx.listener(|view, event: &ClickEvent, window, cx| {
+                window.focus(&view.focus, cx);
+                view.video_click = None;
+                if event.click_count() == 2 {
+                    view.toggle_video_fullscreen(window, cx);
+                    return;
+                }
+                if event.click_count() != 1 {
+                    return;
+                }
+                let active = view.active_id;
+                let playback = view.playback;
+                view.video_click = Some(cx.spawn(async move |view, cx| {
+                    // GPUI's Linux backends recognize double-clicks within 400 ms.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(400))
+                        .await;
+                    let _ = view.update(cx, |view, cx| {
+                        if view.video_open
+                            && view.overlay.is_none()
+                            && view.active_id == active
+                            && view.playback == playback
+                        {
+                            view.toggle_play(cx);
+                        }
+                    });
+                }));
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, _, _| {
+                    if event.click_count >= 2 {
+                        view.video_click = None;
+                    }
+                }),
+            );
+        if !native {
+            let message = self.video_error.clone().unwrap_or_else(|| {
+                if current.is_some() {
+                    "Press play to watch".into()
+                } else {
+                    "Choose something to play".into()
+                }
+            });
+            viewport = viewport.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(18.))
+                    .px(px(40.))
+                    .text_color(self.theme.muted)
+                    .child(message)
+                    .when(self.video_error.is_some(), |body| {
+                        body.child(
+                            div()
+                                .id("retry-video")
+                                .px(px(16.))
+                                .py(px(10.))
+                                .text_color(self.theme.text)
+                                .cursor_pointer()
+                                .child("Retry video")
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(video) = &view.video {
+                                        video.detach();
+                                    }
+                                    view.video_error = None;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+        }
+        let mut content = div().flex_1().min_w_0().flex().flex_col();
+        if !fullscreen {
+            content = content.child(div().bg(self.theme.bg).child(self.header(cx)));
+        }
+        content
+            .child(
+                div()
+                    .h(px(64.))
+                    .flex_shrink_0()
+                    .px(px(24.))
+                    .bg(self.theme.bg)
+                    .flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id("audio-mode")
+                            .px(px(10.))
+                            .py(px(12.))
+                            .text_color(self.theme.muted)
+                            .cursor_pointer()
+                            .child("Audio")
+                            .on_click(cx.listener(|view, _, _, cx| view.set_video_mode(false, cx))),
+                    )
+                    .child(div().text_color(self.theme.accent).child("Video"))
+                    .child(
+                        div()
+                            .id("video-quality-picker")
+                            .px(px(10.))
+                            .py(px(12.))
+                            .cursor_pointer()
+                            .child(self.library.video_quality.label())
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                window.focus(&view.focus, cx);
+                                view.overlay = Some(Overlay::Settings);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button(
+                            "video-fullscreen",
+                            if fullscreen {
+                                "exit-fullscreen"
+                            } else {
+                                "fullscreen"
+                            },
+                            self.theme,
+                        )
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.toggle_video_fullscreen(window, cx)
+                        })),
+                    ),
+            )
+            .when_some(self.error.as_ref(), |content, error| {
+                content.child(
+                    div()
+                        .px(px(24.))
+                        .py(px(12.))
+                        .bg(self.theme.panel)
+                        .text_color(rgb(0xf1a6ae))
+                        .child(error.clone()),
+                )
+            })
+            .child(viewport)
             .into_any_element()
     }
     fn player_bar(&mut self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -3490,7 +4354,15 @@ impl Music {
                                 button("shuffle", "shuffle", self.theme).on_click(cx.listener(
                                     |view, _, _, cx| {
                                         view.library.queue.shuffle_upcoming();
-                                        view.notice = Some("Upcoming songs shuffled".into());
+                                        view.notice = Some(
+                                            if view.library.queue.incomplete {
+                                                "Loaded upcoming songs shuffled"
+                                            } else {
+                                                "Upcoming songs shuffled"
+                                            }
+                                            .into(),
+                                        );
+                                        view.prefetch_queue(cx);
                                         view.save();
                                         cx.notify();
                                     },
@@ -3573,11 +4445,26 @@ impl Music {
             .child(div().flex_1().max_w(px(30.)))
             .child(
                 div()
-                    .w(px(if compact { 158. } else { 208. }))
+                    .w(px(if compact { 198. } else { 248. }))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(10.))
+                    .child(
+                        button("video-toggle", "video", self.theme)
+                            .when(self.video_open, |button| {
+                                button.text_color(self.theme.accent)
+                            })
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                window.focus(&view.focus, cx);
+                                if view.video_open {
+                                    view.video_open = false;
+                                    cx.notify();
+                                } else {
+                                    view.set_video_mode(true, cx);
+                                }
+                            })),
+                    )
                     .child(
                         button("queue-toggle", "queue", self.theme)
                             .when(self.show_queue, |d| d.text_color(self.theme.accent))
@@ -3726,6 +4613,7 @@ impl Music {
                 ("↑ / ↓", "Adjust volume"),
                 ("L", "Like the current song"),
                 ("Q", "Show the queue"),
+                ("F", "Toggle video fullscreen"),
                 ("?", "Keyboard shortcuts"),
                 ("Ctrl Q", "Quit"),
             ] {
@@ -3807,6 +4695,34 @@ impl Music {
                         .text_color(self.theme.muted)
                         .child("Available quality depends on the song and your membership."),
                 );
+            let mut video_qualities = div().mt(px(12.)).flex().flex_wrap().gap(px(4.));
+            for (index, quality) in VideoQuality::ALL.into_iter().enumerate() {
+                video_qualities = video_qualities.child(
+                    div()
+                        .id(("video-quality", index))
+                        .px(px(12.))
+                        .py(px(10.))
+                        .text_size(px(13.))
+                        .border_b_2()
+                        .border_color(if self.library.video_quality == quality {
+                            self.theme.accent
+                        } else {
+                            self.theme.panel
+                        })
+                        .when(self.library.video_quality == quality, |button| {
+                            button.text_color(self.theme.accent)
+                        })
+                        .hover(|button| button.bg(self.theme.raised))
+                        .cursor_pointer()
+                        .child(quality.label())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.set_video_quality(quality, cx);
+                        })),
+                );
+            }
+            body = body
+                .child(div().mt(px(24.)).text_size(px(15.)).child("Video quality"))
+                .child(video_qualities);
             let label = self
                 .account
                 .as_ref()
@@ -3867,6 +4783,20 @@ impl Music {
                 }
             }
         } else if let Overlay::Track { track, index } = kind {
+            let mut track = track.clone();
+            if self.account.is_some()
+                && let Some(current) = self
+                    .library
+                    .queue
+                    .current()
+                    .filter(|current| current.id == track.id)
+            {
+                track.details.rating = current.details.rating;
+                track.details.in_library = current.details.in_library;
+                track.details.add_library = current.details.add_library.clone();
+                track.details.remove_library = current.details.remove_library.clone();
+            }
+            let track = &track;
             if let Some(episode) = &track.details.episode {
                 if !episode.subtitle.is_empty() {
                     body = body.child(
@@ -3928,6 +4858,8 @@ impl Music {
                             retried: false,
                         };
                         view.now_playing = None;
+                        view.queue_source.cancel();
+                        view.queue_waiting = None;
                         view.notice = Some("Loading radio…".into());
                         view.playback_request(
                             PlaybackQuery::Watch {
@@ -4004,7 +4936,7 @@ impl Music {
                     self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
                         let index = view.library.queue.index.map_or(0, |i| i + 1);
                         view.library.queue.tracks.insert(index, song.clone());
-                        view.resume_autoplay(cx);
+                        view.queue_changed(cx);
                         view.overlay = None;
                         view.save();
                         cx.notify();
@@ -4136,15 +5068,11 @@ impl Music {
                             (
                                 "menu-move-down",
                                 "Move down",
-                                if index + 1 < tracks.len() {
-                                    Some(
-                                        tracks
-                                            .get(index + 2)
-                                            .and_then(|track| track.details.set_video_id.clone()),
-                                    )
-                                } else {
-                                    None
-                                },
+                                playlist_move_down(
+                                    &tracks,
+                                    *index,
+                                    self.page.continuation.is_some(),
+                                ),
                             ),
                         ] {
                             if let Some(before) = before {
@@ -4351,7 +5279,11 @@ impl Music {
                 "confirm-delete",
                 "Delete playlist",
                 cx,
-                move |view, _, cx| view.mutate(Mutation::DeletePlaylist { id: id.clone() }, cx),
+                move |view, window, cx| {
+                    if view.mutate(Mutation::DeletePlaylist { id: id.clone() }, cx) {
+                        view.close_overlay(window, cx);
+                    }
+                },
             ));
             body = body.child(
                 self.menu_action("cancel-delete", "Cancel", cx, |view, _, cx| {
@@ -4390,15 +5322,51 @@ impl Drop for Music {
 
 impl Render for Music {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.publish_desktop();
+        if self.video_fullscreen && !self.video_open {
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+            self.video_fullscreen = false;
+        }
+        if self.video_error.is_none()
+            && self
+                .video
+                .as_ref()
+                .is_some_and(|video| video.status() == VideoStatus::Failed)
+        {
+            self.video_error = Some("Video is unavailable. Try again or switch to audio.".into());
+        }
+        let native_video = self.video_open
+            && self.overlay.is_none()
+            && self.active_id.is_some()
+            && self.playback != Playback::Stopped
+            && self.video_error.is_none();
+        if !native_video && let Some(video) = &self.video {
+            video.detach();
+        }
+        if self.video_transparent != native_video {
+            window.set_background_appearance(if native_video {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Opaque
+            });
+            self.video_transparent = native_video;
+        }
+        let fullscreen = self.video_open && window.is_fullscreen();
         let compact = window.viewport_size().width < px(1120.);
-        let sidebar = self.sidebar(compact, cx).into_any_element();
-        let content = self.content(cx);
-        let queue = self.show_queue.then(|| self.queue(cx));
+        let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
+        let content = if self.video_open {
+            self.video_content(window, cx)
+        } else {
+            self.content(cx)
+        };
+        let queue = (self.show_queue && !fullscreen).then(|| self.queue(cx));
         let player = self.player_bar(compact, cx);
         div()
             .size_full()
             .relative()
-            .bg(self.theme.bg)
+            .when(!native_video, |view| view.bg(self.theme.bg))
             .text_color(self.theme.text)
             .text_size(px(14.))
             .font_family("Inter")
@@ -4425,7 +5393,7 @@ impl Render for Music {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(sidebar)
+                    .children(sidebar)
                     .child(content)
                     .children(queue),
             )
@@ -4463,6 +5431,9 @@ fn button(id: impl Into<ElementId>, name: &'static str, theme: Theme) -> Statefu
         "heart" => "Like song",
         "heart-filled" => "Remove from liked music",
         "queue" => "Show queue",
+        "video" => "Show or hide video",
+        "fullscreen" => "Fullscreen",
+        "exit-fullscreen" => "Exit fullscreen",
         "volume" => "Mute",
         "mute" => "Unmute",
         "plus" => "Add",
@@ -4531,6 +5502,73 @@ fn slider(ratio: f32, bounds: Rc<Cell<Bounds<Pixels>>>, theme: Theme) -> impl In
     )
     .size_full()
 }
+fn apply_track_details(
+    tracks: &mut [Track],
+    ratings: &mut HashMap<String, Rating>,
+    source: &Track,
+    fresh: bool,
+) {
+    let mut matched = false;
+    for track in tracks.iter_mut().filter(|track| track.id == source.id) {
+        matched = true;
+        let mut details = source.details.clone();
+        details.set_video_id = track.details.set_video_id.clone();
+        details.credits_id = details
+            .credits_id
+            .or_else(|| track.details.credits_id.clone());
+        if !fresh {
+            details.rating = track.details.rating;
+            details.in_library = track.details.in_library;
+            details.add_library = track.details.add_library.clone();
+            details.remove_library = track.details.remove_library.clone();
+            details.remove_history = track.details.remove_history.clone();
+        }
+        track.details = details;
+        if track.details.episode.is_some() {
+            track.artist = source.artist.clone();
+        }
+    }
+    if matched && fresh {
+        if let Some(rating) = source.details.rating {
+            ratings.insert(source.id.clone(), rating);
+        } else {
+            ratings.remove(&source.id);
+        }
+    }
+}
+
+fn acknowledge_song_change(
+    tracks: &mut [Track],
+    ratings: &mut HashMap<String, Rating>,
+    mutation: &Mutation,
+) {
+    match mutation {
+        Mutation::RateSong { track, rating } => {
+            ratings.insert(track.id.clone(), *rating);
+            for current in tracks.iter_mut().filter(|current| current.id == track.id) {
+                current.details.rating = Some(*rating);
+            }
+        }
+        Mutation::SongLibrary { track, save } => {
+            for current in tracks.iter_mut().filter(|current| current.id == track.id) {
+                current.details.in_library = Some(*save);
+                current.details.add_library = track.details.add_library.clone();
+                current.details.remove_library = track.details.remove_library.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn playlist_move_down(tracks: &[Track], index: usize, has_more: bool) -> Option<Option<String>> {
+    tracks.get(index + 1)?;
+    match tracks.get(index + 2) {
+        Some(successor) => successor.details.set_video_id.clone().map(Some),
+        None if !has_more => Some(None),
+        None => None,
+    }
+}
+
 fn clock(seconds: f64) -> String {
     let seconds = seconds.max(0.) as u64;
     if seconds >= 3600 {
@@ -4547,7 +5585,96 @@ fn clock(seconds: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Playback;
+    use super::{Playback, acknowledge_song_change, apply_track_details, playlist_move_down};
+    use crate::{
+        account::Mutation,
+        catalog::{Rating, Track},
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn acknowledged_song_state_survives_old_reads_and_fresh_reads_can_remove_it() {
+        let mut song: Track = serde_json::from_value(serde_json::json!({
+            "id": "abcdefghijk", "title": "Song", "artist": "Artist"
+        }))
+        .unwrap();
+        song.details.rating = Some(Rating::Indifferent);
+        song.details.in_library = Some(false);
+        song.details.add_library = Some("synthetic-add".into());
+        song.details.remove_library = Some("synthetic-remove".into());
+        let mut tracks = vec![song.clone(), song.clone()];
+        tracks[0].details.set_video_id = Some("first".into());
+        tracks[1].details.set_video_id = Some("second".into());
+        let mut ratings = HashMap::new();
+        acknowledge_song_change(
+            &mut tracks,
+            &mut ratings,
+            &Mutation::RateSong {
+                track: song.clone(),
+                rating: Rating::Like,
+            },
+        );
+        acknowledge_song_change(
+            &mut tracks,
+            &mut ratings,
+            &Mutation::SongLibrary {
+                track: song.clone(),
+                save: true,
+            },
+        );
+        apply_track_details(&mut tracks, &mut ratings, &song, false);
+        assert_eq!(ratings[&song.id], Rating::Like);
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.details.rating == Some(Rating::Like)
+                    && track.details.in_library == Some(true))
+        );
+
+        apply_track_details(&mut tracks, &mut ratings, &song, true);
+        assert_eq!(ratings[&song.id], Rating::Indifferent);
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.details.in_library == Some(false))
+        );
+        assert_eq!(tracks[0].details.set_video_id.as_deref(), Some("first"));
+        assert_eq!(tracks[1].details.set_video_id.as_deref(), Some("second"));
+
+        song.details.rating = None;
+        song.details.in_library = None;
+        apply_track_details(&mut tracks, &mut ratings, &song, true);
+        assert!(!ratings.contains_key(&song.id));
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.details.rating.is_none() && track.details.in_library.is_none())
+        );
+    }
+
+    #[test]
+    fn moving_down_requires_the_successor_or_a_confirmed_playlist_end() {
+        let mut tracks: Vec<Track> = ["first", "second", "third"]
+            .into_iter()
+            .map(|occurrence| {
+                let mut track: Track = serde_json::from_value(serde_json::json!({
+                    "id": "abcdefghijk", "title": "Repeated song", "artist": "Artist"
+                }))
+                .unwrap();
+                track.details.set_video_id = Some(occurrence.into());
+                track
+            })
+            .collect();
+        assert_eq!(
+            playlist_move_down(&tracks, 0, true),
+            Some(Some("third".into()))
+        );
+        assert_eq!(playlist_move_down(&tracks, 1, true), None);
+        assert_eq!(playlist_move_down(&tracks, 1, false), Some(None));
+        assert_eq!(playlist_move_down(&tracks, 2, false), None);
+        tracks[2].details.set_video_id = None;
+        assert_eq!(playlist_move_down(&tracks, 0, false), None);
+    }
 
     #[test]
     fn a_load_retries_once_and_pause_changes_do_not_reset_its_budget() {
@@ -4570,5 +5697,24 @@ mod tests {
         ] {
             assert!(!playback.retry());
         }
+    }
+
+    #[test]
+    fn play_starts_a_stopped_wait_and_loading_toggles_preserve_the_retry_budget() {
+        assert_eq!(Playback::Stopped.toggled(), Playback::Playing);
+        assert_eq!(Playback::Paused.toggled(), Playback::Playing);
+        assert_eq!(Playback::Playing.toggled(), Playback::Paused);
+        let loading = Playback::Loading {
+            paused: false,
+            retried: true,
+        };
+        assert_eq!(
+            loading.toggled(),
+            Playback::Loading {
+                paused: true,
+                retried: true,
+            }
+        );
+        assert_eq!(loading.toggled().toggled(), loading);
     }
 }

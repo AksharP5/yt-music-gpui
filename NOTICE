@@ -1,3 +1,7 @@
 The native text input in src/input.rs is adapted from the GPUI input example.
 Copyright Zed Industries. Licensed under Apache License 2.0, included in
 LICENSE-APACHE. GPUI and its platform implementation retain their own notices.
+
+native/viewporter.xml and its generated protocol bindings are from
+wayland-protocols. Copyright 2013-2016 Collabora, Ltd. Their MIT license is
+included in LICENSE-VIEWPORTER.

@@ -90,6 +90,7 @@ pub enum Mutation {
         title: String,
         description: String,
         privacy: Privacy,
+        initial_video_id: Option<String>,
     },
     EditPlaylist {
         id: String,
@@ -137,7 +138,10 @@ impl Mutation {
 
 pub enum Effect {
     Changed,
-    CreatedPlaylist(String),
+    CreatedPlaylist {
+        id: String,
+        initial_video_id: Option<String>,
+    },
 }
 #[derive(Clone)]
 pub struct Connection {
@@ -418,6 +422,7 @@ impl Catalog {
                 title,
                 description,
                 privacy,
+                ..
             } => {
                 ensure!(!title.trim().is_empty(), "Enter a playlist name");
                 (
@@ -487,16 +492,24 @@ impl Catalog {
         };
         let response = self.request(endpoint, body)?;
         confirm_mutation(endpoint, &response)?;
-        if matches!(mutation, Mutation::CreatePlaylist { .. }) {
-            return Ok(Effect::CreatedPlaylist(
-                response["playlistId"]
-                    .as_str()
-                    .context("YouTube did not return the new playlist")?
-                    .to_owned(),
-            ));
-        }
-        Ok(Effect::Changed)
+        mutation_effect(mutation, &response)
     }
+}
+
+fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
+    if let Mutation::CreatePlaylist {
+        initial_video_id, ..
+    } = mutation
+    {
+        return Ok(Effect::CreatedPlaylist {
+            id: response["playlistId"]
+                .as_str()
+                .context("YouTube did not return the new playlist")?
+                .to_owned(),
+            initial_video_id: initial_video_id.clone(),
+        });
+    }
+    Ok(Effect::Changed)
 }
 fn confirm_mutation(endpoint: &str, response: &Value) -> Result<()> {
     if endpoint == "feedback" {
@@ -530,6 +543,28 @@ fn playlist_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_completion_retains_the_submitted_song_without_a_live_form() {
+        for initial_video_id in [None, Some("abcdefghijk".to_owned())] {
+            let submitted = Mutation::CreatePlaylist {
+                title: "First playlist".into(),
+                description: String::new(),
+                privacy: Privacy::Private,
+                initial_video_id: initial_video_id.clone(),
+            };
+            let Effect::CreatedPlaylist {
+                id,
+                initial_video_id: completed,
+            } = mutation_effect(&submitted, &json!({"playlistId":"PLcreated"})).unwrap()
+            else {
+                panic!("expected the created playlist")
+            };
+            assert_eq!(id, "PLcreated");
+            assert_eq!(completed, initial_video_id);
+            assert!(mutation_effect(&submitted, &json!({})).is_err());
+        }
+    }
     fn synthetic_session() -> Session {
         serde_json::from_value(json!({
             "cookie":"SAPISID=synthetic-test-value",

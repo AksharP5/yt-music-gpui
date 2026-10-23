@@ -35,6 +35,13 @@ impl AssetSource for Assets {
             "settings" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/settings.svg"
             ))),
+            "video" => Some(Cow::Borrowed(include_bytes!("../assets/icons/video.svg"))),
+            "fullscreen" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/fullscreen.svg"
+            ))),
+            "exit-fullscreen" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/exit-fullscreen.svg"
+            ))),
             "help" => Some(Cow::Borrowed(include_bytes!("../assets/icons/help.svg"))),
             _ => None,
         })

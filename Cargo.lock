@@ -6818,10 +6818,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "cc",
  "gpui-pre",
  "gpui-pre-platform",
  "image",
  "libc",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
@@ -6829,6 +6831,7 @@ dependencies = [
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "unicode-segmentation",
+ "zbus",
 ]
 
 [[package]]

@@ -8,12 +8,16 @@ mod country_picker;
 mod history;
 mod input;
 mod library;
+mod mpris;
 mod player;
 mod playlist_form;
+mod queue_source;
 mod search;
 mod search_box;
 mod song_text;
 mod theme;
+mod track_state;
+mod video;
 mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
@@ -28,10 +32,15 @@ fn main() {
         eprintln!("Could not disable credential-bearing crash dumps.");
         std::process::exit(1);
     }
-    let mut connect = false;
+    let mut startup = app::Startup::Restore;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "--connect" => connect = true,
+            "--connect" if startup != app::Startup::Guest => startup = app::Startup::Connect,
+            "--guest" if startup != app::Startup::Connect => startup = app::Startup::Guest,
+            "--connect" | "--guest" => {
+                eprintln!("Choose either --guest or --connect.");
+                std::process::exit(2);
+            }
             "--cookies" => {
                 eprintln!(
                     "Cookie imports cannot identify the selected Google account. Use --connect."
@@ -40,7 +49,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--connect]\n\n--connect        Connect your Google account in a dedicated sign-in window\n\nCookie imports are unsupported because they cannot identify the selected account.\nCtrl K searches. Press ? in the app for all shortcuts."
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading a saved account from the keyring\n--connect        Connect your Google account in a dedicated sign-in window\n\nCookie imports are unsupported because they cannot identify the selected account.\nCtrl K searches. Press ? in the app for all shortcuts."
                 );
                 return;
             }
@@ -54,8 +63,12 @@ fn main() {
             }
         }
     }
-    if connect && !auth::ACCOUNT_LOGIN_ENABLED {
+    if startup == app::Startup::Connect && !auth::ACCOUNT_LOGIN_ENABLED {
         eprintln!("Account connection is disabled until the security review is complete.");
+        std::process::exit(1);
+    }
+    if let Err(error) = video::initialize() {
+        eprintln!("{error:#}");
         std::process::exit(1);
     }
     let _instance = match auth::lock_instance() {
@@ -87,7 +100,7 @@ fn main() {
                     app_id: Some("yt-music-gpui".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| app::Music::new(connect, window, cx)),
+                |window, cx| cx.new(|cx| app::Music::new(startup, window, cx)),
             )
             .expect("open YouTube Music window");
             cx.activate(true);

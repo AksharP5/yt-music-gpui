@@ -1,5 +1,5 @@
 use crate::catalog::{Collection, Track};
-use crate::player::{AudioQuality, PlaybackSpeed};
+use crate::player::{AudioQuality, PlaybackSpeed, VideoQuality};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,6 +7,7 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -40,6 +41,8 @@ pub struct Library {
     pub volume: f64,
     pub speed: PlaybackSpeed,
     pub quality: AudioQuality,
+    pub video: bool,
+    pub video_quality: VideoQuality,
 }
 
 impl Default for Library {
@@ -54,6 +57,8 @@ impl Default for Library {
             volume: 0.,
             speed: PlaybackSpeed::default(),
             quality: AudioQuality::default(),
+            video: false,
+            video_quality: VideoQuality::default(),
         }
     }
 }
@@ -67,6 +72,7 @@ impl Library {
     }
     pub fn music_autoplay(&self) -> bool {
         self.autoplay
+            && !self.queue.incomplete
             && self
                 .queue
                 .current()
@@ -91,6 +97,10 @@ impl Library {
 pub struct Queue {
     pub tracks: Vec<Track>,
     pub index: Option<usize>,
+    /// More explicit tracks exist. Restored partial queues must not enter autoplay.
+    pub incomplete: bool,
+    #[serde(skip)]
+    pub(crate) source_id: Option<Arc<()>>,
 }
 
 impl Queue {
@@ -100,6 +110,8 @@ impl Queue {
     pub fn replace(&mut self, tracks: Vec<Track>, selected: usize) {
         self.index = (selected < tracks.len()).then_some(selected);
         self.tracks = tracks;
+        self.incomplete = false;
+        self.source_id = None;
     }
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tracks.len() {
@@ -118,7 +130,7 @@ impl Queue {
         if self.select(current + 1) {
             return true;
         }
-        repeat != Repeat::Off && self.select(0)
+        !self.incomplete && repeat != Repeat::Off && self.select(0)
     }
     pub fn advance_with_autoplay(
         &mut self,
@@ -130,7 +142,7 @@ impl Queue {
         if self.advance(repeat, natural_end) {
             return true;
         }
-        if !autoplay {
+        if self.incomplete || !autoplay {
             return false;
         }
         let Some(track) = recommendations.pop_front() else {
@@ -358,20 +370,28 @@ mod tests {
         assert!(migrated.autoplay);
         assert_eq!(migrated.speed, PlaybackSpeed::default());
         assert_eq!(migrated.quality, AudioQuality::Normal);
+        assert!(!migrated.video);
+        assert_eq!(migrated.video_quality, VideoQuality::P720);
         assert_eq!(migrated.volume, 37.);
         assert_eq!(migrated.repeat, Repeat::All);
         assert_eq!(migrated.liked[0].id, "saved");
         let library = Library {
             autoplay: false,
             quality: AudioQuality::High,
+            video: true,
+            video_quality: VideoQuality::P1080,
             ..Library::new()
         };
         let saved = serde_json::to_value(library).unwrap();
         assert_eq!(saved["autoplay"], false);
         assert_eq!(saved["quality"], "high");
+        assert_eq!(saved["video"], true);
+        assert_eq!(saved["video_quality"], "1080p");
         let restored = serde_json::from_value::<Library>(saved).unwrap();
         assert!(!restored.autoplay);
         assert_eq!(restored.quality, AudioQuality::High);
+        assert!(restored.video);
+        assert_eq!(restored.video_quality, VideoQuality::P1080);
     }
 
     #[test]
@@ -449,6 +469,7 @@ mod tests {
                     let mut queue = Queue {
                         tracks: tracks.clone(),
                         index: selected,
+                        ..Default::default()
                     };
                     let current = queue.current().cloned();
                     assert_eq!(queue.move_track(from, to), from != to);
