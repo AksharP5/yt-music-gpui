@@ -138,10 +138,7 @@ impl Mutation {
 
 pub enum Effect {
     Changed,
-    CreatedPlaylist {
-        id: String,
-        initial_video_id: Option<String>,
-    },
+    CreatedPlaylist { id: String },
 }
 #[derive(Clone)]
 pub struct Connection {
@@ -185,6 +182,10 @@ pub enum Command {
     },
 }
 pub enum Event {
+    ConnectionNotice {
+        operation: Operation,
+        message: String,
+    },
     Connected {
         operation: Operation,
         result: Result<Option<Connection>, String>,
@@ -216,12 +217,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Finish pending account cleanup before the process can exit.
+    /// Finish accepted account changes and cleanup before the process can exit.
     pub fn finish(self) -> Result<()> {
         self.commands.close();
         self.thread
             .join()
-            .map_err(|_| anyhow::anyhow!("The account cleanup worker stopped unexpectedly"))?
+            .map_err(|_| anyhow::anyhow!("The account worker stopped unexpectedly"))?
     }
 }
 
@@ -243,7 +244,12 @@ pub fn start(
                 let event = match command {
                     Command::Connect(operation) => {
                         let result = (|| {
-                            let (candidate, account) = auth::connect(&operation)?;
+                            let (candidate, account) = auth::connect(&operation, |message| {
+                                let _ = events.send_blocking(Event::ConnectionNotice {
+                                    operation: operation.clone(),
+                                    message,
+                                });
+                            })?;
                             Connection { session: Arc::new(candidate), account }
                                 .publish(&session, &operation).map(Some)
                         })().map_err(|e| format!("{e:#}"));
@@ -379,7 +385,14 @@ impl Catalog {
     }
     pub fn mutate(&self, mutation: &Mutation) -> Result<Effect> {
         self.require_account()?;
-        let (endpoint, body) = match mutation {
+        let (endpoint, body) = self.mutation_request(mutation)?;
+        let response = self.request(endpoint, body)?;
+        confirm_mutation(endpoint, &response)?;
+        mutation_effect(mutation, &response)
+    }
+
+    fn mutation_request(&self, mutation: &Mutation) -> Result<(&'static str, Value)> {
+        Ok(match mutation {
             Mutation::RateSong { track, rating } => {
                 (rating.endpoint(), json!({"target":{"videoId":track.id}}))
             }
@@ -444,13 +457,14 @@ impl Catalog {
                 title,
                 description,
                 privacy,
-                ..
+                initial_video_id,
             } => {
                 ensure!(!title.trim().is_empty(), "Enter a playlist name");
-                (
-                    "playlist/create",
-                    json!({"title":title.trim(),"description":description,"privacyStatus":privacy.value()}),
-                )
+                let mut body = json!({"title":title.trim(),"description":description,"privacyStatus":privacy.value()});
+                if let Some(video_id) = initial_video_id {
+                    body["videoIds"] = json!([video_id]);
+                }
+                ("playlist/create", body)
             }
             Mutation::EditPlaylist {
                 id,
@@ -511,24 +525,17 @@ impl Catalog {
                 )
             }
             Mutation::RemoveHistory { token } => ("feedback", json!({"feedbackTokens":[token]})),
-        };
-        let response = self.request(endpoint, body)?;
-        confirm_mutation(endpoint, &response)?;
-        mutation_effect(mutation, &response)
+        })
     }
 }
 
 fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
-    if let Mutation::CreatePlaylist {
-        initial_video_id, ..
-    } = mutation
-    {
+    if let Mutation::CreatePlaylist { .. } = mutation {
         return Ok(Effect::CreatedPlaylist {
             id: response["playlistId"]
                 .as_str()
                 .context("YouTube did not return the new playlist")?
                 .to_owned(),
-            initial_video_id: initial_video_id.clone(),
         });
     }
     Ok(Effect::Changed)
@@ -567,23 +574,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playlist_completion_retains_the_submitted_song_without_a_live_form() {
+    fn playlist_creation_includes_the_submitted_song_in_its_request() {
+        let catalog = Catalog::new().unwrap();
         for initial_video_id in [None, Some("abcdefghijk".to_owned())] {
             let submitted = Mutation::CreatePlaylist {
-                title: "First playlist".into(),
-                description: String::new(),
-                privacy: Privacy::Private,
+                title: " First playlist ".into(),
+                description: "Description".into(),
+                privacy: Privacy::Unlisted,
                 initial_video_id: initial_video_id.clone(),
             };
-            let Effect::CreatedPlaylist {
-                id,
-                initial_video_id: completed,
-            } = mutation_effect(&submitted, &json!({"playlistId":"PLcreated"})).unwrap()
+            let (endpoint, body) = catalog.mutation_request(&submitted).unwrap();
+            assert_eq!(endpoint, "playlist/create");
+            assert_eq!(body["title"], "First playlist");
+            assert_eq!(body["description"], "Description");
+            assert_eq!(body["privacyStatus"], "UNLISTED");
+            match initial_video_id {
+                Some(_) => assert_eq!(body["videoIds"], json!(["abcdefghijk"])),
+                None => assert!(body.get("videoIds").is_none()),
+            }
+            let Effect::CreatedPlaylist { id } =
+                mutation_effect(&submitted, &json!({"playlistId":"PLcreated"})).unwrap()
             else {
                 panic!("expected the created playlist")
             };
             assert_eq!(id, "PLcreated");
-            assert_eq!(completed, initial_video_id);
             assert!(mutation_effect(&submitted, &json!({})).is_err());
         }
     }
@@ -683,6 +697,45 @@ mod tests {
         assert!(commands.is_closed());
         assert!(commands.is_empty());
         assert!(require_current_session(&shared, &expected).is_ok());
+    }
+    #[test]
+    fn finishing_worker_waits_for_accepted_persistence() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let (commands, pending) = async_channel::bounded(1);
+        let (saving, save_started) = std::sync::mpsc::channel();
+        let (resume, save_resume) = std::sync::mpsc::channel();
+        let worker = Worker {
+            commands: commands.clone(),
+            thread: thread::spawn(move || {
+                while let Ok(command) = pending.recv_blocking() {
+                    let Command::Persist(session) = command else {
+                        panic!("expected persistence")
+                    };
+                    persist_current_session(
+                        &shared,
+                        &session,
+                        || {
+                            saving.send(()).unwrap();
+                            save_resume.recv().unwrap();
+                            Ok(())
+                        },
+                        || anyhow::bail!("The current session must not be cleared"),
+                    )?;
+                }
+                Ok(())
+            }),
+        };
+        commands.send_blocking(Command::Persist(expected)).unwrap();
+        let finished = thread::spawn(move || worker.finish());
+        save_started
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(!finished.is_finished());
+        resume.send(()).unwrap();
+        finished.join().unwrap().unwrap();
+        assert!(commands.is_closed());
+        assert!(commands.is_empty());
     }
     #[test]
     fn sign_out_waits_for_playback_cleanup_and_preserves_failures() {

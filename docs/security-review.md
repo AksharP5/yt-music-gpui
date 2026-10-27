@@ -1,5 +1,17 @@
 # Account security reviews
 
+## 2026-10-27
+
+A bounded readiness review found that ordinary quit could still detach persistence or edits after the connection indicator cleared. Shutdown now drains the existing account worker for every exit. A synthetic persistence test verifies that finishing waits for an accepted save without clearing the current session.
+
+Connection no longer captures the first signed-in channel automatically. The user selects a Google or brand account in the dedicated browser, then confirms it in native Settings. Failed capture or verification leaves that browser open for an explicit retry. Cancel connection preserves the previous connection and its saved keyring item. Existing stable-identity checks remain enforced. Confirmation and cancellation tests use synthetic operations, without a Google account.
+
+Playlist creation now includes an initial song in the create request. Acknowledged library changes update visible page and row metadata before a refresh, and focus refresh runs even with a dialog or earlier page read pending. Artwork navigation drops unstarted old loads; failed images can retry after a cooldown. Horizontal artwork shelves render their viewport rather than every card. These changes received a separate read-only regression review with no concrete new defect found. They do not extend the sealed October 23 scan.
+
+Validation passed 129 ordinary tests, all 22 guest/offline integration tests, formatting, strict all-target Clippy and a release build. No real Google credentials were used. Native release snapshots confirmed Settings and Home rendering, and targeted Escape dismissed Settings. Native Ctrl Q during pending connection exited the app and its dedicated Chromium process and removed the owned temporary profile. Pointer scrolling and confirmation/cancellation clicks remained unverified because both background and foreground input left the window unchanged; desktop capture failed with an X11 GetImage Match error.
+
+Real account compatibility remains unverified. In particular, no authenticated account-menu fixture establishes that the endpoint supplies the stable identity required for activation. Public upstream WEB_REMIX fixtures for other endpoints omit it. This is a proof gap, not evidence that the check can safely be removed. First sign-in, saved-session restoration, brand switching, authenticated playback and cross-client mutations still require a real-account check.
+
 ## 2026-10-23
 
 A whole-repository source review covered the 74 tracked paths at `4fb9970`. It reported one low-severity CWE-459 issue: normal quit during pending sign-in could detach the account worker and leave its temporary browser profile behind. A native test with no credentials reproduced the retained profile. The review did not establish a remote or cross-user disclosure, and its source findings do not certify real account compatibility.

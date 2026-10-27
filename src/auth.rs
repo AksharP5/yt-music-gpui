@@ -29,16 +29,29 @@ pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
 #[derive(Clone, Default)]
-pub struct Operation(Arc<AtomicBool>);
+pub struct Operation(Arc<OperationState>);
+#[derive(Default)]
+struct OperationState {
+    cancelled: AtomicBool,
+    confirmation: AtomicBool,
+}
 impl Operation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
     pub fn matches(&self, other: &Self) -> bool {
         !self.is_cancelled() && Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub fn confirm(&self) {
+        if !self.is_cancelled() {
+            self.0.confirmation.store(true, Ordering::Release);
+        }
+    }
+    fn take_confirmation(&self) -> bool {
+        !self.is_cancelled() && self.0.confirmation.swap(false, Ordering::AcqRel)
     }
 }
 const KEYRING_ATTRIBUTES: [&str; 4] = [
@@ -606,7 +619,10 @@ fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe
 }
 
 /// Explicit user action only. Credentials stay in the OS keyring and RAM.
-pub fn connect(operation: &Operation) -> Result<(Session, crate::catalog::Account)> {
+pub fn connect(
+    operation: &Operation,
+    mut notice: impl FnMut(String),
+) -> Result<(Session, crate::catalog::Account)> {
     ensure!(!operation.is_cancelled(), "Account connection cancelled");
     ensure!(
         ACCOUNT_LOGIN_ENABLED,
@@ -628,12 +644,22 @@ pub fn connect(operation: &Operation) -> Result<(Session, crate::catalog::Accoun
             Instant::now() < deadline,
             "Account connection timed out. Try again when you are ready to sign in."
         );
-        if let Some((session, account)) = capture(&mut pipe)? {
+        if operation.take_confirmation() {
+            let captured = capture(&mut pipe);
             ensure!(!operation.is_cancelled(), "Account connection cancelled");
-            let _ = pipe.call("Browser.close", json!({}), None);
-            return Ok((session, account));
+            match captured {
+                Ok(Some((session, account))) => {
+                    let _ = pipe.call("Browser.close", json!({}), None);
+                    return Ok((session, account));
+                }
+                Ok(None) => notice(
+                    "Finish signing in and select your account in the account window, then try again."
+                        .into(),
+                ),
+                Err(error) => notice(format!("{error:#}")),
+            }
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -717,6 +743,36 @@ fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Ac
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_capture_requires_a_fresh_shared_confirmation() {
+        let operation = Operation::default();
+        let control = operation.clone();
+        assert!(!operation.take_confirmation());
+        control.confirm();
+        control.confirm();
+        assert!(operation.take_confirmation());
+        assert!(!operation.take_confirmation());
+        assert!(!Operation::default().take_confirmation());
+        control.confirm();
+        assert!(operation.take_confirmation());
+        assert!(operation.matches(&control));
+    }
+    #[test]
+    fn cancellation_revokes_pending_and_future_confirmations() {
+        for confirm_first in [false, true] {
+            let operation = Operation::default();
+            let control = operation.clone();
+            if confirm_first {
+                control.confirm();
+            }
+            control.cancel();
+            assert!(operation.is_cancelled());
+            assert!(!operation.take_confirmation());
+            control.confirm();
+            assert!(!operation.take_confirmation());
+            assert!(!operation.matches(&control));
+        }
+    }
     #[test]
     fn only_one_instance_can_own_account_state() {
         let directory = tempfile::tempdir().unwrap();

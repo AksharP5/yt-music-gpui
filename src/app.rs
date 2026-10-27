@@ -32,6 +32,9 @@ use std::{
     time::Duration,
 };
 
+const CARD_WIDTH: f32 = 164.;
+const CARD_GAP: f32 = 20.;
+
 #[derive(Clone, PartialEq)]
 struct Search {
     query: String,
@@ -290,6 +293,7 @@ enum Drag {
     Volume,
 }
 enum AccountOperation {
+    Restoring(Operation),
     Connecting(Operation),
     Disconnecting(Operation),
     DisconnectFailed,
@@ -319,6 +323,7 @@ pub struct Music {
     route: Route,
     page: Page,
     rows: Vec<Item>,
+    shelf_scroll: HashMap<usize, ScrollHandle>,
     back: Vec<(Route, Option<Page>)>,
     list_id: usize,
     error: Option<String>,
@@ -403,7 +408,11 @@ impl Music {
                     account::Command::Restore(operation.clone())
                 };
                 let _ = account_commands.try_send(command);
-                AccountOperation::Connecting(operation)
+                if startup == Startup::Connect {
+                    AccountOperation::Connecting(operation)
+                } else {
+                    AccountOperation::Restoring(operation)
+                }
             });
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = account_events.recv().await {
@@ -736,8 +745,6 @@ impl Music {
             if window.is_window_active()
                 && view.account.is_some()
                 && view.account_operation.is_none()
-                && view.overlay.is_none()
-                && !view.catalog_requests.is_loading(CatalogTarget::Page)
             {
                 view.refresh_remote(cx);
             }
@@ -768,6 +775,7 @@ impl Music {
                 countries: Vec::new(),
             },
             rows: Vec::new(),
+            shelf_scroll: HashMap::new(),
             back: Vec::new(),
             list_id: 0,
             error,
@@ -807,7 +815,7 @@ impl Music {
             pending_seek: None,
             duration: 0.,
             show_queue: false,
-            overlay: None,
+            overlay: (startup == Startup::Connect).then_some(Overlay::Settings),
             overlay_subscription: None,
             drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -1135,6 +1143,8 @@ impl Music {
     }
 
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.artwork.cancel_pending();
+        self.shelf_scroll.clear();
         self.video_open = false;
         if self.route != route {
             let cached = (self.account.is_none()
@@ -1263,6 +1273,8 @@ impl Music {
                 return;
             };
             self.catalog_requests.cancel(CatalogTarget::Page);
+            self.artwork.cancel_pending();
+            self.shelf_scroll.clear();
             self.list_id = self.list_id.wrapping_add(1);
             self.route = route;
             if let Route::Search(search) = &self.route {
@@ -1380,6 +1392,13 @@ impl Music {
             cx.notify();
             return;
         }
+        if let Some(AccountOperation::Connecting(operation)) = &self.account_operation {
+            operation.confirm();
+            self.error = None;
+            self.notice = Some("Checking the selected Google account…".into());
+            cx.notify();
+            return;
+        }
         if self.account_operation.is_some() {
             return;
         }
@@ -1394,6 +1413,21 @@ impl Music {
             }
             Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
         }
+        cx.notify();
+    }
+    fn cancel_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(AccountOperation::Connecting(operation) | AccountOperation::Restoring(operation)) =
+            self.account_operation.as_ref()
+        else {
+            return;
+        };
+        operation.cancel();
+        if let Ok(mut session) = self.session.write() {
+            *session = self.account.as_ref().map(|account| account.session.clone());
+        }
+        self.account_operation = None;
+        self.notice = None;
+        self.error = None;
         cx.notify();
     }
     fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) -> bool {
@@ -1433,7 +1467,10 @@ impl Music {
         ) {
             return;
         }
-        if let Some(AccountOperation::Connecting(operation)) = self.account_operation.take() {
+        if let Some(
+            AccountOperation::Connecting(operation) | AccountOperation::Restoring(operation),
+        ) = self.account_operation.take()
+        {
             operation.cancel();
         }
         if let Ok(mut session) = self.session.write() {
@@ -1643,6 +1680,14 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         match event {
+            account::Event::ConnectionNotice { operation, message } => {
+                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active)) if active.matches(&operation))
+                {
+                    return;
+                }
+                self.notice = None;
+                self.error = Some(message);
+            }
             account::Event::Disconnected { operation, result } => {
                 if !matches!(&self.account_operation, Some(AccountOperation::Disconnecting(active)) if active.matches(&operation))
                 {
@@ -1665,7 +1710,7 @@ impl Music {
                 result,
                 save_session,
             } => {
-                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active)) if active.matches(&operation))
+                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active) | AccountOperation::Restoring(active)) if active.matches(&operation))
                 {
                     return;
                 }
@@ -1727,26 +1772,38 @@ impl Music {
                     Ok(effect) => {
                         let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
                         acknowledge_song_change(
-                            &mut self.library.queue.tracks,
+                            self.library.queue.tracks.iter_mut().chain(
+                                self.page
+                                    .shelves
+                                    .iter_mut()
+                                    .flat_map(|shelf| &mut shelf.items)
+                                    .chain(&mut self.rows)
+                                    .filter_map(|item| match item {
+                                        Item::Track(track) => Some(track),
+                                        _ => None,
+                                    }),
+                            ),
                             &mut self.ratings,
                             &mutation,
                         );
+                        if let Mutation::CollectionLibrary { collection, save } = &mutation {
+                            for item in self
+                                .page
+                                .shelves
+                                .iter_mut()
+                                .flat_map(|shelf| &mut shelf.items)
+                                .chain(&mut self.rows)
+                            {
+                                if let Item::Collection(current) = item
+                                    && current.id == collection.id
+                                {
+                                    current.details.saved = Some(*save);
+                                }
+                            }
+                        }
                         self.notice = Some("Saved to YouTube Music".into());
                         match effect {
-                            Effect::CreatedPlaylist {
-                                id,
-                                initial_video_id,
-                            } => {
-                                if let Some(video_id) = initial_video_id {
-                                    self.mutate(
-                                        Mutation::AddToPlaylist {
-                                            id: id.clone(),
-                                            video_ids: vec![video_id],
-                                            duplicates: false,
-                                        },
-                                        cx,
-                                    );
-                                }
+                            Effect::CreatedPlaylist { id } => {
                                 if self.overlay.is_none() {
                                     self.navigate(
                                         Route::Browse(BrowseLink::new(
@@ -3107,12 +3164,12 @@ impl Music {
                 .h(px(44.))
                 .into_any_element();
         }
-        let art = self.art(item.thumbnail(), 164.);
+        let art = self.art(item.thumbnail(), CARD_WIDTH);
         let title = item.title().to_owned();
         let subtitle = item.subtitle().to_owned();
         div()
             .id(("card", id))
-            .w(px(164.))
+            .w(px(CARD_WIDTH))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -3162,19 +3219,22 @@ impl Music {
                 view.navigate(Route::Browse(link.clone()), cx);
             }))
     }
-    fn shelf(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let shelf = self.page.shelves[index].clone();
+    fn shelf(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let title = self.page.shelves[index].title.clone();
         let mut contents = div()
             .id(("carousel", index))
+            .w_full()
+            .min_w_0()
             .flex()
-            .gap(px(20.))
+            .gap(px(CARD_GAP))
             .overflow_x_scroll()
             .pb(px(10.));
-        if shelf
+        if self.page.shelves[index]
             .items
             .iter()
             .all(|item| matches!(item, Item::Navigation(_)))
         {
+            let shelf = self.page.shelves[index].clone();
             for (column, items) in shelf.items.chunks(4).enumerate() {
                 contents = contents.child(
                     div()
@@ -3196,14 +3256,42 @@ impl Music {
                 );
             }
         } else {
-            contents = contents.children(
-                shelf
-                    .items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, item)| self.card(item, index * 1000 + i, cx))
-                    .collect::<Vec<_>>(),
+            let scroll = self.shelf_scroll.entry(index).or_default().clone();
+            let count = self.page.shelves[index].items.len();
+            // The full window width safely overscans the carousel during resizing.
+            let range = visible_cards(
+                count,
+                (-scroll.offset().x).into(),
+                window.viewport_size().width.into(),
             );
+            let cards = self.page.shelves[index].items[range.clone()].to_vec();
+            let stride = CARD_WIDTH + CARD_GAP;
+            contents = contents
+                .track_scroll(&scroll)
+                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                .child(
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .w(px((count as f32 * stride - CARD_GAP).max(0.)))
+                        .h(px(244.))
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(range.start as f32 * stride))
+                                .flex()
+                                .gap(px(CARD_GAP))
+                                .children(
+                                    cards
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, item)| {
+                                            self.card(item, index * 1000 + range.start + i, cx)
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                        ),
+                );
         }
         div()
             .id(("shelf", index))
@@ -3216,7 +3304,7 @@ impl Music {
                 div()
                     .text_size(px(23.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(shelf.title),
+                    .child(title),
             )
             .child(contents)
             .into_any_element()
@@ -3823,9 +3911,9 @@ impl Music {
                     uniform_list(
                         ("home-shelves", self.list_id),
                         shelves.len(),
-                        cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                        cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
                             range
-                                .map(|i| view.shelf(shelves[i], cx))
+                                .map(|i| view.shelf(shelves[i], window, cx))
                                 .collect::<Vec<_>>()
                         }),
                     )
@@ -4835,10 +4923,18 @@ impl Music {
                 self.account_operation,
                 Some(AccountOperation::DisconnectFailed)
             );
+            let connecting = matches!(
+                self.account_operation,
+                Some(AccountOperation::Connecting(_))
+            );
+            let restoring = matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
             body=body.child(div().mt(px(28.)).text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if disconnect_failed {"Sign-out incomplete"}else if self.account_operation.is_some(){"Connecting account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
+                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if disconnect_failed {"Sign-out incomplete"}else if connecting {"Use selected Google account"}else if restoring {"Restoring account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
+                .when(connecting, |body| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child("Sign in and select your Google or brand account in the Google window, then return here.")))
+                .when(connecting || restoring, |body| body.child(div().id("cancel-connection").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Cancel connection").on_click(cx.listener(|view,_,_,cx|view.cancel_connection(cx)))))
+                .when_some(self.error.as_ref(), |body, error| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(rgb(0xf1a6ae)).child(error.clone())))
                 .when(self.account.is_some() || disconnect_failed, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
@@ -5435,11 +5531,13 @@ impl Music {
 
 impl Drop for Music {
     fn drop(&mut self) {
-        if let Some(AccountOperation::Connecting(operation)) = &self.account_operation {
+        if let Some(
+            AccountOperation::Connecting(operation) | AccountOperation::Restoring(operation),
+        ) = &self.account_operation
+        {
             operation.cancel();
         }
-        if self.account_operation.is_some()
-            && let Some(worker) = self.account_worker.take()
+        if let Some(worker) = self.account_worker.take()
             && let Err(error) = worker.finish()
         {
             eprintln!("Could not finish account cleanup: {error:#}");
@@ -5664,20 +5762,20 @@ fn apply_track_details(
     }
 }
 
-fn acknowledge_song_change(
-    tracks: &mut [Track],
+fn acknowledge_song_change<'a>(
+    tracks: impl IntoIterator<Item = &'a mut Track>,
     ratings: &mut HashMap<String, Rating>,
     mutation: &Mutation,
 ) {
     match mutation {
         Mutation::RateSong { track, rating } => {
             ratings.insert(track.id.clone(), *rating);
-            for current in tracks.iter_mut().filter(|current| current.id == track.id) {
+            for current in tracks.into_iter().filter(|current| current.id == track.id) {
                 current.details.rating = Some(*rating);
             }
         }
         Mutation::SongLibrary { track, save } => {
-            for current in tracks.iter_mut().filter(|current| current.id == track.id) {
+            for current in tracks.into_iter().filter(|current| current.id == track.id) {
                 current.details.in_library = Some(*save);
                 current.details.add_library = track.details.add_library.clone();
                 current.details.remove_library = track.details.remove_library.clone();
@@ -5694,6 +5792,16 @@ fn playlist_move_down(tracks: &[Track], index: usize, has_more: bool) -> Option<
         None if !has_more => Some(None),
         None => None,
     }
+}
+
+fn visible_cards(count: usize, offset: f32, viewport: f32) -> std::ops::Range<usize> {
+    let stride = CARD_WIDTH + CARD_GAP;
+    let offset = offset
+        .max(0.)
+        .min((count as f32 * stride - CARD_GAP - viewport).max(0.));
+    let start = (offset / stride) as usize;
+    let end = ((offset + viewport) / stride).ceil() as usize + 1;
+    start.min(count)..end.min(count)
 }
 
 fn clock(seconds: f64) -> String {
@@ -5714,13 +5822,22 @@ fn clock(seconds: f64) -> String {
 mod tests {
     use super::{
         CatalogRequests, CatalogTarget, Playback, Query, acknowledge_song_change,
-        apply_track_details, playlist_move_down,
+        apply_track_details, playlist_move_down, visible_cards,
     };
     use crate::{
         account::Mutation,
         catalog::{Rating, Track},
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn carousel_only_renders_nearby_cards_and_clamps_after_a_shorter_refresh() {
+        assert_eq!(visible_cards(100, 0., 552.), 0..4);
+        assert_eq!(visible_cards(100, 1840., 552.), 10..14);
+        assert_eq!(visible_cards(100, 100000., 552.), 96..100);
+        assert_eq!(visible_cards(2, 100000., 552.), 0..2);
+        assert_eq!(visible_cards(0, 0., 552.), 0..0);
+    }
 
     #[test]
     fn page_refresh_keeps_the_pending_playlist_picker_and_rejects_older_pages() {
@@ -5836,6 +5953,46 @@ mod tests {
                 .iter()
                 .all(|track| track.details.rating.is_none() && track.details.in_library.is_none())
         );
+    }
+
+    #[test]
+    fn acknowledged_library_changes_update_both_visible_copies_without_a_queue_match() {
+        let mut song: Track = serde_json::from_value(serde_json::json!({
+            "id":"abcdefghijk", "title":"Visible song", "artist":"Artist"
+        }))
+        .unwrap();
+        song.details.in_library = Some(false);
+        song.details.add_library = Some("synthetic-add".into());
+        song.details.remove_library = Some("synthetic-remove".into());
+        let mut page = vec![crate::catalog::Item::Track(song.clone())];
+        let mut rows = page.clone();
+        let mut ratings = HashMap::new();
+        for save in [true, false] {
+            acknowledge_song_change(
+                page.iter_mut()
+                    .chain(&mut rows)
+                    .filter_map(|item| match item {
+                        crate::catalog::Item::Track(track) => Some(track),
+                        _ => None,
+                    }),
+                &mut ratings,
+                &Mutation::SongLibrary {
+                    track: song.clone(),
+                    save,
+                },
+            );
+            for item in page.iter().chain(&rows) {
+                let crate::catalog::Item::Track(track) = item else {
+                    panic!("expected song")
+                };
+                assert_eq!(track.details.in_library, Some(save));
+                assert_eq!(track.details.add_library.as_deref(), Some("synthetic-add"));
+                assert_eq!(
+                    track.details.remove_library.as_deref(),
+                    Some("synthetic-remove")
+                );
+            }
+        }
     }
 
     #[test]
