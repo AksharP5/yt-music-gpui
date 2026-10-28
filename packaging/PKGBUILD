@@ -5,7 +5,7 @@ pkgdesc='Native YouTube Music client built with GPUI'
 arch=('x86_64')
 url='https://github.com/AksharP5/yt-music-gpui'
 license=('MIT' 'Apache-2.0')
-depends=('libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'vulkan-driver' 'mpv' 'yt-dlp' 'libglvnd' 'wayland' 'libx11' 'libxext')
+depends=('libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'vulkan-driver' 'mpv' 'yt-dlp' 'libglvnd' 'wayland' 'libx11' 'libxext' 'python' 'xdg-utils' 'libsecret')
 makedepends=('rust' 'pkgconf')
 
 build() {

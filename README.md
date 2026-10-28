@@ -2,7 +2,7 @@
 
 A native Linux music client built in Rust with GPUI. It browses YouTube Music's live catalog and plays audio and video through libmpv and yt-dlp. The interface follows the current Omarchy theme and runs on Wayland or X11.
 
-This is an independent client. The public-catalog player is working. Account integration is under development. The reviewed Google connection is available for live verification, but account sync and authenticated playback have not yet passed the cross-client checks. See [the parity checklist](docs/parity.md) for the remaining work.
+This is an independent client. The public-catalog player is working. Account integration is under development. Browser connection is available for live verification, but account sync and authenticated playback have not yet passed the cross-client checks. See [the parity checklist](docs/parity.md) for the remaining work.
 
 ## What works
 
@@ -37,7 +37,11 @@ bin/install
 
 The installer writes to `~/.local/bin` and `$XDG_DATA_HOME`, defaulting to `~/.local/share`. It does not install system dependencies. Alternatively, build an Arch package by running `makepkg` inside `packaging/`, then install that package with your package manager.
 
-Connect from Settings or launch with `--connect`. Sign in only in the dedicated Google window, select your Google or brand account, then return to Settings and choose **Use selected Google account**. A rejected verification keeps that window open so you can retry. **Cancel connection** closes it and preserves the previous connection. The app reports a successful connection only after the player confirms credential installation; a failed activation preserves the saved account. Cookie imports are unsupported because they cannot identify the selected Google or brand account. The connection uses the OS keyring and anonymous RAM files for playback credentials. It does not create persistent plaintext cookie exports or inspect existing browser profiles. Authenticated playback requires the reviewed yt-dlp version 2026.08.19 and matching account identity from the service. The desktop runtime directory must be private and RAM-backed. Only one app instance may run at a time to protect shared account and library state.
+Connect from Settings or launch with `--connect`. The app opens YouTube Music in your normal default browser, reusing its Google login. Zen and Firefox profiles are supported. Return to Settings, choose **Read YouTube session**, and confirm **Connect as [account name]** after verification. The read action accesses only YouTube cookies in the named default profile's normal cookie store. Private windows, containers and partitioned sessions are not supported. No extension or separate Chromium window is used.
+
+The verified account is the one YouTube returns for that cookie snapshot. It may differ from the account selected in an open browser tab. Check the displayed name and handle before connecting. **Check another account** discards the preview so you can retry after changing the browser session. **Cancel connection** preserves the existing app connection and leaves your browser open. Credentials are activated only after account confirmation and the player's acknowledgement, then saved in the OS keyring. The app creates no persistent plaintext cookie export. Authentication uses browser cookies, not OAuth; an expired session requires reconnecting.
+
+Connection requires Python 3, xdg-utils and libsecret's `secret-tool`. Authenticated playback requires the reviewed yt-dlp version 2026.08.19 and matching account identity from the service. The desktop runtime directory must be private and RAM-backed. Only one app instance may run at a time to protect shared account and library state.
 
 Launch with `--guest` to skip restoring a saved account from the keyring. This does not delete the saved connection.
 

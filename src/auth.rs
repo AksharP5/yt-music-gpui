@@ -10,7 +10,6 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::{
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::UnixStream,
             process::CommandExt,
         },
     },
@@ -29,29 +28,16 @@ pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
 #[derive(Clone, Default)]
-pub struct Operation(Arc<OperationState>);
-#[derive(Default)]
-struct OperationState {
-    cancelled: AtomicBool,
-    confirmation: AtomicBool,
-}
+pub struct Operation(Arc<AtomicBool>);
 impl Operation {
     pub fn cancel(&self) {
-        self.0.cancelled.store(true, Ordering::Release);
+        self.0.store(true, Ordering::Release);
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire)
     }
     pub fn matches(&self, other: &Self) -> bool {
         !self.is_cancelled() && Arc::ptr_eq(&self.0, &other.0)
-    }
-    pub fn confirm(&self) {
-        if !self.is_cancelled() {
-            self.0.confirmation.store(true, Ordering::Release);
-        }
-    }
-    fn take_confirmation(&self) -> bool {
-        !self.is_cancelled() && self.0.confirmation.swap(false, Ordering::AcqRel)
     }
 }
 const KEYRING_ATTRIBUTES: [&str; 4] = [
@@ -77,13 +63,13 @@ pub struct PlaybackCredentials {
     pub(crate) identity: File,
 }
 
-#[derive(Deserialize)]
-struct BrowserAccount {
-    authuser: String,
-    delegated_session_id: Option<String>,
-    data_sync_id: String,
-    client_version: String,
+#[derive(Clone, Deserialize)]
+pub struct BrowserProfile {
+    pub browser: String,
+    pub name: String,
+    path: PathBuf,
 }
+
 #[derive(Deserialize)]
 struct Cookie {
     name: String,
@@ -91,8 +77,7 @@ struct Cookie {
     domain: String,
     path: String,
     secure: bool,
-    #[serde(default)]
-    expires: f64,
+    expires: u64,
 }
 
 impl Session {
@@ -104,7 +89,7 @@ impl Session {
             .args(KEYRING_ATTRIBUTES)
             .stdin(Stdio::null());
         let output =
-            KeyringProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
+            AccountProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
         if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
             return Ok(None);
         }
@@ -129,7 +114,7 @@ impl Session {
             .stdin(Stdio::from(input))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut process = KeyringProcess::spawn(&mut command)?;
+        let mut process = AccountProcess::spawn(&mut command)?;
         ensure!(
             process.wait(Duration::from_secs(30), None)?.success(),
             "The OS keyring could not save the account. No plaintext fallback is used."
@@ -208,42 +193,7 @@ impl Session {
         self.verify_html_identity(page)
     }
     fn verify_html_identity(&self, page: impl Read) -> Result<()> {
-        const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
-        let mut html = String::new();
-        page.take((MAX_PAGE_BYTES + 1) as u64)
-            .read_to_string(&mut html)
-            .context("Could not read the account verification page")?;
-        ensure!(
-            html.len() <= MAX_PAGE_BYTES,
-            "YouTube Music returned an oversized account verification page"
-        );
-        // The first ytcfg.set call is the JSON bootstrap used by yt-dlp's extract_ytcfg.
-        // Later calls can contain JavaScript expressions; never execute or merge those.
-        let (_, bootstrap) = html
-            .split_once("ytcfg.set(")
-            .context("YouTube Music returned no account configuration")?;
-        let bootstrap = bootstrap.trim_start();
-        let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
-        let config = values
-            .next()
-            .transpose()
-            .context("YouTube Music returned an invalid account configuration")?
-            .context("YouTube Music returned no account configuration")?;
-        ensure!(
-            bootstrap[values.byte_offset()..]
-                .trim_start()
-                .starts_with(')'),
-            "YouTube Music returned an invalid account configuration"
-        );
-        ensure!(
-            config["LOGGED_IN"] == true,
-            "YouTube Music did not accept the account session. Connect again."
-        );
-        ensure!(
-            config.get("DATASYNC_ID").is_some(),
-            "YouTube Music did not confirm the selected account"
-        );
-        self.verify_server_identity(&config)
+        self.verify_server_identity(&page_config(page)?)
     }
     fn server_identity_confirmed(&self, response: &Value) -> Result<bool> {
         self.validate_playback_identity()?;
@@ -309,7 +259,7 @@ impl Session {
         );
         ensure!(
             self.sapisid().is_some(),
-            "Sign in to Google in the account connection window first."
+            "Sign in to YouTube Music in your browser first, then retry."
         );
         self.validate_playback_identity()?;
         Ok(())
@@ -391,12 +341,12 @@ pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
     Ok(file)
 }
 
-struct KeyringProcess(Child);
+struct AccountProcess(Child);
 
 fn clear_keyring(attributes: &[&str]) -> Result<()> {
     let mut command = Command::new("/usr/bin/secret-tool");
     command.arg("clear").args(attributes).stdin(Stdio::null());
-    let output = KeyringProcess::output(&mut command, None, Duration::from_secs(30))?;
+    let output = AccountProcess::output(&mut command, None, Duration::from_secs(30))?;
     // secret-tool returns a silent status 1 when a previous cleanup removed the item.
     let absent =
         output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
@@ -407,7 +357,7 @@ fn clear_keyring(attributes: &[&str]) -> Result<()> {
     Ok(())
 }
 
-impl KeyringProcess {
+impl AccountProcess {
     fn output(
         command: &mut Command,
         operation: Option<&Operation>,
@@ -428,7 +378,7 @@ impl KeyringProcess {
         let read_output = |mut file: File| -> Result<Vec<u8>> {
             ensure!(
                 file.metadata()?.len() <= 1024 * 1024,
-                "The OS keyring returned oversized account data"
+                "The account helper returned oversized data"
             );
             file.rewind()?;
             let mut bytes = Vec::new();
@@ -455,7 +405,9 @@ impl KeyringProcess {
             });
         }
         Ok(Self(
-            command.spawn().context("The OS keyring is unavailable")?,
+            command
+                .spawn()
+                .context("Could not start the account helper")?,
         ))
     }
     fn wait(
@@ -472,15 +424,12 @@ impl KeyringProcess {
             if let Some(status) = self.0.try_wait()? {
                 return Ok(status);
             }
-            ensure!(
-                Instant::now() < deadline,
-                "The OS keyring operation timed out"
-            );
+            ensure!(Instant::now() < deadline, "The account helper timed out");
             thread::sleep(Duration::from_millis(25));
         }
     }
 }
-impl Drop for KeyringProcess {
+impl Drop for AccountProcess {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_some() {
             return;
@@ -499,84 +448,6 @@ fn timestamp() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn youtube_domain(domain: &str) -> bool {
-    let domain = domain.trim_start_matches('.');
-    domain == "youtube.com" || domain.ends_with(".youtube.com")
-}
-
-struct LoginBrowser {
-    child: Child,
-    _profile: tempfile::TempDir,
-}
-impl Drop for LoginBrowser {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        unsafe {
-            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-struct BrowserPipe {
-    stream: UnixStream,
-    pending: Vec<u8>,
-    next_id: u64,
-}
-impl BrowserPipe {
-    fn call(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<Value> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let mut request = json!({"id":id,"method":method,"params":params});
-        if let Some(session) = session {
-            request["sessionId"] = json!(session);
-        }
-        let mut message = serde_json::to_vec(&request)?;
-        message.push(0);
-        self.stream.write_all(&message)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            while let Some(end) = self.pending.iter().position(|c| *c == 0) {
-                let line: Vec<_> = self.pending.drain(..=end).collect();
-                let value: Value = serde_json::from_slice(&line[..end])
-                    .context("Invalid account connection response")?;
-                if value["id"] == id {
-                    ensure!(
-                        value.get("error").is_none(),
-                        "The account connection could not complete this operation"
-                    );
-                    return Ok(value["result"].clone());
-                }
-            }
-            ensure!(
-                Instant::now() < deadline,
-                "The sign-in browser stopped responding"
-            );
-            let mut bytes = [0; 16384];
-            let count = self
-                .stream
-                .read(&mut bytes)
-                .context("Lost the private sign-in connection")?;
-            ensure!(count > 0, "The sign-in window closed");
-            self.pending.extend_from_slice(&bytes[..count]);
-            ensure!(
-                self.pending.len() <= 1024 * 1024,
-                "Oversized account connection response"
-            );
-        }
-    }
-}
-
 fn private_runtime() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -635,228 +506,309 @@ fn lock_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn start_browser(url: &str, headless: bool) -> Result<(LoginBrowser, BrowserPipe)> {
-    // Bypass distribution launch scripts so flags/extensions from another profile
-    // cannot be inherited by the sign-in window.
-    let binary = ["/usr/lib/chromium/chromium", "/opt/google/chrome/chrome"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
-        .context("Account connection needs Chromium or Google Chrome")?;
-    let profile = tempfile::Builder::new()
-        .prefix("yt-music-login-")
-        .tempdir_in(private_runtime()?)?;
-    let (parent, child) = UnixStream::pair()?;
-    parent.set_read_timeout(Some(Duration::from_secs(5)))?;
-    parent.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let fd = child.as_raw_fd();
-    let parent_pid = std::process::id() as libc::pid_t;
-    let mut command = Command::new(binary);
-    command
-        .arg(format!("--user-data-dir={}", profile.path().display()))
-        .args([
-            "--remote-debugging-pipe",
-            "--disable-extensions",
-            "--disable-sync",
-            "--disable-background-mode",
-            "--password-store=gnome-libsecret",
-            "--disable-crash-reporter",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command.arg(format!("--app={url}"));
-    if headless {
-        command.arg("--headless=new");
-    }
-    unsafe {
-        command.pre_exec(move || {
-            for target in [3, 4] {
-                if libc::dup2(fd, target) < 0 || libc::fcntl(target, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent_pid {
-                libc::_exit(0);
-            }
-            Ok(())
-        });
-    }
-    let browser = LoginBrowser {
-        child: command
-            .spawn()
-            .context("Could not open the isolated Google sign-in window")?,
-        _profile: profile,
-    };
-    drop(child);
-    Ok((
-        browser,
-        BrowserPipe {
-            stream: parent,
-            pending: Vec::new(),
-            next_id: 0,
-        },
-    ))
+fn page_config(page: impl Read) -> Result<Value> {
+    const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+    let mut html = String::new();
+    page.take((MAX_PAGE_BYTES + 1) as u64)
+        .read_to_string(&mut html)
+        .context("Could not read the account verification page")?;
+    ensure!(
+        html.len() <= MAX_PAGE_BYTES,
+        "YouTube Music returned an oversized account verification page"
+    );
+    // The first ytcfg.set call is the JSON bootstrap used by yt-dlp's extract_ytcfg.
+    // Later calls can contain JavaScript expressions; never execute or merge those.
+    let (_, bootstrap) = html
+        .split_once("ytcfg.set(")
+        .context("YouTube Music returned no account configuration")?;
+    let bootstrap = bootstrap.trim_start();
+    let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
+    let config = values
+        .next()
+        .transpose()
+        .context("YouTube Music returned an invalid account configuration")?
+        .context("YouTube Music returned no account configuration")?;
+    ensure!(
+        bootstrap[values.byte_offset()..]
+            .trim_start()
+            .starts_with(')'),
+        "YouTube Music returned an invalid account configuration"
+    );
+    ensure!(
+        config["LOGGED_IN"] == true,
+        "YouTube Music did not accept the account session. Connect again."
+    );
+    ensure!(
+        config.get("DATASYNC_ID").is_some(),
+        "YouTube Music did not confirm the selected account"
+    );
+    Ok(config)
 }
 
-/// Explicit user action only. Credentials stay in the OS keyring and RAM.
-pub fn connect(
-    operation: &Operation,
-    mut notice: impl FnMut(String),
-) -> Result<(Session, crate::catalog::Account)> {
-    ensure!(!operation.is_cancelled(), "Account connection cancelled");
-    ensure!(
-        ACCOUNT_LOGIN_ENABLED,
-        "Account connection is disabled until the security review is complete."
-    );
-    ensure!(
-        Path::new("/usr/bin/secret-tool").is_file(),
-        "Account connection requires the desktop OS keyring"
-    );
-    let (mut browser, mut pipe) = start_browser(ORIGIN, false)?;
-    let deadline = Instant::now() + Duration::from_secs(15 * 60);
-    loop {
+impl BrowserProfile {
+    /// Reads profile metadata only. Cookie access requires a separate user action.
+    pub fn open(operation: &Operation) -> Result<Self> {
+        ensure!(ACCOUNT_LOGIN_ENABLED, "Account connection is unavailable");
+        ensure!(
+            Path::new("/usr/bin/secret-tool").is_file(),
+            "Account connection requires the desktop OS keyring"
+        );
+        let mut command = Command::new("/usr/bin/xdg-settings");
+        command
+            .args(["get", "default-web-browser"])
+            .stdin(Stdio::null());
+        let output = AccountProcess::output(&mut command, Some(operation), Duration::from_secs(5))?;
+        ensure!(
+            output.status.success(),
+            "Could not identify your default browser"
+        );
+        let desktop = std::str::from_utf8(&output.stdout)?.trim();
+        let profile =
+            serde_json::from_slice(&browser_helper("profile", Path::new(desktop), operation)?)
+                .context("Could not identify the default browser profile")?;
         ensure!(!operation.is_cancelled(), "Account connection cancelled");
+        // xdg-open reuses the normal browser. It is user-owned and must outlive us.
+        let mut opener = Command::new("/usr/bin/xdg-open")
+            .arg(ORIGIN)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Could not open your default browser")?;
+        thread::spawn(move || {
+            let _ = opener.wait();
+        });
+        Ok(profile)
+    }
+
+    /// Only the explicit Read YouTube session action calls this method.
+    pub fn read_session(&self, operation: &Operation) -> Result<Session> {
+        let cookies: Vec<Cookie> =
+            serde_json::from_slice(&browser_helper("cookies", &self.path, operation)?)
+                .context("The browser returned an unreadable YouTube session")?;
+        let (cookie, playback_cookie) = cookie_headers(&cookies)?;
+        let mut header = HeaderValue::from_str(&cookie).context("Invalid YouTube cookies")?;
+        header.set_sensitive(true);
+        ensure!(!operation.is_cancelled(), "Account connection cancelled");
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36",
+            )
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let page = client
+            .get(ORIGIN)
+            .header("Cookie", header)
+            .header("Cache-Control", "no-cache")
+            .send()
+            .map_err(reqwest::Error::without_url)
+            .context("Could not verify the browser's YouTube session")?;
         ensure!(
-            browser.child.try_wait()?.is_none(),
-            "The Google sign-in window closed before connection finished"
+            page.status() == reqwest::StatusCode::OK,
+            "YouTube Music did not accept the browser session (HTTP {}). Finish signing in and retry.",
+            page.status().as_u16()
         );
-        ensure!(
-            Instant::now() < deadline,
-            "Account connection timed out. Try again when you are ready to sign in."
-        );
-        if operation.take_confirmation() {
-            let captured = capture(&mut pipe);
-            ensure!(!operation.is_cancelled(), "Account connection cancelled");
-            match captured {
-                Ok(Some((session, account))) => {
-                    let _ = pipe.call("Browser.close", json!({}), None);
-                    return Ok((session, account));
-                }
-                Ok(None) => notice(
-                    "Finish signing in and select your account in the account window, then try again."
-                        .into(),
-                ),
-                Err(error) => notice(format!("{error:#}")),
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
+        let config = page_config(page)?;
+        ensure!(!operation.is_cancelled(), "Account connection cancelled");
+        Session::from_browser(cookie, playback_cookie, &config)
     }
 }
 
-fn capture(pipe: &mut BrowserPipe) -> Result<Option<(Session, crate::catalog::Account)>> {
-    let targets = pipe.call("Target.getTargets", json!({}), None)?;
-    let target = targets["targetInfos"]
-        .as_array()
-        .context("No sign-in browser targets")?
-        .iter()
-        .find(|t| {
-            t["type"] == "page"
-                && t["url"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with(&format!("{ORIGIN}/")))
-        });
-    let Some(target) = target else {
-        return Ok(None);
-    };
-    let attached = pipe.call(
-        "Target.attachToTarget",
-        json!({"targetId":target["targetId"],"flatten":true}),
-        None,
-    )?;
-    let id = attached["sessionId"]
-        .as_str()
-        .context("Could not attach to the sign-in window")?;
-    let result = (|| {
-        let account=pipe.call("Runtime.evaluate",json!({"expression":"(() => { const c = window.ytcfg; return c?.get('LOGGED_IN') ? { authuser: String(c.get('SESSION_INDEX') ?? 0), delegated_session_id: c.get('DELEGATED_SESSION_ID') ?? null, data_sync_id: c.get('DATASYNC_ID'), client_version: c.get('INNERTUBE_CLIENT_VERSION') } : null; })()","returnByValue":true}),Some(id))?;
-        if account["result"]["value"].is_null() {
-            return Ok(None);
+fn browser_helper(mode: &str, value: &Path, operation: &Operation) -> Result<Vec<u8>> {
+    let mut command = Command::new("/usr/bin/python3");
+    command
+        .args(["-I", "-c", include_str!("browser_session.py"), mode])
+        .arg(value)
+        .stdin(Stdio::null());
+    let output = AccountProcess::output(&mut command, Some(operation), Duration::from_secs(10))?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+fn cookie_headers(cookies: &[Cookie]) -> Result<(String, String)> {
+    ensure!(cookies.len() <= 256, "Too many YouTube cookies");
+    let mut headers = Vec::new();
+    let mut playback = "# Netscape HTTP Cookie File\n".to_owned();
+    for cookie in cookies {
+        ensure!(
+            matches!(
+                cookie.domain.as_str(),
+                ".youtube.com"
+                    | "youtube.com"
+                    | ".music.youtube.com"
+                    | "music.youtube.com"
+                    | ".www.youtube.com"
+                    | "www.youtube.com"
+            ) && cookie.path == "/"
+                && !cookie.name.is_empty()
+                && cookie
+                    .name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+                && cookie
+                    .value
+                    .bytes()
+                    .all(|c| (0x21..=0x7e).contains(&c) && !b"\",;\\".contains(&c)),
+            "The browser returned invalid YouTube cookies"
+        );
+        if cookie.expires > 0 && cookie.expires <= timestamp() {
+            continue;
         }
-        let account: BrowserAccount = serde_json::from_value(account["result"]["value"].clone())
-            .context("Google did not return a valid music account")?;
-        let data = pipe.call("Network.getCookies", json!({"urls":[ORIGIN]}), Some(id))?;
-        let cookies: Vec<Cookie> = serde_json::from_value(data["cookies"].clone())
-            .context("Google did not return a music session")?;
-        let cookies: Vec<_> = cookies
-            .into_iter()
-            .filter(|c| {
-                youtube_domain(&c.domain) && (c.expires <= 0. || c.expires > timestamp() as f64)
-            })
-            .collect();
-        let mut playback_cookie = "# Netscape HTTP Cookie File\n".to_owned();
-        for c in &cookies {
-            playback_cookie.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                c.domain,
-                if c.domain.starts_with('.') {
-                    "TRUE"
-                } else {
-                    "FALSE"
-                },
-                c.path,
-                if c.secure { "TRUE" } else { "FALSE" },
-                c.expires.max(0.) as u64,
-                c.name,
-                c.value
-            ));
+        if matches!(
+            cookie.domain.as_str(),
+            ".youtube.com" | ".music.youtube.com" | "music.youtube.com"
+        ) {
+            headers.push(format!("{}={}", cookie.name, cookie.value));
         }
-        let session = Session {
-            cookie: cookies
-                .iter()
-                .map(|c| format!("{}={}", c.name, c.value))
-                .collect::<Vec<_>>()
-                .join("; "),
+        playback.push_str(&format!(
+            "{}\t{}\t/\t{}\t{}\t{}\t{}\n",
+            cookie.domain,
+            if cookie.domain.starts_with('.') {
+                "TRUE"
+            } else {
+                "FALSE"
+            },
+            if cookie.secure { "TRUE" } else { "FALSE" },
+            cookie.expires,
+            cookie.name,
+            cookie.value
+        ));
+    }
+    let header = headers.join("; ");
+    ensure!(
+        header.len() <= 64 * 1024 && playback.len() <= 128 * 1024,
+        "The YouTube session is oversized"
+    );
+    ensure!(
+        header
+            .split(';')
+            .filter_map(|p| p.trim().split_once('='))
+            .any(
+                |(key, value)| matches!(key, "SAPISID" | "__Secure-3PAPISID") && !value.is_empty()
+            ),
+        "No signed-in YouTube session was found. Sign in in a normal browser window, then retry."
+    );
+    Ok((header, playback))
+}
+
+impl Session {
+    fn from_browser(cookie: String, playback_cookie: String, config: &Value) -> Result<Self> {
+        ensure!(
+            config["LOGGED_IN"] == true,
+            "Sign in to YouTube Music in your browser, then retry."
+        );
+        let authuser = match &config["SESSION_INDEX"] {
+            Value::String(index) => index.clone(),
+            Value::Number(index) if index.is_u64() => index.to_string(),
+            _ => anyhow::bail!("YouTube Music did not identify the Google account"),
+        };
+        let data_sync_id = config["DATASYNC_ID"]
+            .as_str()
+            .context("YouTube Music did not identify the account")?
+            .to_owned();
+        let (first, second) = data_sync_id
+            .split_once("||")
+            .context("YouTube Music returned an invalid account identity")?;
+        let delegated_session_id = (!second.is_empty()).then(|| first.to_owned());
+        let client_version = config["INNERTUBE_CLIENT_VERSION"]
+            .as_str()
+            .filter(|version| !version.is_empty())
+            .context("YouTube Music returned no client version")?
+            .to_owned();
+        let session = Self {
+            cookie,
             playback_cookie,
-            authuser: account.authuser,
-            delegated_session_id: account.delegated_session_id,
-            data_sync_id: account.data_sync_id,
-            client_version: account.client_version,
+            authuser,
+            delegated_session_id,
+            data_sync_id,
+            client_version,
         };
         session.validate()?;
-        let account =
-            crate::catalog::Catalog::with_session(Some(Arc::new(session.clone())))?.account()?;
-        Ok(Some((session, account)))
-    })();
-    let _ = pipe.call("Target.detachFromTarget", json!({"sessionId":id}), None);
-    result
+        session.verify_server_identity(config)?;
+        Ok(session)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn account_capture_requires_a_fresh_shared_confirmation() {
-        let operation = Operation::default();
-        let control = operation.clone();
-        assert!(!operation.take_confirmation());
-        control.confirm();
-        control.confirm();
-        assert!(operation.take_confirmation());
-        assert!(!operation.take_confirmation());
-        assert!(!Operation::default().take_confirmation());
-        control.confirm();
-        assert!(operation.take_confirmation());
-        assert!(operation.matches(&control));
+    fn browser_reader_uses_configured_profile_and_scoped_read_only_wal() {
+        let mut source = sealed_file(include_bytes!("browser_session.py")).unwrap();
+        source.rewind().unwrap();
+        let output = Command::new("/usr/bin/python3")
+            .args(["-I", "-c", include_str!("browser_session_tests.py")])
+            .stdin(source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     #[test]
-    fn cancellation_revokes_pending_and_future_confirmations() {
-        for confirm_first in [false, true] {
-            let operation = Operation::default();
-            let control = operation.clone();
-            if confirm_first {
-                control.confirm();
-            }
-            control.cancel();
-            assert!(operation.is_cancelled());
-            assert!(!operation.take_confirmation());
-            control.confirm();
-            assert!(!operation.take_confirmation());
-            assert!(!operation.matches(&control));
+    fn browser_cookie_header_respects_destination_and_rejects_injection() {
+        let cookies = serde_json::from_value::<Vec<Cookie>>(json!([
+            {"name":"SAPISID","value":"synthetic","domain":".youtube.com","path":"/","secure":true,"expires":0},
+            {"name":"WWW","value":"synthetic","domain":"www.youtube.com","path":"/","secure":true,"expires":0},
+            {"name":"ROOT_ONLY","value":"synthetic","domain":"youtube.com","path":"/","secure":true,"expires":0},
+            {"name":"OLD","value":"synthetic","domain":".youtube.com","path":"/","secure":true,"expires":1}
+        ])).unwrap();
+        let (header, playback) = cookie_headers(&cookies).unwrap();
+        assert_eq!(header, "SAPISID=synthetic");
+        assert!(playback.contains("www.youtube.com\tFALSE\t/\tTRUE\t0\tWWW\tsynthetic\n"));
+        assert!(!playback.contains("OLD"));
+        for (key, value) in [
+            ("domain", ".google.com"),
+            ("domain", "evil.youtube.com"),
+            ("name", "SAPISID\n"),
+            ("value", "a; injected=b"),
+            ("value", "a\tb"),
+            ("path", "/other"),
+        ] {
+            let mut cookie = json!({"name":"SAPISID","value":"synthetic","domain":".youtube.com","path":"/","secure":true,"expires":0});
+            cookie[key] = json!(value);
+            assert!(
+                cookie_headers(&[serde_json::from_value(cookie).unwrap()]).is_err(),
+                "{key}"
+            );
+        }
+        assert!(cookie_headers(&[]).is_err());
+    }
+    #[test]
+    fn browser_bootstrap_requires_server_account_index_and_full_identity() {
+        let primary = json!({"LOGGED_IN":true,"SESSION_INDEX":2,"DATASYNC_ID":"primary-user||","INNERTUBE_CLIENT_VERSION":"1.test"});
+        let candidate =
+            Session::from_browser("SAPISID=synthetic".into(), String::new(), &primary).unwrap();
+        assert_eq!(candidate.authuser, "2");
+        assert!(candidate.delegated_session_id.is_none());
+        let mut brand = primary.clone();
+        brand["DATASYNC_ID"] = json!("brand-id||primary-user");
+        brand["DELEGATED_SESSION_ID"] = json!("brand-id");
+        let candidate =
+            Session::from_browser("SAPISID=synthetic".into(), String::new(), &brand).unwrap();
+        assert_eq!(candidate.delegated_session_id.as_deref(), Some("brand-id"));
+        for (key, value) in [
+            ("SESSION_INDEX", Value::Null),
+            ("DATASYNC_ID", Value::Null),
+            ("LOGGED_IN", json!(false)),
+            ("DELEGATED_SESSION_ID", json!("other-brand")),
+            ("USER_SESSION_ID", json!("other-user")),
+            ("INNERTUBE_CLIENT_VERSION", json!("")),
+        ] {
+            let mut config = primary.clone();
+            config[key] = value;
+            assert!(
+                Session::from_browser("SAPISID=synthetic".into(), String::new(), &config).is_err(),
+                "{key}"
+            );
         }
     }
     #[test]
@@ -886,7 +838,7 @@ mod tests {
     fn a_timed_out_keyring_process_is_terminated_and_reaped() {
         let mut command = Command::new("/usr/bin/sleep");
         command.arg("30");
-        let mut process = KeyringProcess::spawn(&mut command).unwrap();
+        let mut process = AccountProcess::spawn(&mut command).unwrap();
         let pid = process.0.id() as libc::pid_t;
         assert!(process.wait(Duration::from_millis(20), None).is_err());
         drop(process);
@@ -906,7 +858,7 @@ mod tests {
             "-c",
             "head -c 131072 /dev/zero; printf 'synthetic error' >&2; exit 7",
         ]);
-        let output = KeyringProcess::output(
+        let output = AccountProcess::output(
             &mut command,
             Some(&Operation::default()),
             Duration::from_secs(2),
@@ -918,7 +870,7 @@ mod tests {
 
         let mut command = Command::new("/usr/bin/head");
         command.args(["-c", "1048577", "/dev/zero"]);
-        let error = KeyringProcess::output(
+        let error = AccountProcess::output(
             &mut command,
             Some(&Operation::default()),
             Duration::from_secs(2),
@@ -931,7 +883,7 @@ mod tests {
         let operation = Operation::default();
         let mut command = Command::new("/usr/bin/sleep");
         command.arg("30");
-        let mut process = KeyringProcess::spawn(&mut command).unwrap();
+        let mut process = AccountProcess::spawn(&mut command).unwrap();
         let pid = process.0.id() as libc::pid_t;
         operation.cancel();
         assert!(
@@ -951,7 +903,7 @@ mod tests {
             Some(libc::ECHILD)
         );
         assert!(
-            KeyringProcess::output(&mut command, Some(&operation), Duration::from_secs(30))
+            AccountProcess::output(&mut command, Some(&operation), Duration::from_secs(30))
                 .is_err()
         );
     }
@@ -972,21 +924,21 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             ensure!(
-                KeyringProcess::spawn(&mut store)?
+                AccountProcess::spawn(&mut store)?
                     .wait(Duration::from_secs(30), None)?
                     .success(),
                 "Synthetic store failed"
             );
             let mut lookup = Command::new("/usr/bin/secret-tool");
             lookup.arg("lookup").args(attributes).stdin(Stdio::null());
-            let output = KeyringProcess::output(&mut lookup, None, Duration::from_secs(30))?;
+            let output = AccountProcess::output(&mut lookup, None, Duration::from_secs(30))?;
             ensure!(
                 output.status.success() && output.stdout == b"invented-test-value",
                 "Synthetic lookup failed"
             );
             clear_keyring(&attributes)?;
             clear_keyring(&attributes)?;
-            let output = KeyringProcess::output(&mut lookup, None, Duration::from_secs(30))?;
+            let output = AccountProcess::output(&mut lookup, None, Duration::from_secs(30))?;
             ensure!(
                 output.status.code() == Some(1)
                     && output.stdout.is_empty()
@@ -1011,15 +963,6 @@ mod tests {
             session("__Secure-3PAPISID=preferred; SAPISID=other").sapisid(),
             Some("preferred")
         );
-    }
-    #[test]
-    fn cookies_are_restricted_to_youtube_domains() {
-        for domain in ["youtube.com", ".youtube.com", "music.youtube.com"] {
-            assert!(youtube_domain(domain));
-        }
-        for domain in ["evil-youtube.com", "youtube.com.evil.test"] {
-            assert!(!youtube_domain(domain));
-        }
     }
     #[test]
     fn playback_identity_requires_consistent_primary_or_brand_context() {
@@ -1184,45 +1127,5 @@ mod tests {
             );
             assert!(file.write_all(b"changed").is_err());
         }
-    }
-    #[test]
-    fn browser_pipe_handles_events_and_fragmented_messages() {
-        let (parent, mut child) = UnixStream::pair().unwrap();
-        let worker = thread::spawn(move || {
-            let mut b = [0; 4096];
-            loop {
-                let count = child.read(&mut b).unwrap();
-                assert!(count > 0);
-                if b[..count].contains(&0) {
-                    break;
-                }
-            }
-            child
-                .write_all(b"{\"method\":\"event\"}\0{\"id\":1,\"res")
-                .unwrap();
-            child.write_all(b"ult\":{\"ok\":true}}\0").unwrap();
-        });
-        let mut pipe = BrowserPipe {
-            stream: parent,
-            pending: Vec::new(),
-            next_id: 0,
-        };
-        assert_eq!(pipe.call("Test", json!({}), None).unwrap()["ok"], true);
-        worker.join().unwrap();
-    }
-    #[test]
-    #[ignore = "requires Chromium and a private desktop runtime directory"]
-    fn live_private_browser_transport() {
-        let (mut browser, mut pipe) = start_browser("about:blank", true).unwrap();
-        let version = pipe.call("Browser.getVersion", json!({}), None).unwrap();
-        assert!(version["product"].as_str().unwrap().contains("Chrome"));
-        let args = fs::read(format!("/proc/{}/cmdline", browser.child.id())).unwrap();
-        let args = String::from_utf8_lossy(&args);
-        assert!(args.contains("--disable-extensions"));
-        assert!(!args.contains("--remote-debugging-port"));
-        assert!(!args.contains("--load-extension"));
-        assert!(!browser._profile.path().join("DevToolsActivePort").exists());
-        let _ = pipe.call("Browser.close", json!({}), None);
-        let _ = browser.child.try_wait();
     }
 }

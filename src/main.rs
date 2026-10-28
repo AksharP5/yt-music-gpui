@@ -43,13 +43,13 @@ fn main() {
             }
             "--cookies" => {
                 eprintln!(
-                    "Cookie imports cannot identify the selected Google account. Use --connect."
+                    "Cookie files are unsupported. Use --connect to verify your browser account."
                 );
                 std::process::exit(2);
             }
             "--help" | "-h" => {
                 println!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading a saved account from the keyring\n--connect        Connect your Google account in a dedicated sign-in window\n\nCookie imports are unsupported because they cannot identify the selected account.\nCtrl K searches. Press ? in the app for all shortcuts."
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading a saved account from the keyring\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen and Firefox. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts."
                 );
                 return;
             }

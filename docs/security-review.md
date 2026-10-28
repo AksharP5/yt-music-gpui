@@ -1,5 +1,13 @@
 # Account security reviews
 
+## 2026-10-27 default-browser connection
+
+Google rejected the isolated Chromium login. Connection now opens the normal default browser and supports native Zen and Firefox profiles. Settings names the configured source profile before the explicit Read YouTube session action. A scoped read-only SQLite query reads YouTube cookies, including committed WAL changes, without copying the database or merging container and partitioned stores. A fresh server bootstrap and the existing account-menu identity check produce a preview. Only a separate Connect as action can activate that preview. Cancellation and failed reads preserve the existing connection. The normal browser remains open.
+
+The verified snapshot may identify the default Google account rather than the account selected in an open tab. The displayed name and handle require user confirmation. This is cookie-based session access, not OAuth. Existing keyring storage, anonymous playback files, account-bound requests and extractor identity checks remain in place.
+
+Validation passed 138 ordinary Rust tests, including three synthetic Python reader tests, strict Clippy, formatting, the release build, and the offline authenticated-extractor suite. Native XWayland verification confirmed the named-profile consent screen, Cancel returning to Connect in browser, and clean quit. No real browser cookies were read during testing. Real sign-in, authenticated playback, multiple-account selection and cross-client sync remain unverified. These checks do not establish the absence of security vulnerabilities.
+
 ## 2026-10-27 follow-up
 
 The next readiness pass fixed failed account activation clearing the previous saved connection. A verified candidate remains separate until the player acknowledges credential installation and the UI accepts the same uncancelled operation. Installation errors and a stopped player now reach that completion path. Synthetic tests cover failed installation, cancelled activation, closed response channels and preservation of the previous shared session and keyring lifecycle.

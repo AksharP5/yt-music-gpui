@@ -1,5 +1,7 @@
 # YouTube Music parity
 
+The October 27 browser fix replaces the Google-rejected Chromium window with the default browser. Zen and Firefox sessions require an explicit read and verified account preview before activation. The preview identifies the account returned by YouTube, which may differ from the active browser tab. The native profile prompt and cancellation passed; real sign-in, authenticated playback and cross-client sync remain unverified. See [the browser verification notes](security-review.md#2026-10-27-default-browser-connection).
+
 The account on music.youtube.com is the source of truth. A local edit is complete only when the service accepts it. Data changed on the web must be reloaded into the native client. Local preferences and the in-progress playback queue remain device state, matching the web player's behavior.
 
 The initial release implements public catalog browsing, search, audio playback and a local queue. Its local likes and saved collections are not account sync. They must not be silently uploaded when an account is connected.

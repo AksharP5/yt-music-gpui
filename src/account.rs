@@ -174,6 +174,10 @@ impl Connection {
 
 pub enum Command {
     Connect(Operation),
+    ReadBrowser {
+        operation: Operation,
+        profile: auth::BrowserProfile,
+    },
     Apply {
         session: Arc<Session>,
         mutation: Box<Mutation>,
@@ -190,9 +194,13 @@ pub enum Command {
     },
 }
 pub enum Event {
-    ConnectionNotice {
+    BrowserReady {
         operation: Operation,
-        message: String,
+        result: Result<auth::BrowserProfile, String>,
+    },
+    AccountPreview {
+        operation: Operation,
+        result: Result<Connection, String>,
     },
     Connected {
         operation: Operation,
@@ -251,16 +259,18 @@ pub fn start(
             while let Ok(command) = commands.recv_blocking() {
                 let event = match command {
                     Command::Connect(operation) => {
-                        let result = (|| -> Result<Option<Connection>> {
-                            let (candidate, account) = auth::connect(&operation, |message| {
-                                let _ = events.send_blocking(Event::ConnectionNotice {
-                                    operation: operation.clone(),
-                                    message,
-                                });
-                            })?;
-                            Ok(Some(Connection { session: Arc::new(candidate), account }))
-                        })().map_err(|e| format!("{e:#}"));
-                        Event::Connected { operation, result, save_session: true }
+                        let result = auth::BrowserProfile::open(&operation).map_err(|error| format!("{error:#}"));
+                        Event::BrowserReady { operation, result }
+                    }
+                    Command::ReadBrowser { operation, profile } => {
+                        let result = (|| {
+                            let candidate = profile.read_session(&operation)?;
+                            let catalog = catalog.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                            let connection = Connection::verify(candidate, catalog)?;
+                            ensure!(!operation.is_cancelled(), "Account connection cancelled");
+                            Ok(connection)
+                        })().map_err(|error: anyhow::Error| format!("{error:#}"));
+                        Event::AccountPreview { operation, result }
                     }
                     Command::Restore(operation) => {
                         let result = (|| {

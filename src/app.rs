@@ -294,10 +294,20 @@ enum Drag {
 }
 enum AccountOperation {
     Restoring(Operation),
-    Connecting(Operation),
+    Connecting(Operation, BrowserConnection),
     Activating(Operation),
     Disconnecting(Operation),
     DisconnectFailed,
+}
+
+enum BrowserConnection {
+    Opening,
+    Ready(auth::BrowserProfile),
+    Reading(auth::BrowserProfile),
+    Review {
+        profile: auth::BrowserProfile,
+        connection: Connection,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -410,7 +420,7 @@ impl Music {
                 };
                 let _ = account_commands.try_send(command);
                 if startup == Startup::Connect {
-                    AccountOperation::Connecting(operation)
+                    AccountOperation::Connecting(operation, BrowserConnection::Opening)
                 } else {
                     AccountOperation::Restoring(operation)
                 }
@@ -1391,18 +1401,47 @@ impl Music {
             self.library.liked.iter().any(|t| t.id == track.id)
         }
     }
-    fn connect_account(&mut self, cx: &mut Context<Self>) {
+    fn connect_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !auth::ACCOUNT_LOGIN_ENABLED {
-            self.error = Some(
-                "Account connection is disabled until the security review is complete.".into(),
-            );
+            self.error = Some("Account connection is unavailable.".into());
             cx.notify();
             return;
         }
-        if let Some(AccountOperation::Connecting(operation)) = &self.account_operation {
-            operation.confirm();
-            self.error = None;
-            self.notice = Some("Checking the selected Google account…".into());
+        if let Some(AccountOperation::Connecting(operation, stage)) = &self.account_operation {
+            match stage {
+                BrowserConnection::Ready(profile) => {
+                    let operation = operation.clone();
+                    let profile = profile.clone();
+                    match self
+                        .account_commands
+                        .try_send(account::Command::ReadBrowser {
+                            operation: operation.clone(),
+                            profile: profile.clone(),
+                        }) {
+                        Ok(()) => {
+                            self.account_operation = Some(AccountOperation::Connecting(
+                                operation,
+                                BrowserConnection::Reading(profile),
+                            ));
+                            self.error = None;
+                            self.notice = Some("Checking the browser's YouTube account…".into());
+                        }
+                        Err(_) => {
+                            self.error = Some("The account connection is busy. Try again.".into())
+                        }
+                    }
+                }
+                BrowserConnection::Review { connection, .. } => {
+                    let event = account::Event::Connected {
+                        operation: operation.clone(),
+                        result: Ok(Some(connection.clone())),
+                        save_session: true,
+                    };
+                    self.error = None;
+                    self.account_event(event, window, cx);
+                }
+                BrowserConnection::Opening | BrowserConnection::Reading(_) => {}
+            }
             cx.notify();
             return;
         }
@@ -1415,16 +1454,36 @@ impl Music {
             .try_send(account::Command::Connect(operation.clone()))
         {
             Ok(()) => {
-                self.account_operation = Some(AccountOperation::Connecting(operation));
-                self.notice = Some("Sign in to Google in the account window".into());
+                self.account_operation = Some(AccountOperation::Connecting(
+                    operation,
+                    BrowserConnection::Opening,
+                ));
+                self.error = None;
+                self.notice = Some("Opening your default browser…".into());
             }
             Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
         }
         cx.notify();
     }
+    fn retry_browser_account(&mut self, cx: &mut Context<Self>) {
+        if let Some(AccountOperation::Connecting(
+            operation,
+            BrowserConnection::Review { profile, .. },
+        )) = &self.account_operation
+        {
+            self.account_operation = Some(AccountOperation::Connecting(
+                operation.clone(),
+                BrowserConnection::Ready(profile.clone()),
+            ));
+            self.error = None;
+            self.notice = None;
+            cx.notify();
+        }
+    }
     fn cancel_connection(&mut self, cx: &mut Context<Self>) {
-        let Some(AccountOperation::Connecting(operation) | AccountOperation::Restoring(operation)) =
-            self.account_operation.as_ref()
+        let Some(
+            AccountOperation::Connecting(operation, _) | AccountOperation::Restoring(operation),
+        ) = self.account_operation.as_ref()
         else {
             return;
         };
@@ -1475,7 +1534,7 @@ impl Music {
             return;
         }
         if let Some(
-            AccountOperation::Connecting(operation)
+            AccountOperation::Connecting(operation, _)
             | AccountOperation::Restoring(operation)
             | AccountOperation::Activating(operation),
         ) = self.account_operation.take()
@@ -1689,13 +1748,47 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         match event {
-            account::Event::ConnectionNotice { operation, message } => {
-                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active)) if active.matches(&operation))
+            account::Event::BrowserReady { operation, result } => {
+                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active, BrowserConnection::Opening)) if active.matches(&operation))
                 {
                     return;
                 }
                 self.notice = None;
-                self.error = Some(message);
+                match result {
+                    Ok(profile) => {
+                        self.account_operation = Some(AccountOperation::Connecting(
+                            operation,
+                            BrowserConnection::Ready(profile),
+                        ))
+                    }
+                    Err(error) => {
+                        self.account_operation = None;
+                        self.error = Some(error);
+                    }
+                }
+            }
+            account::Event::AccountPreview { operation, result } => {
+                let Some(AccountOperation::Connecting(active, BrowserConnection::Reading(profile))) =
+                    &self.account_operation
+                else {
+                    return;
+                };
+                if !active.matches(&operation) {
+                    return;
+                }
+                let profile = profile.clone();
+                self.notice = None;
+                let stage = match result {
+                    Ok(connection) => BrowserConnection::Review {
+                        profile,
+                        connection,
+                    },
+                    Err(error) => {
+                        self.error = Some(error);
+                        BrowserConnection::Ready(profile)
+                    }
+                };
+                self.account_operation = Some(AccountOperation::Connecting(operation, stage));
             }
             account::Event::Disconnected { operation, result } => {
                 if !matches!(&self.account_operation, Some(AccountOperation::Disconnecting(active)) if active.matches(&operation))
@@ -1719,7 +1812,7 @@ impl Music {
                 result,
                 save_session,
             } => {
-                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active) | AccountOperation::Restoring(active)) if active.matches(&operation))
+                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active, BrowserConnection::Review { .. }) | AccountOperation::Restoring(active)) if active.matches(&operation))
                 {
                     return;
                 }
@@ -4977,18 +5070,61 @@ impl Music {
             );
             let connecting = matches!(
                 self.account_operation,
-                Some(AccountOperation::Connecting(_))
+                Some(AccountOperation::Connecting(_, _))
             );
             let restoring = matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
             let activating = matches!(
                 self.account_operation,
                 Some(AccountOperation::Activating(_))
             );
+            let (connect_label, instructions) = match &self.account_operation {
+                Some(AccountOperation::Connecting(_, BrowserConnection::Opening)) => {
+                    ("Opening browser…".to_owned(), None)
+                }
+                Some(AccountOperation::Connecting(_, BrowserConnection::Ready(profile))) => (
+                    "Read YouTube session".to_owned(),
+                    Some(format!(
+                        "Reads your YouTube sign-in session from {} · {}. You will confirm the account before connecting.",
+                        profile.browser, profile.name
+                    )),
+                ),
+                Some(AccountOperation::Connecting(_, BrowserConnection::Reading(_))) => {
+                    ("Checking account…".to_owned(), None)
+                }
+                Some(AccountOperation::Connecting(
+                    _,
+                    BrowserConnection::Review { connection, .. },
+                )) => (
+                    format!("Connect as {}", connection.account.name),
+                    Some(format!(
+                        "{} {}",
+                        connection.account.name, connection.account.handle
+                    )),
+                ),
+                Some(AccountOperation::Restoring(_)) => ("Restoring account…".to_owned(), None),
+                Some(AccountOperation::Activating(_)) => {
+                    ("Preparing account playback…".to_owned(), None)
+                }
+                Some(AccountOperation::Disconnecting(_)) => ("Signing out…".to_owned(), None),
+                Some(AccountOperation::DisconnectFailed) => {
+                    ("Sign-out incomplete".to_owned(), None)
+                }
+                None if self.account.is_some() => ("Switch or reconnect account".to_owned(), None),
+                None => ("Connect in browser".to_owned(), None),
+            };
+            let reviewing = matches!(
+                self.account_operation,
+                Some(AccountOperation::Connecting(
+                    _,
+                    BrowserConnection::Review { .. }
+                ))
+            );
             body=body.child(div().mt(px(28.)).text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if disconnect_failed {"Sign-out incomplete"}else if connecting {"Use selected Google account"}else if restoring {"Restoring account…"}else if activating {"Preparing account playback…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
-                    .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
-                .when(connecting, |body| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child("Sign in and select your Google or brand account in the Google window, then return here.")))
+                    .child(connect_label)
+                    .on_click(cx.listener(|view,_,window,cx|view.connect_account(window,cx))))
+                .when_some(instructions, |body, text| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child(text)))
+                .when(reviewing, |body| body.child(div().id("retry-browser-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Check another account").on_click(cx.listener(|view,_,_,cx|view.retry_browser_account(cx)))))
                 .when(connecting || restoring, |body| body.child(div().id("cancel-connection").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Cancel connection").on_click(cx.listener(|view,_,_,cx|view.cancel_connection(cx)))))
                 .when_some(self.error.as_ref(), |body, error| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(rgb(0xf1a6ae)).child(error.clone())))
                 .when(self.account.is_some() || disconnect_failed || activating, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
@@ -5589,7 +5725,7 @@ impl Music {
 impl Drop for Music {
     fn drop(&mut self) {
         if let Some(
-            AccountOperation::Connecting(operation)
+            AccountOperation::Connecting(operation, _)
             | AccountOperation::Restoring(operation)
             | AccountOperation::Activating(operation),
         ) = &self.account_operation
