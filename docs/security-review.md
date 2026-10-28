@@ -1,5 +1,13 @@
 # Account security reviews
 
+## 2026-10-27 signed-in Zen reader repair
+
+A real signed-in Zen session reproduced an exclusive SQLite lock that prevented the reader from reaching YouTube. The reader now uses a bounded, twice-checked database/WAL/journal snapshot only after a busy or locked result. The private copy stays in the RAM-backed runtime directory, uses owner-only permissions, and is removed by Rust after the helper exits or is killed on cancellation. Only filtered YouTube rows leave the helper. SQLite connections close explicitly. Modern Firefox schema expiry timestamps are filtered in milliseconds and converted to seconds for playback.
+
+Once the reader succeeded, live verification exposed a second blocker. YouTube returns a 302 from the account-indexed root to its canonical root. Verification now retries only that exact root with the same account headers, then requires the original full identity. Automatic redirects and other destinations remain disabled.
+
+Validation passed 138 ordinary Rust tests, including five synthetic Python reader tests, formatting, strict all-target Clippy and the release build. The new fixture keeps an exclusive-lock writer running with the latest login only in WAL, verifies modern expiry filtering, and checks that the original files remain unchanged. A separate read-only check of the user's existing signed-in session passed bootstrap, account-menu identity verification, and authenticated playlist-page loading. The diagnostic check saved no session, sent no library mutations or playback-history reports, and logged no cookie values. The installed release subsequently reached the connected state in the native app and rendered the personalized Home and playlists. Authenticated playback, saved-session restoration, account switching and cross-client writes still require verification.
+
 ## 2026-10-27 default-browser connection
 
 Google rejected the isolated Chromium login. Connection now opens the normal default browser and supports native Zen and Firefox profiles. Settings names the configured source profile before the explicit Read YouTube session action. A scoped read-only SQLite query reads YouTube cookies, including committed WAL changes, without copying the database or merging container and partitioned stores. A fresh server bootstrap and the existing account-menu identity check produce a preview. Only a separate Connect as action can activate that preview. Cancellation and failed reads preserve the existing connection. The normal browser remains open.

@@ -173,7 +173,6 @@ impl Session {
         let mut request = self.apply(
             client
                 .get(format!("{ORIGIN}/"))
-                .query(&[("authuser", &self.authuser)])
                 .header("Origin", ORIGIN)
                 .header("Cache-Control", "no-cache")
                 .header("Referer", format!("{ORIGIN}/")),
@@ -181,10 +180,27 @@ impl Session {
         if let Some(delegated) = &self.delegated_session_id {
             request = request.header("X-Goog-PageId", delegated);
         }
-        let page = request
+        let indexed = request
+            .try_clone()
+            .context("Could not prepare account verification")?
+            .query(&[("authuser", &self.authuser)]);
+        let mut page = indexed
             .send()
             .map_err(reqwest::Error::without_url)
             .context("Could not verify the selected YouTube Music account")?;
+        // YouTube strips authuser from the root URL. Retry only its exact canonical
+        // root, keeping the account headers and requiring the same identity below.
+        if page.status() == reqwest::StatusCode::FOUND
+            && matches!(
+                page.headers().get("Location").map(HeaderValue::as_bytes),
+                Some(b"/" | b"https://music.youtube.com/")
+            )
+        {
+            page = request
+                .send()
+                .map_err(reqwest::Error::without_url)
+                .context("Could not verify the selected YouTube Music account")?;
+        }
         ensure!(
             page.status() == reqwest::StatusCode::OK,
             "YouTube Music did not return an account verification page (HTTP {})",
@@ -617,11 +633,23 @@ impl BrowserProfile {
 }
 
 fn browser_helper(mode: &str, value: &Path, operation: &Operation) -> Result<Vec<u8>> {
+    // Rust owns cleanup even if cancellation kills the helper during a locked-DB read.
+    let snapshot = (mode == "cookies")
+        .then(|| {
+            tempfile::Builder::new()
+                .prefix("yt-music-session-")
+                .tempdir_in(private_runtime()?)
+                .context("Could not prepare the private browser session reader")
+        })
+        .transpose()?;
     let mut command = Command::new("/usr/bin/python3");
     command
         .args(["-I", "-c", include_str!("browser_session.py"), mode])
         .arg(value)
         .stdin(Stdio::null());
+    if let Some(snapshot) = &snapshot {
+        command.arg(snapshot.path());
+    }
     let output = AccountProcess::output(&mut command, Some(operation), Duration::from_secs(10))?;
     ensure!(
         output.status.success(),
