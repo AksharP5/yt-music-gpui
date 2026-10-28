@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-channel = "2"
 libc = "0.2"
 raw-window-handle = "0.6"

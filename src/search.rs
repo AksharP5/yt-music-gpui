@@ -89,7 +89,7 @@ impl SearchScope {
     }
 
     fn tab_index(self, filter: SearchFilter) -> usize {
-        // A category-filtered library response also uses the first results tab.
+        // Older responses without tab identifiers put filtered results first.
         if filter != SearchFilter::All {
             return 0;
         }
@@ -97,6 +97,14 @@ impl SearchScope {
             Self::Catalog => 0,
             Self::Library => 1,
             Self::Uploads => 2,
+        }
+    }
+
+    fn tab_id(self) -> &'static str {
+        match self {
+            Self::Catalog => "music_search_catalog",
+            Self::Library => "music_search_library",
+            Self::Uploads => "music_search_upload",
         }
     }
 }
@@ -208,10 +216,19 @@ fn parse_search_page(
         return parse_page(&json!({"contents": []}), &title);
     };
     let results = if let Some(tabbed) = contents.get("tabbedSearchResultsRenderer") {
-        tabbed["tabs"]
+        let tabs = tabbed["tabs"]
             .as_array()
-            .and_then(|tabs| tabs.get(scope.tab_index(filter)))
-            .and_then(|tab| tab.get("tabRenderer"))
+            .context("YouTube Music did not return search tabs")?;
+        let tab = if tabs
+            .iter()
+            .any(|tab| tab["tabRenderer"].get("tabIdentifier").is_some())
+        {
+            tabs.iter()
+                .find(|tab| tab["tabRenderer"]["tabIdentifier"] == scope.tab_id())
+        } else {
+            tabs.get(scope.tab_index(filter))
+        };
+        tab.and_then(|tab| tab.get("tabRenderer"))
             .filter(|tab| tab["selected"] != false)
             .and_then(|tab| tab.get("content"))
             .context("YouTube Music did not return the requested search scope")?
@@ -396,6 +413,38 @@ mod tests {
         for rejected in [logged_out, not_logged_in] {
             assert!(
                 parse_search_page(&rejected, "test", SearchFilter::Songs, SearchScope::Library)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn identified_search_tabs_select_scope_independently_of_category_and_position() {
+        let mut public = tab("Catalog", "public-token", false);
+        public["tabRenderer"]["tabIdentifier"] = json!("music_search_catalog");
+        let mut library = tab("Library songs", "library-token", true);
+        library["tabRenderer"]["tabIdentifier"] = json!("music_search_library");
+        for tabs in [vec![public.clone(), library.clone()], vec![library, public]] {
+            let mut response = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":tabs}}});
+            let songs =
+                parse_search_page(&response, "test", SearchFilter::Songs, SearchScope::Library)
+                    .unwrap();
+            assert_eq!(songs.shelves[0].items[0].title(), "Library songs");
+            assert_eq!(
+                songs.continuation.as_ref().map(Continuation::token),
+                Some("library-token")
+            );
+            for scope in [SearchScope::Catalog, SearchScope::Uploads] {
+                assert!(parse_search_page(&response, "test", SearchFilter::All, scope).is_err());
+            }
+            for tab in response["contents"]["tabbedSearchResultsRenderer"]["tabs"]
+                .as_array_mut()
+                .unwrap()
+            {
+                tab["tabRenderer"]["tabIdentifier"] = json!("unknown_scope");
+            }
+            assert!(
+                parse_search_page(&response, "test", SearchFilter::Songs, SearchScope::Library)
                     .is_err()
             );
         }

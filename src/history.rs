@@ -17,8 +17,7 @@ use std::{
 struct HistoryUrl(Url);
 
 impl HistoryUrl {
-    fn from_player(response: &Value, video_id: &str, expected: &Session) -> Result<Self> {
-        expected.verify_server_identity(response)?;
+    fn from_player(response: &Value, video_id: &str) -> Result<Self> {
         ensure!(
             response
                 .pointer("/videoDetails/videoId")
@@ -79,6 +78,7 @@ impl Catalog {
             expected,
             video_id,
             || self.request("player", player_request(video_id)?),
+            |response| expected.verify_account_identity(response, &self.client),
             |url| {
                 let cpn = playback_nonce()?;
                 let mut request = self
@@ -125,6 +125,7 @@ fn report_current_playback(
     expected: &Arc<Session>,
     video_id: &str,
     player: impl FnOnce() -> Result<Value>,
+    verify: impl FnOnce(&Value) -> Result<()>,
     report: impl FnOnce(HistoryUrl) -> Result<StatusCode>,
 ) -> Result<()> {
     ensure!(
@@ -132,7 +133,10 @@ fn report_current_playback(
         "This song has an invalid YouTube Music ID"
     );
     require_current_session(current, expected)?;
-    let tracking = HistoryUrl::from_player(&player()?, video_id, expected)?;
+    let response = player()?;
+    require_current_session(current, expected)?;
+    let tracking = HistoryUrl::from_player(&response, video_id)?;
+    verify(&response)?;
     require_current_session(current, expected)?;
     let status = report(tracking)?;
     ensure!(
@@ -256,6 +260,7 @@ mod tests {
                     &expected,
                     VIDEO_ID,
                     || Ok(response),
+                    |response| expected.verify_server_identity(response),
                     |_| {
                         dispatched.set(true);
                         Ok(StatusCode::NO_CONTENT)
@@ -282,6 +287,7 @@ mod tests {
                         *shared.write().unwrap() = replacement;
                         Ok(response())
                     },
+                    |response| expected.verify_server_identity(response),
                     |_| {
                         dispatched.set(true);
                         Ok(StatusCode::NO_CONTENT)
@@ -300,6 +306,7 @@ mod tests {
                         fetched.set(true);
                         Ok(response())
                     },
+                    |response| expected.verify_server_identity(response),
                     |_| Ok(StatusCode::NO_CONTENT)
                 )
                 .is_err()
@@ -334,6 +341,7 @@ mod tests {
                         &expected,
                         VIDEO_ID,
                         || Ok(response),
+                        |response| expected.verify_server_identity(response),
                         |_| {
                             dispatched.set(true);
                             Ok(StatusCode::NO_CONTENT)
@@ -354,6 +362,7 @@ mod tests {
                     &expected,
                     VIDEO_ID,
                     || Ok(proven.clone()),
+                    |response| expected.verify_server_identity(response),
                     |_| Ok(StatusCode::NO_CONTENT)
                 )
                 .is_ok()
@@ -372,6 +381,7 @@ mod tests {
                         &expected,
                         VIDEO_ID,
                         || Ok(conflicting),
+                        |response| expected.verify_server_identity(response),
                         |_| panic!("conflicting identity must not dispatch")
                     )
                     .is_err()
@@ -390,9 +400,66 @@ mod tests {
                 &expected,
                 VIDEO_ID,
                 || Ok(response()),
+                |response| expected.verify_server_identity(response),
                 |_| Ok(StatusCode::from_u16(status).unwrap()),
             );
             assert_eq!(result.is_ok(), status == 204);
+        }
+    }
+
+    #[test]
+    fn missing_player_identity_requires_successful_fresh_verification() {
+        let shared = auth::shared(Some(session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        for verified in [false, true] {
+            let dispatched = Cell::new(false);
+            let mut player = response();
+            player["responseContext"]["mainAppWebResponseContext"]
+                .as_object_mut()
+                .unwrap()
+                .remove("datasyncId");
+            let result = report_current_playback(
+                &shared,
+                &expected,
+                VIDEO_ID,
+                || Ok(player),
+                |player| {
+                    assert!(
+                        player
+                            .pointer("/responseContext/mainAppWebResponseContext/datasyncId")
+                            .is_none()
+                    );
+                    ensure!(verified, "Fresh account verification failed");
+                    expected
+                        .verify_server_identity(&json!({"LOGGED_IN":true,"DATASYNC_ID":"user||"}))
+                },
+                |_| {
+                    dispatched.set(true);
+                    Ok(StatusCode::NO_CONTENT)
+                },
+            );
+            assert_eq!(result.is_ok(), verified);
+            assert_eq!(dispatched.get(), verified);
+        }
+    }
+
+    #[test]
+    fn account_changes_during_fresh_verification_prevent_reporting() {
+        for replacement in [None, Some(Arc::new(session()))] {
+            let shared = auth::shared(Some(session()));
+            let expected = shared.read().unwrap().clone().unwrap();
+            let result = report_current_playback(
+                &shared,
+                &expected,
+                VIDEO_ID,
+                || Ok(response()),
+                |_| {
+                    *shared.write().unwrap() = replacement;
+                    Ok(())
+                },
+                |_| panic!("Revoked account must not report playback"),
+            );
+            assert!(result.is_err());
         }
     }
 

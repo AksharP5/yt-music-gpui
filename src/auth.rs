@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -46,6 +47,7 @@ const KEYRING_ATTRIBUTES: [&str; 4] = [
     "credential",
     "youtube-session",
 ];
+const KEYRING_PREFIX: &[u8] = b"yt-music-session-v1:";
 
 // Never derive Debug for reusable account credentials.
 #[derive(Clone, Serialize, Deserialize)]
@@ -97,15 +99,37 @@ impl Session {
             output.status.success(),
             "Could not unlock the saved YouTube Music account"
         );
-        let session: Self = serde_json::from_slice(&output.stdout)
+        Self::from_keyring(&output.stdout).map(Some)
+    }
+    fn from_keyring(value: &[u8]) -> Result<Self> {
+        let decoded;
+        let value = if let Some(encoded) = value.strip_prefix(KEYRING_PREFIX) {
+            decoded = STANDARD
+                .decode(encoded)
+                .context("The saved account is unreadable. Connect again.")?;
+            decoded.as_slice()
+        } else {
+            value
+        };
+        let session: Self = serde_json::from_slice(value)
             .context("The keyring session is unreadable. Connect your account again.")?;
         session.validate()?;
-        Ok(Some(session))
+        Ok(session)
+    }
+    fn keyring_value(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut value = KEYRING_PREFIX.to_vec();
+        value.extend_from_slice(STANDARD.encode(serde_json::to_vec(self)?).as_bytes());
+        // secret-tool's stdin reader truncates input beyond 8192 bytes.
+        ensure!(
+            value.len() <= 8192,
+            "The account session exceeds the desktop keyring helper's storage limit"
+        );
+        Ok(value)
     }
     pub(crate) fn save(&self) -> Result<()> {
-        self.validate()?;
         // A RAM stdin file cannot block on a full pipe while the keyring is locked.
-        let mut input = sealed_file(&serde_json::to_vec(self)?)?;
+        let mut input = sealed_file(&self.keyring_value()?)?;
         input.rewind()?;
         let mut command = Command::new("/usr/bin/secret-tool");
         command
@@ -942,7 +966,14 @@ mod tests {
         let attributes = ["application", "yt-music-gpui-tests", "credential", &id];
         let result = (|| -> Result<()> {
             clear_keyring(&attributes)?;
-            let mut input = sealed_file(b"invented-test-value")?;
+            let mut expected = session("SAPISID=synthetic-keyring-cookie");
+            expected.playback_cookie = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsynthetic-keyring-cookie\n".into();
+            let encoded = expected.keyring_value()?;
+            ensure!(
+                !encoded.contains(&b'\n') && !encoded.contains(&b'\t'),
+                "Session JSON must escape control characters"
+            );
+            let mut input = sealed_file(&encoded)?;
             input.rewind()?;
             let mut store = Command::new("/usr/bin/secret-tool");
             store
@@ -961,8 +992,13 @@ mod tests {
             lookup.arg("lookup").args(attributes).stdin(Stdio::null());
             let output = AccountProcess::output(&mut lookup, None, Duration::from_secs(30))?;
             ensure!(
-                output.status.success() && output.stdout == b"invented-test-value",
+                output.status.success() && output.stdout == encoded,
                 "Synthetic lookup failed"
+            );
+            let decoded = Session::from_keyring(&output.stdout)?;
+            ensure!(
+                decoded.playback_cookie == expected.playback_cookie,
+                "Playback cookies did not survive keyring storage"
             );
             clear_keyring(&attributes)?;
             clear_keyring(&attributes)?;
@@ -991,6 +1027,26 @@ mod tests {
             session("__Secure-3PAPISID=preferred; SAPISID=other").sapisid(),
             Some("preferred")
         );
+    }
+    #[test]
+    fn saved_session_encoding_preserves_cookie_bytes_and_reads_legacy_json() {
+        let mut expected = session("SAPISID=synthetic");
+        expected.playback_cookie = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsynthetic\\value\n".into();
+        let encoded = expected.keyring_value().unwrap();
+        assert!(
+            !encoded
+                .iter()
+                .any(|byte| byte.is_ascii_control() || *byte == b'\\')
+        );
+        let legacy = serde_json::to_vec(&expected).unwrap();
+        for value in [&encoded, &legacy] {
+            let restored = Session::from_keyring(value).unwrap();
+            assert_eq!(restored.playback_cookie, expected.playback_cookie);
+            assert_eq!(restored.cookie, expected.cookie);
+        }
+        assert!(Session::from_keyring(b"yt-music-session-v1:invalid!").is_err());
+        expected.playback_cookie = "x".repeat(8192);
+        assert!(expected.keyring_value().is_err());
     }
     #[test]
     fn playback_identity_requires_consistent_primary_or_brand_context() {
