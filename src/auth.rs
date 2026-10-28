@@ -593,18 +593,9 @@ impl BrowserProfile {
             Path::new("/usr/bin/secret-tool").is_file(),
             "Account connection requires the desktop OS keyring"
         );
-        let mut command = Command::new("/usr/bin/xdg-settings");
-        command
-            .args(["get", "default-web-browser"])
-            .stdin(Stdio::null());
-        let output = AccountProcess::output(&mut command, Some(operation), Duration::from_secs(5))?;
-        ensure!(
-            output.status.success(),
-            "Could not identify your default browser"
-        );
-        let desktop = std::str::from_utf8(&output.stdout)?.trim();
+        let desktop = default_browser(operation)?;
         let profile =
-            serde_json::from_slice(&browser_helper("profile", Path::new(desktop), operation)?)
+            serde_json::from_slice(&browser_helper("profile", Path::new(&desktop), operation)?)
                 .context("Could not identify the default browser profile")?;
         ensure!(!operation.is_cancelled(), "Account connection cancelled");
         // xdg-open reuses the normal browser. It is user-owned and must outlive us.
@@ -654,6 +645,32 @@ impl BrowserProfile {
         ensure!(!operation.is_cancelled(), "Account connection cancelled");
         Session::from_browser(cookie, playback_cookie, &config)
     }
+}
+
+fn default_browser(operation: &Operation) -> Result<String> {
+    let mut command = Command::new("/usr/bin/xdg-settings");
+    command.args(["get", "default-web-browser"]);
+    let read = |command: &mut Command| -> Result<String> {
+        command.stdin(Stdio::null());
+        let output = AccountProcess::output(command, Some(operation), Duration::from_secs(5))?;
+        ensure!(
+            output.status.success(),
+            "Could not identify your default browser"
+        );
+        Ok(std::str::from_utf8(&output.stdout)?.trim().to_owned())
+    };
+    let desktop = read(&mut command)?;
+    if desktop != "omarchy-browser.desktop" {
+        return Ok(desktop);
+    }
+    // Omarchy's link handler delegates to this configured browser resolver.
+    let desktop = read(&mut Command::new("omarchy-cmd-default-browser"))
+        .context("Could not identify the browser configured in Omarchy")?;
+    ensure!(
+        !desktop.is_empty() && desktop != "omarchy-browser.desktop",
+        "Omarchy did not identify its configured browser"
+    );
+    Ok(desktop)
 }
 
 fn browser_helper(mode: &str, value: &Path, operation: &Operation) -> Result<Vec<u8>> {
@@ -790,6 +807,20 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the configured desktop browser and Omarchy resolver; reads profile metadata only"]
+    fn live_default_browser_profile_resolves_omarchy_launcher() -> Result<()> {
+        let operation = Operation::default();
+        let desktop = default_browser(&operation)?;
+        ensure!(
+            desktop != "omarchy-browser.desktop",
+            "Launcher was not resolved"
+        );
+        let _: BrowserProfile =
+            serde_json::from_slice(&browser_helper("profile", Path::new(&desktop), &operation)?)?;
+        Ok(())
+    }
     #[test]
     fn browser_reader_uses_configured_profile_and_scoped_read_only_wal() {
         let mut source = sealed_file(include_bytes!("browser_session.py")).unwrap();

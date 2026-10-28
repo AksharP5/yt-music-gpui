@@ -410,7 +410,49 @@ impl Catalog {
             || self.mutation_request(mutation),
             |endpoint, body| self.request(endpoint, body),
         )?;
-        mutation_effect(mutation, &response)
+        let effect = mutation_effect(mutation, &response)?;
+        let playlist = match (&effect, mutation) {
+            (Effect::CreatedPlaylist { id }, _) => Some(id),
+            (
+                _,
+                Mutation::EditPlaylist { id, .. }
+                | Mutation::AddToPlaylist { id, .. }
+                | Mutation::RemoveFromPlaylist { id, .. }
+                | Mutation::MoveInPlaylist { id, .. },
+            ) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = playlist {
+            self.wait_for_playlist(id, current, expected, |page| {
+                playlist_change_visible(mutation, &response, page)
+            })?;
+        }
+        Ok(effect)
+    }
+
+    fn wait_for_playlist(
+        &self,
+        id: &str,
+        current: &SharedSession,
+        expected: &Arc<Session>,
+        visible: impl Fn(&Page) -> bool,
+    ) -> Result<()> {
+        // Playlist reads can lag an acknowledged write. Retry reads, never the write.
+        for attempt in 0..5 {
+            require_current_session(current, expected)?;
+            let response = self.request("browse", json!({"browseId":format!("VL{}",playlist_id(id))}))
+                .context("YouTube accepted the change, but refreshing the playlist failed. Refresh the playlist.")?;
+            require_current_session(current, expected)?;
+            if response.get("contents").is_some() && visible(&parse_page(&response, "Playlist")?) {
+                return Ok(());
+            }
+            if attempt < 4 {
+                thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        anyhow::bail!(
+            "YouTube accepted the change, but the updated playlist is not available yet. Refresh the playlist."
+        )
     }
 
     fn mutation_request(&self, mutation: &Mutation) -> Result<(&'static str, Value)> {
@@ -554,6 +596,81 @@ impl Catalog {
     }
 }
 
+fn playlist_change_visible(mutation: &Mutation, response: &Value, page: &Page) -> bool {
+    let tracks = page.tracks();
+    match mutation {
+        Mutation::CreatePlaylist {
+            title,
+            description,
+            privacy,
+            initial_video_id,
+        } => {
+            page.title == title.trim()
+                && page.description == *description
+                && page.privacy.as_deref() == Some(privacy.value())
+                && initial_video_id
+                    .as_ref()
+                    .is_none_or(|id| tracks.iter().any(|track| track.id == *id))
+        }
+        Mutation::EditPlaylist {
+            title,
+            description,
+            privacy,
+            ..
+        } => {
+            page.title == title.trim()
+                && page.description == *description
+                && page.privacy.as_deref() == Some(privacy.value())
+        }
+        Mutation::AddToPlaylist { .. } => {
+            let added: Vec<_> = response["playlistEditResults"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|result| {
+                    result
+                        .pointer("/playlistEditVideoAddedResultData/setVideoId")
+                        .and_then(Value::as_str)
+                })
+                .collect();
+            !added.is_empty()
+                && (page.continuation.is_some()
+                    || added.iter().all(|id| {
+                        tracks
+                            .iter()
+                            .any(|track| track.details.set_video_id.as_deref() == Some(id))
+                    }))
+        }
+        Mutation::RemoveFromPlaylist { set_video_id, .. } => !tracks
+            .iter()
+            .any(|track| track.details.set_video_id.as_ref() == Some(set_video_id)),
+        Mutation::MoveInPlaylist {
+            set_video_id,
+            before,
+            ..
+        } => {
+            let position = |id: &str| {
+                tracks
+                    .iter()
+                    .position(|track| track.details.set_video_id.as_deref() == Some(id))
+            };
+            let moved = position(set_video_id);
+            match before {
+                Some(before) => match (moved, position(before)) {
+                    (Some(moved), Some(successor)) => moved + 1 == successor,
+                    (None, None) => page.continuation.is_some(),
+                    _ => false,
+                },
+                None => match moved {
+                    Some(index) => page.continuation.is_none() && index + 1 == tracks.len(),
+                    None => page.continuation.is_some(),
+                },
+            }
+        }
+        _ => true,
+    }
+}
+
 fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
     if let Mutation::CreatePlaylist { .. } = mutation {
         return Ok(Effect::CreatedPlaylist {
@@ -565,7 +682,7 @@ fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
     }
     Ok(Effect::Changed)
 }
-fn confirm_mutation(endpoint: &str, response: &Value) -> Result<()> {
+fn confirm_mutation(endpoint: &str, response: &Value, playlist_id: Option<&str>) -> Result<()> {
     if endpoint == "feedback" {
         let feedback = response["feedbackResponses"]
             .as_array()
@@ -575,10 +692,23 @@ fn confirm_mutation(endpoint: &str, response: &Value) -> Result<()> {
             "YouTube rejected the library change. Refresh and try again."
         );
     }
-    if matches!(endpoint, "browse/edit_playlist" | "playlist/delete") {
+    if endpoint == "browse/edit_playlist" {
         ensure!(
             response["status"] == "STATUS_SUCCEEDED",
             "YouTube did not confirm the playlist change"
+        );
+    }
+    if endpoint == "playlist/delete" {
+        let deleted = response
+            .pointer("/command/commandExecutorCommand/commands")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|command| command.pointer("/handlePlaylistDeletionCommand/playlistId"))
+            .any(|id| id.as_str().is_some_and(|id| Some(id) == playlist_id));
+        ensure!(
+            response["status"] == "STATUS_SUCCEEDED" || deleted,
+            "YouTube did not confirm the playlist deletion"
         );
     }
     if let Some(status) = response["status"].as_str() {
@@ -600,8 +730,12 @@ fn send_current_mutation(
     let (endpoint, body) = prepare()?;
     // Resolving an artist or album can outlive the connected session.
     require_current_session(current, expected)?;
+    let playlist_id = body
+        .get("playlistId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let response = send(endpoint, body)?;
-    confirm_mutation(endpoint, &response)?;
+    confirm_mutation(endpoint, &response, playlist_id.as_deref())?;
     Ok(response)
 }
 
@@ -612,6 +746,197 @@ fn playlist_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn playlist_page(occurrences: &[&str]) -> Page {
+        Page {
+            title: "Renamed".into(),
+            description: "Updated description".into(),
+            privacy: Some("PRIVATE".into()),
+            shelves: vec![crate::catalog::Shelf {
+                title: "Songs".into(),
+                items: occurrences
+                    .iter()
+                    .map(|id| {
+                        let mut track: Track = serde_json::from_value(json!({
+                            "id":"abcdefghijk", "title":"Repeated song", "artist":"Artist"
+                        }))
+                        .unwrap();
+                        track.details.set_video_id = Some((*id).into());
+                        crate::catalog::Item::Track(track)
+                    })
+                    .collect(),
+            }],
+            continuation: None,
+            editable: true,
+            chips: Vec::new(),
+            countries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn playlist_metadata_refresh_waits_for_the_acknowledged_values() {
+        let ready = playlist_page(&["first"]);
+        for mutation in [
+            Mutation::CreatePlaylist {
+                title: " Renamed ".into(),
+                description: "Updated description".into(),
+                privacy: Privacy::Private,
+                initial_video_id: Some("abcdefghijk".into()),
+            },
+            Mutation::EditPlaylist {
+                id: "PLedited".into(),
+                title: " Renamed ".into(),
+                description: "Updated description".into(),
+                privacy: Privacy::Private,
+            },
+        ] {
+            assert!(playlist_change_visible(&mutation, &json!({}), &ready));
+            for stale in [
+                Page {
+                    title: "Old name".into(),
+                    ..ready.clone()
+                },
+                Page {
+                    description: "Old description".into(),
+                    ..ready.clone()
+                },
+                Page {
+                    privacy: Some("PUBLIC".into()),
+                    ..ready.clone()
+                },
+            ] {
+                assert!(!playlist_change_visible(&mutation, &json!({}), &stale));
+            }
+        }
+    }
+
+    #[test]
+    fn playlist_refresh_matches_added_removed_and_moved_occurrences() {
+        let added = Mutation::AddToPlaylist {
+            id: "PLedited".into(),
+            video_ids: vec!["abcdefghijk".into()],
+            duplicates: true,
+        };
+        let response = json!({"playlistEditResults":[{"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"new"}}]});
+        assert!(!playlist_change_visible(
+            &added,
+            &response,
+            &playlist_page(&["original"])
+        ));
+        assert!(playlist_change_visible(
+            &added,
+            &response,
+            &playlist_page(&["original", "new"])
+        ));
+        let removed = Mutation::RemoveFromPlaylist {
+            id: "PLedited".into(),
+            video_id: "abcdefghijk".into(),
+            set_video_id: "new".into(),
+        };
+        assert!(!playlist_change_visible(
+            &removed,
+            &json!({}),
+            &playlist_page(&["original", "new"])
+        ));
+        assert!(playlist_change_visible(
+            &removed,
+            &json!({}),
+            &playlist_page(&["original"])
+        ));
+        let moved = Mutation::MoveInPlaylist {
+            id: "PLedited".into(),
+            set_video_id: "third".into(),
+            before: Some("second".into()),
+        };
+        assert!(!playlist_change_visible(
+            &moved,
+            &json!({}),
+            &playlist_page(&["first", "second", "third"])
+        ));
+        assert!(playlist_change_visible(
+            &moved,
+            &json!({}),
+            &playlist_page(&["first", "third", "second"])
+        ));
+        let to_end = Mutation::MoveInPlaylist {
+            id: "PLedited".into(),
+            set_video_id: "first".into(),
+            before: None,
+        };
+        assert!(!playlist_change_visible(
+            &to_end,
+            &json!({}),
+            &playlist_page(&["first", "second", "third"])
+        ));
+        assert!(playlist_change_visible(
+            &to_end,
+            &json!({}),
+            &playlist_page(&["second", "third", "first"])
+        ));
+    }
+
+    #[test]
+    fn playlist_refresh_does_not_scan_unaffected_pages() {
+        let mut partial = playlist_page(&["visible"]);
+        partial.continuation = parse_page(
+            &json!({"contents":[],"nextContinuationData":{"continuation":"next"}}),
+            "Playlist",
+        )
+        .unwrap()
+        .continuation;
+        let added = Mutation::AddToPlaylist {
+            id: "PLedited".into(),
+            video_ids: vec!["abcdefghijk".into()],
+            duplicates: true,
+        };
+        let response = json!({"playlistEditResults":[{"playlistEditVideoAddedResultData":{"setVideoId":"appended"}}]});
+        assert!(playlist_change_visible(&added, &response, &partial));
+        let moved = Mutation::MoveInPlaylist {
+            id: "PLedited".into(),
+            set_video_id: "later".into(),
+            before: Some("also-later".into()),
+        };
+        assert!(playlist_change_visible(&moved, &json!({}), &partial));
+        let before_visible = Mutation::MoveInPlaylist {
+            id: "PLedited".into(),
+            set_video_id: "later".into(),
+            before: Some("visible".into()),
+        };
+        assert!(!playlist_change_visible(
+            &before_visible,
+            &json!({}),
+            &partial
+        ));
+        let to_end = Mutation::MoveInPlaylist {
+            id: "PLedited".into(),
+            set_video_id: "visible".into(),
+            before: None,
+        };
+        assert!(!playlist_change_visible(&to_end, &json!({}), &partial));
+    }
+
+    #[test]
+    fn playlist_deletion_confirmation_requires_the_requested_id() {
+        let confirmed = json!({"command":{"commandExecutorCommand":{"commands":[
+            {"handlePlaylistDeletionCommand":{"playlistId":"PLdeleted"}},
+            {"removeFromGuideSectionAction":{"guideEntryId":"unrelated"}}
+        ]}}});
+        assert!(confirm_mutation("playlist/delete", &confirmed, Some("PLdeleted")).is_ok());
+        assert!(confirm_mutation("playlist/delete", &confirmed, Some("PLother")).is_err());
+        assert!(confirm_mutation("playlist/delete", &confirmed, None).is_err());
+        assert!(confirm_mutation("playlist/delete", &json!({}), Some("PLdeleted")).is_err());
+        assert!(
+            confirm_mutation(
+                "playlist/delete",
+                &json!({"status":"STATUS_SUCCEEDED"}),
+                Some("PLdeleted")
+            )
+            .is_ok()
+        );
+        let mut failed = confirmed;
+        failed["status"] = json!("STATUS_FAILED");
+        assert!(confirm_mutation("playlist/delete", &failed, Some("PLdeleted")).is_err());
+    }
 
     #[test]
     #[ignore = "requires a public YouTube Music artist read; sends no account mutation"]
@@ -919,20 +1244,22 @@ mod tests {
             json!({"feedbackResponses":[]}),
             json!({"feedbackResponses":[{"isProcessed":false}]}),
         ] {
-            assert!(confirm_mutation("feedback", &response).is_err());
+            assert!(confirm_mutation("feedback", &response, None).is_err());
         }
         assert!(
             confirm_mutation(
                 "feedback",
-                &json!({"feedbackResponses":[{"isProcessed":true}]})
+                &json!({"feedbackResponses":[{"isProcessed":true}]}),
+                None
             )
             .is_ok()
         );
-        assert!(confirm_mutation("browse/edit_playlist", &json!({})).is_err());
+        assert!(confirm_mutation("browse/edit_playlist", &json!({}), None).is_err());
         assert!(
             confirm_mutation(
                 "browse/edit_playlist",
-                &json!({"status":"STATUS_SUCCEEDED"})
+                &json!({"status":"STATUS_SUCCEEDED"}),
+                None
             )
             .is_ok()
         );

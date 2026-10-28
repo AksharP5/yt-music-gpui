@@ -1,5 +1,19 @@
 # Account security reviews
 
+## 2026-10-28 playlist and reconnection follow-up
+
+The saved session was rejected by YouTube before any test mutation. Reconnection then exposed an Omarchy compatibility bug: xdg-settings returned `omarchy-browser.desktop`, which is a router rather than the underlying browser. The app now uses Omarchy's own `omarchy-cmd-default-browser` resolver for that entry. Both resolver processes use the existing cancellation and five-second deadline. Profile selection, the explicit cookie-read action, account preview and identity checks remain unchanged.
+
+A fresh browser session matched the exact previously confirmed stable account identity, verified against YouTube and loaded liked music. That session was saved and restored byte-for-byte, then verified again. Switching between different Google or brand accounts remains unverified.
+
+Live playlist checks reproduced two failures. A new playlist could initially return no contents, and an edit could initially return its previous metadata or occurrences after the service acknowledged the write. The account worker now retries only reads until the visible first-page state matches the acknowledged change. The limit is five reads with 500 ms between attempts. Each read checks the exact current session; network errors stop polling. Appended items and reorders outside the first page do not trigger a full-playlist scan. If the state remains unavailable, the error says the write was accepted and asks for a refresh. It never resubmits the mutation.
+
+Deletion succeeded on the server but returned a command instead of `STATUS_SUCCEEDED`. The parser now also accepts `handlePlaylistDeletionCommand` when it names the exact requested playlist. Empty responses, another playlist's command and an explicit failure status remain rejected.
+
+A disposable private playlist passed creation with its initial song, title and description changes, private visibility retention, adding a second song and a duplicate, distinct duplicate occurrence IDs, reordering one occurrence, removing only that occurrence, account-library discovery, editable-picker discovery and deletion. Fresh service reads checked the results after each operation. The deleted playlist was absent from the account library. Earlier diagnostic attempts were also deleted; no existing playlist was edited. Temporary account diagnostics and recovery records were removed, and credentials and action tokens were not logged or committed.
+
+Validation passed all 146 ordinary tests, strict all-target Clippy, formatting, the metadata-only default-browser integration and the release build. The installed binary matches the verified release artifact. Native playlist controls, public/unlisted visibility changes, a different-account switch, ratings and other library mutations remain unverified. The automation driver captured the existing native Wayland window but refused targeted input because its Hyprland input plugin was unavailable; the installed update requires closing and reopening that running app.
+
 ## 2026-10-28 signed-in history, restoration and search
 
 Three real-account failures were reproduced and fixed. The player response omitted stable account proof, so successful playback produced a history error. History now uses the existing fresh-page verification when API proof is absent. Explicit identity conflicts and logout still fail closed. The exact session is checked around both reads and before dispatch; the requested video, allowed destination and HTTP 204 acknowledgement remain required.
