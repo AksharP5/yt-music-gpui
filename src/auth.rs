@@ -169,11 +169,101 @@ impl Session {
         Ok(())
     }
     pub fn verify_server_identity(&self, response: &Value) -> Result<()> {
-        self.validate_playback_identity()?;
         ensure!(
-            response["LOGGED_IN"] != false
-                && response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
-                    != Some(&json!(true)),
+            self.server_identity_confirmed(response)?,
+            "YouTube Music did not confirm the selected account"
+        );
+        Ok(())
+    }
+    /// The shared API client must reject redirects before forwarding credentials.
+    pub fn verify_account_identity(
+        &self,
+        response: &Value,
+        client: &reqwest::blocking::Client,
+    ) -> Result<()> {
+        // Missing API proof may use the page bootstrap. Conflicting proof must never retry.
+        if self.server_identity_confirmed(response)? {
+            return Ok(());
+        }
+        let mut request = self.apply(
+            client
+                .get(format!("{ORIGIN}/"))
+                .query(&[("authuser", &self.authuser)])
+                .header("Origin", ORIGIN)
+                .header("Cache-Control", "no-cache")
+                .header("Referer", format!("{ORIGIN}/")),
+        )?;
+        if let Some(delegated) = &self.delegated_session_id {
+            request = request.header("X-Goog-PageId", delegated);
+        }
+        let page = request
+            .send()
+            .map_err(reqwest::Error::without_url)
+            .context("Could not verify the selected YouTube Music account")?;
+        ensure!(
+            page.status() == reqwest::StatusCode::OK,
+            "YouTube Music did not return an account verification page (HTTP {})",
+            page.status().as_u16()
+        );
+        self.verify_html_identity(page)
+    }
+    fn verify_html_identity(&self, page: impl Read) -> Result<()> {
+        const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+        let mut html = String::new();
+        page.take((MAX_PAGE_BYTES + 1) as u64)
+            .read_to_string(&mut html)
+            .context("Could not read the account verification page")?;
+        ensure!(
+            html.len() <= MAX_PAGE_BYTES,
+            "YouTube Music returned an oversized account verification page"
+        );
+        // The first ytcfg.set call is the JSON bootstrap used by yt-dlp's extract_ytcfg.
+        // Later calls can contain JavaScript expressions; never execute or merge those.
+        let (_, bootstrap) = html
+            .split_once("ytcfg.set(")
+            .context("YouTube Music returned no account configuration")?;
+        let bootstrap = bootstrap.trim_start();
+        let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
+        let config = values
+            .next()
+            .transpose()
+            .context("YouTube Music returned an invalid account configuration")?
+            .context("YouTube Music returned no account configuration")?;
+        ensure!(
+            bootstrap[values.byte_offset()..]
+                .trim_start()
+                .starts_with(')'),
+            "YouTube Music returned an invalid account configuration"
+        );
+        ensure!(
+            config["LOGGED_IN"] == true,
+            "YouTube Music did not accept the account session. Connect again."
+        );
+        ensure!(
+            config.get("DATASYNC_ID").is_some(),
+            "YouTube Music did not confirm the selected account"
+        );
+        self.verify_server_identity(&config)
+    }
+    fn server_identity_confirmed(&self, response: &Value) -> Result<bool> {
+        self.validate_playback_identity()?;
+        let logged_out = response
+            .pointer("/responseContext/serviceTrackingParams")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|service| service["params"].as_array())
+            .flatten()
+            .any(|parameter| {
+                matches!(parameter["key"].as_str(), Some("logged_in" | "yt_li"))
+                    && parameter["value"] == "0"
+            });
+        ensure!(
+            !logged_out
+                && response.get("LOGGED_IN").is_none_or(|value| value == true)
+                && response
+                    .pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+                    .is_none_or(|value| value == false),
             "YouTube Music did not accept the account session. Connect again."
         );
         let identities = [
@@ -186,10 +276,6 @@ impl Session {
                 .flatten()
                 .all(|value| value.as_str() == Some(self.data_sync_id.as_str())),
             "YouTube Music returned a different account"
-        );
-        ensure!(
-            identities.iter().any(Option::is_some),
-            "YouTube Music did not confirm the selected account"
         );
         if let Some(index) = response.get("SESSION_INDEX") {
             ensure!(
@@ -214,7 +300,7 @@ impl Session {
                 );
             }
         }
-        Ok(())
+        Ok(identities.iter().any(Option::is_some))
     }
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -946,6 +1032,128 @@ mod tests {
         assert!(s.validate_playback_identity().is_ok());
         s.data_sync_id.clear();
         assert!(s.validate_playback_identity().is_err());
+    }
+    #[test]
+    fn account_menu_proof_distinguishes_absence_from_conflicting_identity() {
+        let s = session("SAPISID=synthetic");
+        assert!(!s.server_identity_confirmed(&json!({})).unwrap());
+        let proof = json!({"responseContext":{"mainAppWebResponseContext":{
+            "datasyncId":"synthetic-user||", "loggedOut":false
+        }}});
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        // A menu with complete proof needs no page request.
+        s.verify_account_identity(&proof, &client).unwrap();
+        for invalid in [
+            json!({"DATASYNC_ID":"other||"}),
+            json!({"DATASYNC_ID":null}),
+            json!({"LOGGED_IN":false}),
+            json!({"LOGGED_IN":"true"}),
+            json!({"responseContext":{"mainAppWebResponseContext":{"loggedOut":true}}}),
+            json!({"responseContext":{"serviceTrackingParams":[{
+                "service":"GFEEDBACK", "params":[{"key":"logged_in","value":"0"}]
+            }]}}),
+            json!({"responseContext":{"serviceTrackingParams":[{
+                "service":"CSI", "params":[{"key":"yt_li","value":"0"}]
+            }]}}),
+            json!({"SESSION_INDEX":1}),
+            json!({"USER_SESSION_ID":"other"}),
+            json!({"DELEGATED_SESSION_ID":"other"}),
+        ] {
+            let error = s.verify_account_identity(&invalid, &client).unwrap_err();
+            assert!(
+                error.to_string().contains("different account")
+                    || error.to_string().contains("did not accept"),
+                "Conflicting proof must fail before requesting HTML: {error:#}"
+            );
+        }
+    }
+    #[test]
+    fn html_account_proof_matches_primary_and_brand_bootstraps() {
+        for (identity, delegated, user) in [
+            ("synthetic-user||", None, "synthetic-user"),
+            ("brand||user", Some("brand"), "user"),
+        ] {
+            let mut s = session("SAPISID=synthetic");
+            s.authuser = "2".into();
+            s.data_sync_id = identity.into();
+            s.delegated_session_id = delegated.map(str::to_owned);
+            let config = json!({
+                "LOGGED_IN":true, "DATASYNC_ID":identity, "SESSION_INDEX":"2",
+                "USER_SESSION_ID":user, "DELEGATED_SESSION_ID":delegated,
+                "nested":{"text":"quoted \" } ); ytcfg.set( and braces { }"}
+            });
+            // Current Music HTML has a JSON bootstrap followed by non-JSON ytcfg calls.
+            let html = format!(
+                "<script>var ytcfg={{}};\nytcfg.set({config});</script>\
+                 <script>ytcfg.set({{'CSI_SERVICE_NAME': 'youtube_web_music'}})</script>"
+            );
+            s.verify_html_identity(html.as_bytes()).unwrap();
+        }
+    }
+    #[test]
+    fn html_account_proof_rejects_missing_conflicting_and_logged_out_identity() {
+        let s = session("SAPISID=synthetic");
+        let valid = json!({
+            "LOGGED_IN":true, "DATASYNC_ID":"synthetic-user||", "SESSION_INDEX":0
+        });
+        for (key, value) in [
+            ("LOGGED_IN", json!(false)),
+            ("LOGGED_IN", json!("true")),
+            ("DATASYNC_ID", json!("other||")),
+            ("DATASYNC_ID", Value::Null),
+            ("SESSION_INDEX", json!(1)),
+            ("USER_SESSION_ID", json!("other")),
+            ("DELEGATED_SESSION_ID", json!("brand")),
+            (
+                "responseContext",
+                json!({"mainAppWebResponseContext":{"datasyncId":"other||"}}),
+            ),
+            (
+                "responseContext",
+                json!({"mainAppWebResponseContext":{"loggedOut":true}}),
+            ),
+        ] {
+            let mut config = valid.clone();
+            config[key] = value;
+            let html = format!("<script>ytcfg.set({config});</script>");
+            assert!(s.verify_html_identity(html.as_bytes()).is_err(), "{key}");
+        }
+        for missing in ["LOGGED_IN", "DATASYNC_ID"] {
+            let mut config = valid.clone();
+            config.as_object_mut().unwrap().remove(missing);
+            let html = format!("<script>ytcfg.set({config});</script>");
+            assert!(
+                s.verify_html_identity(html.as_bytes()).is_err(),
+                "{missing}"
+            );
+        }
+    }
+    #[test]
+    fn html_account_proof_rejects_malformed_and_oversized_pages() {
+        let s = session("SAPISID=synthetic");
+        for html in [
+            "<html>No bootstrap</html>",
+            "ytcfg.set(",
+            "ytcfg.set({'LOGGED_IN': true});",
+            "ytcfg.set({\"LOGGED_IN\":true}",
+            "ytcfg.set([])",
+            "ytcfg.set({\"LOGGED_IN\":true}+other)",
+        ] {
+            assert!(s.verify_html_identity(html.as_bytes()).is_err());
+        }
+        let html = format!(
+            "ytcfg.set({{\"LOGGED_IN\":true,\"DATASYNC_ID\":\"synthetic-user||\"}});{}",
+            " ".repeat(4 * 1024 * 1024)
+        );
+        assert!(
+            s.verify_html_identity(html.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("oversized")
+        );
     }
     #[test]
     fn credentials_are_redacted_in_request_debug() {

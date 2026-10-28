@@ -1,6 +1,8 @@
 use crate::{
     auth::{self, Operation, Session, SharedSession},
-    catalog::{Account, Catalog, Collection, Page, Rating, Track, find, parse_page},
+    catalog::{
+        Account, ArtistSubscription, Catalog, Collection, Page, Rating, Track, find, parse_page,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -154,7 +156,13 @@ impl Connection {
         Ok(Self { account, session })
     }
 
-    fn publish(self, shared: &SharedSession, operation: &Operation) -> Result<Self> {
+    pub fn activate(
+        self,
+        shared: &SharedSession,
+        operation: &Operation,
+        playback: Result<(), String>,
+    ) -> Result<Self> {
+        playback.map_err(anyhow::Error::msg)?;
         let mut current = shared
             .write()
             .map_err(|_| anyhow::anyhow!("Account connection is unavailable"))?;
@@ -243,15 +251,14 @@ pub fn start(
             while let Ok(command) = commands.recv_blocking() {
                 let event = match command {
                     Command::Connect(operation) => {
-                        let result = (|| {
+                        let result = (|| -> Result<Option<Connection>> {
                             let (candidate, account) = auth::connect(&operation, |message| {
                                 let _ = events.send_blocking(Event::ConnectionNotice {
                                     operation: operation.clone(),
                                     message,
                                 });
                             })?;
-                            Connection { session: Arc::new(candidate), account }
-                                .publish(&session, &operation).map(Some)
+                            Ok(Some(Connection { session: Arc::new(candidate), account }))
                         })().map_err(|e| format!("{e:#}"));
                         Event::Connected { operation, result, save_session: true }
                     }
@@ -263,7 +270,7 @@ pub fn start(
                             ensure!(!operation.is_cancelled(), "Account connection cancelled");
                             candidate.map(|candidate| {
                                 let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                                Connection::verify(candidate, catalog)?.publish(&session, &operation)
+                                Connection::verify(candidate, catalog)
                             }).transpose()
                         })();
                         Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")), save_session: false }
@@ -277,9 +284,8 @@ pub fn start(
                     }
                     Command::Apply { session: expected, mutation } => {
                         let result = (|| {
-                            require_current_session(&session, &expected)?;
                             catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?
-                                .for_session(Some(expected.clone())).mutate(&mutation)
+                                .for_session(Some(expected.clone())).mutate(&mutation, &session)
                         })().map_err(|e| format!("{e:#}"));
                         Event::Applied { session: expected, mutation, result }
                     }
@@ -383,11 +389,17 @@ impl Catalog {
         ensure!(self.session.is_some(), "Connect your Google account first");
         Ok(())
     }
-    pub fn mutate(&self, mutation: &Mutation) -> Result<Effect> {
-        self.require_account()?;
-        let (endpoint, body) = self.mutation_request(mutation)?;
-        let response = self.request(endpoint, body)?;
-        confirm_mutation(endpoint, &response)?;
+    pub fn mutate(&self, mutation: &Mutation, current: &SharedSession) -> Result<Effect> {
+        let expected = self
+            .session
+            .as_ref()
+            .context("Connect your Google account first")?;
+        let response = send_current_mutation(
+            current,
+            expected,
+            || self.mutation_request(mutation),
+            |endpoint, body| self.request(endpoint, body),
+        )?;
         mutation_effect(mutation, &response)
     }
 
@@ -409,13 +421,16 @@ impl Catalog {
             }
             Mutation::CollectionLibrary { collection, save } => {
                 if collection.id.starts_with("UC") {
+                    // An artist browse ID can differ from its subscribable channel.
+                    let data = self.request("browse", json!({"browseId":collection.id}))?;
+                    let subscription = ArtistSubscription::from_response(&data)?;
                     (
                         if *save {
                             "subscription/subscribe"
                         } else {
                             "subscription/unsubscribe"
                         },
-                        json!({"channelIds":[collection.id]}),
+                        json!({"channelIds":[subscription.channel_id]}),
                     )
                 } else {
                     let canonical = collection.id.strip_prefix("VL").map(str::to_owned);
@@ -565,6 +580,21 @@ fn confirm_mutation(endpoint: &str, response: &Value) -> Result<()> {
     Ok(())
 }
 
+fn send_current_mutation(
+    current: &SharedSession,
+    expected: &Arc<Session>,
+    prepare: impl FnOnce() -> Result<(&'static str, Value)>,
+    send: impl FnOnce(&str, Value) -> Result<Value>,
+) -> Result<Value> {
+    require_current_session(current, expected)?;
+    let (endpoint, body) = prepare()?;
+    // Resolving an artist or album can outlive the connected session.
+    require_current_session(current, expected)?;
+    let response = send(endpoint, body)?;
+    confirm_mutation(endpoint, &response)?;
+    Ok(response)
+}
+
 fn playlist_id(id: &str) -> &str {
     id.strip_prefix("VL").unwrap_or(id)
 }
@@ -572,6 +602,32 @@ fn playlist_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a public YouTube Music artist read; sends no account mutation"]
+    fn live_artist_subscription_request_uses_the_canonical_channel() {
+        let catalog = Catalog::new().unwrap();
+        let artist = Collection {
+            id: "UCmMUZbaYdNH0bEd1PAlAqsA".into(),
+            title: "Oasis".into(),
+            subtitle: String::new(),
+            thumbnail: None,
+            details: Default::default(),
+        };
+        for (save, expected_endpoint) in [
+            (true, "subscription/subscribe"),
+            (false, "subscription/unsubscribe"),
+        ] {
+            let (endpoint, body) = catalog
+                .mutation_request(&Mutation::CollectionLibrary {
+                    collection: artist.clone(),
+                    save,
+                })
+                .unwrap();
+            assert_eq!(endpoint, expected_endpoint);
+            assert_eq!(body, json!({"channelIds":["UCUDVBtnOQi4c7E8jebpjc9Q"]}));
+        }
+    }
 
     #[test]
     fn playlist_creation_includes_the_submitted_song_in_its_request() {
@@ -622,6 +678,45 @@ mod tests {
         assert!(require_current_session(&shared, &expected).is_err());
     }
     #[test]
+    fn resolved_mutations_are_not_sent_after_sign_out_or_account_replacement() {
+        for replacement in [None, Some(Arc::new(synthetic_session()))] {
+            let shared = auth::shared(Some(synthetic_session()));
+            let expected = shared.read().unwrap().clone().unwrap();
+            let result = send_current_mutation(
+                &shared,
+                &expected,
+                || {
+                    *shared.write().unwrap() = replacement;
+                    Ok((
+                        "subscription/subscribe",
+                        json!({"channelIds":["UCresolved"]}),
+                    ))
+                },
+                |_, _| panic!("A revoked account must not send the resolved mutation"),
+            );
+            assert!(result.is_err());
+        }
+
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        send_current_mutation(
+            &shared,
+            &expected,
+            || {
+                Ok((
+                    "subscription/subscribe",
+                    json!({"channelIds":["UCresolved"]}),
+                ))
+            },
+            |endpoint, body| {
+                assert_eq!(endpoint, "subscription/subscribe");
+                assert_eq!(body, json!({"channelIds":["UCresolved"]}));
+                Ok(json!({"status":"STATUS_SUCCEEDED"}))
+            },
+        )
+        .unwrap();
+    }
+    #[test]
     fn rejected_candidate_preserves_the_previous_verified_session() {
         let shared = auth::shared(Some(synthetic_session()));
         let expected = shared.read().unwrap().clone().unwrap();
@@ -631,6 +726,38 @@ mod tests {
         candidate.client_version = "invalid\nclient".into();
         assert!(Connection::verify(candidate, &catalog).is_err());
         assert!(require_current_session(&shared, &expected).is_ok());
+    }
+    #[test]
+    fn activation_requires_playback_success_and_preserves_the_previous_session_on_failure() {
+        for previous in [None, Some(synthetic_session())] {
+            let shared = auth::shared(previous);
+            let previous = shared.read().unwrap().clone();
+            let candidate = Connection {
+                session: Arc::new(synthetic_session()),
+                account: Account {
+                    name: "Candidate".into(),
+                    handle: String::new(),
+                },
+            };
+            let operation = Operation::default();
+            assert!(
+                candidate
+                    .clone()
+                    .activate(
+                        &shared,
+                        &operation,
+                        Err("Player installation failed".into())
+                    )
+                    .is_err()
+            );
+            match previous {
+                Some(previous) => assert!(require_current_session(&shared, &previous).is_ok()),
+                None => assert!(shared.read().unwrap().is_none()),
+            }
+            assert!(require_current_session(&shared, &candidate.session).is_err());
+            let activated = candidate.activate(&shared, &operation, Ok(())).unwrap();
+            assert!(require_current_session(&shared, &activated.session).is_ok());
+        }
     }
     #[test]
     fn cancelled_connection_cannot_publish_after_sign_out() {
@@ -647,7 +774,7 @@ mod tests {
         };
         operation.cancel();
         *shared.write().unwrap() = None;
-        assert!(candidate.publish(&shared, &completion).is_err());
+        assert!(candidate.activate(&shared, &completion, Ok(())).is_err());
         assert!(shared.read().unwrap().is_none());
         assert!(!operation.matches(&completion));
         assert!(require_current_session(&shared, &old_session).is_err());

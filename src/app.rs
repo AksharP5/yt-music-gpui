@@ -295,6 +295,7 @@ enum Drag {
 enum AccountOperation {
     Restoring(Operation),
     Connecting(Operation),
+    Activating(Operation),
     Disconnecting(Operation),
     DisconnectFailed,
 }
@@ -703,9 +704,12 @@ impl Music {
         cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
+                let theme = cx
+                    .background_executor()
+                    .spawn(async { Theme::load() })
+                    .await;
                 if view
                     .update_in(cx, |view, _, cx| {
-                        let theme = Theme::load();
                         if theme != view.theme {
                             view.theme = theme;
                             view.search
@@ -1341,6 +1345,9 @@ impl Music {
                     self.page.shelves.extend(page.shelves);
                 } else {
                     self.page = page;
+                    if matches!(self.overlay, Some(Overlay::Track { .. })) {
+                        self.overlay = None;
+                    }
                 }
                 for track in self.page.tracks() {
                     if self.account.is_some()
@@ -1468,7 +1475,9 @@ impl Music {
             return;
         }
         if let Some(
-            AccountOperation::Connecting(operation) | AccountOperation::Restoring(operation),
+            AccountOperation::Connecting(operation)
+            | AccountOperation::Restoring(operation)
+            | AccountOperation::Activating(operation),
         ) = self.account_operation.take()
         {
             operation.cancel();
@@ -1714,14 +1723,27 @@ impl Music {
                 {
                     return;
                 }
-                self.account_operation = None;
                 match result {
                     Ok(Some(connection)) => {
-                        let label = format!("Connected as {}", connection.account.name);
-                        let credentials = match connection.session.playback_credentials() {
-                            Ok(credentials) => credentials,
+                        let installation =
+                            connection
+                                .session
+                                .playback_credentials()
+                                .and_then(|credentials| {
+                                    self.player
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "The audio player is unavailable. Restart the app."
+                                            )
+                                        })?
+                                        .set_credentials(credentials)
+                                });
+                        let response = match installation {
+                            Ok(response) => response,
                             Err(error) => {
-                                self.disconnect_account(cx);
+                                self.account_operation = None;
+                                self.notice = None;
                                 self.error = Some(format!(
                                     "Could not activate playback credentials: {error:#}"
                                 ));
@@ -1729,29 +1751,58 @@ impl Music {
                                 return;
                             }
                         };
-                        let session = connection.session.clone();
-                        self.account = Some(connection);
-                        self.clear_account_state(cx);
-                        window.focus(&self.focus, cx);
-                        self.navigate(Route::Home, cx);
-                        self.back.clear();
-                        self.player_command(Player::clear_cookies);
+                        self.account_operation =
+                            Some(AccountOperation::Activating(operation.clone()));
+                        self.notice = Some("Preparing account playback…".into());
+                        self.playback_generation.fetch_add(1, Ordering::Relaxed);
+                        self.watch_pending = false;
+                        self.discard_pending_playback();
+                        self.reset_radio();
+                        self.queue_waiting = None;
                         self.active_id = None;
+                        self.pending_seek = None;
+                        self.seekable = false;
                         self.playback = Playback::Stopped;
-                        self.player_command(|p| p.set_credentials(credentials));
-                        if save_session
-                            && self
-                                .account_commands
-                                .try_send(account::Command::Persist(session))
-                                .is_err()
-                        {
-                            self.error = Some("Connected for this session, but the account could not be queued for keyring storage.".into());
-                        }
-                        self.notice = Some(label);
-                        self.refresh_current_account(cx);
+                        cx.spawn_in(window, async move |view, cx| {
+                            let result = response.recv().await.unwrap_or_else(|_| {
+                                Err("The player stopped before confirming the account. Restart the app.".into())
+                            });
+                            let _ = view.update_in(cx, |view, window, cx| {
+                                if !matches!(&view.account_operation, Some(AccountOperation::Activating(active)) if active.matches(&operation)) {
+                                    return;
+                                }
+                                view.account_operation = None;
+                                view.notice = None;
+                                match connection.activate(&view.session, &operation, result) {
+                                    Ok(connection) => {
+                                        let label = format!("Connected as {}", connection.account.name);
+                                        let session = connection.session.clone();
+                                        view.account = Some(connection);
+                                        view.clear_account_state(cx);
+                                        window.focus(&view.focus, cx);
+                                        view.navigate(Route::Home, cx);
+                                        view.back.clear();
+                                        if save_session && view.account_commands.try_send(account::Command::Persist(session)).is_err() {
+                                            view.error = Some("Connected for this session, but the account could not be queued for keyring storage.".into());
+                                        }
+                                        view.notice = Some(label);
+                                        view.refresh_current_account(cx);
+                                    }
+                                    Err(error) => view.error = Some(format!("Could not activate the account: {error:#}")),
+                                }
+                                cx.notify();
+                            });
+                        }).detach();
                     }
-                    Ok(None) => {}
-                    Err(error) => self.error = Some(error),
+                    Ok(None) => {
+                        self.account_operation = None;
+                        self.notice = None;
+                    }
+                    Err(error) => {
+                        self.account_operation = None;
+                        self.notice = None;
+                        self.error = Some(error);
+                    }
                 }
             }
             account::Event::Applied {
@@ -1925,6 +1976,12 @@ impl Music {
         self.play_current_at(0., false, cx);
     }
     fn play_current_at(&mut self, start: f64, paused: bool, cx: &mut Context<Self>) {
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::Activating(_))
+        ) {
+            return;
+        }
         self.queue_waiting = None;
         let Some(track) = self.library.queue.current().cloned() else {
             return;
@@ -2140,16 +2197,6 @@ impl Music {
         self.error = None;
         Ok(())
     }
-    fn replace_queue(&mut self, tracks: Vec<Track>, selected: usize, cx: &mut Context<Self>) {
-        self.queue_source.cancel();
-        self.queue_waiting = None;
-        self.video_open = self.library.video;
-        self.reset_radio();
-        self.now_playing = None;
-        self.library.queue.replace(tracks, selected);
-        self.play_current(cx);
-    }
-
     fn replace_page_queue(&mut self, selected: usize, cx: &mut Context<Self>) {
         self.video_open = self.library.video;
         self.queue_waiting = None;
@@ -2269,21 +2316,19 @@ impl Music {
         self.save();
         cx.notify();
     }
-    fn play_item(&mut self, item: Item, cx: &mut Context<Self>) {
+    fn play_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(item) = self.rows.get(index).cloned() else {
+            return;
+        };
         match item {
             Item::Navigation(link) => self.navigate(Route::Browse(link), cx),
             Item::Collection(collection) => self.navigate(
                 Route::Browse(BrowseLink::new(collection.id, collection.title)),
                 cx,
             ),
-            Item::Track(track) => {
-                let tracks = self.page.tracks();
-                if let Some(index) = tracks.iter().position(|t| {
-                    t.id == track.id && t.details.set_video_id == track.details.set_video_id
-                }) {
-                    self.replace_page_queue(index, cx);
-                } else {
-                    self.replace_queue(vec![track], 0, cx);
+            Item::Track(_) => {
+                if let Some(selected) = self.page.track_index(index) {
+                    self.replace_page_queue(selected, cx);
                 }
             }
         }
@@ -3153,7 +3198,13 @@ impl Music {
                     .text_color(self.theme.muted)
                     .hover(|d| d.text_color(self.theme.text))
                     .child("Refresh")
-                    .on_click(cx.listener(|view, _, _, cx| view.navigate(view.route.clone(), cx))),
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if view.account.is_some() {
+                            view.refresh_remote(cx);
+                        } else {
+                            view.navigate(view.route.clone(), cx);
+                        }
+                    })),
             )
     }
     fn card(&mut self, item: Item, id: usize, cx: &Context<Self>) -> AnyElement {
@@ -3194,7 +3245,7 @@ impl Music {
             )
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
-                view.play_item(item.clone(), cx);
+                view.play_item(id, cx);
             }))
             .into_any_element()
     }
@@ -3221,6 +3272,10 @@ impl Music {
     }
     fn shelf(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let title = self.page.shelves[index].title.clone();
+        let start = self.page.shelves[..index]
+            .iter()
+            .map(|shelf| shelf.items.len())
+            .sum::<usize>();
         let mut contents = div()
             .id(("carousel", index))
             .w_full()
@@ -3248,9 +3303,7 @@ impl Music {
                                 .iter()
                                 .cloned()
                                 .enumerate()
-                                .map(|(row, item)| {
-                                    self.card(item, index * 1000 + column * 4 + row, cx)
-                                })
+                                .map(|(row, item)| self.card(item, start + column * 4 + row, cx))
                                 .collect::<Vec<_>>(),
                         ),
                 );
@@ -3286,7 +3339,7 @@ impl Music {
                                         .into_iter()
                                         .enumerate()
                                         .map(|(i, item)| {
-                                            self.card(item, index * 1000 + range.start + i, cx)
+                                            self.card(item, start + range.start + i, cx)
                                         })
                                         .collect::<Vec<_>>(),
                                 ),
@@ -3320,7 +3373,6 @@ impl Music {
         let art = self.art(item.thumbnail(), 46.);
         let title = item.title().to_owned();
         let subtitle = item.subtitle().to_owned();
-        let cloned = item.clone();
         let mut row = div()
             .id(("song", index))
             .w_full()
@@ -3335,7 +3387,7 @@ impl Music {
             .cursor_pointer()
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
-                view.play_item(cloned.clone(), cx);
+                view.play_item(index, cx);
             }))
             .child(art)
             .child(
@@ -4928,14 +4980,18 @@ impl Music {
                 Some(AccountOperation::Connecting(_))
             );
             let restoring = matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
+            let activating = matches!(
+                self.account_operation,
+                Some(AccountOperation::Activating(_))
+            );
             body=body.child(div().mt(px(28.)).text_size(px(15.)).child(label))
                 .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if disconnect_failed {"Sign-out incomplete"}else if connecting {"Use selected Google account"}else if restoring {"Restoring account…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
+                    .child(if !auth::ACCOUNT_LOGIN_ENABLED {"Sign-in unavailable during security review"}else if matches!(self.account_operation, Some(AccountOperation::Disconnecting(_))) {"Signing out…"}else if disconnect_failed {"Sign-out incomplete"}else if connecting {"Use selected Google account"}else if restoring {"Restoring account…"}else if activating {"Preparing account playback…"}else if self.account.is_some(){"Switch or reconnect account"}else{"Connect Google account"})
                     .on_click(cx.listener(|view,_,_,cx|view.connect_account(cx))))
                 .when(connecting, |body| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child("Sign in and select your Google or brand account in the Google window, then return here.")))
                 .when(connecting || restoring, |body| body.child(div().id("cancel-connection").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Cancel connection").on_click(cx.listener(|view,_,_,cx|view.cancel_connection(cx)))))
                 .when_some(self.error.as_ref(), |body, error| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(rgb(0xf1a6ae)).child(error.clone())))
-                .when(self.account.is_some() || disconnect_failed, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
+                .when(self.account.is_some() || disconnect_failed || activating, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
                 .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
                 .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
         } else if let Overlay::Description { title, text } = kind {
@@ -5236,7 +5292,8 @@ impl Music {
                         },
                     ));
                 }
-                if self.page.editable
+                if index.is_some()
+                    && self.page.editable
                     && let Route::Browse(link) = &self.route
                     && let Some(set_id) = &track.details.set_video_id
                 {
@@ -5259,7 +5316,7 @@ impl Music {
                             );
                         },
                     ));
-                    if let Some(index) = index {
+                    if let Some(index) = index.and_then(|index| self.page.track_index(index)) {
                         let tracks = self.page.tracks();
                         for (key, label, before) in [
                             (
@@ -5276,7 +5333,7 @@ impl Music {
                                 "Move down",
                                 playlist_move_down(
                                     &tracks,
-                                    *index,
+                                    index,
                                     self.page.continuation.is_some(),
                                 ),
                             ),
@@ -5413,7 +5470,7 @@ impl Music {
                     .iter()
                     .flat_map(|shelf| &shelf.items)
                     .filter_map(|item| match item {
-                        Item::Collection(collection) if collection.id.starts_with("VL") => {
+                        Item::Collection(collection) if collection.details.editable => {
                             Some(collection)
                         }
                         _ => None,
@@ -5532,7 +5589,9 @@ impl Music {
 impl Drop for Music {
     fn drop(&mut self) {
         if let Some(
-            AccountOperation::Connecting(operation) | AccountOperation::Restoring(operation),
+            AccountOperation::Connecting(operation)
+            | AccountOperation::Restoring(operation)
+            | AccountOperation::Activating(operation),
         ) = &self.account_operation
         {
             operation.cancel();

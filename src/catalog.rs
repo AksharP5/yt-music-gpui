@@ -20,8 +20,7 @@ pub struct Account {
 }
 
 impl Account {
-    fn from_response(data: &Value, session: &Session) -> Result<Self> {
-        session.verify_server_identity(data)?;
+    fn from_response(data: &Value) -> Result<Self> {
         let header = find(data, "activeAccountHeaderRenderer")
             .context("Google did not accept the account session. Connect again.")?;
         let name = text(&header["accountName"]);
@@ -147,6 +146,44 @@ impl TrackDetails {
 pub struct CollectionDetails {
     pub playlist_id: Option<String>,
     pub saved: Option<bool>,
+    #[serde(skip)]
+    pub editable: bool,
+}
+
+pub(crate) struct ArtistSubscription {
+    pub channel_id: String,
+    pub subscribed: bool,
+}
+
+impl ArtistSubscription {
+    pub(crate) fn from_response(data: &Value) -> Result<Self> {
+        let button = data
+            .pointer(
+                "/header/musicImmersiveHeaderRenderer/subscriptionButton/subscribeButtonRenderer",
+            )
+            .context("YouTube did not provide this artist's subscription")?;
+        Self::from_button(button)
+    }
+
+    fn from_button(button: &Value) -> Result<Self> {
+        let channel_id = button["channelId"]
+            .as_str()
+            .filter(|id| {
+                id.starts_with("UC")
+                    && id.len() == 24
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            })
+            .context("YouTube returned an invalid artist subscription channel")?;
+        let subscribed = button["subscribed"]
+            .as_bool()
+            .context("YouTube did not provide this artist's subscription state")?;
+        Ok(Self {
+            channel_id: channel_id.to_owned(),
+            subscribed,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -342,6 +379,16 @@ pub struct Page {
 }
 
 impl Page {
+    pub fn track_index(&self, item_index: usize) -> Option<usize> {
+        let mut items = self.shelves.iter().flat_map(|shelf| &shelf.items);
+        let preceding = items
+            .by_ref()
+            .take(item_index)
+            .filter(|item| matches!(item, Item::Track(_)))
+            .count();
+        matches!(items.next(), Some(Item::Track(_))).then_some(preceding)
+    }
+
     pub fn tracks(&self) -> Vec<Track> {
         self.shelves
             .iter()
@@ -391,7 +438,8 @@ impl Catalog {
             .as_ref()
             .context("Connect your Google account first")?;
         let data = self.request("account/account_menu", json!({}))?;
-        Account::from_response(&data, session)
+        session.verify_account_identity(&data, &self.client)?;
+        Account::from_response(&data)
     }
 
     pub fn home(&self) -> Result<Page> {
@@ -985,9 +1033,34 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
                     .as_str()
             })
     });
+    let subscribed = if browse_id.starts_with("UC") {
+        row.pointer("/subscriptionButton/subscribeButtonRenderer")
+            .into_iter()
+            .chain(
+                row.pointer("/menu/menuRenderer/topLevelButtons")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|button| button.get("subscribeButtonRenderer")),
+            )
+            .find_map(|button| ArtistSubscription::from_button(button).ok())
+            .map(|subscription| subscription.subscribed)
+    } else {
+        None
+    };
     CollectionDetails {
         playlist_id: playlist_id.map(str::to_owned),
-        saved: item_rating(row).map(|rating| rating == Rating::Like),
+        saved: subscribed.or_else(|| item_rating(row).map(|rating| rating == Rating::Like)),
+        editable: browse_id.strip_prefix("VL").filter(|id| !id.is_empty()).is_some_and(|id| {
+            row.pointer("/menu/menuRenderer/items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|item| {
+                    item.pointer("/menuNavigationItemRenderer/navigationEndpoint/playlistEditorEndpoint/playlistId")
+                        .and_then(Value::as_str) == Some(id)
+                })
+        }),
     }
 }
 
@@ -1418,29 +1491,110 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_activation_requires_matching_primary_or_brand_identity() {
-        for (identity, delegated) in [("user||", None), ("brand||user", Some("brand"))] {
-            let session: Session = serde_json::from_value(json!({
-                "cookie":"SAPISID=synthetic", "playback_cookie":"", "authuser":"2",
-                "delegated_session_id":delegated, "data_sync_id":identity, "client_version":"test"
-            }))
-            .unwrap();
+    fn page_selection_keeps_duplicate_occurrences_across_mixed_shelves() {
+        let track = |id: &str| {
+            Item::Track(
+                serde_json::from_value(json!({
+                    "id":id, "title":id, "artist":"Artist"
+                }))
+                .unwrap(),
+            )
+        };
+        let mut page = Page {
+            title: "Mixed results".into(),
+            shelves: Vec::new(),
+            continuation: None,
+            editable: false,
+            description: String::new(),
+            privacy: None,
+            chips: Vec::new(),
+            countries: Vec::new(),
+        };
+        page.shelves = vec![
+            Shelf {
+                title: "First".into(),
+                items: vec![track("A"), track("B")],
+            },
+            Shelf {
+                title: "Second".into(),
+                items: vec![
+                    Item::Navigation(BrowseLink::new("FEexplore", "Explore")),
+                    track("A"),
+                    track("C"),
+                ],
+            },
+        ];
+        assert_eq!(page.track_index(2), None);
+        assert_eq!(page.track_index(5), None);
+        assert_eq!(page.track_index(0), Some(0));
+        assert_eq!(page.track_index(3), Some(2));
+        let mut queue = crate::library::Queue::default();
+        queue.replace(page.tracks(), page.track_index(3).unwrap());
+        assert_eq!(queue.current().unwrap().id, "A");
+        assert!(queue.advance(crate::library::Repeat::Off, false));
+        assert_eq!(queue.current().unwrap().id, "C");
+    }
+
+    #[test]
+    fn artist_subscription_uses_its_header_channel_and_current_state() {
+        let browse_id = "UCmMUZbaYdNH0bEd1PAlAqsA";
+        let channel_id = "UCUDVBtnOQi4c7E8jebpjc9Q";
+        for subscribed in [false, true] {
+            let button = json!({"channelId":channel_id,"subscribed":subscribed});
             let mut response = json!({
-                "responseContext":{"mainAppWebResponseContext":{"datasyncId":identity}},
-                "activeAccountHeaderRenderer":{
-                    "accountName":{"simpleText":"Test account"},
-                    "channelHandle":{"simpleText":"@test"}
-                }
+                "header":{"musicImmersiveHeaderRenderer":{
+                    "title":{"simpleText":"Oasis"},
+                    "subscriptionButton":{"subscribeButtonRenderer":button}
+                }},
+                "contents":{"subscriptionButton":{"subscribeButtonRenderer":{
+                    "channelId":browse_id,"subscribed":!subscribed
+                }}}
             });
-            let account = Account::from_response(&response, &session).unwrap();
-            assert_eq!(account.name, "Test account");
-            assert_eq!(account.handle, "@test");
-            response["responseContext"]["mainAppWebResponseContext"]["datasyncId"] =
-                json!("another||");
-            assert!(Account::from_response(&response, &session).is_err());
-            response.as_object_mut().unwrap().remove("responseContext");
-            assert!(Account::from_response(&response, &session).is_err());
+            let subscription = ArtistSubscription::from_response(&response).unwrap();
+            assert_eq!(subscription.channel_id, channel_id);
+            assert_ne!(subscription.channel_id, browse_id);
+            assert_eq!(subscription.subscribed, subscribed);
+
+            for row in [
+                json!({"subscriptionButton":{"subscribeButtonRenderer":button}}),
+                json!({"menu":{"menuRenderer":{"topLevelButtons":[{
+                    "subscribeButtonRenderer":button
+                }]}}}),
+            ] {
+                assert_eq!(collection_details(&row, browse_id).saved, Some(subscribed));
+            }
+            response.as_object_mut().unwrap().remove("header");
+            assert!(ArtistSubscription::from_response(&response).is_err());
         }
+    }
+
+    #[test]
+    fn artist_subscription_rejects_invalid_channels_and_missing_state() {
+        for button in [
+            json!({"channelId":"UCshort","subscribed":false}),
+            json!({"channelId":"UCUDVBtnOQi4c7E8jebpjc9/","subscribed":false}),
+            json!({"channelId":"UCUDVBtnOQi4c7E8jebpjc9Q"}),
+            json!({"channelId":"UCUDVBtnOQi4c7E8jebpjc9Q","subscribed":"false"}),
+        ] {
+            let response = json!({"header":{"musicImmersiveHeaderRenderer":{
+                "subscriptionButton":{"subscribeButtonRenderer":button}
+            }}});
+            assert!(ArtistSubscription::from_response(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn account_name_requires_a_signed_in_header() {
+        let mut response = json!({"activeAccountHeaderRenderer":{
+            "accountName":{"simpleText":"Test account"},
+            "channelHandle":{"simpleText":"@test"}
+        }});
+        let account = Account::from_response(&response).unwrap();
+        assert_eq!(account.name, "Test account");
+        assert_eq!(account.handle, "@test");
+        response["activeAccountHeaderRenderer"]["accountName"] = json!({});
+        assert!(Account::from_response(&response).is_err());
+        assert!(Account::from_response(&json!({})).is_err());
     }
 
     fn episode_row() -> Value {
@@ -2317,6 +2471,43 @@ mod tests {
             ["defaultServiceEndpoint"]["likeEndpoint"]["target"]["playlistId"] = json!("OLAKalbum");
         assert!(
             matches!(parse_item(&album), Some(Item::Collection(c)) if c.details.playlist_id.as_deref() == Some("OLAKalbum"))
+        );
+    }
+
+    #[test]
+    fn playlist_editability_requires_its_own_editor_and_is_not_persisted() {
+        let row = |editor_id| {
+            json!({"musicTwoRowItemRenderer":{
+                "title":{"runs":[{"text":"Saved playlist","navigationEndpoint":{
+                    "browseEndpoint":{"browseId":"VLPLsaved"}
+                }}]},
+                "menu":{"menuRenderer":{"items":[{
+                    "menuNavigationItemRenderer":{"navigationEndpoint":{
+                        "playlistEditorEndpoint":{"playlistId":editor_id}
+                    }}
+                }]}}
+            }})
+        };
+        for (editor_id, editable) in [
+            (Some("PLsaved"), true),
+            (Some("PLother"), false),
+            (None, false),
+        ] {
+            let Some(Item::Collection(collection)) = parse_item(&row(editor_id)) else {
+                panic!("expected a playlist");
+            };
+            assert_eq!(collection.details.editable, editable);
+            let mut stored = serde_json::to_value(&collection).unwrap();
+            assert!(stored["details"].get("editable").is_none());
+            stored["details"]["editable"] = json!(true);
+            let restored: Collection = serde_json::from_value(stored).unwrap();
+            assert!(!restored.details.editable);
+        }
+        let mut unrelated = row(Some("PLsaved"));
+        unrelated["musicTwoRowItemRenderer"]["title"]["runs"][0]["navigationEndpoint"]["browseEndpoint"]
+            ["browseId"] = json!("MPREalbum");
+        assert!(
+            matches!(parse_item(&unrelated), Some(Item::Collection(collection)) if !collection.details.editable)
         );
     }
 

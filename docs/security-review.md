@@ -1,5 +1,19 @@
 # Account security reviews
 
+## 2026-10-27 follow-up
+
+The next readiness pass fixed failed account activation clearing the previous saved connection. A verified candidate remains separate until the player acknowledges credential installation and the UI accepts the same uncancelled operation. Installation errors and a stopped player now reach that completion path. Synthetic tests cover failed installation, cancelled activation, closed response channels and preservation of the previous shared session and keyring lifecycle.
+
+Account verification no longer assumes the account-menu endpoint always returns stable identity. Missing proof triggers a bounded, uncached page request under the exact candidate account. Its first JSON configuration must confirm a signed-in session and matching full primary or brand identity. Conflicts and explicit logout from either response are rejected. No script is evaluated and redirects remain disabled. The parser follows the page configuration used by the reviewed yt-dlp implementation; public HTML and synthetic primary/brand fixtures exercise its format. An authenticated service fixture is still required to establish compatibility.
+
+A public Oasis artist read reproduced a browse ID that differs from the subscribable channel. Subscriptions now use the channel issued by that artist's header. A final review caught a related sign-out race: target resolution could finish after the account was revoked and then send its write. Mutations now recheck the exact session after resolution, with a regression covering sign-out and account replacement. An already dispatched write may still finish. The playlist picker requires the matching editor endpoint, refreshed pages close stale song menus, and Refresh also reloads current-song account state. Duplicate-song selection uses the clicked occurrence across mixed shelves. Periodic theme reads run off the UI thread.
+
+Validation passed 139 ordinary tests, all 24 guest/offline integration tests, formatting, strict all-target Clippy and a release build. The integration checks include public canonical-channel resolution, credential-installation failure, guest playback, isolated Chromium transport, synthetic keyring cleanup and immediate Play/sign-out races. No real Google credentials or account mutations were used.
+
+Native release checks confirmed Home and Settings rendering, opening the isolated browser, rejecting confirmation with no signed-in account while retaining the browser for retry, and Ctrl Q cleanup of the app, browser and temporary profile. The first forced-XWayland test removed `WAYLAND_DISPLAY` but retained `XDG_SESSION_TYPE=wayland`, which caused Chromium to exit. Setting the test environment consistently to X11 resolved it without an application change. Settings and confirmation clicks worked through foreground automation. Cancellation clicks were refused when the compositor would not activate the target; horizontal scrolling produced no visible change. Those interactions remain unverified. A 15-second settled guest Home sample at 1916 by 1050 measured 0.33% of one CPU core and 153.6 MiB PSS; this is an idle observation, not a connected-account or comparative benchmark.
+
+First Google sign-in, saved-session restoration, brand switching, authenticated playback/history and cross-client library mutations remain unverified. These source reviews and guest checks do not extend the October 23 sealed security scan or establish complete web-client parity.
+
 ## 2026-10-27
 
 A bounded readiness review found that ordinary quit could still detach persistence or edits after the connection indicator cleared. Shutdown now drains the existing account worker for every exit. A synthetic persistence test verifies that finishing waits for an accepted save without clearing the current session.

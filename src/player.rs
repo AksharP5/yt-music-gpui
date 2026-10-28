@@ -263,7 +263,7 @@ enum PlayerCommand {
     Json(Value),
     Credentials {
         next: Option<PlaybackCredentials>,
-        reply: Option<async_channel::Sender<Result<(), String>>>,
+        reply: async_channel::Sender<Result<(), String>>,
     },
     AttachVideo {
         video: Arc<NativeVideo>,
@@ -336,23 +336,23 @@ impl Player {
         Ok(track_id)
     }
 
-    pub fn set_credentials(&self, credentials: PlaybackCredentials) -> Result<()> {
+    /// A successful response confirms the old extractor stopped and the new credentials are installed.
+    pub fn set_credentials(
+        &self,
+        credentials: PlaybackCredentials,
+    ) -> Result<async_channel::Receiver<Result<(), String>>> {
+        let (reply, response) = async_channel::bounded(1);
         self.send(PlayerCommand::Credentials {
             next: Some(credentials),
-            reply: None,
-        })
+            reply,
+        })?;
+        Ok(response)
     }
-    pub fn clear_cookies(&self) -> Result<()> {
-        self.clear_credentials().map(|_| ())
-    }
-    /// Success confirms extractor termination, option reset, and credential revocation.
+    /// A successful response confirms extractor termination, option reset, and credential revocation.
     /// A closed response channel means the player exited without confirming cleanup.
     pub fn clear_credentials(&self) -> Result<async_channel::Receiver<Result<(), String>>> {
         let (reply, response) = async_channel::bounded(1);
-        self.send(PlayerCommand::Credentials {
-            next: None,
-            reply: Some(reply),
-        })?;
+        self.send(PlayerCommand::Credentials { next: None, reply })?;
         Ok(response)
     }
     pub fn pause(&self, paused: bool) -> Result<()> {
@@ -988,14 +988,12 @@ fn run(
                         &mut state,
                         events,
                     );
-                    if let Some(reply) = reply {
-                        let _ = reply.send_blocking(
-                            result
-                                .as_ref()
-                                .map(|_| ())
-                                .map_err(|error| format!("{error:#}")),
-                        );
-                    }
+                    let _ = reply.send_blocking(
+                        result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:#}")),
+                    );
                     result?;
                 }
                 Ok(PlayerCommand::AttachVideo { video: next, reply }) => {
@@ -2771,7 +2769,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
     }
 
     #[test]
-    fn credential_clear_response_closes_if_the_worker_cannot_handle_it() {
+    fn credential_responses_close_if_the_worker_cannot_handle_them() {
         let (commands, received) = mpsc::channel();
         let (_, events) = async_channel::unbounded();
         let player = Player {
@@ -2780,11 +2778,20 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             next_id: AtomicU64::new(1),
             worker: None,
         };
-        let response = player.clear_credentials().unwrap();
-        assert!(response.is_empty());
+        let cleared = player.clear_credentials().unwrap();
+        let installed = player
+            .set_credentials(synthetic_credentials("INVENTED_UNHANDLED"))
+            .unwrap();
+        assert!(cleared.is_empty() && installed.is_empty());
         drop(received);
-        assert!(response.recv_blocking().is_err());
+        assert!(cleared.recv_blocking().is_err());
+        assert!(installed.recv_blocking().is_err());
         assert!(player.clear_credentials().is_err());
+        assert!(
+            player
+                .set_credentials(synthetic_credentials("INVENTED_UNHANDLED"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2965,9 +2972,12 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let first = ExtractorProcess::start(&player, directory.path());
         player
             .set_credentials(synthetic_credentials("INVENTED_SECOND"))
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
             .unwrap();
-        let second = ExtractorProcess::start(&player, directory.path());
         first.assert_revoked();
+        let second = ExtractorProcess::start(&player, directory.path());
         let response = player.clear_credentials().unwrap();
         response.recv_blocking().unwrap().unwrap();
         second.assert_revoked();
@@ -2977,6 +2987,36 @@ os.kill(os.getpid(), signal.SIGSTOP)
             .recv_blocking()
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires libmpv and yt-dlp; no network, display, or audio"]
+    fn credential_installation_reports_preparation_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut player = Player::new(PlayerOptions {
+            audio_output: Some("null".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        player
+            .clear_credentials()
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
+            .unwrap();
+        let mut credentials = synthetic_credentials("INVENTED_INVALID_SOURCE");
+        credentials.cookies = File::open(directory.path()).unwrap();
+        let result = player
+            .set_credentials(credentials)
+            .unwrap()
+            .recv_blocking()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "failed installation must not acknowledge success"
+        );
+        player.shutdown().unwrap();
+        assert!(player.clear_credentials().is_err());
     }
 
     #[test]
@@ -2991,6 +3031,9 @@ os.kill(os.getpid(), signal.SIGSTOP)
         for _ in 0..100 {
             player
                 .set_credentials(synthetic_credentials("INVENTED_IMMEDIATE"))
+                .unwrap()
+                .recv_blocking()
+                .unwrap()
                 .unwrap();
             player
                 .play_url(
