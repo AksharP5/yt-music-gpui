@@ -1,135 +1,72 @@
 # YouTube Music GPUI
 
-A native Linux music client built in Rust with GPUI. It browses YouTube Music's live catalog and plays audio and video through libmpv and yt-dlp. The interface follows the current Omarchy theme and runs on Wayland or X11.
+A native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv and yt-dlp. It runs on Wayland and X11 and follows your Omarchy theme.
 
-This is an independent client. The public-catalog player is working. Account integration is under development. Browser connection, saved-session restoration, signed-in library reads, scoped search and playback-history reporting have passed live checks. Private playlist creation, metadata edits, duplicate additions, reordering and removal have also passed service readback. Other library edits and full cross-client parity still need verification. See [the parity checklist](docs/parity.md) for the remaining work.
+- Browse Home, Explore, charts, artists, albums and playlists, with search suggestions and category filters.
+- Play audio and video with a persistent queue, shuffle, repeat, radio and autoplay.
+- Read lyrics and credits, and browse podcasts with episode descriptions and chapters.
+- Connect your account to access your library, edit playlists and record playback history.
+- Control playback with keyboard shortcuts, media keys and MPRIS desktop controls.
 
-## What works
+This is an independent client using YouTube Music's unofficial API. Account support is experimental, and service changes can break playback or account features.
 
-- Home filters and Explore, new releases, charts with country selection, mood and genre pages, search suggestions and category filters, and artist, album, and playlist browsing.
-- Streaming audio, pause, seek, previous/next, volume, mute, audio quality and playback speed.
-- Native video playback, fullscreen, saved video quality limits and service-provided Song/Video alternatives.
-- A persistent queue with add next, remove, reorder, clear, shuffle upcoming tracks, and repeat off/all/one.
-- Radio, continued autoplay, lyrics, song credits and related music when the service provides them.
-- Podcast show and episode pages, full descriptions, chapter navigation, show navigation and episode duration labels.
-- Local liked songs, saved collections, and recently played songs.
-- Keyboard controls, native text input, and a compact sidebar on narrow windows.
-- Media keys and desktop playback controls through the app's MPRIS service.
+## Build and install
 
-## Build and run
-
-The development machine uses Omarchy on x86-64, Rust 1.99, mpv 0.41, and yt-dlp 2026.08.19. Cargo.lock pins the dependency graph, including GPUI 0.3.9.
-
-You need a current Rust toolchain, a C toolchain and pkg-config, libxcb, libxkbcommon, libxkbcommon-x11, a working Vulkan driver, libmpv, EGL/GLES, Wayland client/EGL libraries, Xlib, Xext and yt-dlp. On Arch, mpv supplies libmpv and libglvnd supplies EGL/GLES. Omarchy already supplies most of these. `yt-dlp` is resolved from PATH or `~/.local/bin/yt-dlp`.
+Requires Rust, a C compiler and pkg-config. On Arch, runtime dependencies are `libxcb`, `libxkbcommon`, `libxkbcommon-x11`, `vulkan-driver`, `mpv`, `yt-dlp`, `libglvnd`, `wayland`, `libx11` and `libxext`.
 
 ```sh
 bin/build
-target/release/yt-music-gpui
-```
-
-Builds default to two jobs to limit peak memory. Set `CARGO_BUILD_JOBS` to change that. The first build compiles GPUI and its graphics dependencies and takes several minutes.
-
-To install the built binary, icon, and app launcher entry for your user:
-
-```sh
 bin/install
 ```
 
-The installer writes to `~/.local/bin` and `$XDG_DATA_HOME`, defaulting to `~/.local/share`. It does not install system dependencies. Alternatively, build an Arch package by running `makepkg` inside `packaging/`, then install that package with your package manager.
+Launch YouTube Music from your app launcher, or run `target/release/yt-music-gpui` directly. The installer uses `~/.local/bin` and `~/.local/share`, respecting `XDG_DATA_HOME`. It does not install dependencies.
 
-Connect from Settings or launch with `--connect`. The app opens YouTube Music in your normal default browser, reusing its Google login. Zen and Firefox profiles are supported. When Omarchy supplies its browser launcher as the default, the app uses Omarchy's resolver to identify the configured browser. Return to Settings, choose **Read YouTube session**, and confirm **Connect as [account name]** after verification. The read action imports YouTube cookies from the named default profile's normal cookie store. Zen can stay open; a locked cookie database is briefly copied into private RAM storage and removed after the read. Private windows, containers and partitioned sessions are not supported. No extension or separate Chromium window is used.
+Builds default to two jobs. Set `CARGO_BUILD_JOBS` to change that. For an Arch package, run `makepkg` inside `packaging/`.
 
-The verified account is the one YouTube returns for that cookie snapshot. It may differ from the account selected in an open browser tab. Check the displayed name and handle before connecting. **Check another account** discards the preview so you can retry after changing the browser session. **Cancel connection** preserves the existing app connection and leaves your browser open. Credentials are activated only after account confirmation and the player's acknowledgement, then saved in the OS keyring. The app creates no persistent plaintext cookie export. Authentication uses browser cookies, not OAuth; an expired session requires reconnecting.
+## Connect your account
 
-Connection requires Python 3, xdg-utils and libsecret's `secret-tool`. Authenticated playback requires the reviewed yt-dlp version 2026.08.19 and matching account identity from the service. The desktop runtime directory must be private and RAM-backed. Only one app instance may run at a time to protect shared account and library state.
+Connection requires Python 3, xdg-utils, libsecret's `secret-tool` and a running Secret Service keyring. Signed-in playback currently requires yt-dlp **2026.08.19**.
 
-Launch with `--guest` to skip restoring a saved account from the keyring. This does not delete the saved connection.
+1. Open Settings and choose **Connect in browser**, or launch with `--connect`.
+2. Sign in to YouTube Music in your default browser. Zen and Firefox are supported, including Omarchy's default-browser launcher.
+3. Return to Settings and choose **Read YouTube session**.
+4. Check the displayed name and handle, then choose **Connect as [account name]**.
+
+The app reads YouTube cookies from the named browser profile and saves the confirmed session in your desktop keyring. It uses your browser session rather than OAuth, so it has that session's YouTube access. It creates no persistent plaintext cookie export. Private windows, containers and partitioned sessions are unsupported.
+
+The account returned by YouTube can differ from the one selected in an open tab. Use **Check another account** to retry, or **Cancel connection** to keep your existing connection. Reconnect from Settings if the session expires.
+
+Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
 
 ## Controls
 
 | Key | Action |
 | --- | --- |
-| Ctrl K | Focus search; Up/Down selects suggestions; Enter submits |
-| Ctrl R | Refresh the current page |
+| Ctrl K | Search |
+| Ctrl R | Refresh |
 | Space | Play or pause |
 | Ctrl Right / Ctrl Left | Next / previous song |
 | Right / Left | Seek 5 seconds |
 | Up / Down | Adjust volume |
 | L | Like the current song |
 | Q | Toggle queue |
-| F | Toggle fullscreen in the video view |
-| ? | Show keyboard help |
-| Escape | Close a dialog, exit video fullscreen, close queue or leave search |
+| F | Toggle video fullscreen |
+| Escape | Dismiss a dialog or leave fullscreen, queue or search |
+| ? | Keyboard help |
 | Ctrl Q | Quit |
 
-Escape dismisses the current dialog without closing the queue behind it.
+Settings includes playback speed, audio quality and video resolution limits. The song menu has radio, queue, sharing, lyrics and credits actions when available.
 
-Click an album, artist, or playlist to open it. Click a song to play from that occurrence in the current results, including repeated songs. The plus adds a song to the queue or saves a collection. Search keeps its query, category and scope while loading more results or navigating back. Library search supports category filters; uploads search covers all uploads. Both scopes require a connected account.
-
-The video button in the playback bar opens the native video view. Click the picture to pause or resume; double-click it or press F for fullscreen. Audio returns to audio playback. The quality button opens Settings, with limits from 144p through 2160p and a default of 720p. These are maximum heights, not a promise that every recording offers that resolution. Video formats retain the selected audio quality and never fall back to an above-limit stream. Quality and Audio/Video changes preserve position and pause state. When YouTube Music provides an exact Song/Video pair, switching selects that recording; otherwise video plays the current recording. Closing the view keeps playback running. Dialogs temporarily detach the video so their controls remain accessible.
-
-Explore keeps the service's main navigation and mood section. Mood and genre links retain their exact category parameters through navigation, Back and Refresh. Navigation links open pages; collection rows retain their separate save controls.
-
-The song menu offers credits, radio, play next, queue and sharing actions, plus available artist and album links. The current song's menu also exposes lyrics and related music when the service provides them. Credits retain the service's roles and names. Lyrics and credits load independently of radio and autoplay. Pausing while radio loads keeps the returned selection paused. Queue arrows move individual occurrences without changing the selected song. Shuffle changes upcoming songs and preserves the current track. Autoplay recommendations follow your explicit queue; switching autoplay off drops those pending recommendations. Its preference is saved on this device.
-
-Playing a playlist or search page loads its remaining pages as the queue approaches the loaded end. Repeated songs retain their order. A failed page can be retried with Next; recommendations and repeat-all wait until the source ends. Shuffle affects loaded upcoming songs. After restarting or changing accounts, reopen an unfinished playlist to load its remaining pages.
-
-Desktop Next and Previous use the same queue as the app and preserve pause or stop. Stop retains the selected song; Play starts it again. The desktop position, speed, volume and repeat settings follow confirmed app state.
-
-Episode details expose the service's chapter links in a native Chapters dialog. Choosing a chapter starts that episode at its timestamp or seeks the current episode, preserving pause when it is already loaded. Podcast episodes advance through the explicit queue without adding music recommendations.
-
-Settings changes playback speed from 0.25× to 2× and audio quality between Low, Normal and High. Both preferences are saved on this device. Normal is the default quality. Changing quality reloads the current stream at its playback position, keeping its pause state, queue and existing history report.
-
-A stream that fails before playback starts gets one fresh extraction attempt at the same position and pause state. A second failure is reported. Playback errors after a song has started are reported immediately.
-
-Selection uses YouTube's quality labels before bitrate because its variable-bitrate streams can exceed nominal rates. High selects the best stream the service makes available to the account. Available quality depends on the song and membership.
-
-## Data and performance
-
-The library is stored at `$XDG_DATA_HOME/yt-music-gpui/library.json`, or `~/.local/share/yt-music-gpui/library.json`. Writes use an atomic replacement on a dedicated worker. Closing the app flushes the last pending write. An unreadable library is preserved and reported instead of overwritten.
-
-Network requests, image decoding, audio extraction, theme-file reads, and disk writes run off the UI thread. Lists render visible rows; horizontal artwork carousels render their viewport with a small overscan. Artwork is limited to 96 decoded images, each at most 320 pixels per edge, with three download workers. Navigation drops unstarted artwork requests from the previous page. Failed artwork can retry on access after 30 seconds. Catalog requests retain the latest pending navigation and playlist-picker request independently, with two workers and two pending slots. The UI redraws playback progress once per displayed second and has no continuous decorative animation. mpv's forward audio cache is capped at 32 MiB. Normal shutdown drains accepted account writes as well as device-state writes.
-
-To measure a running release build on Linux:
-
-```sh
-bin/profile APP_PID 30
-```
-
-This samples CPU and resident memory for the app and its existing child processes. CPU is a percentage of one core. PSS apportions shared mappings; GPU memory is not included. Measure after artwork loads, and start playback before sampling playback performance so temporary yt-dlp startup work is excluded.
-
-Measured on the development Omarchy desktop on 2026-10-23 with release `4191ff3`, under XWayland at 1920 × 1080 fullscreen. Public guest playback used Muse's "Uprising" at 1280 × 720 with NVDEC, Low audio quality, 1× speed, muted volume and autoplay off. The queue contained 200 tracks after the playlist continuation check. Each steady sample lasted 30 seconds after loading finished.
-
-| State | App CPU | App PSS |
-| --- | ---: | ---: |
-| Playing 720p video | 3.87% | 522.7 MiB |
-| Paused 720p video | 0.37% | 526.3 MiB |
-
-Both samples recorded zero dropped frames; the paused position stayed unchanged. PSS excludes GPU memory. Matched web-client comparisons and connected-account measurements remain pending. An earlier rendering stall and the current verification limits are recorded in [docs/parity.md](docs/parity.md). `bin/profile` includes children spawned from worker threads and excludes transient processes that start after sampling begins.
-
-A separate native Wayland guest session at 956 × 523 recorded 2.87% of one CPU core and 579.0 MiB PSS during 30 seconds of the same 720p stream, with zero dropped frames. That session also passed Stop, renderer detachment, Play and renderer reattachment.
-
-## Validation
+## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 bin/test
-bin/test -- --ignored --nocapture
 ```
 
-The ordinary tests cover account isolation, catalog and search parsing, stale suggestions and song text, radio continuation, queue reordering and autoplay transitions, library write flushing, and stale playback events. Player checks also cover pause confirmation and stream replacement. An ignored offline test checks quality selectors using yt-dlp. The live ignored tests make real YouTube Music requests and stream audio through mpv's null output, including pause, seek, speed changes and a paused quality reload at 30 seconds. They need network access, mpv, and yt-dlp. Public search categories, suggestions, credits, discovery links and radio continuation have passed live service checks. Interactive XWayland checks passed New releases, Charts, mood categories, category Refresh, suggestions, category search, Back navigation, credits, speed and quality selection, quality preference restoration after restart, queue add/reorder/clear and autoplay settings. All eight signed-in library search categories and the uploads scope passed live reads. Library edits and full cross-client sync remain unverified.
+Optional integration tests are ignored by default. List them with `bin/test -- --ignored --list` and run individual tests by name; some require external services or desktop components. To sample CPU and memory for a running release build, use `bin/profile APP_PID 30`.
 
-YouTube's internal API and stream extraction can change. Public guest playback may need an updated yt-dlp; authenticated playback deliberately rejects versions that have not been reviewed. Catalog changes may require a client update. Complete account parity and remaining verification are tracked in docs/parity.md. Private playlist edits have passed live service readback. Ratings and other library mutations still need signed-in cross-client verification. GPUI's custom controls currently have limited screen-reader support.
+Local preferences, queue and guest library data live in `$XDG_DATA_HOME/yt-music-gpui/library.json`, defaulting to `~/.local/share/yt-music-gpui/library.json`.
 
-MIT licensed, with the adapted GPUI text input example under Apache-2.0. See NOTICE and LICENSE-APACHE.
-
-The account security design and verification limits are documented in [docs/account-security.md](docs/account-security.md).
-
-The October 23 security pass fixed cleanup when quitting during sign-in, bounded and made keyring lookup cancellable, and made sign-out wait for player and keyring cleanup. Account activation rejects missing or mismatched stable identity. Patched TLS dependencies address two certificate-validation advisories. Those checks used synthetic credentials; see [the review](docs/security-review.md#2026-10-23).
-
-The October 27 readiness pass fixes failed account activation losing the saved connection, artist subscriptions targeting the wrong channel, and writes starting after sign-out during target resolution. The account check can verify identity from a fresh page configuration when the menu omits it. The playlist picker offers service-confirmed editable playlists. Refresh also reloads the current song's account state and closes stale song-action menus while preserving edit forms. All 139 ordinary tests and 24 guest/offline integration tests pass, along with strict Clippy, formatting and a release build. Those checks did not use a real Google account. See [the readiness follow-up](docs/security-review.md#2026-10-27-follow-up).
-
-The October 28 signed-in pass fixes playback-history reporting when the player response omits account identity, preserves cookie bytes across desktop keyring storage, and selects library search results by the service's scope identifier. The installed app restores the account after restarting and plays with authenticated credentials. Live checks confirmed native playback in server history, all library categories and all eight library search filters. All 142 ordinary tests and the focused integration checks pass. See [the signed-in results](docs/security-review.md#2026-10-28-signed-in-history-restoration-and-search).
-
-The October 28 playlist follow-up fixes Omarchy browser resolution, successful deletions reported as failures, and stale playlist reads immediately after saves. Playlist completion now waits for the visible saved state with bounded read retries; it never repeats the write. A disposable private playlist passed creation with its initial song, renaming, description changes, duplicate additions, reordering, occurrence removal, editable-picker discovery and deletion. All 146 ordinary tests pass. See [the playlist verification](docs/security-review.md#2026-10-28-playlist-and-reconnection-follow-up).
+MIT licensed. Third-party attributions and licenses are listed in [NOTICE](NOTICE).
