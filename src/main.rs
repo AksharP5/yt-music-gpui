@@ -81,6 +81,11 @@ fn main() {
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            if let Err(error) = cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(
+                include_bytes!("../assets/fonts/Roboto.ttf").as_slice(),
+            )]) {
+                eprintln!("Could not load the interface font: {error:#}");
+            }
             input::init(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {

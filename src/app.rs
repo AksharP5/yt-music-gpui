@@ -2,9 +2,12 @@ use crate::{
     account::{self, Connection, Effect, Mutation, Privacy, Section},
     artwork::Artwork,
     auth::{self, Operation, Session, SharedSession},
-    catalog::{BrowseLink, Catalog, Collection, Continuation, Item, Page, Rating, Shelf, Track},
+    catalog::{
+        BrowseLink, Catalog, Collection, Continuation, Item, Page, PlaylistTarget, Rating, Shelf,
+        ShelfLayout, Track,
+    },
     country_picker::{CountryPicker, CountryPickerEvent},
-    library::{Library, LibraryWriter, Repeat, Store},
+    library::{Library, LibraryWriter, Queue, Repeat, Store},
     mpris,
     player::{
         AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions,
@@ -17,7 +20,7 @@ use crate::{
     song_text::{self, Content as SongText, Query as TextQuery},
     theme::Theme,
     track_state,
-    watch::{MediaPair, Watch, WatchContinuation, WatchPage},
+    watch::{MediaPair, Watch, WatchContinuation, WatchMode, WatchPage},
 };
 use gpui::{prelude::*, *};
 use std::{
@@ -32,8 +35,9 @@ use std::{
     time::Duration,
 };
 
-const CARD_WIDTH: f32 = 164.;
-const CARD_GAP: f32 = 20.;
+const CARD_WIDTH: f32 = 180.;
+const CARD_GAP: f32 = 24.;
+const SHELF_HEIGHT: f32 = 350.;
 
 #[derive(Clone, PartialEq)]
 struct Search {
@@ -54,6 +58,9 @@ enum Route {
     Library(Section),
 }
 impl Route {
+    fn is_artist(&self) -> bool {
+        matches!(self, Self::Browse(link) if link.id.starts_with("UC"))
+    }
     fn is_home(&self) -> bool {
         matches!(self, Self::Home)
             || matches!(self, Self::Browse(link) if link.id == "FEmusic_home")
@@ -71,12 +78,14 @@ enum Query {
     },
     Library(Section),
     PlaylistChoices,
+    SidebarPlaylists,
     PlaylistChoicesMore(Continuation),
 }
 impl Query {
     fn target(&self) -> CatalogTarget {
         match self {
             Self::PlaylistChoices | Self::PlaylistChoicesMore(_) => CatalogTarget::PlaylistPicker,
+            Self::SidebarPlaylists => CatalogTarget::Sidebar,
             _ => CatalogTarget::Page,
         }
     }
@@ -98,19 +107,23 @@ struct CatalogResult {
 enum CatalogTarget {
     Page,
     PlaylistPicker,
+    Sidebar,
+}
+impl CatalogTarget {
+    const ALL: [Self; 3] = [Self::Page, Self::PlaylistPicker, Self::Sidebar];
 }
 struct CatalogRequests {
-    generations: Arc<[AtomicU64; 2]>,
-    loading: [bool; 2],
+    generations: Arc<[AtomicU64; CatalogTarget::ALL.len()]>,
+    loading: [bool; CatalogTarget::ALL.len()],
     jobs: async_channel::Sender<Job>,
     pending: async_channel::Receiver<Job>,
 }
 impl CatalogRequests {
     fn new() -> Self {
-        let (jobs, pending) = async_channel::bounded(2);
+        let (jobs, pending) = async_channel::bounded(CatalogTarget::ALL.len());
         Self {
-            generations: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
-            loading: [false; 2],
+            generations: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            loading: [false; CatalogTarget::ALL.len()],
             jobs,
             pending,
         }
@@ -125,13 +138,13 @@ impl CatalogRequests {
         let target = query.target();
         self.cancel(target);
         let id = self.generations[target as usize].load(Ordering::Relaxed);
-        let mut other = None;
+        let mut other = Vec::with_capacity(CatalogTarget::ALL.len() - 1);
         while let Ok(job) = self.pending.try_recv() {
             if job.query.target() != target {
-                other = Some(job);
+                other.push(job);
             }
         }
-        // The two bounded slots retain the latest request for each destination.
+        // Keep one pending request per destination, including sidebar and picker reads.
         for job in other.into_iter().chain(std::iter::once(Job {
             id,
             account_revision,
@@ -164,8 +177,24 @@ impl CatalogRequests {
     }
 }
 enum PlaybackQuery {
-    Watch { track: Box<Track>, radio: bool },
+    Watch { track: Box<Track>, mode: WatchMode },
+    Playlist(Arc<PlaylistTarget>),
     More(WatchContinuation),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueUpdate {
+    Preserve,
+    Adopt,
+    Replace,
+}
+impl From<WatchMode> for QueueUpdate {
+    fn from(mode: WatchMode) -> Self {
+        match mode {
+            WatchMode::Details => Self::Preserve,
+            WatchMode::Issued => Self::Adopt,
+            WatchMode::Radio => Self::Replace,
+        }
+    }
 }
 struct PlaybackJob {
     id: u64,
@@ -177,7 +206,7 @@ enum PlaybackResult {
     Watch {
         id: u64,
         account_revision: u64,
-        radio: bool,
+        update: QueueUpdate,
         result: Result<Box<Watch>, String>,
     },
     More {
@@ -294,6 +323,7 @@ enum Drag {
 }
 enum AccountOperation {
     Restoring(Operation),
+    RestoreFailed,
     Connecting(Operation, BrowserConnection),
     Activating(Operation),
     Disconnecting(Operation),
@@ -317,6 +347,58 @@ pub enum Startup {
     Guest,
 }
 
+enum ListRow {
+    Heading(usize),
+    Item(usize),
+    Shelf(usize),
+    More(usize),
+}
+
+struct DetailList {
+    state: ListState,
+    inline_header: bool,
+}
+impl DetailList {
+    fn new() -> Self {
+        Self {
+            state: ListState::new(0, ListAlignment::Top, px(128.)),
+            inline_header: false,
+        }
+    }
+    fn reset_rows(&self, rows: usize) {
+        let top = self.state.logical_scroll_top();
+        self.state.reset(rows + usize::from(self.inline_header));
+        self.state.scroll_to(top);
+    }
+    fn set_inline_header(&mut self, inline: bool) {
+        if self.inline_header == inline {
+            return;
+        }
+        let top = self.state.logical_scroll_top();
+        if inline {
+            self.state.splice(0..0, 1);
+        } else {
+            self.state.splice(0..1, 0);
+        }
+        self.inline_header = inline;
+        if top.item_ix == 0 && top.offset_in_item == px(0.) {
+            self.state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
+        self.state.remeasure();
+    }
+}
+
+struct NavigationState {
+    route: Route,
+    page: Option<Page>,
+    list_scroll: UniformListScrollHandle,
+    detail_list: DetailList,
+    shelf_scroll: HashMap<usize, ScrollHandle>,
+}
+
 pub struct Music {
     theme: Theme,
     session: SharedSession,
@@ -334,8 +416,15 @@ pub struct Music {
     route: Route,
     page: Page,
     rows: Vec<Item>,
+    list_rows: Vec<ListRow>,
     shelf_scroll: HashMap<usize, ScrollHandle>,
-    back: Vec<(Route, Option<Page>)>,
+    list_scroll: UniformListScrollHandle,
+    detail_list: DetailList,
+    sidebar_collapsed: bool,
+    sidebar_playlists: Vec<Collection>,
+    sidebar_error: Option<String>,
+    sidebar_scroll: UniformListScrollHandle,
+    back: Vec<NavigationState>,
     list_id: usize,
     error: Option<String>,
     notice: Option<String>,
@@ -353,7 +442,7 @@ pub struct Music {
     queue_source: queue_source::Worker,
     queue_waiting: Option<QueueAdvance>,
     autoplay_tracks: VecDeque<Track>,
-    watch_pending: bool,
+    watch_pending: Option<QueueUpdate>,
     song_text: song_text::Worker,
     artwork: Artwork,
     library: Library,
@@ -375,6 +464,7 @@ pub struct Music {
     duration: f64,
     show_queue: bool,
     overlay: Option<Overlay>,
+    overlay_anchor: Option<Point<Pixels>>,
     overlay_subscription: Option<Subscription>,
     drag: Option<Drag>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -476,7 +566,9 @@ impl Music {
                                     Query::Home => catalog.home(),
                                     Query::Explore => catalog.explore(),
                                     Query::Library(section) => catalog.library(*section),
-                                    Query::PlaylistChoices => catalog.library(Section::Playlists),
+                                    Query::PlaylistChoices | Query::SidebarPlaylists => {
+                                        catalog.library(Section::Playlists)
+                                    }
                                     Query::PlaylistChoicesMore(token) => catalog.more(token),
                                     Query::Search(search) => catalog.search_filtered(
                                         &search.query,
@@ -553,13 +645,24 @@ impl Music {
                         .map(|catalog| catalog.for_session(job.session))
                         .map_err(|error| format!("{error:#}"));
                     let result = match job.query {
-                        PlaybackQuery::Watch { track, radio } => PlaybackResult::Watch {
+                        PlaybackQuery::Watch { track, mode } => PlaybackResult::Watch {
                             id: job.id,
                             account_revision: job.account_revision,
-                            radio,
+                            update: mode.into(),
                             result: catalog.and_then(|catalog| {
                                 catalog
-                                    .watch(&track, radio)
+                                    .watch(&track, mode)
+                                    .map(Box::new)
+                                    .map_err(|error| format!("{error:#}"))
+                            }),
+                        },
+                        PlaybackQuery::Playlist(target) => PlaybackResult::Watch {
+                            id: job.id,
+                            account_revision: job.account_revision,
+                            update: QueueUpdate::Replace,
+                            result: catalog.and_then(|catalog| {
+                                catalog
+                                    .watch_playlist(&target)
                                     .map(Box::new)
                                     .map_err(|error| format!("{error:#}"))
                             }),
@@ -664,7 +767,7 @@ impl Music {
             while let Ok(loaded) = loaded.recv().await {
                 if view
                     .update_in(cx, |view, window, cx| {
-                        if let Some(old) = view.artwork.insert(loaded) {
+                        for old in view.artwork.insert(loaded) {
                             cx.drop_image(old, Some(window));
                         }
                         cx.notify();
@@ -711,29 +814,6 @@ impl Music {
             })
             .detach();
         }
-        cx.spawn_in(window, async move |view, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(2)).await;
-                let theme = cx
-                    .background_executor()
-                    .spawn(async { Theme::load() })
-                    .await;
-                if view
-                    .update_in(cx, |view, _, cx| {
-                        if theme != view.theme {
-                            view.theme = theme;
-                            view.search
-                                .update(cx, |search, cx| search.set_theme(theme, cx));
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
         let subscription =
             cx.subscribe_in(&search, window, |view, _, event, window, cx| match event {
                 SearchBoxEvent::Submit(query) => {
@@ -780,6 +860,7 @@ impl Music {
             route: Route::Home,
             page: Page {
                 title: "Home".into(),
+                header: None,
                 shelves: Vec::new(),
                 continuation: None,
                 editable: false,
@@ -789,7 +870,14 @@ impl Music {
                 countries: Vec::new(),
             },
             rows: Vec::new(),
+            list_rows: Vec::new(),
             shelf_scroll: HashMap::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            detail_list: DetailList::new(),
+            sidebar_collapsed: false,
+            sidebar_playlists: Vec::new(),
+            sidebar_error: None,
+            sidebar_scroll: UniformListScrollHandle::new(),
             back: Vec::new(),
             list_id: 0,
             error,
@@ -808,7 +896,7 @@ impl Music {
             queue_source,
             queue_waiting: None,
             autoplay_tracks: VecDeque::new(),
-            watch_pending: false,
+            watch_pending: None,
             song_text,
             artwork,
             library,
@@ -830,6 +918,7 @@ impl Music {
             duration: 0.,
             show_queue: false,
             overlay: (startup == Startup::Connect).then_some(Overlay::Settings),
+            overlay_anchor: None,
             overlay_subscription: None,
             drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -842,6 +931,25 @@ impl Music {
         view
     }
 
+    fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
+        self.reset_radio();
+        self.player_command(Player::stop);
+        self.active_id = None;
+        self.seekable = false;
+        self.pending_seek = None;
+        self.position = 0.;
+        self.playback = Playback::Loading {
+            paused: false,
+            retried: false,
+        };
+        self.now_playing = None;
+        self.media_pair = None;
+        self.queue_source.cancel();
+        self.queue_waiting = None;
+        self.notice = Some("Loading music…".into());
+        self.playback_request(query, cx);
+    }
+
     fn playback_request(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
         let id = if matches!(query, PlaybackQuery::More(_)) {
             if !self.pending_playback_jobs.is_empty() || self.radio_loading {
@@ -851,7 +959,11 @@ impl Music {
             self.radio_generation.fetch_add(1, Ordering::Relaxed) + 1
         } else {
             self.discard_pending_playback();
-            self.watch_pending = matches!(query, PlaybackQuery::Watch { .. });
+            self.watch_pending = match &query {
+                PlaybackQuery::Watch { mode, .. } => Some((*mode).into()),
+                PlaybackQuery::Playlist(_) => Some(QueueUpdate::Replace),
+                PlaybackQuery::More(_) => None,
+            };
             self.playback_generation.fetch_add(1, Ordering::Relaxed) + 1
         };
         let session = self
@@ -869,7 +981,7 @@ impl Music {
             .is_err()
         {
             self.radio_loading = false;
-            self.watch_pending = false;
+            self.watch_pending = None;
             self.autoplay_waiting = None;
             if self.active_id.is_none() {
                 self.playback = Playback::Stopped;
@@ -960,7 +1072,7 @@ impl Music {
         ) {
             self.autoplay_waiting = None;
             self.follow_queue_selection(intent.playback, cx);
-        } else if self.radio_loading || self.watch_pending {
+        } else if self.radio_loading || self.watch_pending.is_some() {
             self.playback = Playback::Loading {
                 paused: intent.playback.is_paused(),
                 retried: false,
@@ -976,13 +1088,18 @@ impl Music {
             PlaybackResult::Watch {
                 id,
                 account_revision,
-                radio,
+                update,
                 result,
             } => {
                 if id != self.playback_generation.load(Ordering::Relaxed) {
                     return;
                 }
-                self.watch_pending = false;
+                self.watch_pending = None;
+                let advance = if update != QueueUpdate::Preserve {
+                    self.queue_waiting.take()
+                } else {
+                    None
+                };
                 match result {
                     Ok(watch) => {
                         let mut watch = *watch;
@@ -992,21 +1109,31 @@ impl Music {
                                 track.details.clear_account_state();
                             }
                         }
-                        if radio {
-                            let Some(index) = watch.current_index else {
-                                self.playback = Playback::Stopped;
-                                self.notice = None;
-                                self.error = Some("YouTube Music did not include the requested song in its radio.".into());
-                                cx.notify();
-                                return;
+                        let replaced =
+                            match adopt_watch_queue(&mut self.library.queue, &watch, update) {
+                                Ok(replaced) => replaced,
+                                Err(error) => {
+                                    if update == QueueUpdate::Replace || self.active_id.is_none() {
+                                        self.playback = Playback::Stopped;
+                                    }
+                                    self.notice = None;
+                                    self.error = Some(error);
+                                    cx.notify();
+                                    return;
+                                }
                             };
+                        if replaced {
                             self.reset_radio();
-                            self.queue_source.cancel();
+                            let session =
+                                self.account.as_ref().map(|account| account.session.clone());
+                            self.queue_source.attach_watch(
+                                &mut self.library.queue,
+                                &watch,
+                                session,
+                            );
                             self.queue_waiting = None;
-                            self.library.queue.replace(watch.queue.clone(), index);
-                            self.radio = watch.continuation.clone();
                             self.autoplay_seeded = true;
-                            self.notice = Some("Radio started".into());
+                            self.notice = None;
                         }
                         if let Some(track) = &watch.current {
                             apply_track_details(
@@ -1040,7 +1167,8 @@ impl Music {
                             pair.video.details.clear_account_state();
                             self.media_pair = Some(pair);
                         }
-                        let switch_mode = (radio || self.active_id.is_some())
+                        let switch_mode = (update == QueueUpdate::Replace
+                            || self.active_id.is_some())
                             && current.is_some_and(|current| {
                                 self.media_pair
                                     .as_ref()
@@ -1049,24 +1177,38 @@ impl Music {
                             });
                         self.now_playing = Some(watch);
                         let video_open = self.video_open;
-                        if radio {
+                        if let Some(intent) = advance {
+                            self.advance_queue(intent, cx);
+                        } else if update == QueueUpdate::Replace {
                             let paused = self.playback.is_paused();
                             if switch_mode {
                                 self.set_video_mode(self.library.video, cx);
                             }
-                            self.play_current_at(0., paused, cx);
+                            self.play_current_at(0., paused, WatchMode::Details, cx);
                         } else if switch_mode {
                             self.set_video_mode(self.library.video, cx);
                         } else {
                             self.extend_autoplay(cx);
                             self.resume_autoplay(cx);
+                            if replaced {
+                                self.prefetch_queue(cx);
+                                self.save();
+                            }
                         }
                         self.video_open = video_open;
                     }
-                    Err(error) if radio => {
+                    Err(error)
+                        if update != QueueUpdate::Preserve
+                            && (update == QueueUpdate::Replace || self.active_id.is_none()) =>
+                    {
                         self.playback = Playback::Stopped;
                         self.notice = None;
                         self.error = Some(error);
+                    }
+                    Err(error) if update == QueueUpdate::Adopt => {
+                        self.notice = Some(format!(
+                            "Could not load the playlist. Playing the selected song: {error}"
+                        ));
                     }
                     Err(error) => {
                         if self.autoplay_waiting.take().is_some() {
@@ -1102,6 +1244,10 @@ impl Music {
     fn clear_account_state(&mut self, cx: &mut Context<Self>) {
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
+        self.catalog_requests.cancel(CatalogTarget::Sidebar);
+        self.sidebar_playlists.clear();
+        self.sidebar_scroll = UniformListScrollHandle::new();
+        self.sidebar_error = None;
         self.queue_source.cancel();
         self.queue_waiting = None;
         let session = self
@@ -1111,6 +1257,9 @@ impl Music {
         self.search
             .update(cx, |search, cx| search.set_session(session, cx));
         self.ratings.clear();
+        self.list_scroll = UniformListScrollHandle::new();
+        self.detail_list = DetailList::new();
+        self.shelf_scroll.clear();
         self.account_revision = self.account_revision.wrapping_add(1);
         self.track_state.cancel();
         self.track_state_id = None;
@@ -1118,13 +1267,16 @@ impl Music {
         self.song_text.cancel();
         self.pending_mutations.clear();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
-        self.watch_pending = false;
+        self.watch_pending = None;
         self.reset_radio();
         let _ = self.pending_playback_jobs.try_recv();
         self.now_playing = None;
         self.media_pair = None;
         self.overlay = None;
         self.overlay_subscription = None;
+        for collection in &mut self.library.saved {
+            collection.details.play = None;
+        }
         for track in self
             .library
             .queue
@@ -1150,7 +1302,11 @@ impl Music {
             if let Some(Overlay::PlaylistPicker { error, .. }) = &mut self.overlay {
                 *error = result.err();
             }
-        } else if let Err(error) = result {
+        } else if target == CatalogTarget::Sidebar {
+            self.sidebar_error = result.err();
+        } else if target == CatalogTarget::Page
+            && let Err(error) = result
+        {
             self.error = Some(error);
         }
         cx.notify();
@@ -1158,14 +1314,22 @@ impl Music {
 
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         self.artwork.cancel_pending();
-        self.shelf_scroll.clear();
         self.video_open = false;
         if self.route != route {
             let cached = (self.account.is_none()
                 && !self.catalog_requests.is_loading(CatalogTarget::Page)
                 && self.error.is_none())
             .then(|| self.page.clone());
-            self.back.push((self.route.clone(), cached));
+            self.back.push(NavigationState {
+                route: self.route.clone(),
+                page: cached,
+                list_scroll: std::mem::replace(
+                    &mut self.list_scroll,
+                    UniformListScrollHandle::new(),
+                ),
+                shelf_scroll: std::mem::take(&mut self.shelf_scroll),
+                detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
+            });
             if self.back.len() > 12 {
                 self.back.remove(0);
             }
@@ -1175,6 +1339,7 @@ impl Music {
         self.error = None;
         self.notice = None;
         self.page.shelves.clear();
+        self.page.header = None;
         self.page.continuation = None;
         self.page.editable = false;
         self.page.description.clear();
@@ -1182,6 +1347,7 @@ impl Music {
         self.page.chips.clear();
         self.page.countries.clear();
         self.rows.clear();
+        self.list_rows.clear();
         match route {
             Route::Home => {
                 self.page.title = "Home".into();
@@ -1222,6 +1388,38 @@ impl Music {
         }
     }
 
+    fn rebuild_rows(&mut self) {
+        self.rows.clear();
+        self.list_rows.clear();
+        let artist = self.route.is_artist();
+        for (index, shelf) in self.page.shelves.iter().enumerate() {
+            let carousel = artist && shelf.layout != ShelfLayout::Songs;
+            if carousel {
+                self.list_rows.push(ListRow::Shelf(index));
+            } else if !shelf.title.is_empty() {
+                self.list_rows.push(ListRow::Heading(index));
+            }
+            for item in &shelf.items {
+                if !carousel {
+                    self.list_rows.push(ListRow::Item(self.rows.len()));
+                }
+                self.rows.push(item.clone());
+            }
+            if artist && !carousel && shelf.more.is_some() {
+                self.list_rows.push(ListRow::More(index));
+            }
+        }
+        if self.page.header.is_some() {
+            self.detail_list.reset_rows(if artist {
+                self.list_rows.len()
+            } else {
+                self.rows.len()
+            });
+        } else {
+            self.detail_list = DetailList::new();
+        }
+    }
+
     fn refresh_local(&mut self) {
         let (title, rows) = match self.route {
             Route::Liked => (
@@ -1255,8 +1453,11 @@ impl Music {
         };
         self.page = Page {
             title: title.into(),
+            header: None,
             shelves: vec![Shelf {
+                layout: ShelfLayout::Cards,
                 title: String::new(),
+                more: None,
                 items: rows,
             }],
             continuation: None,
@@ -1266,12 +1467,7 @@ impl Music {
             chips: Vec::new(),
             countries: Vec::new(),
         };
-        self.rows = self
-            .page
-            .shelves
-            .iter()
-            .flat_map(|s| s.items.clone())
-            .collect();
+        self.rebuild_rows();
     }
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
@@ -1280,17 +1476,12 @@ impl Music {
             cx.notify();
             return;
         }
-        if let Some((route, page)) = self.back.pop() {
-            let Some(page) = page.filter(|_| self.account.is_none()) else {
-                self.route = route.clone();
-                self.navigate(route, cx);
-                return;
-            };
+        let Some(state) = self.back.pop() else { return };
+        if let Some(page) = state.page.filter(|_| self.account.is_none()) {
             self.catalog_requests.cancel(CatalogTarget::Page);
             self.artwork.cancel_pending();
-            self.shelf_scroll.clear();
             self.list_id = self.list_id.wrapping_add(1);
-            self.route = route;
+            self.route = state.route;
             if let Route::Search(search) = &self.route {
                 self.search
                     .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
@@ -1298,19 +1489,43 @@ impl Music {
             self.page = page;
             self.error = None;
             self.notice = None;
-            self.rows = self
-                .page
-                .shelves
-                .iter()
-                .flat_map(|s| s.items.clone())
-                .collect();
+            self.rebuild_rows();
             self.refresh_local();
-            cx.notify();
+        } else {
+            self.route = state.route.clone();
+            self.navigate(state.route, cx);
         }
+        self.list_scroll = state.list_scroll;
+        self.detail_list = state.detail_list;
+        self.shelf_scroll = state.shelf_scroll;
+        cx.notify();
     }
 
     fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
         if !self.catalog_requests.finish(result.target, result.id) {
+            return;
+        }
+        if result.target == CatalogTarget::Sidebar {
+            match result.result {
+                Ok(page) => {
+                    self.sidebar_playlists = page
+                        .shelves
+                        .into_iter()
+                        .flat_map(|shelf| shelf.items)
+                        .filter_map(|item| match item {
+                            Item::Collection(collection)
+                                if !matches!(collection.id.as_str(), "VLLM" | "VLSE") =>
+                            {
+                                Some(collection)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    self.sidebar_error = None;
+                }
+                Err(error) => self.sidebar_error = Some(error),
+            }
+            cx.notify();
             return;
         }
         if matches!(result.target, CatalogTarget::PlaylistPicker) {
@@ -1359,7 +1574,16 @@ impl Music {
                         self.overlay = None;
                     }
                 }
-                for track in self.page.tracks() {
+                for track in self
+                    .page
+                    .shelves
+                    .iter()
+                    .flat_map(|shelf| &shelf.items)
+                    .filter_map(|item| match item {
+                        Item::Track(track) => Some(track),
+                        _ => None,
+                    })
+                {
                     if self.account.is_some()
                         && self
                             .library
@@ -1370,15 +1594,10 @@ impl Music {
                         continue;
                     }
                     if let Some(rating) = track.details.rating {
-                        self.ratings.insert(track.id, rating);
+                        self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                self.rows = self
-                    .page
-                    .shelves
-                    .iter()
-                    .flat_map(|s| s.items.clone())
-                    .collect();
+                self.rebuild_rows();
             }
             Err(error) => self.error = Some(error),
         }
@@ -1404,6 +1623,25 @@ impl Music {
     fn connect_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !auth::ACCOUNT_LOGIN_ENABLED {
             self.error = Some("Account connection is unavailable.".into());
+            cx.notify();
+            return;
+        }
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::RestoreFailed)
+        ) {
+            let operation = Operation::default();
+            match self
+                .account_commands
+                .try_send(account::Command::Restore(operation.clone()))
+            {
+                Ok(()) => {
+                    self.account_operation = Some(AccountOperation::Restoring(operation));
+                    self.error = None;
+                    self.notice = Some("Restoring your saved account…".into());
+                }
+                Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
+            }
             cx.notify();
             return;
         }
@@ -1558,6 +1796,9 @@ impl Music {
         self.playback = Playback::Stopped;
         self.navigate(Route::Home, cx);
         self.back.clear();
+        self.list_scroll = UniformListScrollHandle::new();
+        self.detail_list = DetailList::new();
+        self.shelf_scroll.clear();
         let operation = Operation::default();
         if self
             .account_commands
@@ -1589,6 +1830,7 @@ impl Music {
             Route::Library(section) => Query::Library(*section),
         };
         self.request(query, cx);
+        self.request(Query::SidebarPlaylists, cx);
         self.refresh_current_account(cx);
     }
 
@@ -1713,10 +1955,24 @@ impl Music {
         self.overlay = Some(Overlay::CountryPicker(picker));
         cx.notify();
     }
+    fn open_track_menu(
+        &mut self,
+        track: Track,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        self.overlay_anchor = Some(window.mouse_position());
+        self.overlay = Some(Overlay::Track { track, index });
+        cx.notify();
+    }
+
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.song_text.cancel();
         self.overlay = None;
+        self.overlay_anchor = None;
         self.overlay_subscription = None;
         window.focus(&self.focus, cx);
         cx.notify();
@@ -1816,6 +2072,8 @@ impl Music {
                 {
                     return;
                 }
+                let restoring =
+                    matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
                 match result {
                     Ok(Some(connection)) => {
                         let installation =
@@ -1835,7 +2093,8 @@ impl Music {
                         let response = match installation {
                             Ok(response) => response,
                             Err(error) => {
-                                self.account_operation = None;
+                                self.account_operation =
+                                    restoring.then_some(AccountOperation::RestoreFailed);
                                 self.notice = None;
                                 self.error = Some(format!(
                                     "Could not activate playback credentials: {error:#}"
@@ -1848,7 +2107,7 @@ impl Music {
                             Some(AccountOperation::Activating(operation.clone()));
                         self.notice = Some("Preparing account playback…".into());
                         self.playback_generation.fetch_add(1, Ordering::Relaxed);
-                        self.watch_pending = false;
+                        self.watch_pending = None;
                         self.discard_pending_playback();
                         self.reset_radio();
                         self.queue_waiting = None;
@@ -1874,14 +2133,18 @@ impl Music {
                                         view.clear_account_state(cx);
                                         window.focus(&view.focus, cx);
                                         view.navigate(Route::Home, cx);
+                                        view.request(Query::SidebarPlaylists,cx);
                                         view.back.clear();
                                         if save_session && view.account_commands.try_send(account::Command::Persist(session)).is_err() {
                                             view.error = Some("Connected for this session, but the account could not be queued for keyring storage.".into());
                                         }
-                                        view.notice = Some(label);
+                                        view.notice = (!restoring).then_some(label);
                                         view.refresh_current_account(cx);
                                     }
-                                    Err(error) => view.error = Some(format!("Could not activate the account: {error:#}")),
+                                    Err(error) => {
+                                        view.account_operation=restoring.then_some(AccountOperation::RestoreFailed);
+                                        view.error=Some(format!("Could not activate the account: {error:#}"));
+                                    }
                                 }
                                 cx.notify();
                             });
@@ -1892,7 +2155,8 @@ impl Music {
                         self.notice = None;
                     }
                     Err(error) => {
-                        self.account_operation = None;
+                        self.account_operation =
+                            restoring.then_some(AccountOperation::RestoreFailed);
                         self.notice = None;
                         self.error = Some(error);
                     }
@@ -1931,6 +2195,14 @@ impl Music {
                             &mutation,
                         );
                         if let Mutation::CollectionLibrary { collection, save } = &mutation {
+                            if matches!(&self.route, Route::Browse(link) if link.id == collection.id)
+                                && let Some(header) = &mut self.page.header
+                                && collection.id.starts_with("UC")
+                            {
+                                header.subscribed = Some(*save);
+                                header.subscription_label =
+                                    if *save { "Subscribed" } else { "Subscribe" }.into();
+                            }
                             for item in self
                                 .page
                                 .shelves
@@ -2066,9 +2338,15 @@ impl Music {
         cx.notify();
     }
     fn play_current(&mut self, cx: &mut Context<Self>) {
-        self.play_current_at(0., false, cx);
+        self.play_current_at(0., false, WatchMode::Details, cx);
     }
-    fn play_current_at(&mut self, start: f64, paused: bool, cx: &mut Context<Self>) {
+    fn play_current_at(
+        &mut self,
+        start: f64,
+        paused: bool,
+        watch_mode: WatchMode,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(
             self.account_operation,
             Some(AccountOperation::Activating(_))
@@ -2094,7 +2372,7 @@ impl Music {
         self.autoplay_waiting = None;
         self.notice = None;
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
-        self.watch_pending = false;
+        self.watch_pending = None;
         self.discard_pending_playback();
         // The queue may already name a different recording. Retire the old load
         // before enqueueing, including when the player has stopped accepting work.
@@ -2129,7 +2407,8 @@ impl Music {
                 self.position = start;
                 self.duration = track.duration.unwrap_or(0) as f64;
                 self.error = None;
-                if self.account.is_some()
+                if watch_mode != WatchMode::Details
+                    || self.account.is_some()
                     || !self
                         .now_playing
                         .as_ref()
@@ -2145,7 +2424,7 @@ impl Music {
                     self.playback_request(
                         PlaybackQuery::Watch {
                             track: Box::new(track),
-                            radio: false,
+                            mode: watch_mode,
                         },
                         cx,
                     );
@@ -2176,7 +2455,7 @@ impl Music {
             self.now_playing = None;
             self.library.queue.replace(vec![track], 0);
         }
-        self.play_current_at(seconds as f64, false, cx);
+        self.play_current_at(seconds as f64, false, WatchMode::Details, cx);
     }
     fn set_audio_quality(&mut self, quality: AudioQuality, cx: &mut Context<Self>) {
         if self.library.quality == quality {
@@ -2221,7 +2500,7 @@ impl Music {
             self.reset_radio();
             self.now_playing = None;
             if self.active_id.is_some() {
-                self.play_current_at(position, paused, cx);
+                self.play_current_at(position, paused, WatchMode::Details, cx);
             }
         } else if changed
             && self.active_id.is_some()
@@ -2391,7 +2670,7 @@ impl Music {
         self.media_pair = None;
         self.reset_radio();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
-        self.watch_pending = false;
+        self.watch_pending = None;
         self.discard_pending_playback();
         self.save();
         cx.notify();
@@ -2419,10 +2698,37 @@ impl Music {
                 Route::Browse(BrowseLink::new(collection.id, collection.title)),
                 cx,
             ),
-            Item::Track(_) => {
-                if let Some(selected) = self.page.track_index(index) {
-                    self.replace_page_queue(selected, cx);
+            Item::Track(track) => {
+                let page_queue = match &self.route {
+                    Route::Browse(link) => ["VL", "MPRE", "MPSP", "MPED"]
+                        .iter()
+                        .any(|prefix| link.id.starts_with(prefix)),
+                    Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => true,
+                    _ => false,
+                };
+                if page_queue {
+                    if let Some(selected) = self.page.track_index(index) {
+                        self.replace_page_queue(selected, cx);
+                    }
+                    return;
                 }
+                let mode = if track
+                    .details
+                    .watch
+                    .as_ref()
+                    .is_some_and(|target| !target.is_single_video())
+                {
+                    WatchMode::Issued
+                } else {
+                    WatchMode::Details
+                };
+                self.reset_radio();
+                self.queue_source.cancel();
+                self.queue_waiting = None;
+                self.now_playing = None;
+                self.library.queue.replace(vec![track], 0);
+                self.video_open = self.library.video;
+                self.play_current_at(0., false, mode, cx);
             }
         }
     }
@@ -2440,7 +2746,7 @@ impl Music {
             cx.notify();
             return;
         }
-        if self.waiting_for_radio() {
+        if self.waiting_for_watch() {
             self.playback = self.playback.toggled();
             cx.notify();
             return;
@@ -2464,8 +2770,8 @@ impl Music {
             self.play_current(cx);
         }
     }
-    fn waiting_for_radio(&self) -> bool {
-        self.watch_pending
+    fn waiting_for_watch(&self) -> bool {
+        self.watch_pending.is_some()
             && self.active_id.is_none()
             && matches!(self.playback, Playback::Loading { .. })
     }
@@ -2480,12 +2786,21 @@ impl Music {
 
     fn advance_queue(&mut self, intent: QueueAdvance, cx: &mut Context<Self>) {
         let autoplay = self.library.music_autoplay();
-        if self.library.queue.advance_with_autoplay(
-            self.library.repeat,
-            intent.natural,
-            autoplay,
-            &mut self.autoplay_tracks,
-        ) {
+        let wait_for_queue = self.watch_pending == Some(QueueUpdate::Replace)
+            || (self.watch_pending == Some(QueueUpdate::Adopt)
+                && self
+                    .library
+                    .queue
+                    .index
+                    .is_none_or(|index| index + 1 >= self.library.queue.tracks.len()));
+        if !wait_for_queue
+            && self.library.queue.advance_with_autoplay(
+                self.library.repeat,
+                intent.natural,
+                autoplay,
+                &mut self.autoplay_tracks,
+            )
+        {
             self.follow_queue_selection(intent.playback, cx);
         } else {
             self.player_command(Player::stop);
@@ -2495,6 +2810,18 @@ impl Music {
             self.playback = Playback::Stopped;
             self.position = self.duration;
             self.notice = None;
+            if wait_for_queue {
+                self.queue_waiting = Some(intent);
+                if intent.playback != Playback::Stopped {
+                    self.playback = Playback::Loading {
+                        paused: intent.playback.is_paused(),
+                        retried: false,
+                    };
+                }
+                self.notice = Some("Loading more queued songs".into());
+                cx.notify();
+                return;
+            }
             if self.library.queue.incomplete {
                 self.autoplay_waiting = None;
                 let session = self.account.as_ref().map(|account| &account.session);
@@ -2548,7 +2875,7 @@ impl Music {
 
     fn follow_queue_selection(&mut self, playback: Playback, cx: &mut Context<Self>) {
         if playback != Playback::Stopped {
-            self.play_current_at(0., playback.is_paused(), cx);
+            self.play_current_at(0., playback.is_paused(), WatchMode::Details, cx);
             return;
         }
         self.stop_playback(cx);
@@ -2574,7 +2901,7 @@ impl Music {
         self.queue_waiting = None;
         self.reset_radio();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
-        self.watch_pending = false;
+        self.watch_pending = None;
         self.discard_pending_playback();
         self.now_playing = None;
         self.video_click = None;
@@ -2742,6 +3069,10 @@ impl Music {
                     })
             });
         let can_go_next = loaded_next
+            || matches!(
+                self.watch_pending,
+                Some(QueueUpdate::Adopt | QueueUpdate::Replace)
+            )
             || (queue.incomplete && self.queue_source.can_continue())
             || (!queue.incomplete
                 && self.library.repeat != Repeat::Off
@@ -2749,12 +3080,12 @@ impl Music {
             || (self.library.music_autoplay()
                 && (!self.autoplay_tracks.is_empty()
                     || self.radio.is_some()
-                    || self.watch_pending
+                    || self.watch_pending.is_some()
                     || self.radio_loading
                     || seed_available));
         let waiting = self.queue_waiting.is_some()
             || self.autoplay_waiting.is_some()
-            || self.waiting_for_radio();
+            || self.waiting_for_watch();
         service.publish(mpris::State {
             playback: if self.playback == Playback::Stopped {
                 mpris::PlaybackStatus::Stopped
@@ -2970,7 +3301,12 @@ impl Music {
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        let control = event.keystroke.modifiers.control;
+        let modifiers = event.keystroke.modifiers;
+        let control = modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.function
+            && !modifiers.shift;
         if control && key == "q" {
             cx.quit();
             return;
@@ -2993,14 +3329,38 @@ impl Music {
             }
             return;
         }
+        if modifiers.alt
+            && !modifiers.control
+            && !modifiers.platform
+            && !modifiers.function
+            && !modifiers.shift
+            && key == "left"
+        {
+            self.go_back(cx);
+            return;
+        }
         if self.search.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        if control {
+            match key {
+                "right" => self.next(false, cx),
+                "left" => self.previous(cx),
+                _ => {}
+            }
+            return;
+        }
+        if modifiers.control
+            || modifiers.alt
+            || modifiers.platform
+            || modifiers.function
+            || (modifiers.shift && !matches!(key, "?" | "/"))
+        {
             return;
         }
         match key {
             "space" => self.toggle_play(cx),
             "f" if self.video_open => self.toggle_video_fullscreen(window, cx),
-            "right" if control => self.next(false, cx),
-            "left" if control => self.previous(cx),
             "right" => {
                 let seconds = (self.playback_position() + 5.).min(self.duration);
                 self.seek_current(seconds, cx);
@@ -3080,82 +3440,39 @@ impl Music {
             || (route == Route::Saved && matches!(self.route, Route::Library(_)));
         div()
             .id(id)
-            .h(px(44.))
-            .px(px(13.))
+            .h(px(if compact { 68. } else { 48. }))
+            .flex_shrink_0()
+            .px(px(if compact { 4. } else { 16. }))
             .flex()
             .items_center()
-            .gap(px(14.))
-            .rounded(px(7.))
-            .text_color(if active {
-                self.theme.text
-            } else {
-                self.theme.muted
-            })
+            .when(compact, |d| d.flex_col().justify_center())
+            .gap(px(if compact { 6. } else { 24. }))
+            .rounded(px(8.))
+            .text_size(px(if compact { 10. } else { 16. }))
+            .text_color(self.theme.text)
             .when(active, |d| d.bg(self.theme.selection))
-            .hover(|d| d.bg(self.theme.raised).text_color(self.theme.text))
+            .hover(|d| d.bg(self.theme.raised))
             .cursor_pointer()
-            .tooltip(move |_, cx| {
-                cx.new(|_| Hint {
-                    text: label,
-                    theme: Theme::load(),
-                })
-                .into()
-            })
-            .child(icon(
-                glyph,
-                21.,
-                if active {
-                    self.theme.text
-                } else {
-                    self.theme.muted
-                },
-            ))
-            .when(!compact, |d| d.child(label))
+            .child(icon(glyph, 24., self.theme.text))
+            .child(label)
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
                 view.navigate(route.clone(), cx);
             }))
     }
     fn sidebar(&self, compact: bool, cx: &Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(if compact { 74. } else { 206. }))
+        let mut sidebar = div()
+            .id("sidebar")
+            .w(px(if compact { 72. } else { 240. }))
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .px(px(12.))
-            .py(px(24.))
-            .gap(px(6.))
+            .px(px(if compact { 4. } else { 8. }))
+            .pt(px(8.))
             .border_r_1()
             .border_color(self.theme.border)
-            .bg(self.theme.panel)
-            .child(
-                div()
-                    .h(px(45.))
-                    .px(px(12.))
-                    .mb(px(25.))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(
-                        div()
-                            .size(px(29.))
-                            .rounded_full()
-                            .bg(rgb(0xff344e))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon("play", 18., self.theme.text).text_color(rgb(0xffffff))),
-                    )
-                    .when(!compact, |d| {
-                        d.child(
-                            div()
-                                .text_size(px(21.))
-                                .font_weight(FontWeight::BOLD)
-                                .child("Music"),
-                        )
-                    }),
-            )
+            .bg(self.theme.bg)
             .child(self.nav("home-nav", "home", "Home", Route::Home, compact, cx))
             .child(self.nav(
                 "explore-nav",
@@ -3165,166 +3482,444 @@ impl Music {
                 compact,
                 cx,
             ))
+            .child(self.nav("saved-nav", "library", "Library", Route::Saved, compact, cx));
+        if compact {
+            return sidebar.into_any_element();
+        }
+        sidebar = sidebar
             .child(
                 div()
                     .h(px(1.))
-                    .mx(px(12.))
-                    .my(px(17.))
+                    .mx(px(16.))
+                    .my(px(24.))
                     .bg(self.theme.border),
             )
-            .child(self.nav(
-                "liked-nav",
-                "heart",
-                "Liked songs",
-                Route::Liked,
-                compact,
-                cx,
-            ))
-            .child(self.nav(
-                "saved-nav",
-                "library",
-                if self.account.is_some() {
-                    "Library"
-                } else {
-                    "Saved collections"
-                },
-                Route::Saved,
-                compact,
-                cx,
-            ))
-            .child(self.nav(
-                "recent-nav",
-                "history",
-                "Recently played",
-                Route::Recent,
-                compact,
-                cx,
-            ))
-            .child(div().flex_1())
             .child(
                 div()
-                    .id("shortcut-help")
-                    .h(px(42.))
-                    .px(px(13.))
+                    .id("sidebar-new-playlist")
+                    .mx(px(12.))
+                    .h(px(36.))
+                    .mb(px(16.))
+                    .rounded_full()
+                    .bg(self.theme.selection)
                     .flex()
                     .items_center()
-                    .gap(px(14.))
-                    .text_color(self.theme.muted)
+                    .justify_center()
+                    .gap(px(8.))
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
-                    .hover(|d| d.text_color(self.theme.text))
-                    .child(icon("help", 20., self.theme.text))
-                    .when(!compact, |d| d.child("Keyboard shortcuts"))
+                    .hover(|d| d.bg(self.theme.raised))
+                    .child(icon("plus", 20., self.theme.text))
+                    .child("New playlist")
                     .on_click(cx.listener(|view, _, window, cx| {
                         window.focus(&view.focus, cx);
-                        view.overlay = Some(Overlay::Help);
-                        cx.notify();
+                        if view.account.is_some() {
+                            view.playlist_form(false, None, window, cx);
+                        } else {
+                            view.overlay = Some(Overlay::Settings);
+                            cx.notify();
+                        }
                     })),
-            )
-            .child(
+            );
+        for (id, title, subtitle, route) in [
+            ("liked-nav", "Liked Music", "Auto playlist", Route::Liked),
+            ("recent-nav", "History", "Recently played", Route::Recent),
+        ]
+        .into_iter()
+        .filter(|(id, _, _, _)| self.account.is_none() || *id != "recent-nav")
+        {
+            sidebar = sidebar.child(
                 div()
-                    .id("settings-nav")
-                    .h(px(42.))
-                    .px(px(13.))
+                    .id(id)
+                    .h(px(56.))
+                    .px(px(16.))
+                    .rounded(px(8.))
                     .flex()
-                    .items_center()
-                    .gap(px(14.))
-                    .text_color(self.theme.muted)
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(4.))
                     .cursor_pointer()
-                    .hover(|d| d.text_color(self.theme.text))
-                    .child(icon("settings", 20., self.theme.text))
-                    .when(!compact, |d| d.child("Settings"))
-                    .on_click(cx.listener(|view, _, window, cx| {
+                    .when(self.route == route, |d| d.bg(self.theme.selection))
+                    .hover(|d| d.bg(self.theme.raised))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(self.theme.muted)
+                            .child(subtitle),
+                    )
+                    .on_click(cx.listener(move |view, _, window, cx| {
                         window.focus(&view.focus, cx);
-                        view.overlay = Some(Overlay::Settings);
-                        cx.notify();
+                        view.navigate(route.clone(), cx);
                     })),
+            );
+        }
+        if self.account.is_some() {
+            sidebar = sidebar.child(
+                div()
+                    .id("saved-episodes-nav")
+                    .h(px(56.))
+                    .px(px(16.))
+                    .rounded(px(8.))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(self.theme.raised))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Episodes for Later"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(self.theme.muted)
+                            .child("Auto playlist"),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.navigate(Route::Library(Section::Episodes), cx)
+                    })),
+            );
+        }
+        let playlists = if self.account.is_some() {
+            &self.sidebar_playlists
+        } else {
+            &self.library.saved
+        };
+        sidebar = sidebar.child(
+            uniform_list(
+                "sidebar-playlists",
+                playlists.len(),
+                cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
+                    let playlists = if view.account.is_some() {
+                        &view.sidebar_playlists
+                    } else {
+                        &view.library.saved
+                    };
+                    range
+                        .map(|index| {
+                            let playlist = &playlists[index];
+                            let link = BrowseLink::new(playlist.id.clone(), playlist.title.clone());
+                            div()
+                                .id(("sidebar-playlist", index))
+                                .h(px(56.))
+                                .px(px(16.))
+                                .rounded(px(8.))
+                                .flex()
+                                .flex_col()
+                                .justify_center()
+                                .gap(px(4.))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(view.theme.raised))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(playlist.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .text_color(view.theme.muted)
+                                        .child(playlist.subtitle.clone()),
+                                )
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    window.focus(&view.focus, cx);
+                                    view.navigate(Route::Browse(link.clone()), cx);
+                                }))
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>()
+                }),
             )
+            .track_scroll(&self.sidebar_scroll)
+            .flex_1()
+            .min_h_0(),
+        );
+        if let Some(error) = &self.sidebar_error {
+            sidebar = sidebar.child(
+                div()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .text_size(px(12.))
+                    .text_color(self.theme.muted)
+                    .child(error.clone())
+                    .child(
+                        div()
+                            .id("retry-sidebar")
+                            .mt(px(8.))
+                            .text_color(self.theme.text)
+                            .cursor_pointer()
+                            .child("Retry playlists")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.request(Query::SidebarPlaylists, cx)
+                            })),
+                    ),
+            );
+        }
+        sidebar.into_any_element()
     }
-    fn header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn header(&self, inset: f32, cx: &Context<Self>) -> impl IntoElement {
+        let initial = self
+            .account
+            .as_ref()
+            .and_then(|connection| connection.account.name.chars().next())
+            .map(|initial| initial.to_uppercase().to_string());
         div()
-            .h(px(80.))
-            .px(px(30.))
+            .h(px(64.))
+            .w_full()
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(18.))
-            .child(
-                button("back", "back", self.theme)
-                    .opacity(if self.back.is_empty() { 0.3 } else { 1. })
-                    .on_click(cx.listener(|view, _, _, cx| view.go_back(cx))),
-            )
+            .when(!self.route.is_artist() || self.video_open, |d| {
+                d.bg(self.theme.bg)
+            })
             .child(
                 div()
-                    .id("search-box")
-                    .max_w(px(670.))
-                    .flex_1()
-                    .h(px(46.))
+                    .w(px(240.))
+                    .flex_shrink_0()
                     .px(px(16.))
-                    .rounded(px(8.))
-                    .bg(self.theme.raised)
-                    .border_1()
-                    .border_color(self.theme.border)
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        window.focus(&view.search.focus_handle(cx), cx)
-                    }))
-                    .child(icon("search", 21., self.theme.text).text_color(self.theme.muted))
-                    .child(div().flex_1().min_w_0().child(self.search.clone()))
+                    .child(
+                        button("guide-toggle", "menu", self.theme)
+                            .size(px(40.))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.sidebar_collapsed = !view.sidebar_collapsed;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(self.theme.muted)
-                            .child("Ctrl K"),
+                            .id("brand-home")
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .size(px(26.))
+                                    .rounded_full()
+                                    .bg(self.theme.accent)
+                                    .child(icon("brand", 26., self.theme.text)),
+                            )
+                            .child(
+                                svg()
+                                    .path("wordmark")
+                                    .w(px(47.))
+                                    .h(px(26.))
+                                    .text_color(self.theme.text),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| view.navigate(Route::Home, cx))),
                     ),
-            )
-            .child(div().flex_1())
-            .child(
-                button("open-web", "external", self.theme)
-                    .on_click(|_, _, cx| cx.open_url("https://music.youtube.com")),
             )
             .child(
                 div()
-                    .id("refresh")
-                    .cursor_pointer()
-                    .text_color(self.theme.muted)
-                    .hover(|d| d.text_color(self.theme.text))
-                    .child("Refresh")
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        if view.account.is_some() {
-                            view.refresh_remote(cx);
-                        } else {
-                            view.navigate(view.route.clone(), cx);
-                        }
-                    })),
+                    .flex_1()
+                    .min_w_0()
+                    .pl(px(inset))
+                    .pr(px(32.))
+                    .flex()
+                    .items_center()
+                    .gap(px(24.))
+                    .child(
+                        div()
+                            .id("search-box")
+                            .w(px(480.))
+                            .min_w_0()
+                            .h(px(42.))
+                            .px(px(12.))
+                            .rounded(px(8.))
+                            .bg(self.theme.raised)
+                            .border_1()
+                            .border_color(rgb(0x484848))
+                            .flex()
+                            .items_center()
+                            .gap(px(16.))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                window.focus(&view.search.focus_handle(cx), cx)
+                            }))
+                            .child(icon("search", 24., self.theme.text))
+                            .child(div().flex_1().min_w_0().child(self.search.clone())),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("account-menu")
+                            .size(px(32.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(rgb(0x3f3f3f))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .when_some(initial, |d, initial| d.child(initial))
+                            .when(self.account.is_none(), |d| {
+                                d.child(icon("person", 24., self.theme.text))
+                            })
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Hint {
+                                    text: "Account and settings",
+                                    theme: Theme::load(),
+                                })
+                                .into()
+                            })
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                window.focus(&view.focus, cx);
+                                view.overlay = Some(Overlay::Settings);
+                                cx.notify();
+                            })),
+                    ),
             )
     }
-    fn card(&mut self, item: Item, id: usize, cx: &Context<Self>) -> AnyElement {
+    fn card(
+        &mut self,
+        item: Item,
+        id: usize,
+        width: f32,
+        layout: ShelfLayout,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         if let Item::Navigation(link) = item {
             return self
                 .navigation(link, ("shelf-link", id), cx)
-                .w(px(240.))
+                .w(px(width))
                 .h(px(44.))
                 .into_any_element();
         }
-        let art = self.art(item.thumbnail(), CARD_WIDTH);
         let title = item.title().to_owned();
         let subtitle = item.subtitle().to_owned();
+        if layout == ShelfLayout::Songs {
+            let art = self.art(item.thumbnail(), 48.);
+            return div()
+                .id(("quick-pick", id))
+                .w(px(width))
+                .h(px(64.))
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|d| d.bg(self.theme.raised))
+                .child(art)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(16.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(14.))
+                                .text_color(self.theme.muted)
+                                .child(subtitle),
+                        ),
+                )
+                .child(
+                    button(("quick-menu", id), "more", self.theme).on_click(cx.listener(
+                        move |view, _, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&view.focus, cx);
+                            if let Some(Item::Track(track)) = view.rows.get(id) {
+                                view.open_track_menu(track.clone(), Some(id), window, cx);
+                            }
+                        },
+                    )),
+                )
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    window.focus(&view.focus, cx);
+                    view.play_item(id, cx);
+                }))
+                .into_any_element();
+        }
+        let image = item.thumbnail().and_then(|url| self.artwork.get(url));
+        let artist =
+            matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
+        let play = match &item {
+            Item::Collection(collection) => collection.details.play.clone(),
+            _ => None,
+        };
+        let mut art = div()
+            .relative()
+            .w(px(width))
+            .h(px(if layout == ShelfLayout::Videos {
+                width * 9. / 16.
+            } else {
+                width
+            }))
+            .rounded(px(4.))
+            .when(artist, |d| d.rounded_full())
+            .overflow_hidden()
+            .bg(self.theme.raised);
+        art = if let Some(image) = image {
+            art.child(img(image).size_full().object_fit(ObjectFit::Cover))
+        } else {
+            art.flex()
+                .items_center()
+                .justify_center()
+                .child(icon("music", 32., self.theme.muted))
+        };
+        if let Some(target) = play {
+            art = art.child(
+                div()
+                    .id(("collection-play", id))
+                    .invisible()
+                    .group_hover("music-card", |d| d.visible())
+                    .absolute()
+                    .right(px(12.))
+                    .bottom(px(12.))
+                    .size(px(48.))
+                    .rounded_full()
+                    .bg(rgba(0x030303dd))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(icon("play", 28., self.theme.text))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&view.focus, cx);
+                        view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                    })),
+            );
+        }
         div()
             .id(("card", id))
-            .w(px(CARD_WIDTH))
+            .group("music-card")
+            .w(px(width))
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(px(9.))
+            .gap(px(8.))
             .cursor_pointer()
-            .child(div().rounded(px(5.)).overflow_hidden().child(art))
+            .child(art)
             .child(
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(15.))
+                    .text_size(px(16.))
                     .font_weight(FontWeight::MEDIUM)
                     .child(title),
             )
@@ -3332,7 +3927,7 @@ impl Music {
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(px(16.))
                     .text_color(self.theme.muted)
                     .child(subtitle),
             )
@@ -3363,118 +3958,236 @@ impl Music {
                 view.navigate(Route::Browse(link.clone()), cx);
             }))
     }
-    fn shelf(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let title = self.page.shelves[index].title.clone();
+    fn shelf(
+        &mut self,
+        index: usize,
+        inset: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let shelf = &self.page.shelves[index];
+        let title = shelf.title.clone();
+        let more = shelf.more.clone();
+        let layout = shelf.layout;
         let start = self.page.shelves[..index]
             .iter()
             .map(|shelf| shelf.items.len())
             .sum::<usize>();
-        let mut contents = div()
+        let navigation = shelf
+            .items
+            .iter()
+            .all(|item| matches!(item, Item::Navigation(_)));
+        let width = if navigation {
+            240.
+        } else {
+            match layout {
+                ShelfLayout::Cards => CARD_WIDTH,
+                ShelfLayout::Videos => 256.,
+                ShelfLayout::Songs => 360.,
+            }
+        };
+        let rows = if navigation || layout == ShelfLayout::Songs {
+            4
+        } else {
+            1
+        };
+        let count = shelf.items.len().div_ceil(rows);
+        let scroll = self.shelf_scroll.entry(index).or_default().clone();
+        let range = visible_cards(
+            count,
+            (-scroll.offset().x).into(),
+            window.viewport_size().width.into(),
+            width + CARD_GAP,
+        );
+        let stride = width + CARD_GAP;
+        let columns = range
+            .clone()
+            .map(|column| {
+                let items = self.page.shelves[index]
+                    .items
+                    .iter()
+                    .skip(column * rows)
+                    .take(rows)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(if navigation { 12. } else { 0. }))
+                    .children(
+                        items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(row, item)| {
+                                self.card(item, start + column * rows + row, width, layout, cx)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let contents = div()
             .id(("carousel", index))
             .w_full()
             .min_w_0()
             .flex()
-            .gap(px(CARD_GAP))
             .overflow_x_scroll()
-            .pb(px(10.));
-        if self.page.shelves[index]
-            .items
-            .iter()
-            .all(|item| matches!(item, Item::Navigation(_)))
-        {
-            let shelf = self.page.shelves[index].clone();
-            for (column, items) in shelf.items.chunks(4).enumerate() {
-                contents = contents.child(
-                    div()
-                        .w(px(240.))
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .children(
-                            items
-                                .iter()
-                                .cloned()
-                                .enumerate()
-                                .map(|(row, item)| self.card(item, start + column * 4 + row, cx))
-                                .collect::<Vec<_>>(),
-                        ),
-                );
-            }
-        } else {
-            let scroll = self.shelf_scroll.entry(index).or_default().clone();
-            let count = self.page.shelves[index].items.len();
-            // The full window width safely overscans the carousel during resizing.
-            let range = visible_cards(
-                count,
-                (-scroll.offset().x).into(),
-                window.viewport_size().width.into(),
-            );
-            let cards = self.page.shelves[index].items[range.clone()].to_vec();
-            let stride = CARD_WIDTH + CARD_GAP;
-            contents = contents
-                .track_scroll(&scroll)
-                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                .child(
-                    div()
-                        .relative()
-                        .flex_shrink_0()
-                        .w(px((count as f32 * stride - CARD_GAP).max(0.)))
-                        .h(px(244.))
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(range.start as f32 * stride))
-                                .flex()
-                                .gap(px(CARD_GAP))
-                                .children(
-                                    cards
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(i, item)| {
-                                            self.card(item, start + range.start + i, cx)
-                                        })
-                                        .collect::<Vec<_>>(),
-                                ),
-                        ),
-                );
-        }
-        div()
-            .id(("shelf", index))
-            .h(px(308.))
-            .px(px(30.))
-            .flex()
-            .flex_col()
-            .gap(px(17.))
+            .track_scroll(&scroll)
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .child(
                 div()
-                    .text_size(px(23.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
+                    .relative()
+                    .flex_shrink_0()
+                    .w(px((count as f32 * stride - CARD_GAP).max(0.)))
+                    .h(px(260.))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(range.start as f32 * stride))
+                            .flex()
+                            .gap(px(CARD_GAP))
+                            .children(columns),
+                    ),
+            );
+        let previous = scroll.clone();
+        let next = scroll.clone();
+        div()
+            .id(("shelf", index))
+            .w_full()
+            .min_w_0()
+            .h(px(SHELF_HEIGHT))
+            .px(px(inset))
+            .pt(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(20.))
+            .child(
+                div()
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(32.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(16.))
+                            .children(more.map(|link| {
+                                div()
+                                    .id(("carousel-more", index))
+                                    .h(px(36.))
+                                    .px(px(16.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(self.theme.border)
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .child(link.title.clone())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.navigate(Route::Browse(link.clone()), cx)
+                                    }))
+                            }))
+                            .child(
+                                button(("shelf-previous", index), "back", self.theme)
+                                    .size(px(36.))
+                                    .border_1()
+                                    .border_color(self.theme.border)
+                                    .opacity(if scroll.offset().x < px(-1.) {
+                                        1.
+                                    } else {
+                                        0.35
+                                    })
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        let offset = previous.offset();
+                                        previous.set_offset(point(
+                                            (offset.x + px(stride * 3.)).min(px(0.)),
+                                            offset.y,
+                                        ));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                button(("shelf-next", index), "forward", self.theme)
+                                    .size(px(36.))
+                                    .border_1()
+                                    .border_color(self.theme.border)
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        let offset = next.offset();
+                                        next.set_offset(point(
+                                            (offset.x - px(stride * 3.)).max(-next.max_offset().x),
+                                            offset.y,
+                                        ));
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
             .child(contents)
             .into_any_element()
     }
-    fn row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn row(
+        &mut self,
+        index: usize,
+        inset: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let item = self.rows[index].clone();
-        let active = self
-            .library
-            .queue
-            .current()
-            .is_some_and(|t| t.id == item.id())
-            && self.active_id.is_some();
-        let art = self.art(item.thumbnail(), 46.);
+        let artist =
+            self.route.is_artist() && window.viewport_size().width >= px(1200.) && !self.show_queue;
+        let active = self.library.queue.current().is_some_and(|current| {
+            current.id == item.id()
+                && match &item {
+                    Item::Track(track) if track.details.set_video_id.is_some() => {
+                        current.details.set_video_id == track.details.set_video_id
+                    }
+                    _ => true,
+                }
+        }) && self.active_id.is_some();
+        let numbered = matches!(&self.route,Route::Browse(link) if link.id.starts_with("MPRE"))
+            && matches!(item, Item::Track(_));
+        let art = if numbered {
+            div()
+                .w(px(32.))
+                .h(px(48.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(self.theme.muted)
+                .when(active, |d| d.child(icon("volume", 20., self.theme.text)))
+                .when(!active, |d| d.child((index + 1).to_string()))
+                .into_any_element()
+        } else {
+            let thumbnail = item.thumbnail().map(str::to_owned).or_else(|| {
+                self.page
+                    .header
+                    .as_ref()
+                    .and_then(|header| header.thumbnail.clone())
+            });
+            self.art(thumbnail.as_deref(), if artist { 40. } else { 48. })
+        };
         let title = item.title().to_owned();
         let subtitle = item.subtitle().to_owned();
         let mut row = div()
             .id(("song", index))
+            .group("music-row")
             .w_full()
-            .px(px(30.))
-            .h(px(68.))
+            .h(px(if artist { 50. } else { 64. }))
             .flex()
             .items_center()
-            .gap(px(14.))
-            .rounded(px(6.))
+            .gap(px(if artist { 24. } else { 14. }))
+            .rounded(px(4.))
             .when(active, |d| d.bg(self.theme.selection))
             .hover(|d| d.bg(self.theme.raised))
             .cursor_pointer()
@@ -3483,7 +4196,49 @@ impl Music {
                 view.play_item(index, cx);
             }))
             .child(art)
-            .child(
+            .child(if artist {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(24.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(16.))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .w(px(180.))
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(16.))
+                            .text_color(self.theme.muted)
+                            .child(subtitle),
+                    )
+                    .when_some(
+                        match &item {
+                            Item::Track(track) => track.album.clone(),
+                            _ => None,
+                        },
+                        |d, album| {
+                            d.child(
+                                div()
+                                    .w(px(180.))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(16.))
+                                    .text_color(self.theme.muted)
+                                    .child(album),
+                            )
+                        },
+                    )
+                    .into_any_element()
+            } else {
                 div()
                     .flex_1()
                     .min_w_0()
@@ -3493,25 +4248,26 @@ impl Music {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(15.))
+                            .text_size(px(16.))
                             .when(active, |d| d.text_color(self.theme.accent))
                             .child(title),
                     )
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(px(14.))
                             .text_color(self.theme.muted)
                             .child(subtitle),
-                    ),
-            );
+                    )
+                    .into_any_element()
+            });
         match item {
             Item::Navigation(link) => {
                 return self
                     .navigation(link, ("browse-link", index), cx)
                     .w_full()
-                    .h(px(68.))
-                    .px(px(30.))
+                    .h(px(64.))
+                    .px(px(inset))
                     .hover(|d| d.bg(self.theme.raised))
                     .into_any_element();
             }
@@ -3527,7 +4283,7 @@ impl Music {
                             } else {
                                 48.
                             }))
-                            .text_size(px(12.))
+                            .text_size(px(14.))
                             .text_color(self.theme.muted)
                             .child(track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
                                 track
@@ -3541,26 +4297,31 @@ impl Music {
                     .child(
                         button(
                             ("like", index),
-                            if liked { "heart-filled" } else { "heart" },
+                            if liked { "thumb-up-filled" } else { "thumb-up" },
                             self.theme,
                         )
-                        .when(liked, |d| d.text_color(self.theme.accent))
+                        .when(!liked, |d| {
+                            d.invisible().group_hover("music-row", |d| d.visible())
+                        })
                         .on_click(cx.listener(move |view, _, _, cx| {
                             cx.stop_propagation();
                             view.toggle_like(&like_track, cx);
                         })),
                     )
                     .child(
-                        button(("add", index), "plus", self.theme).on_click(cx.listener(
-                            move |view, _, _, cx| {
+                        button(("add", index), "plus", self.theme)
+                            .invisible()
+                            .group_hover("music-row", |d| d.visible())
+                            .on_click(cx.listener(move |view, _, _, cx| {
                                 cx.stop_propagation();
                                 view.enqueue(track.clone(), cx);
-                            },
-                        )),
+                            })),
                     )
                     .child(
                         div()
                             .id(("track-menu", index))
+                            .invisible()
+                            .group_hover("music-row", |d| d.visible())
                             .w(px(32.))
                             .h(px(36.))
                             .flex()
@@ -3571,18 +4332,14 @@ impl Music {
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&view.focus, cx);
-                                view.overlay = Some(Overlay::Track {
-                                    track: menu_track.clone(),
-                                    index: Some(index),
-                                });
-                                cx.notify();
+                                view.open_track_menu(menu_track.clone(), Some(index), window, cx);
                             })),
                     );
             }
             Item::Collection(collection) => {
                 let saved = self.is_saved(&collection);
                 row = row
-                    .child(div().text_size(px(12.)).text_color(self.theme.muted).child(
+                    .child(div().text_size(px(14.)).text_color(self.theme.muted).child(
                         if collection.id.starts_with("UC") {
                             "Artist"
                         } else {
@@ -3603,217 +4360,446 @@ impl Music {
                     .child(icon("forward", 17., self.theme.text).text_color(self.theme.muted));
             }
         }
-        row.into_any_element()
+        div().w_full().px(px(inset)).child(row).into_any_element()
     }
-    fn content(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let home = self.route.is_home() || matches!(self.route, Route::Explore);
-        let has_tracks = self.rows.iter().any(|i| matches!(i, Item::Track(_)));
-        let single_episode =
-            matches!(self.rows.as_slice(), [Item::Track(track)] if track.details.episode.is_some());
-        let chapter_track = match self.rows.as_slice() {
-            [Item::Track(track)]
-                if track
-                    .details
-                    .episode
-                    .as_ref()
-                    .is_some_and(|episode| !episode.chapters.is_empty()) =>
-            {
-                Some(track.clone())
+    fn artist_heading(&mut self, inset: f32, cx: &mut Context<Self>) -> AnyElement {
+        let header = self.page.header.clone().expect("artist page header");
+        let mut actions = div().flex().items_center().flex_wrap().gap(px(8.));
+        for (id, label, target) in [
+            ("artist-shuffle", "Shuffle", header.shuffle),
+            ("artist-mix", "Mix", header.mix),
+        ] {
+            if let Some(target) = target {
+                actions = actions.child(
+                    div()
+                        .id(id)
+                        .w(px(136.))
+                        .h(px(36.))
+                        .rounded_full()
+                        .bg(self.theme.text)
+                        .text_color(self.theme.bg)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .child(label)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                        })),
+                );
             }
-            _ => None,
-        };
-        let mut content = div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(self.header(cx))
-            .child(
+        }
+        if let Some(subscribed) = header.subscribed {
+            let label = if header.subscription_label.is_empty() {
+                if subscribed {
+                    "Subscribed"
+                } else {
+                    "Subscribe"
+                }
+                .to_owned()
+            } else {
+                header.subscription_label
+            };
+            let label = if header.subscriber_count.is_empty() {
+                label
+            } else {
+                format!("{label} {}", header.subscriber_count)
+            };
+            actions = actions.child(
                 div()
-                    .px(px(30.))
-                    .pt(px(10.))
-                    .pb(px(25.))
+                    .id("artist-subscribe")
+                    .h(px(36.))
+                    .px(px(16.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(self.theme.accent)
+                    .text_color(self.theme.accent)
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        window.focus(&view.focus, cx);
+                        if view.account.is_none() {
+                            view.overlay = Some(Overlay::Settings);
+                            cx.notify();
+                            return;
+                        }
+                        let Route::Browse(link) = &view.route else {
+                            return;
+                        };
+                        let collection = Collection {
+                            id: link.id.clone(),
+                            title: view.page.title.clone(),
+                            subtitle: String::new(),
+                            thumbnail: None,
+                            details: Default::default(),
+                        };
+                        view.mutate(
+                            Mutation::CollectionLibrary {
+                                collection,
+                                save: !subscribed,
+                            },
+                            cx,
+                        );
+                    })),
+            );
+        }
+        div()
+            .w_full()
+            .h(px(500.))
+            .px(px(inset))
+            .pb(px(32.))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .gap(px(16.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(31.))
+                            .text_size(px(32.))
+                            .line_height(relative(1.2))
                             .font_weight(FontWeight::BOLD)
                             .child(self.page.title.clone()),
                     )
-                    .when(!self.page.description.is_empty(), |heading| {
-                        heading.child(
+                    .when(!header.subtitle.is_empty(), |d| {
+                        d.child(
                             div()
-                                .id("page-description")
-                                .py(px(10.))
-                                .text_size(px(13.))
-                                .cursor_pointer()
-                                .child("Description")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    window.focus(&view.focus, cx);
-                                    view.overlay = Some(Overlay::Description {
-                                        title: view.page.title.clone(),
-                                        text: view.page.description.clone(),
-                                    });
-                                    cx.notify();
-                                })),
+                                .text_size(px(16.))
+                                .line_height(relative(1.25))
+                                .text_color(self.theme.muted)
+                                .child(header.subtitle),
                         )
-                    })
-                    .when_some(chapter_track, |heading, track| {
-                        heading.child(
-                            div()
-                                .id("page-chapters")
-                                .py(px(10.))
-                                .text_size(px(13.))
-                                .cursor_pointer()
-                                .child("Chapters")
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    window.focus(&view.focus, cx);
-                                    view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(!self.page.countries.is_empty(), |heading| {
-                        let label = self
-                            .page
-                            .countries
-                            .iter()
-                            .find(|choice| choice.selected)
-                            .map(|choice| choice.label.clone())
-                            .unwrap_or_else(|| "Country".into());
-                        heading.child(
-                            div()
-                                .id("chart-country")
-                                .py(px(10.))
-                                .flex()
-                                .items_center()
-                                .gap(px(10.))
-                                .text_size(px(14.))
-                                .cursor_pointer()
-                                .child(label)
-                                .child(icon("forward", 14., self.theme.muted))
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.country_picker(window, cx)
-                                })),
-                        )
-                    })
-                    .when(
-                        self.account.is_some()
-                            && matches!(
-                                self.route,
-                                Route::Saved | Route::Library(Section::Playlists)
-                            ),
-                        |d| {
-                            d.child(
-                                div()
-                                    .id("new-playlist")
-                                    .cursor_pointer()
-                                    .text_size(px(13.))
-                                    .child("New playlist")
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.playlist_form(false, None, window, cx)
-                                    })),
-                            )
-                        },
+                    }),
+            )
+            .when(!self.page.description.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("artist-description")
+                        .max_w(px(700.))
+                        .line_clamp(2)
+                        .max_h(px(40.))
+                        .overflow_hidden()
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .cursor_pointer()
+                        .child(self.page.description.clone())
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            window.focus(&view.focus, cx);
+                            view.overlay = Some(Overlay::Description {
+                                title: view.page.title.clone(),
+                                text: view.page.description.clone(),
+                            });
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(actions)
+            .into_any_element()
+    }
+    fn list_row(
+        &mut self,
+        index: usize,
+        inset: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match self.list_rows[index] {
+            ListRow::Heading(shelf) => div()
+                .h(px(64.))
+                .px(px(inset))
+                .flex()
+                .items_center()
+                .text_size(px(24.))
+                .font_weight(FontWeight::BOLD)
+                .child(self.page.shelves[shelf].title.clone())
+                .into_any_element(),
+            ListRow::Item(index) => self.row(index, inset, window, cx),
+            ListRow::Shelf(index) => self.shelf(index, inset, window, cx),
+            ListRow::More(index) => {
+                let link = self.page.shelves[index]
+                    .more
+                    .clone()
+                    .expect("shelf navigation row");
+                div()
+                    .h(px(72.))
+                    .px(px(inset))
+                    .pt(px(8.))
+                    .flex()
+                    .items_start()
+                    .child(
+                        div()
+                            .id(("shelf-more", index))
+                            .h(px(36.))
+                            .px(px(16.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(self.theme.border)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .child(link.title.clone())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.navigate(Route::Browse(link.clone()), cx);
+                            })),
                     )
-                    .when(self.account.is_some() && self.page.editable, |d| {
+                    .into_any_element()
+            }
+        }
+    }
+    fn page_heading(&mut self, stacked: bool, edge: f32, cx: &mut Context<Self>) -> AnyElement {
+        let header = self.page.header.clone();
+        let title = self.page.title.clone();
+        let has_tracks = self.rows.iter().any(|item| matches!(item, Item::Track(_)));
+        let mut cover = None;
+        let mut heading = div()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .when(stacked, |d| d.items_center().text_center());
+        if let Some(header) = header {
+            if let Some(url) = header.thumbnail {
+                cover = Some(self.art(Some(&url), edge));
+            }
+            heading = heading.child(
+                div()
+                    .w_full()
+                    .text_size(px(if stacked { 24. } else { 32. }))
+                    .font_weight(FontWeight::BOLD)
+                    .child(title),
+            );
+            if !header.subtitle.is_empty() {
+                heading = heading.child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(self.theme.muted)
+                        .child(header.subtitle),
+                );
+            }
+        } else {
+            heading = heading.child(
+                div()
+                    .w_full()
+                    .text_size(px(32.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(title),
+            );
+        }
+        if !self.page.description.is_empty() {
+            heading = heading.child(
+                div()
+                    .id("page-description")
+                    .w_full()
+                    .text_size(px(14.))
+                    .text_color(self.theme.muted)
+                    .max_h(px(40.))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .child(self.page.description.clone())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        window.focus(&view.focus, cx);
+                        view.overlay = Some(Overlay::Description {
+                            title: view.page.title.clone(),
+                            text: view.page.description.clone(),
+                        });
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(12.))
+            .when(stacked, |d| d.justify_center());
+        if has_tracks {
+            actions = actions.child(
+                div()
+                    .id("play-all")
+                    .h(px(40.))
+                    .px(px(24.))
+                    .rounded_full()
+                    .bg(self.theme.text)
+                    .text_color(self.theme.bg)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .child(icon("play", 24., self.theme.bg))
+                    .child("Play")
+                    .on_click(cx.listener(|view, _, _, cx| view.replace_page_queue(0, cx))),
+            );
+        }
+        if let [Item::Track(track)] = self.rows.as_slice()
+            && track
+                .details
+                .episode
+                .as_ref()
+                .is_some_and(|episode| !episode.chapters.is_empty())
+        {
+            let track = track.clone();
+            actions = actions.child(
+                div()
+                    .id("page-chapters")
+                    .px(px(12.))
+                    .py(px(10.))
+                    .cursor_pointer()
+                    .child("Chapters")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        window.focus(&view.focus, cx);
+                        view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
+                        cx.notify();
+                    })),
+            );
+        }
+        if !self.page.countries.is_empty() {
+            let label = self
+                .page
+                .countries
+                .iter()
+                .find(|choice| choice.selected)
+                .map_or("Country", |choice| choice.label.as_str())
+                .to_owned();
+            actions = actions.child(
+                filter_chip("chart-country", label, false, self.theme)
+                    .on_click(cx.listener(|view, _, window, cx| view.country_picker(window, cx))),
+            );
+        }
+        if self.account.is_some() && self.page.editable {
+            actions = actions
+                .child(
+                    filter_chip("edit-playlist", "Edit playlist", false, self.theme).on_click(
+                        cx.listener(|view, _, window, cx| {
+                            view.playlist_form(true, None, window, cx)
+                        }),
+                    ),
+                )
+                .child(
+                    filter_chip("delete-playlist", "Delete", false, self.theme).on_click(
+                        cx.listener(|view, _, window, cx| {
+                            window.focus(&view.focus, cx);
+                            if let Route::Browse(link) = &view.route {
+                                view.overlay = Some(Overlay::DeletePlaylist {
+                                    id: link.id.clone(),
+                                    title: view.page.title.clone(),
+                                });
+                                cx.notify();
+                            }
+                        }),
+                    ),
+                );
+        }
+        if self.account.is_some()
+            && matches!(
+                self.route,
+                Route::Saved | Route::Library(Section::Playlists)
+            )
+        {
+            actions = actions.child(
+                filter_chip("new-playlist", "New playlist", false, self.theme).on_click(
+                    cx.listener(|view, _, window, cx| view.playlist_form(false, None, window, cx)),
+                ),
+            );
+        }
+        let heading = heading.child(actions);
+        match cover {
+            Some(cover) if stacked => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(20.))
+                .child(cover)
+                .child(heading)
+                .into_any_element(),
+            Some(cover) => div()
+                .flex()
+                .items_start()
+                .gap(px(24.))
+                .child(cover)
+                .child(heading.flex_1().min_w_0())
+                .into_any_element(),
+            None => heading.into_any_element(),
+        }
+    }
+    fn content(&mut self, inset: f32, available: f32, cx: &mut Context<Self>) -> AnyElement {
+        let home = self.route.is_home() || matches!(self.route, Route::Explore);
+        let search = matches!(self.route, Route::Search(_));
+        let library = matches!(self.route, Route::Saved | Route::Library(_));
+        let collection = !home && self.page.header.is_some();
+        let artist = collection && self.route.is_artist();
+        let stacked = collection && !artist && available >= 980.;
+        let mut content = div().flex_1().min_w_0().min_h_0().flex().flex_col();
+        if !home && !artist {
+            content = content.child(
+                div()
+                    .h(px(48.))
+                    .px(px(inset))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .when(!self.back.is_empty(), |d| {
                         d.child(
-                            div()
-                                .id("edit-playlist")
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .child("Edit")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.playlist_form(true, None, window, cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("delete-playlist")
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .child("Delete")
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    if let Route::Browse(link) = &view.route {
-                                        view.overlay = Some(Overlay::DeletePlaylist {
-                                            id: link.id.clone(),
-                                            title: view.page.title.clone(),
-                                        });
-                                        cx.notify();
-                                    }
-                                })),
-                        )
-                    })
-                    .when(!home && has_tracks, |d| {
-                        d.child(
-                            div()
-                                .id("play-all")
-                                .h(px(36.))
-                                .px(px(17.))
-                                .rounded_full()
-                                .bg(self.theme.text)
-                                .text_color(self.theme.bg)
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .cursor_pointer()
-                                .child(icon("play", 17., self.theme.text))
-                                .child(if single_episode { "Play" } else { "Play all" })
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.replace_page_queue(0, cx);
-                                })),
+                            button("back", "back", self.theme)
+                                .on_click(cx.listener(|view, _, _, cx| view.go_back(cx))),
                         )
                     }),
             );
+        }
+        if !home && !search && !collection {
+            let heading = self.page_heading(false, 128., cx);
+            content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
+        }
         if !self.page.chips.is_empty() {
             content = content.child(
                 div()
                     .id("home-filters")
-                    .mx(px(30.))
-                    .mb(px(20.))
+                    .mx(px(inset))
+                    .mt(px(46.))
+                    .mb(px(36.))
+                    .flex_shrink_0()
                     .flex()
-                    .gap(px(22.))
+                    .gap(px(12.))
                     .overflow_x_scroll()
-                    .children(self.page.chips.iter().enumerate().map(|(index, choice)| {
-                        let target = choice.target.clone();
-                        div()
-                            .id(("home-filter", index))
-                            .flex_shrink_0()
-                            .pb(px(9.))
-                            .border_b_2()
-                            .border_color(if choice.selected {
-                                self.theme.accent
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .text_color(if choice.selected {
-                                self.theme.text
-                            } else {
-                                self.theme.muted
-                            })
-                            .cursor_pointer()
-                            .child(choice.label.clone())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.navigate(Route::Browse(target.clone()), cx)
-                            }))
-                    })),
+                    .children(
+                        self.page
+                            .chips
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, choice)| choice.label != "All" || !choice.selected)
+                            .map(|(index, choice)| {
+                                let target = choice.target.clone();
+                                filter_chip(
+                                    ("home-filter", index),
+                                    choice.label.clone(),
+                                    choice.selected,
+                                    self.theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |view, _, _, cx| {
+                                        view.navigate(Route::Browse(target.clone()), cx)
+                                    },
+                                ))
+                            }),
+                    ),
             );
+        } else if home {
+            content = content.child(div().h(px(40.)).flex_shrink_0());
         }
         if let Route::Search(search) = &self.route {
             if self.account.is_some() {
                 content = content.child(
                     div()
                         .id("search-scopes")
-                        .mx(px(30.))
-                        .mb(px(16.))
+                        .mx(px(inset))
+                        .mb(px(24.))
                         .flex()
-                        .gap(px(22.))
+                        .gap(px(32.))
                         .children(SearchScope::ALL.into_iter().enumerate().map(
                             |(index, scope)| {
                                 let mut next = search.clone();
@@ -3823,10 +4809,10 @@ impl Music {
                                 }
                                 div()
                                     .id(("search-scope", index))
-                                    .pb(px(8.))
+                                    .pb(px(12.))
                                     .border_b_2()
                                     .border_color(if scope == search.scope {
-                                        self.theme.accent
+                                        self.theme.text
                                     } else {
                                         gpui::transparent_black()
                                     })
@@ -3847,10 +4833,11 @@ impl Music {
             content = content.child(
                 div()
                     .id("search-filters")
-                    .mx(px(30.))
-                    .mb(px(20.))
+                    .mx(px(inset))
+                    .mb(px(24.))
+                    .flex_shrink_0()
                     .flex()
-                    .gap(px(22.))
+                    .gap(px(12.))
                     .overflow_x_scroll()
                     .children(
                         search
@@ -3864,35 +4851,54 @@ impl Music {
                                     filter,
                                     ..search.clone()
                                 };
-                                div()
-                                    .id(("search-filter", index))
-                                    .flex_shrink_0()
-                                    .pb(px(9.))
-                                    .border_b_2()
-                                    .border_color(if filter == search.filter {
-                                        self.theme.accent
-                                    } else {
-                                        gpui::transparent_black()
-                                    })
-                                    .text_color(if filter == search.filter {
-                                        self.theme.text
-                                    } else {
-                                        self.theme.muted
-                                    })
-                                    .cursor_pointer()
-                                    .child(filter.label())
-                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                filter_chip(
+                                    ("search-filter", index),
+                                    filter.label(),
+                                    filter == search.filter,
+                                    self.theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |view, _, _, cx| {
                                         view.navigate(Route::Search(next.clone()), cx)
-                                    }))
+                                    },
+                                ))
                             }),
                     ),
             );
         }
-        if self.account.is_some()
-            && matches!(
-                self.route,
-                Route::Saved | Route::Liked | Route::Recent | Route::Library(_)
-            )
+        if self.account.is_none()
+            && matches!(self.route, Route::Saved | Route::Liked | Route::Recent)
+        {
+            content = content.child(
+                div()
+                    .id("local-library-sections")
+                    .mx(px(inset))
+                    .mb(px(24.))
+                    .flex()
+                    .gap(px(12.))
+                    .children(
+                        [
+                            (Route::Saved, "Playlists"),
+                            (Route::Liked, "Liked Music"),
+                            (Route::Recent, "History"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (route, label))| {
+                            filter_chip(
+                                ("local-library-section", index),
+                                label,
+                                self.route == route,
+                                self.theme,
+                            )
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.navigate(route.clone(), cx)),
+                            )
+                        }),
+                    ),
+            );
+        }
+        if self.account.is_some() && (library || matches!(self.route, Route::Liked | Route::Recent))
         {
             let selected = match self.route {
                 Route::Liked => Section::Liked,
@@ -3903,21 +4909,22 @@ impl Music {
             content = content.child(
                 div()
                     .id("library-sections")
-                    .mx(px(30.))
-                    .mb(px(20.))
+                    .mx(px(inset))
+                    .mb(px(28.))
+                    .flex_shrink_0()
                     .flex()
-                    .gap(px(22.))
+                    .gap(px(12.))
                     .overflow_x_scroll()
                     .children(
                         [
+                            Section::Playlists,
+                            Section::Podcasts,
                             Section::Songs,
                             Section::Albums,
                             Section::Artists,
                             Section::Subscriptions,
-                            Section::Playlists,
                             Section::Liked,
                             Section::History,
-                            Section::Podcasts,
                             Section::Episodes,
                             Section::Uploads,
                             Section::UploadAlbums,
@@ -3926,26 +4933,15 @@ impl Music {
                         .into_iter()
                         .enumerate()
                         .map(|(index, section)| {
-                            div()
-                                .id(("library-section", index))
-                                .flex_shrink_0()
-                                .pb(px(9.))
-                                .border_b_2()
-                                .border_color(if section == selected {
-                                    self.theme.accent
-                                } else {
-                                    gpui::transparent_black()
-                                })
-                                .text_color(if section == selected {
-                                    self.theme.text
-                                } else {
-                                    self.theme.muted
-                                })
-                                .cursor_pointer()
-                                .child(section.title())
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.navigate(Route::Library(section), cx)
-                                }))
+                            filter_chip(
+                                ("library-section", index),
+                                section.title(),
+                                section == selected,
+                                self.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |view, _, _, cx| view.navigate(Route::Library(section), cx),
+                            ))
                         }),
                     ),
             );
@@ -3953,35 +4949,31 @@ impl Music {
         if let Some(error) = &self.error {
             content = content.child(
                 div()
-                    .mx(px(30.))
+                    .mx(px(inset))
                     .mb(px(16.))
-                    .p(px(14.))
-                    .rounded(px(6.))
-                    .bg(self.theme.raised)
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
                     .text_color(rgb(0xf1a6ae))
-                    .text_size(px(13.))
-                    .child(error.clone())
+                    .text_size(px(14.))
+                    .child(div().flex_1().child(error.clone()))
                     .child(
-                        div()
-                            .id("retry")
-                            .mt(px(10.))
-                            .text_color(self.theme.text)
-                            .cursor_pointer()
-                            .child("Dismiss")
-                            .on_click(cx.listener(|view, _, _, cx| {
+                        button("dismiss-error", "close", self.theme).on_click(cx.listener(
+                            |view, _, _, cx| {
                                 view.error = None;
                                 cx.notify();
-                            })),
+                            },
+                        )),
                     ),
             );
         }
         if let Some(notice) = &self.notice {
             content = content.child(
                 div()
-                    .px(px(30.))
-                    .pb(px(12.))
-                    .text_size(px(12.))
-                    .text_color(self.theme.accent)
+                    .px(px(inset))
+                    .pb(px(16.))
+                    .text_size(px(14.))
+                    .text_color(self.theme.muted)
                     .child(notice.clone()),
             );
         }
@@ -3989,32 +4981,35 @@ impl Music {
             return content
                 .child(
                     div()
-                        .px(px(30.))
-                        .py(px(25.))
+                        .px(px(inset))
+                        .py(px(24.))
                         .text_color(self.theme.muted)
                         .child("Loading music…"),
                 )
                 .into_any_element();
         }
-        if self.rows.is_empty() {
+        let heading = (collection && stacked)
+            .then(|| self.page_heading(true, if stacked { 264. } else { 200. }, cx));
+        if self.rows.is_empty() && !collection {
             let message = match self.route {
-                Route::Liked => "Tap the heart on a song to save it here.",
-                Route::Recent => "Your recently played songs will appear here.",
-                Route::Saved => "Save albums, artists, and playlists from search results.",
-                Route::Search(..) => "No results. Try a different song or artist.",
+                Route::Liked => "Music you like will appear here.",
+                Route::Recent => "Your listening history will appear here.",
+                Route::Saved | Route::Library(_) => "Nothing saved yet.",
+                Route::Search(_) => "No results. Try a different search.",
                 _ => "No music to show yet.",
             };
             return content
+                .children(heading.map(|heading| div().px(px(inset)).pb(px(24.)).child(heading)))
                 .child(
                     div()
-                        .px(px(30.))
-                        .py(px(30.))
+                        .px(px(inset))
+                        .py(px(24.))
                         .text_color(self.theme.muted)
                         .child(message),
                 )
                 .into_any_element();
         }
-        content = if home {
+        if home {
             let mut links = Vec::new();
             let mut shelves = Vec::new();
             for (index, shelf) in self.page.shelves.iter().enumerate() {
@@ -4032,7 +5027,11 @@ impl Music {
                                     ("discovery-link", index * 1000 + i),
                                     cx,
                                 )
-                                .py(px(10.)),
+                                .h(px(72.))
+                                .px(px(24.))
+                                .rounded(px(4.))
+                                .bg(self.theme.raised)
+                                .flex_1(),
                             );
                         }
                     }
@@ -4040,15 +5039,14 @@ impl Music {
                     shelves.push(index);
                 }
             }
-            content
-                .when(!links.is_empty(), |content| {
-                    content.child(
+            content = content
+                .when(!links.is_empty(), |d| {
+                    d.child(
                         div()
-                            .mx(px(30.))
-                            .mb(px(12.))
+                            .mx(px(inset))
+                            .mb(px(36.))
                             .flex()
-                            .flex_wrap()
-                            .gap(px(28.))
+                            .gap(px(24.))
                             .children(links),
                     )
                 })
@@ -4058,31 +5056,182 @@ impl Music {
                         shelves.len(),
                         cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
                             range
-                                .map(|i| view.shelf(shelves[i], window, cx))
+                                .map(|i| view.shelf(shelves[i], inset, window, cx))
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .track_scroll(&self.list_scroll)
                     .flex_1()
                     .min_h_0(),
-                )
+                );
         } else {
-            content.child(
-                uniform_list(
-                    ("music-results", self.list_id),
-                    self.rows.len(),
-                    cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
-                        range.map(|i| view.row(i, cx)).collect::<Vec<_>>()
+            let grid = !collection
+                && self
+                    .rows
+                    .iter()
+                    .all(|item| matches!(item, Item::Collection(_)));
+            let grouped =
+                matches!(&self.route,Route::Search(search) if search.filter==SearchFilter::All);
+            let list = if collection && stacked && self.rows.is_empty() {
+                div()
+                    .flex_1()
+                    .px(px(24.))
+                    .py(px(32.))
+                    .text_color(self.theme.muted)
+                    .child("No songs here yet.")
+                    .into_any_element()
+            } else if collection {
+                self.detail_list.set_inline_header(!stacked);
+                let inline = self.detail_list.inline_header;
+                list(
+                    self.detail_list.state.clone(),
+                    cx.processor(move |view, index: usize, window, cx| {
+                        if artist {
+                            return if index == 0 {
+                                view.artist_heading(inset, cx)
+                            } else {
+                                view.list_row(index - 1, inset, window, cx)
+                            };
+                        }
+                        if inline && index == 0 {
+                            let heading = view.page_heading(true, 200., cx);
+                            return div()
+                                .w_full()
+                                .px(px(inset))
+                                .pb(px(32.))
+                                .flex()
+                                .justify_center()
+                                .child(div().w_full().max_w(px(500.)).child(heading).when(
+                                    view.rows.is_empty(),
+                                    |d| {
+                                        d.child(
+                                            div()
+                                                .mt(px(24.))
+                                                .text_color(view.theme.muted)
+                                                .child("No songs here yet."),
+                                        )
+                                    },
+                                ))
+                                .into_any_element();
+                        }
+                        view.row(
+                            index - usize::from(inline),
+                            if stacked { 0. } else { inset },
+                            window,
+                            cx,
+                        )
                     }),
                 )
                 .flex_1()
-                .min_h_0(),
-            )
-        };
+                .min_h_0()
+                .into_any_element()
+            } else if grouped {
+                uniform_list(
+                    ("search-results", self.list_id),
+                    self.list_rows.len(),
+                    cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
+                        range
+                            .map(|index| view.list_row(index, inset, window, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&self.list_scroll)
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            } else if grid {
+                let columns = ((available - inset * 2. + CARD_GAP) / (CARD_WIDTH + CARD_GAP))
+                    .floor()
+                    .max(1.) as usize;
+                uniform_list(
+                    ("collection-grid", self.list_id),
+                    self.rows.len().div_ceil(columns),
+                    cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|row| {
+                                let items = view
+                                    .rows
+                                    .iter()
+                                    .skip(row * columns)
+                                    .take(columns)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                div()
+                                    .h(px(274.))
+                                    .px(px(inset))
+                                    .flex()
+                                    .gap(px(CARD_GAP))
+                                    .children(
+                                        items
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(column, item)| {
+                                                view.card(
+                                                    item,
+                                                    row * columns + column,
+                                                    CARD_WIDTH,
+                                                    ShelfLayout::Cards,
+                                                    cx,
+                                                )
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&self.list_scroll)
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            } else {
+                let row_inset = if stacked { 0. } else { inset };
+                uniform_list(
+                    ("music-results", self.list_id),
+                    self.rows.len(),
+                    cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
+                        range
+                            .map(|i| view.row(i, row_inset, window, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&self.list_scroll)
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            };
+            content = if stacked {
+                content.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .px(px(60.))
+                        .flex()
+                        .gap(px(56.))
+                        .child(
+                            div()
+                                .id("collection-header")
+                                .w(px(280.))
+                                .h_full()
+                                .flex_shrink_0()
+                                .overflow_y_scroll()
+                                .children(heading),
+                        )
+                        .child(list),
+                )
+            } else {
+                content
+                    .children(heading.map(|heading| div().px(px(inset)).pb(px(28.)).child(heading)))
+                    .child(list)
+            };
+        }
         if self.page.continuation.is_some() {
             content = content.child(
                 div()
                     .id("load-more")
-                    .h(px(44.))
+                    .h(px(40.))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -4113,7 +5262,7 @@ impl Music {
         }
         content.into_any_element()
     }
-    fn queue(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn queue(&mut self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let count = self.library.queue.tracks.len();
         let episodes = self
             .library
@@ -4130,17 +5279,17 @@ impl Music {
             _ => format!("{count} items"),
         };
         div()
-            .w(px(304.))
+            .w(px(if compact { 320. } else { 400. }))
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
             .border_l_1()
             .border_color(self.theme.border)
-            .bg(self.theme.panel)
+            .bg(self.theme.bg)
             .child(
                 div()
-                    .h(px(80.))
+                    .h(px(64.))
                     .px(px(20.))
                     .flex()
                     .items_center()
@@ -4230,13 +5379,13 @@ impl Music {
                                                 .child(
                                                     div()
                                                         .truncate()
-                                                        .text_size(px(13.))
+                                                        .text_size(px(16.))
                                                         .child(track.title),
                                                 )
                                                 .child(
                                                     div()
                                                         .truncate()
-                                                        .text_size(px(11.))
+                                                        .text_size(px(14.))
                                                         .text_color(view.theme.muted)
                                                         .child(format!(
                                                             "Autoplay · {}",
@@ -4285,7 +5434,7 @@ impl Music {
                                             .child(
                                                 div()
                                                     .truncate()
-                                                    .text_size(px(13.))
+                                                    .text_size(px(16.))
                                                     .when(active, |d| {
                                                         d.text_color(view.theme.accent)
                                                     })
@@ -4294,7 +5443,7 @@ impl Music {
                                             .child(
                                                 div()
                                                     .truncate()
-                                                    .text_size(px(11.))
+                                                    .text_size(px(14.))
                                                     .text_color(view.theme.muted)
                                                     .child(track.artist),
                                             ),
@@ -4357,7 +5506,7 @@ impl Music {
                     div()
                         .px(px(20.))
                         .text_color(self.theme.muted)
-                        .text_size(px(13.))
+                        .text_size(px(16.))
                         .child("Play a song or add one with +."),
                 )
             })
@@ -4491,10 +5640,7 @@ impl Music {
                     }),
             );
         }
-        let mut content = div().flex_1().min_w_0().flex().flex_col();
-        if !fullscreen {
-            content = content.child(div().bg(self.theme.bg).child(self.header(cx)));
-        }
+        let content = div().flex_1().min_w_0().flex().flex_col();
         content
             .child(
                 div()
@@ -4567,86 +5713,6 @@ impl Music {
     }
     fn player_bar(&mut self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let current = self.library.queue.current().cloned();
-        let mut details = div()
-            .w(px(if compact { 230. } else { 310. }))
-            .min_w_0()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(12.));
-        if let Some(track) = current {
-            let art = self.art(track.thumbnail.as_deref(), 52.);
-            let menu_track = track.clone();
-            let liked = self.is_liked(&track);
-            let subtitle = match self.playback {
-                Playback::Loading { .. } => "Loading track…".into(),
-                Playback::Loaded {
-                    paused: false,
-                    buffering: true,
-                } => "Buffering…".into(),
-                _ => track.artist.clone(),
-            };
-            details = details
-                .child(art)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.))
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(track.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(12.))
-                                .text_color(self.theme.muted)
-                                .child(subtitle),
-                        ),
-                )
-                .child(
-                    button(
-                        "like-current",
-                        if liked { "heart-filled" } else { "heart" },
-                        self.theme,
-                    )
-                    .when(liked, |d| d.text_color(self.theme.accent))
-                    .on_click(cx.listener(move |view, _, _, cx| view.toggle_like(&track, cx))),
-                )
-                .child(
-                    div()
-                        .id("current-song-menu")
-                        .w(px(26.))
-                        .h(px(32.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .text_size(px(22.))
-                        .child("⋯")
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            window.focus(&view.focus, cx);
-                            view.overlay = Some(Overlay::Track {
-                                track: menu_track.clone(),
-                                index: None,
-                            });
-                            cx.notify();
-                        })),
-                );
-        } else {
-            details = details.child(
-                div()
-                    .text_color(self.theme.muted)
-                    .text_size(px(13.))
-                    .child("Choose something to play"),
-            );
-        }
         let progress = if self.duration > 0. {
             (self
                 .drag_position
@@ -4656,54 +5722,134 @@ impl Music {
         } else {
             0.
         };
-        let seek_bounds = self.seek_bounds.clone();
-        let volume_bounds = self.volume_bounds.clone();
         let playing = self.active_id.is_some()
             && self.playback != Playback::Stopped
             && !self.playback.is_paused();
-        div()
-            .h(px(106.))
-            .flex_shrink_0()
-            .px(px(24.))
-            .border_t_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.panel)
+        let mut details = div()
+            .flex_1()
+            .min_w_0()
+            .max_w(px(660.))
             .flex()
             .items_center()
-            .gap(px(24.))
-            .child(details)
+            .gap(px(16.));
+        if let Some(track) = current {
+            let art = self.art(track.thumbnail.as_deref(), 40.);
+            let liked = self.is_liked(&track);
+            let disliked = self
+                .ratings
+                .get(&track.id)
+                .copied()
+                .or(track.details.rating)
+                == Some(Rating::Dislike);
+            let subtitle = match self.playback {
+                Playback::Loading { .. } => "Loading track…".into(),
+                Playback::Loaded {
+                    paused: false,
+                    buffering: true,
+                } => "Buffering…".into(),
+                _ => track.artist.clone(),
+            };
+            let like_track = track.clone();
+            let dislike_track = track.clone();
+            let menu_track = track.clone();
+            details = details
+                .child(art)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(16.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(track.title),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(16.))
+                                .text_color(self.theme.muted)
+                                .child(subtitle),
+                        ),
+                )
+                .when(self.account.is_some() && !compact, |d| {
+                    d.child(
+                        button("dislike-current", "thumb-down", self.theme)
+                            .opacity(if disliked { 1. } else { 0.65 })
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.mutate(
+                                    Mutation::RateSong {
+                                        track: dislike_track.clone(),
+                                        rating: if disliked {
+                                            Rating::Indifferent
+                                        } else {
+                                            Rating::Dislike
+                                        },
+                                    },
+                                    cx,
+                                );
+                            })),
+                    )
+                })
+                .child(
+                    button(
+                        "like-current",
+                        if liked { "thumb-up-filled" } else { "thumb-up" },
+                        self.theme,
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| view.toggle_like(&like_track, cx))),
+                )
+                .child(
+                    button("current-song-menu", "more", self.theme).on_click(cx.listener(
+                        move |view, _, window, cx| {
+                            window.focus(&view.focus, cx);
+                            view.open_track_menu(menu_track.clone(), None, window, cx);
+                        },
+                    )),
+                );
+        }
+        let seek_bounds = self.seek_bounds.clone();
+        let volume_bounds = self.volume_bounds.clone();
+        div()
+            .h(px(74.))
+            .flex_shrink_0()
+            .relative()
+            .bg(self.theme.panel)
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .max_w(px(650.))
+                    .id("seek-track")
+                    .absolute()
+                    .top(px(-6.))
+                    .left_0()
+                    .right_0()
+                    .h(px(12.))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                            view.drag = Some(Drag::Seek);
+                            view.drag_to(event.position, cx);
+                        }),
+                    )
+                    .child(slider(progress, seek_bounds, self.theme)),
+            )
+            .child(
+                div()
+                    .size_full()
+                    .px(px(16.))
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(if compact { 16. } else { 32. }))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
-                            .gap(px(14.))
-                            .child(
-                                button("shuffle", "shuffle", self.theme).on_click(cx.listener(
-                                    |view, _, _, cx| {
-                                        view.library.queue.shuffle_upcoming();
-                                        view.notice = Some(
-                                            if view.library.queue.incomplete {
-                                                "Loaded upcoming songs shuffled"
-                                            } else {
-                                                "Upcoming songs shuffled"
-                                            }
-                                            .into(),
-                                        );
-                                        view.prefetch_queue(cx);
-                                        view.save();
-                                        cx.notify();
-                                    },
-                                )),
-                            )
+                            .gap(px(8.))
                             .child(
                                 button("previous", "previous", self.theme)
                                     .on_click(cx.listener(|view, _, _, cx| view.previous(cx))),
@@ -4714,20 +5860,91 @@ impl Music {
                                     if playing { "pause" } else { "play" },
                                     self.theme,
                                 )
-                                .size(px(40.))
-                                .rounded_full()
-                                .bg(self.theme.text)
-                                .text_color(self.theme.bg)
+                                .size(px(48.))
                                 .on_click(cx.listener(|view, _, _, cx| view.toggle_play(cx))),
                             )
                             .child(
                                 button("next", "next", self.theme)
                                     .on_click(cx.listener(|view, _, _, cx| view.next(false, cx))),
                             )
+                            .when(!compact, |d| {
+                                d.child(
+                                    div()
+                                        .ml(px(8.))
+                                        .text_size(px(12.))
+                                        .text_color(self.theme.muted)
+                                        .child(format!(
+                                            "{} / {}",
+                                            clock(
+                                                self.drag_position
+                                                    .unwrap_or_else(|| self.playback_position())
+                                            ),
+                                            clock(self.duration)
+                                        )),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .justify_center()
+                            .child(details),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .when(!compact, |d| {
+                                d.child(
+                                    div()
+                                        .id("volume-track")
+                                        .w(px(72.))
+                                        .h(px(18.))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                                                view.drag = Some(Drag::Volume);
+                                                view.drag_to(event.position, cx);
+                                            }),
+                                        )
+                                        .child(slider(
+                                            (self.library.volume / 100.) as f32,
+                                            volume_bounds,
+                                            self.theme,
+                                        )),
+                                )
+                            })
+                            .child(
+                                button(
+                                    "mute-toggle",
+                                    if self.library.volume == 0. {
+                                        "mute"
+                                    } else {
+                                        "volume"
+                                    },
+                                    self.theme,
+                                )
+                                .on_click(cx.listener(
+                                    |view, _, _, cx| {
+                                        view.set_volume(
+                                            if view.library.volume > 0. { 0. } else { 60. },
+                                            cx,
+                                        );
+                                        view.save();
+                                    },
+                                )),
+                            )
                             .child(
                                 button("repeat", "repeat", self.theme)
-                                    .when(self.library.repeat != Repeat::Off, |d| {
-                                        d.text_color(self.theme.accent)
+                                    .opacity(if self.library.repeat == Repeat::Off {
+                                        0.6
+                                    } else {
+                                        1.
                                     })
                                     .when(self.library.repeat == Repeat::One, |d| {
                                         d.child(
@@ -4744,104 +5961,39 @@ impl Music {
                                         view.save();
                                         cx.notify();
                                     })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap(px(11.))
-                            .text_size(px(11.))
-                            .text_color(self.theme.muted)
+                            )
                             .child(
-                                div().w(px(56.)).flex_shrink_0().text_right().child(clock(
-                                    self.drag_position
-                                        .unwrap_or_else(|| self.playback_position()),
+                                button("shuffle", "shuffle", self.theme).on_click(cx.listener(
+                                    |view, _, _, cx| {
+                                        view.library.queue.shuffle_upcoming();
+                                        view.notice = Some("Upcoming songs shuffled".into());
+                                        view.prefetch_queue(cx);
+                                        view.save();
+                                        cx.notify();
+                                    },
                                 )),
                             )
                             .child(
-                                div()
-                                    .id("seek-track")
-                                    .h(px(16.))
-                                    .flex_1()
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|view, event: &MouseDownEvent, _, cx| {
-                                            view.drag = Some(Drag::Seek);
-                                            view.drag_to(event.position, cx);
-                                        }),
-                                    )
-                                    .child(slider(progress, seek_bounds, self.theme)),
+                                button("video-toggle", "video", self.theme)
+                                    .opacity(if self.video_open { 1. } else { 0.65 })
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        window.focus(&view.focus, cx);
+                                        if view.video_open {
+                                            view.video_open = false;
+                                            cx.notify();
+                                        } else {
+                                            view.set_video_mode(true, cx);
+                                        }
+                                    })),
                             )
-                            .child(div().w(px(56.)).flex_shrink_0().child(clock(self.duration))),
-                    ),
-            )
-            .child(div().flex_1().max_w(px(30.)))
-            .child(
-                div()
-                    .w(px(if compact { 198. } else { 248. }))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(
-                        button("video-toggle", "video", self.theme)
-                            .when(self.video_open, |button| {
-                                button.text_color(self.theme.accent)
-                            })
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                window.focus(&view.focus, cx);
-                                if view.video_open {
-                                    view.video_open = false;
-                                    cx.notify();
-                                } else {
-                                    view.set_video_mode(true, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        button("queue-toggle", "queue", self.theme)
-                            .when(self.show_queue, |d| d.text_color(self.theme.accent))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.show_queue = !view.show_queue;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        button(
-                            "mute-toggle",
-                            if self.library.volume == 0. {
-                                "mute"
-                            } else {
-                                "volume"
-                            },
-                            self.theme,
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.set_volume(if view.library.volume > 0. { 0. } else { 60. }, cx);
-                            view.save();
-                        })),
-                    )
-                    .child(
-                        div()
-                            .id("volume-track")
-                            .flex_1()
-                            .h(px(18.))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|view, event: &MouseDownEvent, _, cx| {
-                                    view.drag = Some(Drag::Volume);
-                                    view.drag_to(event.position, cx);
-                                }),
-                            )
-                            .child(slider(
-                                (self.library.volume / 100.) as f32,
-                                volume_bounds,
-                                self.theme,
-                            )),
+                            .child(
+                                button("queue-toggle", "queue", self.theme)
+                                    .opacity(if self.show_queue { 1. } else { 0.65 })
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.show_queue = !view.show_queue;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -4874,12 +6026,15 @@ impl Music {
             .justify_center()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, _, window, cx| view.close_overlay(window, cx)),
+                cx.listener(|view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.close_overlay(window, cx);
+                }),
             )
             .child(body)
             .into_any_element()
     }
-    fn overlay(&self, kind: &Overlay, cx: &Context<Self>) -> AnyElement {
+    fn overlay(&self, kind: &Overlay, window: &Window, cx: &Context<Self>) -> AnyElement {
         if let Overlay::CountryPicker(picker) = kind {
             return self.backdrop(picker.clone().into_any_element(), cx);
         }
@@ -4915,6 +6070,9 @@ impl Music {
                     .justify_between()
                     .mb(px(24.))
                     .gap(px(12.))
+                    .when(matches!(kind, Overlay::Track { .. }), |d| {
+                        d.h(px(0.)).mb(px(0.)).overflow_hidden()
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -4943,6 +6101,7 @@ impl Music {
         if matches!(kind, Overlay::Help) {
             for (key, action) in [
                 ("Ctrl K", "Search"),
+                ("Alt ←", "Go back"),
                 ("Space", "Play or pause"),
                 ("Ctrl → / Ctrl ←", "Next / previous song"),
                 ("→ / ←", "Seek 5 seconds"),
@@ -4964,6 +6123,84 @@ impl Music {
                 );
             }
         } else if matches!(kind, Overlay::Settings) {
+            let label = self
+                .account
+                .as_ref()
+                .map(|a| format!("{} {}", a.account.name, a.account.handle))
+                .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
+            let disconnect_failed = matches!(
+                self.account_operation,
+                Some(AccountOperation::DisconnectFailed)
+            );
+            let connecting = matches!(
+                self.account_operation,
+                Some(AccountOperation::Connecting(_, _))
+            );
+            let restoring = matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
+            let activating = matches!(
+                self.account_operation,
+                Some(AccountOperation::Activating(_))
+            );
+            let (connect_label, instructions) = match &self.account_operation {
+                Some(AccountOperation::Connecting(_, BrowserConnection::Opening)) => {
+                    ("Opening browser…".to_owned(), None)
+                }
+                Some(AccountOperation::Connecting(_, BrowserConnection::Ready(profile))) => (
+                    "Read YouTube session".to_owned(),
+                    Some(format!(
+                        "Reads your YouTube sign-in session from {} · {}. After you confirm, Music can refresh this account from that profile when restoring an expired saved session.",
+                        profile.browser, profile.name
+                    )),
+                ),
+                Some(AccountOperation::Connecting(_, BrowserConnection::Reading(_))) => {
+                    ("Checking account…".to_owned(), None)
+                }
+                Some(AccountOperation::Connecting(
+                    _,
+                    BrowserConnection::Review { connection, .. },
+                )) => (
+                    format!("Connect as {}", connection.account.name),
+                    Some(format!(
+                        "{} {}",
+                        connection.account.name, connection.account.handle
+                    )),
+                ),
+                Some(AccountOperation::Restoring(_)) => ("Restoring account…".to_owned(), None),
+                Some(AccountOperation::RestoreFailed) => ("Retry saved account".to_owned(), None),
+                Some(AccountOperation::Activating(_)) => {
+                    ("Preparing account playback…".to_owned(), None)
+                }
+                Some(AccountOperation::Disconnecting(_)) => ("Signing out…".to_owned(), None),
+                Some(AccountOperation::DisconnectFailed) => {
+                    ("Sign-out incomplete".to_owned(), None)
+                }
+                None if self.account.is_some() => ("Switch or reconnect account".to_owned(), None),
+                None => ("Connect in browser".to_owned(), None),
+            };
+            let reviewing = matches!(
+                self.account_operation,
+                Some(AccountOperation::Connecting(
+                    _,
+                    BrowserConnection::Review { .. }
+                ))
+            );
+            body=body.child(div().text_size(px(15.)).child(label))
+                .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
+                    .child(connect_label)
+                    .on_click(cx.listener(|view,_,window,cx|view.connect_account(window,cx))))
+                .when_some(instructions, |body, text| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child(text)))
+                .when(matches!(self.account_operation,Some(AccountOperation::RestoreFailed)),|body|body.child(
+                    div().id("reconnect-browser-account").mt(px(16.)).cursor_pointer().child("Connect in browser")
+                        .on_click(cx.listener(|view,_,window,cx|{
+                            view.account_operation=None;
+                            view.connect_account(window,cx);
+                        }))))
+                .when(reviewing, |body| body.child(div().id("retry-browser-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Check another account").on_click(cx.listener(|view,_,_,cx|view.retry_browser_account(cx)))))
+                .when(connecting || restoring, |body| body.child(div().id("cancel-connection").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Cancel connection").on_click(cx.listener(|view,_,_,cx|view.cancel_connection(cx)))))
+                .when_some(self.error.as_ref(), |body, error| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(rgb(0xf1a6ae)).child(error.clone())))
+                .when(self.account.is_some() || disconnect_failed || activating, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
+                .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
+                .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
             let mut speeds = div().mt(px(12.)).flex().flex_wrap().gap(px(4.));
             for (index, speed) in PlaybackSpeed::ALL.into_iter().enumerate() {
                 speeds = speeds.child(
@@ -4994,7 +6231,7 @@ impl Music {
                 );
             }
             body = body
-                .child(div().text_size(px(15.)).child("Playback speed"))
+                .child(div().mt(px(32.)).text_size(px(15.)).child("Playback speed"))
                 .child(speeds);
             let mut qualities = div().mt(px(12.)).flex().gap(px(12.));
             for (index, quality) in AudioQuality::ALL.into_iter().enumerate() {
@@ -5059,77 +6296,6 @@ impl Music {
             body = body
                 .child(div().mt(px(24.)).text_size(px(15.)).child("Video quality"))
                 .child(video_qualities);
-            let label = self
-                .account
-                .as_ref()
-                .map(|a| format!("{} {}", a.account.name, a.account.handle))
-                .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
-            let disconnect_failed = matches!(
-                self.account_operation,
-                Some(AccountOperation::DisconnectFailed)
-            );
-            let connecting = matches!(
-                self.account_operation,
-                Some(AccountOperation::Connecting(_, _))
-            );
-            let restoring = matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
-            let activating = matches!(
-                self.account_operation,
-                Some(AccountOperation::Activating(_))
-            );
-            let (connect_label, instructions) = match &self.account_operation {
-                Some(AccountOperation::Connecting(_, BrowserConnection::Opening)) => {
-                    ("Opening browser…".to_owned(), None)
-                }
-                Some(AccountOperation::Connecting(_, BrowserConnection::Ready(profile))) => (
-                    "Read YouTube session".to_owned(),
-                    Some(format!(
-                        "Reads your YouTube sign-in session from {} · {}. You will confirm the account before connecting.",
-                        profile.browser, profile.name
-                    )),
-                ),
-                Some(AccountOperation::Connecting(_, BrowserConnection::Reading(_))) => {
-                    ("Checking account…".to_owned(), None)
-                }
-                Some(AccountOperation::Connecting(
-                    _,
-                    BrowserConnection::Review { connection, .. },
-                )) => (
-                    format!("Connect as {}", connection.account.name),
-                    Some(format!(
-                        "{} {}",
-                        connection.account.name, connection.account.handle
-                    )),
-                ),
-                Some(AccountOperation::Restoring(_)) => ("Restoring account…".to_owned(), None),
-                Some(AccountOperation::Activating(_)) => {
-                    ("Preparing account playback…".to_owned(), None)
-                }
-                Some(AccountOperation::Disconnecting(_)) => ("Signing out…".to_owned(), None),
-                Some(AccountOperation::DisconnectFailed) => {
-                    ("Sign-out incomplete".to_owned(), None)
-                }
-                None if self.account.is_some() => ("Switch or reconnect account".to_owned(), None),
-                None => ("Connect in browser".to_owned(), None),
-            };
-            let reviewing = matches!(
-                self.account_operation,
-                Some(AccountOperation::Connecting(
-                    _,
-                    BrowserConnection::Review { .. }
-                ))
-            );
-            body=body.child(div().mt(px(28.)).text_size(px(15.)).child(label))
-                .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(connect_label)
-                    .on_click(cx.listener(|view,_,window,cx|view.connect_account(window,cx))))
-                .when_some(instructions, |body, text| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child(text)))
-                .when(reviewing, |body| body.child(div().id("retry-browser-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Check another account").on_click(cx.listener(|view,_,_,cx|view.retry_browser_account(cx)))))
-                .when(connecting || restoring, |body| body.child(div().id("cancel-connection").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Cancel connection").on_click(cx.listener(|view,_,_,cx|view.cancel_connection(cx)))))
-                .when_some(self.error.as_ref(), |body, error| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(rgb(0xf1a6ae)).child(error.clone())))
-                .when(self.account.is_some() || disconnect_failed || activating, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
-                .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
-                .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
         } else if let Overlay::Description { title, text } = kind {
             body = body
                 .child(
@@ -5245,24 +6411,10 @@ impl Music {
                     cx,
                     move |view, _, cx| {
                         view.overlay = None;
-                        view.reset_radio();
-                        view.player_command(Player::stop);
-                        view.active_id = None;
-                        view.seekable = false;
-                        view.pending_seek = None;
-                        view.position = 0.;
-                        view.playback = Playback::Loading {
-                            paused: false,
-                            retried: false,
-                        };
-                        view.now_playing = None;
-                        view.queue_source.cancel();
-                        view.queue_waiting = None;
-                        view.notice = Some("Loading radio…".into());
-                        view.playback_request(
+                        view.start_queue(
                             PlaybackQuery::Watch {
                                 track: Box::new(song.clone()),
-                                radio: true,
+                                mode: WatchMode::Radio,
                             },
                             cx,
                         );
@@ -5718,6 +6870,36 @@ impl Music {
                 );
             }
         }
+        if matches!(kind, Overlay::Track { .. }) {
+            let position = self.overlay_anchor.unwrap_or_else(|| {
+                point(
+                    window.viewport_size().width / 2.,
+                    window.viewport_size().height / 3.,
+                )
+            });
+            return div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.close_overlay(window, cx);
+                    }),
+                )
+                .child(
+                    anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            body.w(px(320.))
+                                .p(px(8.))
+                                .max_h(window.viewport_size().height - px(16.)),
+                        ),
+                )
+                .into_any_element();
+        }
         self.backdrop(body.into_any_element(), cx)
     }
 }
@@ -5774,27 +6956,71 @@ impl Render for Music {
             self.video_transparent = native_video;
         }
         let fullscreen = self.video_open && window.is_fullscreen();
-        let compact = window.viewport_size().width < px(1120.);
+        let width: f32 = window.viewport_size().width.into();
+        let compact = self.sidebar_collapsed || width < 1090. || (self.show_queue && width < 1440.);
+        let queue_compact = width < 1200.;
+        let available = width
+            - if compact { 72. } else { 240. }
+            - if self.show_queue && !fullscreen {
+                if queue_compact { 320. } else { 400. }
+            } else {
+                0.
+            };
+        let inset = if available >= 1000. { 100. } else { 32. };
+        let artist_top = self.detail_list.state.logical_scroll_top();
+        let artist_art = if self.route.is_artist() && !self.video_open && artist_top.item_ix == 0 {
+            let url = self
+                .page
+                .header
+                .as_ref()
+                .and_then(|header| header.thumbnail.as_deref());
+            url.and_then(|url| self.artwork.get_hero(url))
+        } else {
+            None
+        };
+        let artist_background = artist_art.map(|image| {
+            let offset = -artist_top.offset_in_item;
+            div()
+                .absolute()
+                .left(px(if compact { 72. } else { 240. }))
+                .right_0()
+                .top(offset)
+                .h(px(564.))
+                .overflow_hidden()
+                .child(img(image).size_full().object_fit(ObjectFit::Cover))
+                .child(div().absolute().inset_0().bg(linear_gradient(
+                    180.,
+                    linear_color_stop(rgba(0x03030388), 0.),
+                    linear_color_stop(self.theme.bg, 1.),
+                )))
+        });
+        let header = (!fullscreen).then(|| self.header(inset, cx).into_any_element());
         let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
         let content = if self.video_open {
             self.video_content(window, cx)
         } else {
-            self.content(cx)
+            self.content(inset, available, cx)
         };
-        let queue = (self.show_queue && !fullscreen).then(|| self.queue(cx));
-        let player = self.player_bar(compact, cx);
+        let queue = (self.show_queue && !fullscreen).then(|| self.queue(queue_compact, cx));
+        let player = self
+            .library
+            .queue
+            .current()
+            .is_some()
+            .then(|| self.player_bar(width < 1120., cx));
         div()
             .size_full()
             .relative()
             .when(!native_video, |view| view.bg(self.theme.bg))
             .text_color(self.theme.text)
             .text_size(px(14.))
-            .font_family("Inter")
+            .font_family("Roboto")
             .flex()
             .flex_col()
             .key_context("Music")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
                 if view.drag.is_some() {
                     view.drag_to(event.position, cx);
@@ -5808,6 +7034,8 @@ impl Render for Music {
                 MouseButton::Left,
                 cx.listener(|view, _, _, cx| view.end_drag(cx)),
             )
+            .children(artist_background)
+            .children(header)
             .child(
                 div()
                     .flex_1()
@@ -5817,8 +7045,12 @@ impl Render for Music {
                     .child(content)
                     .children(queue),
             )
-            .child(player)
-            .children(self.overlay.as_ref().map(|kind| self.overlay(kind, cx)))
+            .children(player)
+            .children(
+                self.overlay
+                    .as_ref()
+                    .map(|kind| self.overlay(kind, window, cx)),
+            )
     }
 }
 fn icon(name: &'static str, edge: f32, color: Hsla) -> Svg {
@@ -5842,6 +7074,12 @@ impl Render for Hint {
 }
 fn button(id: impl Into<ElementId>, name: &'static str, theme: Theme) -> Stateful<Div> {
     let label = match name {
+        "menu" => "Toggle sidebar",
+        "more" => "More options",
+        "thumb-up" => "Like song",
+        "thumb-up-filled" => "Remove from liked music",
+        "thumb-down" => "Dislike song",
+        "forward" => "Next items",
         "play" => "Play",
         "pause" => "Pause",
         "previous" => "Previous song",
@@ -5866,34 +7104,37 @@ fn button(id: impl Into<ElementId>, name: &'static str, theme: Theme) -> Statefu
     div()
         .id(id)
         .relative()
-        .size(px(34.))
+        .size(px(40.))
         .flex_shrink_0()
-        .rounded(px(6.))
+        .rounded_full()
         .flex()
         .items_center()
         .justify_center()
-        .text_color(theme.muted)
+        .text_color(theme.text)
         .cursor_pointer()
         .tooltip(move |_, cx| cx.new(|_| Hint { text: label, theme }).into())
-        .hover(move |d| {
-            let background = if matches!(name, "play" | "pause") {
-                theme.text
-            } else {
-                theme.raised
-            };
-            d.bg(background)
-        })
-        .child(icon(
-            name,
-            19.,
-            if matches!(name, "play" | "pause") {
-                theme.bg
-            } else if name == "heart-filled" {
-                theme.accent
-            } else {
-                theme.text
-            },
-        ))
+        .hover(move |d| d.bg(theme.raised))
+        .child(icon(name, 24., theme.text))
+}
+fn filter_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    theme: Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(36.))
+        .px(px(12.))
+        .flex_shrink_0()
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .bg(if selected { theme.text } else { theme.raised })
+        .text_color(if selected { theme.bg } else { theme.text })
+        .text_size(px(14.))
+        .cursor_pointer()
+        .child(label.into())
 }
 fn slider(ratio: f32, bounds: Rc<Cell<Bounds<Pixels>>>, theme: Theme) -> impl IntoElement {
     canvas(
@@ -5943,6 +7184,7 @@ fn apply_track_details(
             details.remove_library = track.details.remove_library.clone();
             details.remove_history = track.details.remove_history.clone();
         }
+        details.watch = track.details.watch.clone().or(details.watch);
         track.details = details;
         if track.details.episode.is_some() {
             track.artist = source.artist.clone();
@@ -5980,6 +7222,30 @@ fn acknowledge_song_change<'a>(
     }
 }
 
+fn adopt_watch_queue(
+    queue: &mut Queue,
+    watch: &Watch,
+    update: QueueUpdate,
+) -> Result<bool, String> {
+    if update == QueueUpdate::Preserve {
+        return Ok(false);
+    }
+    if update == QueueUpdate::Adopt
+        && (queue.tracks.len() != 1
+            || !queue
+                .current()
+                .zip(watch.current.as_ref())
+                .is_some_and(|(current, issued)| current.id == issued.id))
+    {
+        return Ok(false);
+    }
+    let index = watch
+        .current_index
+        .ok_or("YouTube Music did not include the requested song in its playback queue")?;
+    queue.replace(watch.queue.clone(), index);
+    Ok(true)
+}
+
 fn playlist_move_down(tracks: &[Track], index: usize, has_more: bool) -> Option<Option<String>> {
     tracks.get(index + 1)?;
     match tracks.get(index + 2) {
@@ -5989,8 +7255,7 @@ fn playlist_move_down(tracks: &[Track], index: usize, has_more: bool) -> Option<
     }
 }
 
-fn visible_cards(count: usize, offset: f32, viewport: f32) -> std::ops::Range<usize> {
-    let stride = CARD_WIDTH + CARD_GAP;
+fn visible_cards(count: usize, offset: f32, viewport: f32, stride: f32) -> std::ops::Range<usize> {
     let offset = offset
         .max(0.)
         .min((count as f32 * stride - CARD_GAP - viewport).max(0.));
@@ -6016,22 +7281,126 @@ fn clock(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CatalogRequests, CatalogTarget, Playback, Query, acknowledge_song_change,
-        apply_track_details, playlist_move_down, visible_cards,
+        CatalogRequests, CatalogTarget, DetailList, Playback, Query, QueueUpdate,
+        acknowledge_song_change, adopt_watch_queue, apply_track_details, playlist_move_down,
+        visible_cards,
     };
     use crate::{
         account::Mutation,
         catalog::{Rating, Track},
+        library::Queue,
+        watch::Watch,
     };
+    use gpui::{ListOffset, px};
     use std::collections::HashMap;
 
     #[test]
+    fn collection_layout_preserves_scroll_when_the_header_moves_between_columns() {
+        let mut details = DetailList::new();
+        details.reset_rows(100);
+        details.set_inline_header(true);
+        assert_eq!(details.state.item_count(), 101);
+        assert_eq!(details.state.logical_scroll_top().item_ix, 0);
+        details.state.scroll_to(ListOffset {
+            item_ix: 31,
+            offset_in_item: px(8.),
+        });
+        details.set_inline_header(false);
+        assert_eq!(details.state.item_count(), 100);
+        assert_eq!(details.state.logical_scroll_top().item_ix, 30);
+        assert_eq!(details.state.logical_scroll_top().offset_in_item, px(8.));
+        details.set_inline_header(true);
+        assert_eq!(details.state.logical_scroll_top().item_ix, 31);
+        details.reset_rows(200);
+        assert_eq!(details.state.item_count(), 201);
+        assert_eq!(details.state.logical_scroll_top().item_ix, 31);
+    }
+
+    #[test]
+    fn issued_queue_adoption_preserves_manual_edits_and_the_selected_occurrence() {
+        let track = |id: &str| Track {
+            id: id.into(),
+            title: id.into(),
+            artist: "Artist".into(),
+            album: None,
+            duration: None,
+            thumbnail: None,
+            details: Default::default(),
+        };
+        let seed = track("abcdefghijk");
+        let next = track("lmnopqrstuv");
+        let watch = Watch {
+            current: Some(seed.clone()),
+            current_index: Some(1),
+            queue: vec![next.clone(), seed.clone(), next.clone()],
+            lyrics: None,
+            related: None,
+            alternatives: None,
+            continuation: None,
+        };
+        let mut queue = Queue::default();
+        queue.replace(vec![seed.clone()], 0);
+        assert!(adopt_watch_queue(&mut queue, &watch, QueueUpdate::Adopt).unwrap());
+        assert_eq!(queue.index, Some(1));
+        assert_eq!(queue.current().unwrap().id, seed.id);
+        assert_eq!(
+            queue
+                .tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            [next.id.as_str(), seed.id.as_str(), next.id.as_str()]
+        );
+
+        queue.replace(vec![seed.clone(), track("manual-edit")], 0);
+        assert!(!adopt_watch_queue(&mut queue, &watch, QueueUpdate::Adopt).unwrap());
+        assert_eq!(queue.tracks[1].id, "manual-edit");
+        assert_eq!(queue.index, Some(0));
+        assert!(!adopt_watch_queue(&mut queue, &watch, QueueUpdate::Preserve).unwrap());
+        assert_eq!(queue.tracks[1].id, "manual-edit");
+
+        queue.replace(vec![track("new-selection")], 0);
+        assert!(!adopt_watch_queue(&mut queue, &watch, QueueUpdate::Adopt).unwrap());
+        assert_eq!(queue.current().unwrap().id, "new-selection");
+        assert!(adopt_watch_queue(&mut queue, &watch, QueueUpdate::Replace).unwrap());
+        assert_eq!(queue.current().unwrap().id, seed.id);
+    }
+
+    #[test]
+    fn page_refresh_preserves_sidebar_and_picker_requests() {
+        let mut requests = CatalogRequests::new();
+        requests.request(Query::Home, 0, None).unwrap();
+        let old_page = requests.generations[CatalogTarget::Page as usize]
+            .load(std::sync::atomic::Ordering::Relaxed);
+        requests.request(Query::PlaylistChoices, 0, None).unwrap();
+        requests.request(Query::SidebarPlaylists, 0, None).unwrap();
+        requests.request(Query::Explore, 0, None).unwrap();
+        let pending = std::iter::from_fn(|| requests.pending.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(pending.len(), 3);
+        for target in CatalogTarget::ALL {
+            assert_eq!(
+                pending
+                    .iter()
+                    .filter(|job| job.query.target() == target)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            pending
+                .iter()
+                .any(|job| matches!(job.query, Query::Explore))
+        );
+        assert!(!requests.finish(CatalogTarget::Page, old_page));
+    }
+
+    #[test]
     fn carousel_only_renders_nearby_cards_and_clamps_after_a_shorter_refresh() {
-        assert_eq!(visible_cards(100, 0., 552.), 0..4);
-        assert_eq!(visible_cards(100, 1840., 552.), 10..14);
-        assert_eq!(visible_cards(100, 100000., 552.), 96..100);
-        assert_eq!(visible_cards(2, 100000., 552.), 0..2);
-        assert_eq!(visible_cards(0, 0., 552.), 0..0);
+        assert_eq!(visible_cards(100, 0., 612., 204.), 0..4);
+        assert_eq!(visible_cards(100, 2040., 612., 204.), 10..14);
+        assert_eq!(visible_cards(100, 100000., 612., 204.), 96..100);
+        assert_eq!(visible_cards(2, 100000., 612., 204.), 0..2);
+        assert_eq!(visible_cards(0, 0., 612., 204.), 0..0);
     }
 
     #[test]

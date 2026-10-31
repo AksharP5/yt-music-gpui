@@ -1,7 +1,7 @@
 use crate::{
     auth::Session,
     catalog::{
-        Catalog, EpisodeContext, PODCAST_EPISODE, Track, duration, episode_context, episode_header,
+        Catalog, PODCAST_EPISODE, PlaylistTarget, Track, duration, episode_context, episode_header,
         text, thumbnail, track_details, valid_service_params, valid_video_id,
     },
 };
@@ -41,19 +41,42 @@ pub struct WatchContinuation {
     session: Option<Arc<Session>>,
 }
 
+impl WatchContinuation {
+    pub(crate) fn token(&self) -> &str {
+        self.request["continuation"]
+            .as_str()
+            .expect("validated watch continuation token")
+    }
+}
+
 pub struct WatchPage {
     pub queue: Vec<Track>,
     pub continuation: Option<WatchContinuation>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchMode {
+    Details,
+    Issued,
+    Radio,
+}
+
 impl Catalog {
-    pub fn watch(&self, track: &Track, radio: bool) -> Result<Watch> {
+    pub fn watch_playlist(&self, target: &PlaylistTarget) -> Result<Watch> {
+        let mut request = target.request();
+        request["enablePersistentPlaylistPanel"] = json!(true);
+        request["isAudioOnly"] = json!(true);
+        let response = self.request("next", request.clone())?;
+        parse_playlist_watch(&response, request, self.session.clone())
+    }
+
+    pub fn watch(&self, track: &Track, mode: WatchMode) -> Result<Watch> {
         ensure!(
             valid_video_id(&track.id),
             "This item has an invalid YouTube Music ID"
         );
         ensure!(
-            !radio || track.details.episode.is_none(),
+            mode != WatchMode::Radio || track.details.episode.is_none(),
             "Radio is not available for podcast episodes"
         );
         let refreshed;
@@ -70,9 +93,9 @@ impl Catalog {
         } else {
             track
         };
-        let request = watch_request(&track.id, track.details.episode.as_deref(), radio)?;
+        let request = watch_request(track, mode)?;
         let response = self.request("next", request.clone())?;
-        parse_watch(&response, track, request, self.session.clone())
+        parse_watch(&response, track, request, self.session.clone(), mode)
     }
 
     pub fn watch_more(&self, continuation: &WatchContinuation) -> Result<WatchPage> {
@@ -103,13 +126,68 @@ impl Catalog {
     }
 }
 
-fn watch_request(video_id: &str, episode: Option<&EpisodeContext>, radio: bool) -> Result<Value> {
+fn playlist_panel(response: &Value) -> Result<&Value> {
+    response.pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
+        .and_then(Value::as_array)
+        .context("YouTube Music returned no playback details")?
+        .iter()
+        .find_map(|tab| tab.pointer("/tabRenderer/content/musicQueueRenderer/content/playlistPanelRenderer"))
+        .context("YouTube Music returned no playback queue")
+}
+
+fn playlist_row(item: &Value) -> Option<&Value> {
+    item.get("playlistPanelVideoRenderer").or_else(|| {
+        item.pointer(
+            "/playlistPanelVideoWrapperRenderer/primaryRenderer/playlistPanelVideoRenderer",
+        )
+    })
+}
+
+pub(crate) fn parse_playlist_watch(
+    response: &Value,
+    request: Value,
+    session: Option<Arc<Session>>,
+) -> Result<Watch> {
+    let contents = playlist_panel(response)?["contents"]
+        .as_array()
+        .context("YouTube Music returned an unreadable playback queue")?;
+    let selected = contents
+        .iter()
+        .flat_map(|item| {
+            playlist_row(item).into_iter().chain(
+                item.pointer("/playlistPanelVideoWrapperRenderer/counterpart")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        entry.pointer("/counterpartRenderer/playlistPanelVideoRenderer")
+                    }),
+            )
+        })
+        .filter(|row| row["selected"] == true)
+        .find_map(|row| parse_track(row, row["videoId"].as_str()?));
+    let seed = selected
+        .or_else(|| {
+            contents
+                .iter()
+                .filter_map(playlist_row)
+                .find_map(|row| parse_track(row, row["videoId"].as_str()?))
+        })
+        .context("YouTube Music returned no playable songs in this playlist")?;
+    parse_watch(response, &seed, request, session, WatchMode::Issued)
+}
+
+fn watch_request(track: &Track, mode: WatchMode) -> Result<Value> {
+    let video_id = &track.id;
     ensure!(
         valid_video_id(video_id),
         "This song has an invalid YouTube Music ID"
     );
-    if let Some(episode) = episode {
-        ensure!(!radio, "Radio is not available for podcast episodes");
+    if let Some(episode) = track.details.episode.as_deref() {
+        ensure!(
+            mode != WatchMode::Radio,
+            "Radio is not available for podcast episodes"
+        );
         let params = episode
             .watch_params
             .as_deref()
@@ -125,6 +203,17 @@ fn watch_request(video_id: &str, episode: Option<&EpisodeContext>, radio: bool) 
             }
         }));
     }
+    if mode == WatchMode::Issued {
+        let mut body = track
+            .details
+            .watch
+            .as_ref()
+            .context("Refresh this song before starting its playback queue")?
+            .request(video_id)?;
+        body["enablePersistentPlaylistPanel"] = json!(true);
+        body["isAudioOnly"] = json!(true);
+        return Ok(body);
+    }
     let mut body = json!({
         "videoId": video_id,
         "playlistId": format!("RDAMVM{video_id}"),
@@ -132,7 +221,7 @@ fn watch_request(video_id: &str, episode: Option<&EpisodeContext>, radio: bool) 
         "isAudioOnly": true,
         "tunerSettingValue": "AUTOMIX_SETTING_NORMAL"
     });
-    if radio {
+    if mode == WatchMode::Radio {
         body["params"] = json!("wAEB");
     } else {
         body["watchEndpointMusicSupportedConfigs"] = json!({
@@ -150,17 +239,13 @@ fn parse_watch(
     seed: &Track,
     request: Value,
     session: Option<Arc<Session>>,
+    mode: WatchMode,
 ) -> Result<Watch> {
     let tabs = response
         .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
         .and_then(Value::as_array)
         .context("YouTube Music returned no playback details")?;
-    let panel = tabs
-        .iter()
-        .find_map(|tab| {
-            tab.pointer("/tabRenderer/content/musicQueueRenderer/content/playlistPanelRenderer")
-        })
-        .context("YouTube Music returned no playback queue")?;
+    let panel = playlist_panel(response)?;
     let contents = panel["contents"]
         .as_array()
         .context("YouTube Music returned an unreadable playback queue")?;
@@ -168,6 +253,10 @@ fn parse_watch(
     ensure!(
         !queue.is_empty(),
         "YouTube Music returned no playable songs"
+    );
+    ensure!(
+        mode != WatchMode::Issued || current_index.is_some(),
+        "YouTube Music did not include the requested song in its playback queue"
     );
     if let Some(episode) = &seed.details.episode {
         alternatives = None;
@@ -263,11 +352,7 @@ fn parse_queue(
     let mut first_match = None;
     let mut selected_match = None;
     for item in contents {
-        let row = item.get("playlistPanelVideoRenderer").or_else(|| {
-            item.pointer(
-                "/playlistPanelVideoWrapperRenderer/primaryRenderer/playlistPanelVideoRenderer",
-            )
-        });
+        let row = playlist_row(item);
         let Some(row) = row else { continue };
         let Some(track) = parse_track(row, current_id) else {
             continue;
@@ -398,7 +483,7 @@ fn parse_track(row: &Value, current_id: &str) -> Option<Track> {
             .filter(|id| id.starts_with("MPRE"))?;
         run["text"].as_str().map(str::to_owned)
     });
-    let mut details = track_details(row, &runs);
+    let mut details = track_details(row, &runs, id);
     details.episode = episode_context(row, id, &runs).ok()?;
     if id != current_id {
         details.clear_account_state();
@@ -432,7 +517,7 @@ fn parse_lyrics(response: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{BrowseLink, Rating};
+    use crate::catalog::{BrowseLink, EpisodeContext, Rating, parse_page};
 
     fn track(id: &str) -> Track {
         Track {
@@ -448,24 +533,113 @@ mod tests {
 
     #[test]
     fn playback_requests_separate_track_details_from_radio() {
-        let details = watch_request("abcdefghijk", None, false).unwrap();
+        let details = watch_request(&track("abcdefghijk"), WatchMode::Details).unwrap();
         assert_eq!(details["videoId"], "abcdefghijk");
         assert_eq!(details["playlistId"], "RDAMVMabcdefghijk");
         assert!(details.get("params").is_none());
         assert_eq!(details.pointer("/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/hasPersistentPlaylistPanel"), Some(&json!(true)));
-        let radio = watch_request("abcdefghijk", None, true).unwrap();
+        let radio = watch_request(&track("abcdefghijk"), WatchMode::Radio).unwrap();
         assert_eq!(radio["params"], "wAEB");
         assert!(radio.get("watchEndpointMusicSupportedConfigs").is_none());
-        assert!(watch_request("not a video ID", None, true).is_err());
+        assert!(watch_request(&track("not a video ID"), WatchMode::Radio).is_err());
+    }
+
+    fn issued_track(endpoint: Value) -> Track {
+        parse_page(&json!({"contents":[{"musicShelfRenderer":{"contents":[{
+            "musicResponsiveListItemRenderer":{
+                "title":{"runs":[{"text":"Song","navigationEndpoint":{"watchEndpoint":endpoint}}]},
+                "playlistItemData":{"videoId":"abcdefghijk"}
+            }
+        }]}}]}), "Results").unwrap().tracks().pop().unwrap()
+    }
+
+    #[test]
+    fn issued_playback_preserves_single_video_radio_and_playlist_destinations() {
+        let single = issued_track(json!({"videoId":"abcdefghijk",
+            "watchEndpointMusicSupportedConfigs":{"watchEndpointMusicConfig":{"musicVideoType":"MUSIC_VIDEO_TYPE_OMV"}}
+        }));
+        let request = watch_request(&single, WatchMode::Issued).unwrap();
+        assert!(single.details.watch.as_ref().unwrap().is_single_video());
+        assert_eq!(request["videoId"], "abcdefghijk");
+        assert_eq!(
+            request.pointer(
+                "/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType"
+            ),
+            Some(&json!("MUSIC_VIDEO_TYPE_OMV"))
+        );
+        assert!(request.get("playlistId").is_none());
+        assert!(request.get("params").is_none());
+        assert!(request.get("tunerSettingValue").is_none());
+        let quick_pick = issued_track(
+            json!({"videoId":"abcdefghijk", "playlistId":"RDAMVMabcdefghijk", "params":"wAEB"}),
+        );
+        let request = watch_request(&quick_pick, WatchMode::Issued).unwrap();
+        assert!(!quick_pick.details.watch.as_ref().unwrap().is_single_video());
+        assert_eq!(request["playlistId"], "RDAMVMabcdefghijk");
+        assert_eq!(request["params"], "wAEB");
+        let playlist = issued_track(
+            json!({"videoId":"abcdefghijk", "playlistId":"OLAKissued", "index":17, "params":"issued-private%3D"}),
+        );
+        let request = watch_request(&playlist, WatchMode::Issued).unwrap();
+        assert_eq!(request["playlistId"], "OLAKissued");
+        assert_eq!(request["index"], 17);
+        assert_eq!(request["params"], "issued-private%3D");
+        let radio = watch_request(&playlist, WatchMode::Radio).unwrap();
+        assert_eq!(radio["playlistId"], "RDAMVMabcdefghijk");
+        assert_eq!(radio["params"], "wAEB");
+        assert!(radio.get("index").is_none());
+        let details = watch_request(&playlist, WatchMode::Details).unwrap();
+        assert_eq!(details["playlistId"], "RDAMVMabcdefghijk");
+        assert!(details.get("params").is_none());
+    }
+
+    #[test]
+    fn only_destinations_without_playlist_params_or_index_are_single_video() {
+        for (extra, single) in [
+            (json!({}), true),
+            (json!({"playlistId":"OLAKissued"}), false),
+            (json!({"params":"wAEB"}), false),
+            (json!({"index":0}), false),
+        ] {
+            let mut endpoint = json!({"videoId":"abcdefghijk"});
+            endpoint
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let track = issued_track(endpoint);
+            assert_eq!(
+                track.details.watch.as_ref().unwrap().is_single_video(),
+                single
+            );
+        }
+    }
+
+    #[test]
+    fn issued_context_cannot_survive_persistence_account_change_or_another_video() {
+        let mut issued = issued_track(
+            json!({"videoId":"abcdefghijk", "playlistId":"OLAKissued", "params":"issued-private%3D"}),
+        );
+        assert!(!format!("{:?}", issued.details.watch).contains("issued-private"));
+        let restored: Track =
+            serde_json::from_value(serde_json::to_value(&issued).unwrap()).unwrap();
+        assert!(restored.details.watch.is_none());
+        assert!(watch_request(&restored, WatchMode::Issued).is_err());
+        issued.id = "lmnopqrstuv".into();
+        assert!(watch_request(&issued, WatchMode::Issued).is_err());
+        issued.id = "abcdefghijk".into();
+        issued.details.clear_account_state();
+        assert!(issued.details.watch.is_none());
+        assert!(watch_request(&issued, WatchMode::Issued).is_err());
     }
 
     #[test]
     fn episode_requests_preserve_issued_params_without_music_radio_context() {
-        let mut episode = EpisodeContext {
+        let mut seed = track("abcdefghijk");
+        seed.details.episode = Some(Box::new(EpisodeContext {
             watch_params: Some("issued-params%3D".into()),
             ..Default::default()
-        };
-        let request = watch_request("abcdefghijk", Some(&episode), false).unwrap();
+        }));
+        let request = watch_request(&seed, WatchMode::Details).unwrap();
         assert_eq!(request["params"], "issued-params%3D");
         assert_eq!(
             request.pointer(
@@ -475,20 +649,21 @@ mod tests {
         );
         assert!(request.get("playlistId").is_none());
         assert!(request.get("tunerSettingValue").is_none());
-        assert!(watch_request("abcdefghijk", Some(&episode), true).is_err());
+        assert!(watch_request(&seed, WatchMode::Radio).is_err());
         for params in [
             None,
             Some(String::new()),
             Some("%bad%XX".into()),
             Some("unsafe\nvalue".into()),
         ] {
-            episode.watch_params = params;
-            assert!(watch_request("abcdefghijk", Some(&episode), false).is_err());
+            seed.details.episode.as_mut().unwrap().watch_params = params;
+            assert!(watch_request(&seed, WatchMode::Details).is_err());
         }
-
-        let mut seed = track("abcdefghijk");
-        seed.details.episode = Some(Box::new(episode));
-        let error = Catalog::new().unwrap().watch(&seed, true).err().unwrap();
+        let error = Catalog::new()
+            .unwrap()
+            .watch(&seed, WatchMode::Radio)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("Radio is not available"));
     }
 
@@ -554,6 +729,64 @@ mod tests {
     }
 
     #[test]
+    fn playlist_starts_select_real_returned_rows_without_inventing_a_seed() {
+        let mut response =
+            watch_response(json!([row("abcdefghijk", false), row("lmnopqrstuv", true)]));
+        let panel = response.pointer_mut("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs/1/tabRenderer/content/musicQueueRenderer/content/playlistPanelRenderer").unwrap();
+        panel["continuations"] = json!([{"nextRadioContinuationData":{"continuation":"more"}}]);
+        let watch = parse_playlist_watch(
+            &response,
+            json!({"playlistId":"PLissued", "params":"wAEB"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(watch.current_index, Some(1));
+        assert_eq!(watch.current.unwrap().id, "lmnopqrstuv");
+        let continued = watch.continuation.unwrap().request;
+        assert_eq!(continued["playlistId"], "PLissued");
+        assert_eq!(continued["params"], "wAEB");
+        assert!(continued.get("videoId").is_none());
+
+        let mut unavailable = row("abcdefghijk", true);
+        unavailable["playlistPanelVideoRenderer"]["unplayableText"] =
+            json!({"simpleText":"Unavailable"});
+        let watch = parse_playlist_watch(
+            &watch_response(json!([
+                unavailable.clone(),
+                row("invalid", false),
+                row("lmnopqrstuv", false)
+            ])),
+            json!({"playlistId":"PLissued"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(watch.current_index, Some(0));
+        assert_eq!(watch.current.unwrap().id, "lmnopqrstuv");
+        assert!(
+            parse_playlist_watch(
+                &watch_response(json!([unavailable])),
+                json!({"playlistId":"PLissued"}),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn playlist_start_respects_a_selected_real_video_counterpart() {
+        let response = watch_response(json!([media_wrapper(
+            media_row("abcdefghijk", false, "MUSIC_VIDEO_TYPE_ATV"),
+            media_row("lmnopqrstuv", true, "MUSIC_VIDEO_TYPE_OMV")
+        )]));
+        let watch =
+            parse_playlist_watch(&response, json!({"playlistId":"PLissued"}), None).unwrap();
+        assert_eq!(watch.current_index, Some(0));
+        assert_eq!(watch.current.unwrap().id, "lmnopqrstuv");
+        assert_eq!(watch.queue[0].id, "lmnopqrstuv");
+        assert!(watch.alternatives.is_some());
+    }
+
+    #[test]
     fn service_media_pairs_keep_each_recordings_own_identity_and_account_state() {
         for video_kind in ["MUSIC_VIDEO_TYPE_OMV", "MUSIC_VIDEO_TYPE_UGC"] {
             let song = media_row("abcdefghijk", true, "MUSIC_VIDEO_TYPE_ATV");
@@ -561,7 +794,14 @@ mod tests {
             for (primary, counterpart) in [(song.clone(), video.clone()), (video, song)] {
                 let response = watch_response(json!([media_wrapper(primary, counterpart)]));
                 for current in ["abcdefghijk", "lmnopqrstuv"] {
-                    let watch = parse_watch(&response, &track(current), json!({}), None).unwrap();
+                    let watch = parse_watch(
+                        &response,
+                        &track(current),
+                        json!({}),
+                        None,
+                        WatchMode::Details,
+                    )
+                    .unwrap();
                     assert_eq!(watch.current.as_ref().unwrap().id, current);
                     assert_eq!(watch.queue.len(), 1);
                     assert_eq!(watch.queue[0].id, current);
@@ -608,7 +848,14 @@ mod tests {
                 current_video,
             );
             let response = watch_response(json!([first, row("vwxyzABCDEF", false), selected]));
-            let watch = parse_watch(&response, &track("lmnopqrstuv"), json!({}), None).unwrap();
+            let watch = parse_watch(
+                &response,
+                &track("lmnopqrstuv"),
+                json!({}),
+                None,
+                WatchMode::Details,
+            )
+            .unwrap();
             assert_eq!(watch.current_index, Some(2));
             assert_eq!(
                 watch
@@ -661,6 +908,7 @@ mod tests {
                 &track("abcdefghijk"),
                 json!({}),
                 None,
+                WatchMode::Details,
             )
             .unwrap();
             assert!(watch.alternatives.is_none());
@@ -685,7 +933,8 @@ mod tests {
                     &watch_response(json!([invalid])),
                     &track("abcdefghijk"),
                     json!({}),
-                    None
+                    None,
+                    WatchMode::Details
                 )
                 .unwrap()
                 .alternatives
@@ -693,10 +942,24 @@ mod tests {
             );
         }
         let response = watch_response(json!([wrapper.clone()]));
-        let unrelated = parse_watch(&response, &track("vwxyzABCDEF"), json!({}), None).unwrap();
+        let unrelated = parse_watch(
+            &response,
+            &track("vwxyzABCDEF"),
+            json!({}),
+            None,
+            WatchMode::Details,
+        )
+        .unwrap();
         assert!(unrelated.current.is_none() && unrelated.alternatives.is_none());
         let response = watch_response(json!([row("abcdefghijk", true), wrapper]));
-        let selected = parse_watch(&response, &track("abcdefghijk"), json!({}), None).unwrap();
+        let selected = parse_watch(
+            &response,
+            &track("abcdefghijk"),
+            json!({}),
+            None,
+            WatchMode::Details,
+        )
+        .unwrap();
         assert_eq!(selected.current_index, Some(0));
         assert!(selected.alternatives.is_none());
     }
@@ -715,8 +978,9 @@ mod tests {
         let watch = parse_watch(
             &response,
             &track("abcdefghijk"),
-            watch_request("abcdefghijk", None, false).unwrap(),
+            watch_request(&track("abcdefghijk"), WatchMode::Details).unwrap(),
             None,
+            WatchMode::Details,
         )
         .unwrap();
         assert_eq!(
@@ -761,8 +1025,9 @@ mod tests {
         let watch = parse_watch(
             &response,
             &track("abcdefghijk"),
-            watch_request("abcdefghijk", None, false).unwrap(),
+            watch_request(&track("abcdefghijk"), WatchMode::Details).unwrap(),
             None,
+            WatchMode::Details,
         )
         .unwrap();
         assert!(watch.current.is_none());
@@ -771,6 +1036,43 @@ mod tests {
         assert_eq!(watch.queue[0].details.rating, None);
         assert_eq!(watch.queue[0].details.add_library, None);
         assert_eq!(watch.lyrics, None);
+    }
+
+    #[test]
+    fn issued_queues_require_the_requested_playable_occurrence() {
+        let seed = issued_track(json!({"videoId":"abcdefghijk", "playlistId":"OLAKissued"}));
+        let mut unavailable = row("abcdefghijk", true);
+        unavailable["playlistPanelVideoRenderer"]["unplayableText"] =
+            json!({"simpleText":"Unavailable"});
+        for rows in [
+            json!([row("lmnopqrstuv", true)]),
+            json!([unavailable, row("lmnopqrstuv", true)]),
+        ] {
+            let error = parse_watch(
+                &watch_response(rows),
+                &seed,
+                watch_request(&seed, WatchMode::Issued).unwrap(),
+                None,
+                WatchMode::Issued,
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not include the requested song")
+            );
+        }
+        let watch = parse_watch(
+            &watch_response(json!([row("lmnopqrstuv", false), row("abcdefghijk", true)])),
+            &seed,
+            watch_request(&seed, WatchMode::Issued).unwrap(),
+            None,
+            WatchMode::Issued,
+        )
+        .unwrap();
+        assert_eq!(watch.current_index, Some(1));
+        assert_eq!(watch.current.unwrap().id, "abcdefghijk");
     }
 
     #[test]
@@ -798,8 +1100,9 @@ mod tests {
         let watch = parse_watch(
             &response,
             &seed,
-            watch_request(&seed.id, seed.details.episode.as_deref(), false).unwrap(),
+            watch_request(&seed, WatchMode::Details).unwrap(),
             None,
+            WatchMode::Details,
         )
         .unwrap();
         assert_eq!(watch.current_index, Some(2));
@@ -815,7 +1118,7 @@ mod tests {
             other.show_id.is_none() && other.description.is_empty() && other.watch_params.is_none()
         );
         let mismatch = watch_response(json!([row("lmnopqrstuv", true)]));
-        assert!(parse_watch(&mismatch, &seed, json!({}), None).is_err());
+        assert!(parse_watch(&mismatch, &seed, json!({}), None, WatchMode::Details).is_err());
     }
 
     #[test]
@@ -827,11 +1130,13 @@ mod tests {
         let watch = parse_watch(
             &response,
             &track("abcdefghijk"),
-            watch_request("abcdefghijk", None, true).unwrap(),
+            watch_request(&track("abcdefghijk"), WatchMode::Radio).unwrap(),
             None,
+            WatchMode::Radio,
         )
         .unwrap();
         let continuation = watch.continuation.unwrap();
+        assert_eq!(continuation.token(), "first-token");
         assert_eq!(continuation.request["continuation"], "first-token");
         assert_eq!(continuation.request["playlistId"], "RDAMVMabcdefghijk");
         assert_eq!(continuation.request["params"], "wAEB");
@@ -884,7 +1189,7 @@ mod tests {
         let catalog = Catalog::with_session(Some(current)).unwrap();
         for expected in [None, Some(Arc::new(session))] {
             let continuation = WatchContinuation {
-                request: watch_request("abcdefghijk", None, true).unwrap(),
+                request: watch_request(&track("abcdefghijk"), WatchMode::Radio).unwrap(),
                 session: expected,
             };
             let error = catalog.watch_more(&continuation).err().unwrap();
@@ -909,8 +1214,9 @@ mod tests {
             parse_watch(
                 &json!({}),
                 &track("abcdefghijk"),
-                watch_request("abcdefghijk", None, false).unwrap(),
-                None
+                watch_request(&track("abcdefghijk"), WatchMode::Details).unwrap(),
+                None,
+                WatchMode::Details
             )
             .is_err()
         );
@@ -920,7 +1226,9 @@ mod tests {
     #[ignore = "uses the public YouTube Music next and lyrics endpoints"]
     fn live_public_watch() {
         let catalog = Catalog::new().unwrap();
-        let watch = catalog.watch(&track("dQw4w9WgXcQ"), false).unwrap();
+        let watch = catalog
+            .watch(&track("dQw4w9WgXcQ"), WatchMode::Details)
+            .unwrap();
         assert_eq!(
             watch.current.as_ref().map(|track| track.id.as_str()),
             Some("dQw4w9WgXcQ")
@@ -932,10 +1240,121 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads public issued playback destinations without playback or an account"]
+    fn live_public_issued_click_queues() {
+        let catalog = Catalog::new().unwrap();
+        let home = catalog.home().unwrap();
+        let explore = catalog.explore().unwrap();
+        let search = catalog
+            .search_filtered(
+                "Khruangbin",
+                crate::search::SearchFilter::Songs,
+                crate::search::SearchScope::Catalog,
+            )
+            .unwrap();
+        let video = explore
+            .shelves
+            .iter()
+            .find(|shelf| shelf.layout == crate::catalog::ShelfLayout::Videos)
+            .and_then(|shelf| {
+                shelf.items.iter().find_map(|item| match item {
+                    crate::catalog::Item::Track(track) if track.details.watch.is_some() => {
+                        Some(track.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .expect("Explore must expose an issued video destination");
+        let mut examples = vec![("Explore video", video)];
+        for (name, page) in [("Home", home), ("Explore", explore), ("Search", search)] {
+            examples.push((
+                name,
+                page.tracks()
+                    .into_iter()
+                    .find(|track| track.details.watch.is_some())
+                    .expect("Public song row must retain its issued destination"),
+            ));
+        }
+        for (name, seed) in examples {
+            let watch = catalog.watch(&seed, WatchMode::Issued).unwrap();
+            assert_eq!(
+                watch.current.as_ref().map(|track| track.id.as_str()),
+                Some(seed.id.as_str())
+            );
+            println!(
+                "Public {name} issued destination: {} queue rows, continued: {}",
+                watch.queue.len(),
+                watch.continuation.is_some()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "reads issued public artist and collection playlist starts without playback or an account"]
+    fn live_public_playlist_starts() {
+        let catalog = Catalog::new().unwrap();
+        let artists = catalog
+            .search_filtered(
+                "Daft Punk",
+                crate::search::SearchFilter::Artists,
+                crate::search::SearchScope::Catalog,
+            )
+            .unwrap();
+        let artist = artists
+            .shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .find_map(|item| match item {
+                crate::catalog::Item::Collection(collection) if collection.id.starts_with("UC") => {
+                    Some(collection)
+                }
+                _ => None,
+            })
+            .expect("Artist search must provide a real artist page");
+        let artist = catalog
+            .browse(&BrowseLink::new(artist.id.clone(), artist.title.clone()))
+            .unwrap();
+        let top_songs = artist
+            .shelves
+            .iter()
+            .find(|shelf| shelf.title == "Top songs")
+            .and_then(|shelf| shelf.more.as_ref())
+            .expect("Artist Top songs must provide an issued Show all destination");
+        let expanded = catalog.browse(top_songs).unwrap();
+        assert!(!expanded.tracks().is_empty());
+        println!("Public artist Show all: {} rows", expanded.tracks().len());
+        let header = artist.header.unwrap();
+        assert!(header.subscribed.is_some());
+        assert!(!header.subtitle.is_empty());
+        for (label, target) in [("Shuffle", header.shuffle), ("Mix", header.mix)] {
+            let watch = catalog
+                .watch_playlist(&target.expect("Artist must provide an issued playback button"))
+                .unwrap();
+            assert!(watch.current.is_some() && watch.current_index.is_some());
+            println!("Public artist {label}: {} queue rows", watch.queue.len());
+        }
+        let home = catalog.home().unwrap();
+        let target = home
+            .shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .find_map(|item| match item {
+                crate::catalog::Item::Collection(collection) => collection.details.play.as_ref(),
+                _ => None,
+            })
+            .expect("Home collection must provide an issued play control");
+        let watch = catalog.watch_playlist(target).unwrap();
+        assert!(watch.current.is_some() && watch.current_index.is_some());
+        println!("Public collection play: {} queue rows", watch.queue.len());
+    }
+
+    #[test]
     #[ignore = "uses the public YouTube Music radio continuation endpoint"]
     fn live_public_radio_continuation() {
         let catalog = Catalog::new().unwrap();
-        let watch = catalog.watch(&track("dQw4w9WgXcQ"), true).unwrap();
+        let watch = catalog
+            .watch(&track("dQw4w9WgXcQ"), WatchMode::Radio)
+            .unwrap();
         let first = catalog.watch_more(&watch.continuation.unwrap()).unwrap();
         assert!(!first.queue.is_empty());
         let second = catalog.watch_more(&first.continuation.unwrap()).unwrap();
@@ -1004,7 +1423,7 @@ mod tests {
                 .watch_params
                 .is_none()
         );
-        let watch = catalog.watch(&restored, false).unwrap();
+        let watch = catalog.watch(&restored, WatchMode::Details).unwrap();
         let current = watch.current.unwrap();
         assert_eq!(current.id, episode.id);
         assert_eq!(

@@ -3,12 +3,13 @@
 
 use std::ops::Range;
 
+use crate::theme::Theme;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, rgb, size,
+    fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
 
@@ -21,9 +22,17 @@ actions!(
         Right,
         SelectLeft,
         SelectRight,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -44,6 +53,7 @@ pub struct SearchInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_x: Pixels,
+    theme: Theme,
 }
 
 pub enum InputEvent {
@@ -61,12 +71,20 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", Right, Some("SearchInput")),
         KeyBinding::new("shift-left", SelectLeft, Some("SearchInput")),
         KeyBinding::new("shift-right", SelectRight, Some("SearchInput")),
+        KeyBinding::new("ctrl-left", WordLeft, Some("SearchInput")),
+        KeyBinding::new("ctrl-right", WordRight, Some("SearchInput")),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, Some("SearchInput")),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, Some("SearchInput")),
+        KeyBinding::new("ctrl-backspace", DeleteWordLeft, Some("SearchInput")),
+        KeyBinding::new("ctrl-delete", DeleteWordRight, Some("SearchInput")),
         KeyBinding::new("ctrl-a", SelectAll, Some("SearchInput")),
         KeyBinding::new("ctrl-v", Paste, Some("SearchInput")),
         KeyBinding::new("ctrl-c", Copy, Some("SearchInput")),
         KeyBinding::new("ctrl-x", Cut, Some("SearchInput")),
         KeyBinding::new("home", Home, Some("SearchInput")),
         KeyBinding::new("end", End, Some("SearchInput")),
+        KeyBinding::new("shift-home", SelectHome, Some("SearchInput")),
+        KeyBinding::new("shift-end", SelectEnd, Some("SearchInput")),
         KeyBinding::new("enter", Submit, Some("SearchInput")),
         KeyBinding::new("escape", Blur, Some("SearchInput")),
     ]);
@@ -77,7 +95,7 @@ impl SearchInput {
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
-            placeholder: "Search songs, artists, albums".into(),
+            placeholder: "Search songs, albums, artists, podcasts".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -85,6 +103,7 @@ impl SearchInput {
             last_bounds: None,
             is_selecting: false,
             scroll_x: px(0.),
+            theme: Theme::load(),
         }
     }
     pub fn set_placeholder(
@@ -136,6 +155,46 @@ impl SearchInput {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(previous_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(next_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(previous_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(next_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(previous_word(&self.content, self.cursor_offset()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(next_word(&self.content, self.cursor_offset()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
@@ -147,6 +206,14 @@ impl SearchInput {
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.content.len(), cx);
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -182,10 +249,19 @@ impl SearchInput {
         window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
 
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+        let offset = self.index_for_mouse_position(event.position);
+        if event.click_count >= 3 {
+            self.selected_range = 0..self.content.len();
+            self.selection_reversed = false;
+            cx.notify();
+        } else if event.click_count == 2 {
+            self.selected_range = word_at(&self.content, offset);
+            self.selection_reversed = false;
+            cx.notify();
+        } else if event.modifiers.shift {
+            self.select_to(offset, cx);
         } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx)
+            self.move_to(offset, cx)
         }
     }
 
@@ -210,7 +286,7 @@ impl SearchInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
+            self.replace_text_in_range(None, &text.replace(['\n', '\r', '\t'], " "), window, cx);
         }
     }
 
@@ -532,7 +608,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(0x8e8e9f).into())
+            (input.placeholder.clone(), input.theme.muted)
         } else {
             (content, style.color)
         };
@@ -593,7 +669,7 @@ impl Element for TextElement {
                         point(left + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0xc8c8f0),
+                    input.theme.text,
                 )),
             )
         } else {
@@ -603,7 +679,7 @@ impl Element for TextElement {
                         point(left + line.x_for_index(selected_range.start), bounds.top()),
                         point(left + line.x_for_index(selected_range.end), bounds.bottom()),
                     ),
-                    rgb(0x454565),
+                    input.theme.text_selection,
                 )),
                 None,
             )
@@ -673,9 +749,17 @@ impl Render for SearchInput {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
@@ -688,9 +772,9 @@ impl Render for SearchInput {
             .on_action(cx.listener(Self::blur))
             .w_full()
             .overflow_hidden()
-            .text_color(rgb(0xe9e9ef))
+            .text_color(self.theme.text)
             .line_height(px(24.))
-            .text_size(px(15.))
+            .text_size(px(16.))
             .child(
                 div()
                     .w_full()
@@ -703,5 +787,59 @@ impl Render for SearchInput {
 impl Focusable for SearchInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+fn previous_word(text: &str, offset: usize) -> usize {
+    text.unicode_word_indices()
+        .rev()
+        .find_map(|(start, _)| (start < offset).then_some(start))
+        .unwrap_or(0)
+}
+
+fn next_word(text: &str, offset: usize) -> usize {
+    text.unicode_word_indices()
+        .find_map(|(start, word)| {
+            let end = start + word.len();
+            (end > offset).then_some(end)
+        })
+        .unwrap_or(text.len())
+}
+
+fn word_at(text: &str, offset: usize) -> Range<usize> {
+    let offset = offset.min(text.len().saturating_sub(1));
+    text.split_word_bound_indices()
+        .find_map(|(start, word)| {
+            let end = start + word.len();
+            (offset < end).then_some(start..end)
+        })
+        .unwrap_or(text.len()..text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_word, previous_word, word_at};
+
+    #[test]
+    fn word_navigation_uses_unicode_boundaries_and_skips_separators() {
+        let text = "Beyoncé,  déjà vu";
+        assert_eq!(previous_word(text, text.len()), 18);
+        assert_eq!(previous_word(text, 18), 11);
+        assert_eq!(previous_word(text, 11), 0);
+        assert_eq!(previous_word(text, 0), 0);
+        assert_eq!(next_word(text, 0), 8);
+        assert_eq!(next_word(text, 8), 17);
+        assert_eq!(next_word(text, 17), text.len());
+        assert_eq!(next_word(text, text.len()), text.len());
+    }
+
+    #[test]
+    fn double_click_selects_a_whole_word_without_splitting_unicode() {
+        let text = "Beyoncé, déjà";
+        assert_eq!(word_at(text, 4), 0..8);
+        assert_eq!(word_at(text, 8), 8..9);
+        assert_eq!(word_at(text, 11), 10..16);
+        assert_eq!(word_at(text, text.len()), 10..16);
+        assert_eq!(word_at("", 0), 0..0);
     }
 }

@@ -50,7 +50,10 @@ impl CountryPicker {
             }
             InputEvent::Blur => cx.emit(CountryPickerEvent::Cancel),
         });
-        let highlighted = choices.iter().position(|choice| choice.selected);
+        let highlighted = choices
+            .iter()
+            .position(|choice| choice.selected)
+            .or_else(|| (!choices.is_empty()).then_some(0));
         let scroll = UniformListScrollHandle::new();
         if let Some(index) = highlighted {
             scroll.scroll_to_item(index, ScrollStrategy::Center);
@@ -73,7 +76,7 @@ impl CountryPicker {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.modifiers.control && event.keystroke.key == "q" {
+        if event.keystroke.modifiers.modified() {
             return;
         }
         if !self.filtered.is_empty() {

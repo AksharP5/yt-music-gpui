@@ -49,6 +49,29 @@ const KEYRING_ATTRIBUTES: [&str; 4] = [
 ];
 const KEYRING_PREFIX: &[u8] = b"yt-music-session-v1:";
 
+#[derive(Debug)]
+pub(crate) struct RejectedSession;
+
+impl std::fmt::Display for RejectedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("YouTube Music did not accept the account session. Connect again.")
+    }
+}
+
+impl std::error::Error for RejectedSession {}
+
+pub(crate) fn session_was_rejected(error: &anyhow::Error) -> bool {
+    error.is::<RejectedSession>()
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                matches!(
+                    error.status(),
+                    Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
+                )
+            })
+        })
+}
+
 // Never derive Debug for reusable account credentials.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -58,6 +81,8 @@ pub struct Session {
     pub delegated_session_id: Option<String>,
     data_sync_id: String,
     pub client_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_profile: Option<BrowserProfile>,
 }
 
 pub struct PlaybackCredentials {
@@ -65,7 +90,7 @@ pub struct PlaybackCredentials {
     pub(crate) identity: File,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BrowserProfile {
     pub browser: String,
     pub name: String,
@@ -177,6 +202,16 @@ impl Session {
         );
         Ok(())
     }
+    pub(crate) fn require_same_account(&self, refreshed: &Self) -> Result<()> {
+        self.validate_playback_identity()?;
+        refreshed.validate_playback_identity()?;
+        ensure!(
+            self.data_sync_id == refreshed.data_sync_id
+                && self.delegated_session_id == refreshed.delegated_session_id,
+            "The saved browser profile now has a different YouTube account. Reconnect to choose an account."
+        );
+        Ok(())
+    }
     pub fn verify_server_identity(&self, response: &Value) -> Result<()> {
         ensure!(
             self.server_identity_confirmed(response)?,
@@ -225,6 +260,12 @@ impl Session {
                 .map_err(reqwest::Error::without_url)
                 .context("Could not verify the selected YouTube Music account")?;
         }
+        if matches!(
+            page.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(RejectedSession.into());
+        }
         ensure!(
             page.status() == reqwest::StatusCode::OK,
             "YouTube Music did not return an account verification page (HTTP {})",
@@ -248,9 +289,15 @@ impl Session {
                 matches!(parameter["key"].as_str(), Some("logged_in" | "yt_li"))
                     && parameter["value"] == "0"
             });
+        if logged_out
+            || response.get("LOGGED_IN") == Some(&json!(false))
+            || response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+                == Some(&json!(true))
+        {
+            return Err(RejectedSession.into());
+        }
         ensure!(
-            !logged_out
-                && response.get("LOGGED_IN").is_none_or(|value| value == true)
+            response.get("LOGGED_IN").is_none_or(|value| value == true)
                 && response
                     .pointer("/responseContext/mainAppWebResponseContext/loggedOut")
                     .is_none_or(|value| value == false),
@@ -574,6 +621,9 @@ fn page_config(page: impl Read) -> Result<Value> {
             .starts_with(')'),
         "YouTube Music returned an invalid account configuration"
     );
+    if config["LOGGED_IN"] == false {
+        return Err(RejectedSession.into());
+    }
     ensure!(
         config["LOGGED_IN"] == true,
         "YouTube Music did not accept the account session. Connect again."
@@ -612,7 +662,7 @@ impl BrowserProfile {
         Ok(profile)
     }
 
-    /// Only the explicit Read YouTube session action calls this method.
+    /// Read the named profile after consent, including refresh of its confirmed account.
     pub fn read_session(&self, operation: &Operation) -> Result<Session> {
         let cookies: Vec<Cookie> =
             serde_json::from_slice(&browser_helper("cookies", &self.path, operation)?)
@@ -643,7 +693,9 @@ impl BrowserProfile {
         );
         let config = page_config(page)?;
         ensure!(!operation.is_cancelled(), "Account connection cancelled");
-        Session::from_browser(cookie, playback_cookie, &config)
+        let mut session = Session::from_browser(cookie, playback_cookie, &config)?;
+        session.source_profile = Some(self.clone());
+        Ok(session)
     }
 }
 
@@ -797,6 +849,7 @@ impl Session {
             delegated_session_id,
             data_sync_id,
             client_version,
+            source_profile: None,
         };
         session.validate()?;
         session.verify_server_identity(config)?;
@@ -915,6 +968,7 @@ mod tests {
             delegated_session_id: None,
             data_sync_id: "synthetic-user||".into(),
             client_version: String::new(),
+            source_profile: None,
         }
     }
     #[test]
@@ -1078,6 +1132,59 @@ mod tests {
         assert!(Session::from_keyring(b"yt-music-session-v1:invalid!").is_err());
         expected.playback_cookie = "x".repeat(8192);
         assert!(expected.keyring_value().is_err());
+    }
+    #[test]
+    fn saved_profile_consent_round_trips_and_legacy_entries_have_no_source() {
+        let mut expected = session("SAPISID=synthetic");
+        let legacy = serde_json::to_vec(&expected).unwrap();
+        assert!(
+            Session::from_keyring(&legacy)
+                .unwrap()
+                .source_profile
+                .is_none()
+        );
+        expected.source_profile = Some(
+            serde_json::from_value(json!({
+                "browser":"Zen", "name":"Confirmed profile", "path":"/synthetic/confirmed-profile"
+            }))
+            .unwrap(),
+        );
+        let restored = Session::from_keyring(&expected.keyring_value().unwrap()).unwrap();
+        let source = restored.source_profile.unwrap();
+        assert_eq!(source.browser, "Zen");
+        assert_eq!(source.name, "Confirmed profile");
+        assert_eq!(source.path, Path::new("/synthetic/confirmed-profile"));
+    }
+
+    #[test]
+    fn only_explicit_session_rejection_allows_browser_refresh() {
+        let saved = session("SAPISID=synthetic");
+        for rejected in [
+            json!({"LOGGED_IN":false}),
+            json!({"responseContext":{"mainAppWebResponseContext":{"loggedOut":true}}}),
+            json!({"responseContext":{"serviceTrackingParams":[{
+                "params":[{"key":"logged_in", "value":"0"}]
+            }]}}),
+        ] {
+            assert!(session_was_rejected(
+                &saved.verify_server_identity(&rejected).unwrap_err()
+            ));
+        }
+        let rejected_html =
+            page_config(b"ytcfg.set({\"LOGGED_IN\":false});".as_slice()).unwrap_err();
+        assert!(session_was_rejected(&rejected_html));
+        for invalid in [
+            json!({}),
+            json!({"LOGGED_IN":"true"}),
+            json!({"DATASYNC_ID":"other||"}),
+        ] {
+            assert!(!session_was_rejected(
+                &saved.verify_server_identity(&invalid).unwrap_err()
+            ));
+        }
+        assert!(!session_was_rejected(&anyhow::anyhow!(
+            "Network unavailable"
+        )));
     }
     #[test]
     fn playback_identity_requires_consistent_primary_or_brand_context() {

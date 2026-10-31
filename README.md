@@ -1,6 +1,6 @@
 # YouTube Music GPUI
 
-A native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv and yt-dlp. It runs on Wayland and X11 and follows your Omarchy theme.
+A native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv and yt-dlp. It runs on Wayland and X11 with YouTube Music's dark interface.
 
 - Browse Home, Explore, charts, artists, albums and playlists, with search suggestions and category filters.
 - Play audio and video with a persistent queue, shuffle, repeat, radio and autoplay.
@@ -34,7 +34,7 @@ Connection requires Python 3, xdg-utils, libsecret's `secret-tool` and a running
 
 The app reads YouTube cookies from the named browser profile and saves the confirmed session in your desktop keyring. It uses your browser session rather than OAuth, so it has that session's YouTube access. It creates no persistent plaintext cookie export. Private windows, containers and partitioned sessions are unsupported.
 
-The account returned by YouTube can differ from the one selected in an open tab. Use **Check another account** to retry, or **Cancel connection** to keep your existing connection. Reconnect from Settings if the session expires.
+The account returned by YouTube can differ from the one selected in an open tab. Use **Check another account** to retry, or **Cancel connection** to keep your existing connection. Confirmed connections remember their browser profile and can refresh an expired session when the app reopens. Older saved connections need one reconnect to enable this. A different browser account still requires your confirmation.
 
 Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
 
@@ -44,6 +44,7 @@ Use `--guest` to start without restoring the saved account. Guest likes and save
 | --- | --- |
 | Ctrl K | Search |
 | Ctrl R | Refresh |
+| Alt Left | Go back |
 | Space | Play or pause |
 | Ctrl Right / Ctrl Left | Next / previous song |
 | Right / Left | Seek 5 seconds |

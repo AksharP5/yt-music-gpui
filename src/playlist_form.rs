@@ -5,6 +5,12 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 
+const PRIVACY_CHOICES: [(&str, &str, Privacy); 3] = [
+    ("private", "Private", Privacy::Private),
+    ("unlisted", "Unlisted", Privacy::Unlisted),
+    ("public", "Public", Privacy::Public),
+];
+
 pub enum PlaylistFormEvent {
     Save {
         title: String,
@@ -18,6 +24,9 @@ pub struct PlaylistForm {
     title: Entity<SearchInput>,
     description: Entity<SearchInput>,
     privacy: Privacy,
+    privacy_focus: [FocusHandle; PRIVACY_CHOICES.len()],
+    cancel_focus: FocusHandle,
+    save_focus: FocusHandle,
     theme: Theme,
     _subscriptions: [Subscription; 2],
 }
@@ -54,6 +63,9 @@ impl PlaylistForm {
             title,
             description,
             privacy,
+            privacy_focus: std::array::from_fn(|_| cx.focus_handle()),
+            cancel_focus: cx.focus_handle(),
+            save_focus: cx.focus_handle(),
             theme: Theme::load(),
             _subscriptions: subscriptions,
         }
@@ -72,22 +84,57 @@ impl PlaylistForm {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.modifiers.control && event.keystroke.key == "q" {
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
             return;
         }
-        if event.keystroke.key == "tab" {
-            let title = self.title.focus_handle(cx);
-            let description = self.description.focus_handle(cx);
-            window.focus(
-                if title.is_focused(window) {
-                    &description
-                } else {
-                    &title
-                },
-                cx,
-            );
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            cx.emit(PlaylistFormEvent::Cancel);
             cx.stop_propagation();
+            return;
         }
+        if key == "tab" {
+            let handles = [
+                self.title.focus_handle(cx),
+                self.description.focus_handle(cx),
+                self.privacy_focus[0].clone(),
+                self.privacy_focus[1].clone(),
+                self.privacy_focus[2].clone(),
+                self.cancel_focus.clone(),
+                self.save_focus.clone(),
+            ];
+            let count = handles.len() - usize::from(self.title.read(cx).value().trim().is_empty());
+            let focused = handles[..count]
+                .iter()
+                .position(|handle| handle.is_focused(window));
+            let next = if modifiers.shift {
+                focused.map_or(count - 1, |index| (index + count - 1) % count)
+            } else {
+                focused.map_or(0, |index| (index + 1) % count)
+            };
+            window.focus(&handles[next], cx);
+            cx.stop_propagation();
+            return;
+        }
+        if modifiers.shift || !matches!(key, "enter" | "space") {
+            return;
+        }
+        if let Some(index) = self
+            .privacy_focus
+            .iter()
+            .position(|handle| handle.is_focused(window))
+        {
+            self.privacy = PRIVACY_CHOICES[index].2;
+        } else if self.cancel_focus.is_focused(window) {
+            cx.emit(PlaylistFormEvent::Cancel);
+        } else if self.save_focus.is_focused(window) {
+            self.save(cx);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 }
 
@@ -98,7 +145,7 @@ impl Focusable for PlaylistForm {
 }
 
 impl Render for PlaylistForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let can_save = !self.title.read(cx).value().trim().is_empty();
         div()
@@ -154,23 +201,22 @@ impl Render for PlaylistForm {
                     .flex_col()
                     .gap(px(8.))
                     .child(div().text_color(theme.muted).child("Privacy"))
-                    .child(
-                        div().flex().gap(px(8.)).children(
-                            [
-                                ("private", "Private", Privacy::Private),
-                                ("unlisted", "Unlisted", Privacy::Unlisted),
-                                ("public", "Public", Privacy::Public),
-                            ]
-                            .map(|(id, label, privacy)| {
+                    .child(div().flex().gap(px(8.)).children(
+                        PRIVACY_CHOICES.into_iter().enumerate().map(
+                            |(index, (id, label, privacy))| {
                                 let selected = self.privacy == privacy;
+                                let focused = self.privacy_focus[index].is_focused(window);
                                 div()
                                     .id(id)
+                                    .track_focus(&self.privacy_focus[index])
                                     .flex_1()
                                     .py(px(10.))
                                     .text_center()
                                     .rounded(px(6.))
                                     .border_1()
-                                    .border_color(if selected {
+                                    .border_color(if focused {
+                                        theme.text
+                                    } else if selected {
                                         theme.accent
                                     } else {
                                         theme.border
@@ -183,13 +229,19 @@ impl Render for PlaylistForm {
                                     .cursor_pointer()
                                     .hover(|style| style.bg(theme.raised))
                                     .child(label)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |form, _, window, cx| {
+                                            window.focus(&form.privacy_focus[index], cx);
+                                        }),
+                                    )
                                     .on_click(cx.listener(move |form, _, _, cx| {
                                         form.privacy = privacy;
                                         cx.notify();
                                     }))
-                            }),
+                            },
                         ),
-                    ),
+                    )),
             )
             .child(
                 div()
@@ -200,12 +252,25 @@ impl Render for PlaylistForm {
                     .child(
                         div()
                             .id("cancel-playlist")
+                            .track_focus(&self.cancel_focus)
                             .px(px(18.))
                             .py(px(10.))
                             .rounded(px(6.))
+                            .border_1()
+                            .border_color(if self.cancel_focus.is_focused(window) {
+                                theme.text
+                            } else {
+                                gpui::transparent_black()
+                            })
                             .cursor_pointer()
                             .hover(|style| style.bg(theme.raised))
                             .child("Cancel")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|form, _, window, cx| {
+                                    window.focus(&form.cancel_focus, cx);
+                                }),
+                            )
                             .on_click(
                                 cx.listener(|_, _, _, cx| cx.emit(PlaylistFormEvent::Cancel)),
                             ),
@@ -213,14 +278,29 @@ impl Render for PlaylistForm {
                     .child(
                         div()
                             .id("save-playlist")
+                            .track_focus(&self.save_focus)
                             .px(px(22.))
                             .py(px(10.))
                             .rounded(px(6.))
+                            .border_1()
+                            .border_color(if self.save_focus.is_focused(window) {
+                                theme.text
+                            } else {
+                                gpui::transparent_black()
+                            })
                             .bg(if can_save { theme.accent } else { theme.raised })
                             .text_color(if can_save { theme.bg } else { theme.muted })
                             .font_weight(FontWeight::SEMIBOLD)
                             .when(can_save, |button| button.cursor_pointer())
                             .child("Save")
+                            .when(can_save, |button| {
+                                button.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|form, _, window, cx| {
+                                        window.focus(&form.save_focus, cx);
+                                    }),
+                                )
+                            })
                             .on_click(cx.listener(|form, _, _, cx| form.save(cx))),
                     ),
             )

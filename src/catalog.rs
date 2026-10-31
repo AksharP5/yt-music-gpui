@@ -56,6 +56,158 @@ impl Track {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub struct WatchTarget {
+    video_id: Option<String>,
+    playlist_id: Option<String>,
+    params: Option<String>,
+    index: Option<u32>,
+    music_video_type: Option<String>,
+}
+
+impl WatchTarget {
+    pub fn is_single_video(&self) -> bool {
+        self.playlist_id.is_none() && self.params.is_none() && self.index.is_none()
+    }
+
+    fn from_row(row: &Value, video_id: &str) -> Option<Self> {
+        let endpoints = [
+            row.pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint"),
+            row.pointer("/title/runs/0/navigationEndpoint/watchEndpoint"),
+            row.pointer("/navigationEndpoint/watchEndpoint"),
+            row.pointer("/onTap/watchEndpoint"),
+            row.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint"),
+            row.pointer("/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint"),
+        ];
+        if endpoints
+            .iter()
+            .flatten()
+            .any(|endpoint| endpoint["videoId"].as_str() != Some(video_id))
+        {
+            return None;
+        }
+        let endpoint = endpoints.into_iter().flatten().next()?;
+        Self::from_endpoint(endpoint)
+    }
+
+    fn from_endpoint(endpoint: &Value) -> Option<Self> {
+        let video_id = match endpoint.get("videoId") {
+            Some(value) => Some(value.as_str().filter(|id| valid_video_id(id))?.to_owned()),
+            None => None,
+        };
+        let playlist_id = match endpoint.get("playlistId") {
+            Some(value) => Some(value.as_str()?.to_owned()),
+            None => None,
+        };
+        if playlist_id.as_ref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 256
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        }) {
+            return None;
+        }
+        if video_id.is_none() && playlist_id.is_none() {
+            return None;
+        }
+        let params = match endpoint.get("params") {
+            Some(value) => Some(value.as_str()?.to_owned()),
+            None => None,
+        };
+        if params
+            .as_ref()
+            .is_some_and(|params| params.is_empty() || !valid_service_params(params))
+        {
+            return None;
+        }
+        let index = match endpoint.get("index") {
+            Some(value) => Some(u32::try_from(value.as_u64()?).ok()?),
+            None => None,
+        };
+        let music_video_type = match endpoint
+            .pointer("/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
+        {
+            Some(value) => Some(value.as_str()?.to_owned()),
+            None => None,
+        };
+        if music_video_type.as_ref().is_some_and(|kind| {
+            !kind.starts_with("MUSIC_VIDEO_TYPE_")
+                || kind.len() <= "MUSIC_VIDEO_TYPE_".len()
+                || kind.len() > 80
+                || !kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        }) {
+            return None;
+        }
+        Some(Self {
+            video_id,
+            playlist_id,
+            params,
+            index,
+            music_video_type,
+        })
+    }
+
+    pub(crate) fn request(&self, video_id: &str) -> Result<Value> {
+        ensure!(
+            self.video_id.as_deref() == Some(video_id),
+            "The playback destination belongs to a different song. Refresh and try again."
+        );
+        Ok(self.body())
+    }
+
+    fn body(&self) -> Value {
+        let mut body = json!({});
+        if let Some(id) = &self.video_id {
+            body["videoId"] = json!(id);
+        }
+        if let Some(id) = &self.playlist_id {
+            body["playlistId"] = json!(id);
+        }
+        if let Some(params) = &self.params {
+            body["params"] = json!(params);
+        }
+        if let Some(index) = self.index {
+            body["index"] = json!(index);
+        }
+        if let Some(kind) = &self.music_video_type {
+            body["watchEndpointMusicSupportedConfigs"] =
+                json!({"watchEndpointMusicConfig":{"musicVideoType":kind}});
+        }
+        body
+    }
+}
+
+impl fmt::Debug for WatchTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WatchTarget { .. }")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaylistTarget(WatchTarget);
+
+impl PlaylistTarget {
+    fn from_navigation(navigation: &Value) -> Option<Self> {
+        let endpoint = match (
+            navigation.get("watchPlaylistEndpoint"),
+            navigation.get("watchEndpoint"),
+        ) {
+            (Some(endpoint), None) | (None, Some(endpoint)) => endpoint,
+            _ => return None,
+        };
+        let target = WatchTarget::from_endpoint(endpoint)?;
+        target.playlist_id.as_ref()?;
+        Some(Self(target))
+    }
+
+    pub(crate) fn request(&self) -> Value {
+        self.0.body()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chapter {
     pub title: String,
@@ -109,6 +261,8 @@ impl Rating {
 #[serde(default)]
 pub struct TrackDetails {
     #[serde(skip)]
+    pub watch: Option<Arc<WatchTarget>>,
+    #[serde(skip)]
     pub rating: Option<Rating>,
     #[serde(skip)]
     pub in_library: Option<bool>,
@@ -129,6 +283,7 @@ pub struct TrackDetails {
 
 impl TrackDetails {
     pub fn clear_account_state(&mut self) {
+        self.watch = None;
         self.rating = None;
         self.in_library = None;
         self.add_library = None;
@@ -144,6 +299,8 @@ impl TrackDetails {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectionDetails {
+    #[serde(skip)]
+    pub play: Option<Arc<PlaylistTarget>>,
     pub playlist_id: Option<String>,
     pub saved: Option<bool>,
     #[serde(skip)]
@@ -322,6 +479,27 @@ impl Item {
 pub struct Shelf {
     pub title: String,
     pub items: Vec<Item>,
+    pub layout: ShelfLayout,
+    pub more: Option<BrowseLink>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShelfLayout {
+    #[default]
+    Cards,
+    Videos,
+    Songs,
+}
+
+#[derive(Clone, Debug)]
+pub struct PageHeader {
+    pub thumbnail: Option<String>,
+    pub subtitle: String,
+    pub shuffle: Option<Arc<PlaylistTarget>>,
+    pub mix: Option<Arc<PlaylistTarget>>,
+    pub subscribed: Option<bool>,
+    pub subscription_label: String,
+    pub subscriber_count: String,
 }
 
 #[derive(Clone)]
@@ -369,6 +547,7 @@ impl fmt::Debug for Continuation {
 #[derive(Clone, Debug)]
 pub struct Page {
     pub title: String,
+    pub header: Option<PageHeader>,
     pub shelves: Vec<Shelf>,
     pub continuation: Option<Continuation>,
     pub editable: bool,
@@ -577,6 +756,11 @@ impl Catalog {
             Some(session) => session.apply(request)?,
             None => request,
         };
+        let request = if endpoint == "music/get_search_suggestions" {
+            request.timeout(Duration::from_secs(4))
+        } else {
+            request
+        };
         Ok(request)
     }
 }
@@ -763,7 +947,7 @@ pub(crate) fn episode_header(data: &Value, video_id: &str) -> Result<Track> {
         "YouTube Music returned an unnamed episode"
     );
     let artist = text(&header["straplineTextOne"]);
-    let mut details = track_details(header, &runs);
+    let mut details = track_details(header, &runs, video_id);
     details.episode = Some(episode);
     Ok(Track {
         id: video_id.to_owned(),
@@ -838,6 +1022,8 @@ fn apply_episode_page(page: &mut Page, data: &Value, browse_id: &str) -> Result<
         page.shelves = vec![Shelf {
             title: String::new(),
             items: vec![Item::Track(track)],
+            layout: ShelfLayout::Songs,
+            more: None,
         }];
         page.continuation = None;
         page.editable = false;
@@ -962,12 +1148,14 @@ fn parse_item(value: &Value) -> Option<Item> {
             .iter()
             .filter_map(|r| r["text"].as_str().and_then(duration))
             .next()
+            .or_else(|| metadata.iter().find_map(|value| duration(&text(value))))
+            .or_else(|| duration(&text(&row["lengthText"])))
             .or_else(|| {
                 episode
                     .as_ref()
                     .and_then(|episode| duration(&episode.duration_text))
             });
-        let mut details = track_details(row, &runs);
+        let mut details = track_details(row, &runs, id);
         details.episode = episode;
         return Some(Item::Track(Track {
             id: id.to_owned(),
@@ -1049,6 +1237,10 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
         None
     };
     CollectionDetails {
+        play: row.pointer("/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint")
+            .or_else(|| row.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint"))
+            .and_then(PlaylistTarget::from_navigation)
+            .map(Arc::new),
         playlist_id: playlist_id.map(str::to_owned),
         saved: subscribed.or_else(|| item_rating(row).map(|rating| rating == Rating::Like)),
         editable: browse_id.strip_prefix("VL").filter(|id| !id.is_empty()).is_some_and(|id| {
@@ -1064,7 +1256,7 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
     }
 }
 
-pub(crate) fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
+pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> TrackDetails {
     let browse_id = |prefix: &str| {
         runs.iter()
             .filter_map(|r| {
@@ -1075,6 +1267,7 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value]) -> TrackDetails {
             .map(str::to_owned)
     };
     let mut details = TrackDetails {
+        watch: WatchTarget::from_row(row, video_id).map(Arc::new),
         rating: item_rating(row),
         set_video_id: row
             .pointer("/playlistItemData/setVideoId")
@@ -1189,7 +1382,20 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                         }
                     }
                     if !items.is_empty() {
-                        shelves.push(Shelf { title, items });
+                        let more = shelf.get("bottomEndpoint")
+                            .and_then(|endpoint| BrowseLink::from_endpoint(&endpoint["browseEndpoint"], text(&shelf["bottomText"])))
+                            .or_else(|| {
+                                let button = shelf.pointer("/header/musicCarouselShelfBasicHeaderRenderer/moreContentButton/buttonRenderer")?;
+                                BrowseLink::from_endpoint(&button["navigationEndpoint"]["browseEndpoint"], text(&button["text"]))
+                            });
+                        shelves.push(Shelf {
+                            title,
+                            items,
+                            layout: contents
+                                .and_then(Value::as_array)
+                                .map_or(ShelfLayout::Cards, |items| shelf_layout(items)),
+                            more,
+                        });
                     }
                     return;
                 }
@@ -1204,6 +1410,8 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                 shelves.push(Shelf {
                     title: String::new(),
                     items: rows,
+                    layout: shelf_layout(items),
+                    more: None,
                 });
             }
             for item in items {
@@ -1214,6 +1422,23 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
         }
         _ => {}
     }
+}
+
+fn shelf_layout(items: &[Value]) -> ShelfLayout {
+    if items.iter().any(|item| {
+        item.pointer("/musicTwoRowItemRenderer/aspectRatio")
+            .and_then(Value::as_str)
+            == Some("MUSIC_TWO_ROW_ITEM_THUMBNAIL_ASPECT_RATIO_RECTANGLE_16_9")
+    }) {
+        return ShelfLayout::Videos;
+    }
+    if items
+        .iter()
+        .any(|item| item.get("musicResponsiveListItemRenderer").is_some())
+    {
+        return ShelfLayout::Songs;
+    }
+    ShelfLayout::Cards
 }
 
 fn owned_continuation(owner: &Value) -> Option<Continuation> {
@@ -1252,6 +1477,11 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     ]
     .iter()
     .find_map(|key| find(editable_header.unwrap_or(data), key));
+    let artist_header = data.pointer("/header/musicImmersiveHeaderRenderer");
+    let subscription_button = artist_header
+        .and_then(|header| header.pointer("/subscriptionButton/subscribeButtonRenderer"))
+        .filter(|button| ArtistSubscription::from_button(button).is_ok());
+    let subscribed = subscription_button.and_then(|button| button["subscribed"].as_bool());
     let title = header
         .map(|header| text(&header["title"]))
         .filter(|s| !s.is_empty())
@@ -1283,6 +1513,59 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     }
     Ok(Page {
         title,
+        header: header.map(|header| PageHeader {
+            thumbnail: thumbnail(&header["thumbnail"]),
+            subtitle: [
+                "straplineTextOne",
+                "subtitle",
+                "secondSubtitle",
+                "monthlyListenerCount",
+            ]
+            .into_iter()
+            .map(|key| text(&header[key]))
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" • "),
+            shuffle: artist_header
+                .and_then(|header| header.pointer("/playButton/buttonRenderer"))
+                .filter(|button| {
+                    button.pointer("/icon/iconType").and_then(Value::as_str)
+                        == Some("MUSIC_SHUFFLE")
+                })
+                .and_then(|button| PlaylistTarget::from_navigation(&button["navigationEndpoint"]))
+                .map(Arc::new),
+            mix: artist_header
+                .and_then(|header| header.pointer("/startRadioButton/buttonRenderer"))
+                .filter(|button| {
+                    button.pointer("/icon/iconType").and_then(Value::as_str) == Some("MIX")
+                })
+                .and_then(|button| PlaylistTarget::from_navigation(&button["navigationEndpoint"]))
+                .map(Arc::new),
+            subscribed,
+            subscription_label: subscription_button
+                .map(|button| {
+                    text(
+                        &button[if subscribed == Some(true) {
+                            "subscribedButtonText"
+                        } else {
+                            "unsubscribedButtonText"
+                        }],
+                    )
+                })
+                .unwrap_or_default(),
+            subscriber_count: subscription_button
+                .and_then(|button| {
+                    [
+                        "shortSubscriberCountText",
+                        "longSubscriberCountText",
+                        "subscriberCountText",
+                    ]
+                    .into_iter()
+                    .map(|key| text(&button[key]))
+                    .find(|text| !text.trim().is_empty())
+                })
+                .unwrap_or_default(),
+        }),
         shelves,
         continuation,
         editable: editable_header.is_some(),
@@ -1491,6 +1774,251 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_heroes_use_the_page_header_and_never_a_song_cover() {
+        for renderer in [
+            "musicResponsiveHeaderRenderer",
+            "musicDetailHeaderRenderer",
+            "musicImmersiveHeaderRenderer",
+        ] {
+            let response = json!({
+                "header": {renderer: {
+                    "title":{"simpleText":"Collection"},
+                    "straplineTextOne":{"simpleText":"Artist"},
+                    "subtitle":{"runs":[{"text":"Album"},{"text":" • 2026"}]},
+                    "secondSubtitle":{"simpleText":"10 songs"},
+                    "thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{
+                        "url":"https://lh3.googleusercontent.com/collection","width":360,"height":360
+                    }]}}}
+                }},
+                "contents":[]
+            });
+            let page = parse_page(&response, "Fallback").unwrap();
+            assert_eq!(page.title, "Collection");
+            let header = page.header.unwrap();
+            assert_eq!(
+                header.thumbnail.as_deref(),
+                Some("https://lh3.googleusercontent.com/collection")
+            );
+            assert_eq!(header.subtitle, "Artist • Album • 2026 • 10 songs");
+        }
+        let page = parse_page(
+            &json!({"contents":[{"musicShelfRenderer":{"contents":[{
+                "musicResponsiveListItemRenderer":{
+                    "title":{"simpleText":"Song"},
+                    "playlistItemData":{"videoId":"abcdefghijk"},
+                    "thumbnail":{"thumbnails":[{"url":"https://i.ytimg.com/song","width":360}]}
+                }
+            }]}}]}),
+            "Playlist",
+        )
+        .unwrap();
+        assert_eq!(
+            page.tracks()[0].thumbnail.as_deref(),
+            Some("https://i.ytimg.com/song")
+        );
+        assert!(page.header.is_none());
+    }
+
+    #[test]
+    fn artist_header_uses_issued_shuffle_mix_and_subscription_state() {
+        let mut response = json!({"header":{"musicImmersiveHeaderRenderer":{
+            "title":{"simpleText":"Artist"},
+            "monthlyListenerCount":{"simpleText":"1.2M monthly listeners"},
+            "playButton":{"buttonRenderer":{"icon":{"iconType":"MUSIC_SHUFFLE"},"navigationEndpoint":{"watchEndpoint":{
+                "videoId":"abcdefghijk", "playlistId":"RDAOartist", "params":"wAEB8gECGAE%3D", "index":2
+            }}}},
+            "startRadioButton":{"buttonRenderer":{"icon":{"iconType":"MIX"},"navigationEndpoint":{"watchEndpoint":{
+                "videoId":"lmnopqrstuv", "playlistId":"RDEMartist", "params":"wAEB"
+            }}}},
+            "subscriptionButton":{"subscribeButtonRenderer":{
+                "channelId":"UCUDVBtnOQi4c7E8jebpjc9Q", "subscribed":false,
+                "subscribedButtonText":{"simpleText":"Subscribed"},
+                "unsubscribedButtonText":{"simpleText":"Subscribe"},
+                "shortSubscriberCountText":{"simpleText":"7M"},
+                "longSubscriberCountText":{"simpleText":"7M subscribers"}
+            }}
+        }},"contents":[]});
+        for subscribed in [false, true] {
+            response["header"]["musicImmersiveHeaderRenderer"]["subscriptionButton"]["subscribeButtonRenderer"]
+                ["subscribed"] = json!(subscribed);
+            let header = parse_page(&response, "Artist").unwrap().header.unwrap();
+            assert_eq!(header.subtitle, "1.2M monthly listeners");
+            assert_eq!(header.subscribed, Some(subscribed));
+            assert_eq!(
+                header.subscription_label,
+                if subscribed {
+                    "Subscribed"
+                } else {
+                    "Subscribe"
+                }
+            );
+            assert_eq!(header.subscriber_count, "7M");
+            let shuffle = header.shuffle.unwrap().request();
+            assert_eq!(
+                shuffle,
+                json!({"videoId":"abcdefghijk", "playlistId":"RDAOartist", "params":"wAEB8gECGAE%3D", "index":2})
+            );
+            let mix = header.mix.unwrap().request();
+            assert_eq!(mix["playlistId"], "RDEMartist");
+            assert_eq!(mix["videoId"], "lmnopqrstuv");
+        }
+        let header = response["header"].take();
+        response["frameworkUpdates"] = header;
+        let header = parse_page(&response, "Artist").unwrap().header.unwrap();
+        assert!(header.shuffle.is_none() && header.mix.is_none() && header.subscribed.is_none());
+    }
+
+    #[test]
+    fn collection_play_uses_only_its_thumbnail_control_and_is_not_persisted() {
+        let mut row = json!({"musicTwoRowItemRenderer":{
+            "title":{"simpleText":"Playlist"},
+            "navigationEndpoint":{"browseEndpoint":{"browseId":"VLplaylist"}},
+            "thumbnailOverlay":{"musicItemThumbnailOverlayRenderer":{"content":{"musicPlayButtonRenderer":{
+                "playNavigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"playlist", "params":"wAEB", "index":3}}
+            }}}},
+            "menu":{"watchPlaylistEndpoint":{"playlistId":"unrelated-menu-playlist"}}
+        }});
+        let Some(Item::Collection(collection)) = parse_item(&row) else {
+            panic!("expected a collection")
+        };
+        let play = collection.details.play.as_ref().unwrap();
+        assert_eq!(
+            play.request(),
+            json!({"playlistId":"playlist", "params":"wAEB", "index":3})
+        );
+        assert!(!format!("{play:?}").contains("wAEB"));
+        let restored: Collection =
+            serde_json::from_value(serde_json::to_value(collection).unwrap()).unwrap();
+        assert!(restored.details.play.is_none());
+        row["musicTwoRowItemRenderer"]["thumbnailOverlay"] = Value::Null;
+        let Some(Item::Collection(collection)) = parse_item(&row) else {
+            panic!("expected a collection")
+        };
+        assert!(collection.details.play.is_none());
+    }
+
+    #[test]
+    fn playlist_targets_require_an_unambiguous_valid_issued_playlist() {
+        for navigation in [
+            json!({"watchPlaylistEndpoint":{}}),
+            json!({"watchPlaylistEndpoint":{"playlistId":""}}),
+            json!({"watchPlaylistEndpoint":{"playlistId":"../other"}}),
+            json!({"watchPlaylistEndpoint":{"playlistId":"valid", "params":"bad%XX"}}),
+            json!({"watchPlaylistEndpoint":{"playlistId":"valid", "index":-1}}),
+            json!({"watchEndpoint":{"videoId":"invalid", "playlistId":"valid"}}),
+            json!({"watchEndpoint":{"videoId":"abcdefghijk"}}),
+            json!({"watchEndpoint":{"videoId":"abcdefghijk", "playlistId":"valid"}, "watchPlaylistEndpoint":{"playlistId":"another"}}),
+        ] {
+            assert!(PlaylistTarget::from_navigation(&navigation).is_none());
+        }
+    }
+
+    #[test]
+    fn shelf_layouts_keep_responsive_songs_and_wide_video_carousels() {
+        let cards = json!({"musicTwoRowItemRenderer":{
+            "title":{"simpleText":"Album"},
+            "navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}},
+            "aspectRatio":"MUSIC_TWO_ROW_ITEM_THUMBNAIL_ASPECT_RATIO_SQUARE"
+        }});
+        let videos = json!({"musicTwoRowItemRenderer":{
+            "title":{"simpleText":"Video"},
+            "navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}},
+            "aspectRatio":"MUSIC_TWO_ROW_ITEM_THUMBNAIL_ASPECT_RATIO_RECTANGLE_16_9"
+        }});
+        let songs = json!({"musicResponsiveListItemRenderer":{
+            "title":{"simpleText":"Song"},
+            "playlistItemData":{"videoId":"abcdefghijk"}
+        }});
+        for (item, layout) in [
+            (cards, ShelfLayout::Cards),
+            (videos, ShelfLayout::Videos),
+            (songs.clone(), ShelfLayout::Songs),
+        ] {
+            let page = parse_page(&json!({"contents":[{"musicCarouselShelfRenderer":{
+                "header":{"musicCarouselShelfBasicHeaderRenderer":{"title":{"simpleText":"Shelf"}}},
+                "contents":[item]
+            }}]}), "Home").unwrap();
+            assert_eq!(page.shelves.len(), 1);
+            assert_eq!(page.shelves[0].layout, layout);
+            assert_eq!(page.shelves[0].items.len(), 1);
+        }
+        let list = parse_page(
+            &json!({"contents":[{"musicShelfRenderer":{"contents":[songs]}}]}),
+            "Songs",
+        )
+        .unwrap();
+        assert_eq!(list.shelves[0].layout, ShelfLayout::Songs);
+    }
+
+    #[test]
+    fn shelf_more_controls_preserve_scoped_labels_and_parameterized_destinations() {
+        let mut response = json!({"contents":[
+            {"musicShelfRenderer":{
+                "title":{"simpleText":"Top songs"},
+                "bottomText":{"simpleText":"Show all"},
+                "bottomEndpoint":{"browseEndpoint":{"browseId":"VLOLAKartist", "params":"ggMCCAI%3D"}},
+                "contents":[{"musicResponsiveListItemRenderer":{"title":{"simpleText":"Song"},"playlistItemData":{"videoId":"abcdefghijk"}}}]
+            }},
+            {"musicCarouselShelfRenderer":{
+                "header":{"musicCarouselShelfBasicHeaderRenderer":{
+                    "title":{"runs":[{"text":"Albums", "navigationEndpoint":{"browseEndpoint":{"browseId":"MPADartist", "params":"title-only"}}}]},
+                    "moreContentButton":{"buttonRenderer":{"text":{"simpleText":"More"},"navigationEndpoint":{"browseEndpoint":{"browseId":"MPADartist", "params":"ggMIegYIARoCAQI%3D"}}}}
+                }},
+                "contents":[{"musicTwoRowItemRenderer":{"title":{"simpleText":"Album"}, "navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}}}]
+            }}
+        ]});
+        let page = parse_page(&response, "Artist").unwrap();
+        let songs = page.shelves[0].more.as_ref().unwrap();
+        assert_eq!(songs.title, "Show all");
+        assert_eq!(songs.id, "VLOLAKartist");
+        assert_eq!(songs.params.as_deref(), Some("ggMCCAI%3D"));
+        let albums = page.shelves[1].more.as_ref().unwrap();
+        assert_eq!(albums.title, "More");
+        assert_eq!(albums.id, "MPADartist");
+        assert_eq!(albums.params.as_deref(), Some("ggMIegYIARoCAQI%3D"));
+
+        response["contents"][0]["musicShelfRenderer"]["bottomEndpoint"]["browseEndpoint"]["params"] =
+            json!("bad%XX");
+        response["contents"][1]["musicCarouselShelfRenderer"]["header"]["musicCarouselShelfBasicHeaderRenderer"]
+            ["moreContentButton"] = Value::Null;
+        let page = parse_page(&response, "Artist").unwrap();
+        assert!(page.shelves[0].more.is_none());
+        assert!(
+            page.shelves[1].more.is_none(),
+            "A title link must not fabricate a More control"
+        );
+        response["contents"][0]["musicShelfRenderer"]["bottomEndpoint"]["browseEndpoint"]["params"] =
+            json!("valid");
+        response["contents"][0]["musicShelfRenderer"]["bottomText"] = json!({"simpleText":""});
+        assert!(
+            parse_page(&response, "Artist").unwrap().shelves[0]
+                .more
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn suggestions_have_a_short_deadline_without_limiting_catalog_pages() {
+        let catalog = Catalog::new().unwrap();
+        let suggestions = catalog
+            .page_request(
+                "music/get_search_suggestions",
+                json!({"input":"Song"}),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(suggestions.timeout(), Some(&Duration::from_secs(4)));
+        let browse = catalog
+            .page_request("browse", json!({"browseId":"FEmusic_home"}), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(browse.timeout().is_none());
+    }
+
+    #[test]
     fn page_selection_keeps_duplicate_occurrences_across_mixed_shelves() {
         let track = |id: &str| {
             Item::Track(
@@ -1502,6 +2030,7 @@ mod tests {
         };
         let mut page = Page {
             title: "Mixed results".into(),
+            header: None,
             shelves: Vec::new(),
             continuation: None,
             editable: false,
@@ -1514,6 +2043,8 @@ mod tests {
             Shelf {
                 title: "First".into(),
                 items: vec![track("A"), track("B")],
+                layout: ShelfLayout::Songs,
+                more: None,
             },
             Shelf {
                 title: "Second".into(),
@@ -1522,6 +2053,8 @@ mod tests {
                     track("A"),
                     track("C"),
                 ],
+                layout: ShelfLayout::Songs,
+                more: None,
             },
         ];
         assert_eq!(page.track_index(2), None);
@@ -2449,6 +2982,98 @@ mod tests {
     }
 
     #[test]
+    fn song_durations_accept_simple_text_columns_and_length_labels() {
+        let mut row = json!({"musicResponsiveListItemRenderer":{
+            "title":{"simpleText":"Song"},
+            "playlistItemData":{"videoId":"abcdefghijk"},
+            "fixedColumns":[{"musicResponsiveListItemFixedColumnRenderer":{"text":{"simpleText":"3:42"}}}]
+        }});
+        let Some(Item::Track(track)) = parse_item(&row) else {
+            panic!("expected a song")
+        };
+        assert_eq!(track.duration, Some(222));
+        row["musicResponsiveListItemRenderer"]["fixedColumns"] = json!([]);
+        row["musicResponsiveListItemRenderer"]["lengthText"] = json!({"simpleText":"4:20"});
+        let Some(Item::Track(track)) = parse_item(&row) else {
+            panic!("expected a song")
+        };
+        assert_eq!(track.duration, Some(260));
+        row["musicResponsiveListItemRenderer"]["lengthText"] = json!({"simpleText":"2M views"});
+        let Some(Item::Track(track)) = parse_item(&row) else {
+            panic!("expected a song")
+        };
+        assert_eq!(track.duration, None);
+    }
+
+    #[test]
+    fn issued_watch_targets_reject_malformed_and_conflicting_clicks() {
+        let endpoint = json!({
+            "videoId":"abcdefghijk", "playlistId":"OLAKplaylist", "params":"issued%3D", "index":2,
+            "watchEndpointMusicSupportedConfigs":{"watchEndpointMusicConfig":{"musicVideoType":"MUSIC_VIDEO_TYPE_ATV"}}
+        });
+        let row = json!({"musicResponsiveListItemRenderer":{
+            "title":{"runs":[{"text":"Song","navigationEndpoint":{"watchEndpoint":endpoint}}]},
+            "playlistItemData":{"videoId":"abcdefghijk"},
+            "menu":{"menuRenderer":{"items":[{"menuNavigationItemRenderer":{"navigationEndpoint":{
+                "watchEndpoint":{"videoId":"lmnopqrstuv", "playlistId":"RDAMVMlmnopqrstuv", "params":"wAEB"}
+            }}}]}}
+        }});
+        let Some(Item::Track(valid)) = parse_item(&row) else {
+            panic!("expected a song")
+        };
+        assert!(
+            valid.details.watch.is_some(),
+            "Menu destinations are not the row's click target"
+        );
+        for (field, value) in [
+            ("videoId", json!("lmnopqrstuv")),
+            ("playlistId", json!("https://example.invalid/playlist")),
+            ("playlistId", json!("x".repeat(257))),
+            ("playlistId", json!("")),
+            ("playlistId", json!(7)),
+            ("params", json!("invalid%XX")),
+            ("params", json!("unsafe\nvalue")),
+            ("params", json!("x".repeat(8193))),
+            ("params", json!(7)),
+            ("index", json!(-1)),
+            ("index", json!(u64::from(u32::MAX) + 1)),
+            ("index", json!("2")),
+            (
+                "watchEndpointMusicSupportedConfigs",
+                json!({"watchEndpointMusicConfig":{"musicVideoType":"MUSIC_VIDEO_TYPE_ATV\n"}}),
+            ),
+        ] {
+            let mut invalid = row.clone();
+            invalid["musicResponsiveListItemRenderer"]["title"]["runs"][0]["navigationEndpoint"]
+                ["watchEndpoint"][field] = value;
+            let Some(Item::Track(track)) = parse_item(&invalid) else {
+                panic!("expected a song")
+            };
+            assert!(
+                track.details.watch.is_none(),
+                "Invalid {field} must not become a destination"
+            );
+        }
+        let mut conflicting = row.clone();
+        conflicting["musicResponsiveListItemRenderer"]["overlay"] = json!({"musicItemThumbnailOverlayRenderer":{"content":{"musicPlayButtonRenderer":{
+            "playNavigationEndpoint":{"watchEndpoint":{"videoId":"lmnopqrstuv"}}
+        }}}});
+        let Some(Item::Track(track)) = parse_item(&conflicting) else {
+            panic!("expected a song")
+        };
+        assert!(track.details.watch.is_none());
+        let mut menu_only = row;
+        menu_only["musicResponsiveListItemRenderer"]["title"] = json!({"simpleText":"Song"});
+        let Some(Item::Track(track)) = parse_item(&menu_only) else {
+            panic!("expected a song")
+        };
+        assert!(
+            track.details.watch.is_none(),
+            "An unrelated menu must never supply a click destination"
+        );
+    }
+
+    #[test]
     fn playlist_navigation_is_not_its_shuffle_endpoint() {
         let item = json!({"musicTwoRowItemRenderer": {
             "title":{"runs":[{"text":"My mix","navigationEndpoint":{"browseEndpoint":{"browseId":"VLplaylist"}}}]},
@@ -2598,7 +3223,7 @@ mod tests {
                 }}
             ]
         }}});
-        let details = track_details(&row, &[]);
+        let details = track_details(&row, &[], "abcdefghijk");
         assert_eq!(details.rating, Some(Rating::Dislike));
         assert_eq!(details.in_library, Some(true));
         assert_eq!(details.add_library.as_deref(), Some("add-song"));
@@ -2610,7 +3235,7 @@ mod tests {
         toggle["defaultServiceEndpoint"]["feedbackEndpoint"]["feedbackToken"] =
             json!("remove-song");
         toggle["toggledServiceEndpoint"]["feedbackEndpoint"]["feedbackToken"] = json!("add-song");
-        let details = track_details(&row, &[]);
+        let details = track_details(&row, &[], "abcdefghijk");
         assert_eq!(details.add_library.as_deref(), Some("add-song"));
         assert_eq!(details.remove_library.as_deref(), Some("remove-song"));
     }
@@ -2624,14 +3249,23 @@ mod tests {
                 "toggledServiceEndpoint":{"likeEndpoint":{"status":"INDIFFERENT","target":{"videoId":"abcdefghijk"}}}
             }
         }]}}});
-        assert_eq!(track_details(&row, &[]).rating, Some(Rating::Indifferent));
+        assert_eq!(
+            track_details(&row, &[], "abcdefghijk").rating,
+            Some(Rating::Indifferent)
+        );
         row["menu"]["menuRenderer"]["items"][0]["toggleMenuServiceItemRenderer"]["isToggled"] =
             json!(true);
-        assert_eq!(track_details(&row, &[]).rating, Some(Rating::Like));
+        assert_eq!(
+            track_details(&row, &[], "abcdefghijk").rating,
+            Some(Rating::Like)
+        );
         let toggle = &mut row["menu"]["menuRenderer"]["items"][0]["toggleMenuServiceItemRenderer"];
         toggle["isToggled"] = json!(false);
         toggle["defaultServiceEndpoint"]["likeEndpoint"]["status"] = json!("INDIFFERENT");
-        assert_eq!(track_details(&row, &[]).rating, Some(Rating::Like));
+        assert_eq!(
+            track_details(&row, &[], "abcdefghijk").rating,
+            Some(Rating::Like)
+        );
     }
 
     #[test]

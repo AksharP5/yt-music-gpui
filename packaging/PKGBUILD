@@ -4,7 +4,7 @@ pkgrel=1
 pkgdesc='Native YouTube Music client built with GPUI'
 arch=('x86_64')
 url='https://github.com/AksharP5/yt-music-gpui'
-license=('MIT' 'Apache-2.0')
+license=('MIT' 'Apache-2.0' 'OFL-1.1')
 depends=('libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'vulkan-driver' 'mpv' 'yt-dlp' 'libglvnd' 'wayland' 'libx11' 'libxext' 'python' 'xdg-utils' 'libsecret')
 makedepends=('rust' 'pkgconf')
 
@@ -21,6 +21,7 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
   install -Dm644 LICENSE-VIEWPORTER "$pkgdir/usr/share/licenses/$pkgname/LICENSE-VIEWPORTER"
+  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/$pkgname/OFL.txt"
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

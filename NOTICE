@@ -5,3 +5,11 @@ LICENSE-APACHE. GPUI and its platform implementation retain their own notices.
 native/viewporter.xml and its generated protocol bindings are from
 wayland-protocols. Copyright 2013-2016 Collabora, Ltd. Their MIT license is
 included in LICENSE-VIEWPORTER.
+
+assets/fonts/Roboto.ttf is Roboto, Copyright 2011 The Roboto Project Authors.
+Licensed under the SIL Open Font License 1.1, included in assets/fonts/OFL.txt.
+Source: https://github.com/google/fonts/tree/main/ofl/roboto
+
+The YouTube Music wordmark and symbol are from
+https://music.youtube.com/img/on_platform_logo_dark.svg.
+YouTube and YouTube Music are trademarks of Google LLC.

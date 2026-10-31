@@ -2,6 +2,7 @@ use crate::{catalog::Track, library::Repeat, player::PlaybackSpeed};
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
+    fmt::Write,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::Instant,
@@ -70,10 +71,14 @@ impl Metadata {
         } else {
             track.duration.map(|seconds| seconds as f64)
         };
-        let id: String = track.id.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let prefix = "/yt_music_gpui/track/v";
+        let mut path = String::with_capacity(prefix.len() + track.id.len() * 2);
+        path.push_str(prefix);
+        for byte in track.id.bytes() {
+            write!(path, "{byte:02x}").expect("writing to a String cannot fail");
+        }
         Self {
-            path: ObjectPath::try_from(format!("/yt_music_gpui/track/v{id}"))
-                .expect("hex-encoded track IDs are valid object paths"),
+            path: ObjectPath::try_from(path).expect("hex-encoded track IDs are valid object paths"),
             title: track.title.clone(),
             artist: track.artist.clone(),
             album: track.album.clone(),

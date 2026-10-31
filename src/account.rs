@@ -172,6 +172,36 @@ impl Connection {
     }
 }
 
+fn restore_connection(
+    candidate: Session,
+    operation: &Operation,
+    verify: impl Fn(Session) -> Result<Connection>,
+    read_profile: impl FnOnce(&auth::BrowserProfile) -> Result<Session>,
+) -> Result<(Connection, bool)> {
+    ensure!(!operation.is_cancelled(), "Account connection cancelled");
+    let rejected = match verify(candidate.clone()) {
+        Ok(connection) => {
+            ensure!(!operation.is_cancelled(), "Account connection cancelled");
+            return Ok((connection, false));
+        }
+        Err(error) if auth::session_was_rejected(&error) => error,
+        Err(error) => return Err(error),
+    };
+    ensure!(!operation.is_cancelled(), "Account connection cancelled");
+    let source = candidate.source_profile.as_ref().ok_or_else(|| {
+        rejected.context(
+            "The saved session expired. Reconnect once to enable automatic refresh from your browser profile.",
+        )
+    })?;
+    let refreshed = read_profile(source)
+        .context("Could not refresh the saved account. Your saved connection has been kept.")?;
+    ensure!(!operation.is_cancelled(), "Account connection cancelled");
+    candidate.require_same_account(&refreshed)?;
+    let connection = verify(refreshed)?;
+    ensure!(!operation.is_cancelled(), "Account connection cancelled");
+    Ok((connection, true))
+}
+
 pub enum Command {
     Connect(Operation),
     ReadBrowser {
@@ -273,6 +303,7 @@ pub fn start(
                         Event::AccountPreview { operation, result }
                     }
                     Command::Restore(operation) => {
+                        let mut refreshed = false;
                         let result = (|| {
                             ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
                             ensure!(!operation.is_cancelled(), "Account connection cancelled");
@@ -280,10 +311,17 @@ pub fn start(
                             ensure!(!operation.is_cancelled(), "Account connection cancelled");
                             candidate.map(|candidate| {
                                 let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                                Connection::verify(candidate, catalog)
+                                let (connection, renewed) = restore_connection(
+                                    candidate,
+                                    &operation,
+                                    |candidate| Connection::verify(candidate, catalog),
+                                    |profile| profile.read_session(&operation),
+                                )?;
+                                refreshed = renewed;
+                                Ok(connection)
                             }).transpose()
                         })();
-                        Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")), save_session: false }
+                        Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")), save_session: refreshed }
                     }
                     Command::Disconnect { operation, playback } => {
                         // End in-memory authority even if keyring removal needs another attempt.
@@ -749,11 +787,14 @@ mod tests {
 
     fn playlist_page(occurrences: &[&str]) -> Page {
         Page {
+            header: None,
             title: "Renamed".into(),
             description: "Updated description".into(),
             privacy: Some("PRIVATE".into()),
             shelves: vec![crate::catalog::Shelf {
+                layout: crate::catalog::ShelfLayout::Songs,
                 title: "Songs".into(),
+                more: None,
                 items: occurrences
                     .iter()
                     .map(|id| {
@@ -1001,6 +1042,196 @@ mod tests {
         }))
         .unwrap()
     }
+
+    fn sourced_session() -> Session {
+        let mut saved = synthetic_session();
+        saved.source_profile = Some(
+            serde_json::from_value(json!({
+                "browser":"Zen", "name":"Confirmed profile", "path":"/synthetic/confirmed-profile"
+            }))
+            .unwrap(),
+        );
+        saved
+    }
+
+    fn synthetic_connection(session: Session) -> Connection {
+        Connection {
+            session: Arc::new(session),
+            account: Account {
+                name: "Synthetic account".into(),
+                handle: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn valid_saved_sessions_restore_without_reading_the_browser() {
+        let (connection, save_session) = restore_connection(
+            sourced_session(),
+            &Operation::default(),
+            |candidate| Ok(synthetic_connection(candidate)),
+            |_| panic!("A valid saved session must not read browser cookies"),
+        )
+        .unwrap();
+        assert!(!save_session);
+        assert_eq!(connection.account.name, "Synthetic account");
+    }
+
+    #[test]
+    fn rejected_sessions_refresh_only_the_confirmed_profile_before_activation() {
+        let saved = sourced_session();
+        let shared = auth::shared(Some(saved.clone()));
+        let previous = shared.read().unwrap().clone().unwrap();
+        let checks = std::cell::Cell::new(0);
+        let operation = Operation::default();
+        let (connection, save_session) = restore_connection(
+            saved.clone(),
+            &operation,
+            |candidate| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    return Err(auth::RejectedSession.into());
+                }
+                assert_eq!(candidate.client_version, "refreshed");
+                Ok(synthetic_connection(candidate))
+            },
+            |source| {
+                assert_eq!(
+                    serde_json::to_value(source).unwrap(),
+                    serde_json::to_value(saved.source_profile.as_ref().unwrap()).unwrap()
+                );
+                let mut refreshed = saved.clone();
+                refreshed.client_version = "refreshed".into();
+                // Account order can change while the full primary/brand identity stays the same.
+                refreshed.authuser = "2".into();
+                Ok(refreshed)
+            },
+        )
+        .unwrap();
+        assert!(save_session);
+        assert_eq!(checks.get(), 2);
+        assert!(require_current_session(&shared, &previous).is_ok());
+        assert!(
+            connection
+                .activate(&shared, &operation, Err("Player failed".into()))
+                .is_err()
+        );
+        assert!(require_current_session(&shared, &previous).is_ok());
+    }
+
+    #[test]
+    fn refresh_rejects_other_primary_and_brand_accounts() {
+        for (identity, delegated, other, other_delegated) in [
+            ("synthetic-user||", None, "other-user||", None),
+            (
+                "brand||user",
+                Some("brand"),
+                "other-brand||user",
+                Some("other-brand"),
+            ),
+            (
+                "brand||user",
+                Some("brand"),
+                "brand||other-user",
+                Some("brand"),
+            ),
+        ] {
+            let mut stored = serde_json::to_value(sourced_session()).unwrap();
+            stored["data_sync_id"] = json!(identity);
+            stored["delegated_session_id"] = json!(delegated);
+            let saved: Session = serde_json::from_value(stored.clone()).unwrap();
+            let shared = auth::shared(Some(saved.clone()));
+            let previous = shared.read().unwrap().clone().unwrap();
+            let checks = std::cell::Cell::new(0);
+            let result = restore_connection(
+                saved,
+                &Operation::default(),
+                |_| {
+                    checks.set(checks.get() + 1);
+                    Err(auth::RejectedSession.into())
+                },
+                |_| {
+                    stored["data_sync_id"] = json!(other);
+                    stored["delegated_session_id"] = json!(other_delegated);
+                    Ok(serde_json::from_value(stored).unwrap())
+                },
+            );
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("different YouTube account")
+            );
+            assert_eq!(checks.get(), 1);
+            assert!(require_current_session(&shared, &previous).is_ok());
+        }
+    }
+
+    #[test]
+    fn failed_and_cancelled_refreshes_preserve_the_existing_connection() {
+        for cancel in [false, true] {
+            let saved = sourced_session();
+            let shared = auth::shared(Some(saved.clone()));
+            let previous = shared.read().unwrap().clone().unwrap();
+            let operation = Operation::default();
+            let result = restore_connection(
+                saved.clone(),
+                &operation,
+                |_| Err(auth::RejectedSession.into()),
+                |_| {
+                    if cancel {
+                        operation.cancel();
+                        return Ok(saved);
+                    }
+                    anyhow::bail!("Browser profile unavailable")
+                },
+            );
+            assert!(result.is_err());
+            assert!(require_current_session(&shared, &previous).is_ok());
+        }
+        let saved = sourced_session();
+        let checks = std::cell::Cell::new(0);
+        let reads = std::cell::Cell::new(0);
+        let result = restore_connection(
+            saved.clone(),
+            &Operation::default(),
+            |_| {
+                checks.set(checks.get() + 1);
+                Err(auth::RejectedSession.into())
+            },
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(saved)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(checks.get(), 2);
+        assert_eq!(reads.get(), 1, "A rejected refresh must not loop");
+    }
+
+    #[test]
+    fn transport_errors_and_legacy_sessions_do_not_guess_a_browser_profile() {
+        let error = restore_connection(
+            sourced_session(),
+            &Operation::default(),
+            |_| anyhow::bail!("Network unavailable"),
+            |_| panic!("A transport error must not trigger a browser read"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "Network unavailable");
+        let error = restore_connection(
+            synthetic_session(),
+            &Operation::default(),
+            |_| Err(auth::RejectedSession.into()),
+            |_| panic!("An older session has no profile consent"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("Reconnect once"));
+    }
+
     #[test]
     fn queued_writes_require_the_exact_verified_session() {
         let shared = auth::shared(Some(synthetic_session()));

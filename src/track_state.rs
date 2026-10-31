@@ -1,6 +1,7 @@
 use crate::{
     auth::Session,
     catalog::{Catalog, Track},
+    watch::WatchMode,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -49,7 +50,7 @@ impl Worker {
                             .as_ref()
                             .map_err(|error| anyhow::anyhow!("{error:#}"))?
                             .for_session(Some(request.session))
-                            .watch(&request.track, false)?
+                            .watch(&request.track, WatchMode::Details)?
                             .current
                             .filter(|track| track.id == request.track.id)
                             .context(

@@ -151,11 +151,6 @@ impl SearchBox {
         self.invalidate(cx);
     }
 
-    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
-        self.theme = theme;
-        cx.notify();
-    }
-
     fn invalidate(&mut self, cx: &mut Context<Self>) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.debounce = None;
@@ -228,7 +223,7 @@ impl SearchBox {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.suggestions.is_empty() {
+        if self.suggestions.is_empty() || event.keystroke.modifiers.modified() {
             return;
         }
         self.selected = match event.keystroke.key.as_str() {

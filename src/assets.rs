@@ -43,6 +43,22 @@ impl AssetSource for Assets {
                 "../assets/icons/exit-fullscreen.svg"
             ))),
             "help" => Some(Cow::Borrowed(include_bytes!("../assets/icons/help.svg"))),
+            "menu" => Some(Cow::Borrowed(include_bytes!("../assets/icons/menu.svg"))),
+            "person" => Some(Cow::Borrowed(include_bytes!("../assets/icons/person.svg"))),
+            "more" => Some(Cow::Borrowed(include_bytes!("../assets/icons/more.svg"))),
+            "brand" => Some(Cow::Borrowed(include_bytes!("../assets/icons/brand.svg"))),
+            "thumb-up" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/thumb-up.svg"
+            ))),
+            "thumb-up-filled" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/thumb-up-filled.svg"
+            ))),
+            "thumb-down" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/thumb-down.svg"
+            ))),
+            "wordmark" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/wordmark.svg"
+            ))),
             _ => None,
         })
     }
