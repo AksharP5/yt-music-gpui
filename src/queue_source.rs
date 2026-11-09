@@ -1,5 +1,5 @@
 use crate::{
-    auth::Session,
+    auth::{self, Session},
     catalog::{Catalog, Continuation, Item, Page, Track},
     library::Queue,
     search::{SearchFilter, SearchScope},
@@ -41,6 +41,13 @@ impl SourceContinuation {
             Self::Watch(continuation) => continuation.token(),
         }
     }
+
+    fn renew_session(&mut self, expected: &Arc<Session>, next: &Arc<Session>) -> Result<()> {
+        match self {
+            Self::Page { continuation, .. } => continuation.renew_session(expected, next),
+            Self::Watch(continuation) => continuation.renew_session(expected, next),
+        }
+    }
 }
 
 struct QueuePage {
@@ -57,6 +64,13 @@ struct Request {
 pub struct Event {
     id: u64,
     result: Result<QueuePage, String>,
+    session_rejected: bool,
+    session: Option<Arc<Session>>,
+}
+impl Event {
+    pub fn rejected_for(&self, session: Option<&Arc<Session>>) -> bool {
+        self.session_rejected && same_session(self.session.as_ref(), session)
+    }
 }
 
 enum State {
@@ -143,12 +157,16 @@ impl Worker {
                     if request.id != current.load(Ordering::Acquire) {
                         continue;
                     }
-                    let result = load(&request).map_err(|error| format!("{error:#}"));
+                    let result = load(&request);
+                    let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                    let result = result.map_err(|error| format!("{error:#}"));
                     if request.id == current.load(Ordering::Acquire)
                         && events
                             .force_send(Event {
                                 id: request.id,
                                 result,
+                                session_rejected,
+                                session: request.session,
                             })
                             .is_err()
                     {
@@ -325,7 +343,32 @@ impl Worker {
         self.source.is_some()
     }
 
-    /// Cancel on queue replacement, clear, radio start, and every account transition.
+    /// Rebind only after verified same-account renewal and player activation.
+    pub fn renew_session(
+        &mut self,
+        expected: &Arc<Session>,
+        next: Arc<Session>,
+    ) -> Result<bool, String> {
+        let Some(source) = &mut self.source else {
+            return Ok(false);
+        };
+        if !same_session(source.session.as_ref(), Some(expected)) {
+            return Err(
+                "The account changed. Open the playlist again to continue its queue.".into(),
+            );
+        }
+        source
+            .continuation
+            .renew_session(expected, &next)
+            .map_err(|error| format!("{error:#}"))?;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let _ = self.pending.try_recv();
+        source.session = Some(next);
+        source.state = State::Ready;
+        Ok(true)
+    }
+
+    /// Cancel on queue replacement, clear, radio start, and account switches.
     /// The queue's incomplete marker remains until a new queue explicitly replaces it.
     pub fn cancel(&mut self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
@@ -436,14 +479,283 @@ mod tests {
     }
 
     fn session() -> Arc<Session> {
+        account("synthetic-user||", None)
+    }
+
+    fn account(identity: &str, delegated: Option<&str>) -> Arc<Session> {
         Arc::new(
             serde_json::from_value(json!({
                 "cookie":"synthetic", "playback_cookie":"synthetic",
-                "authuser":"0", "delegated_session_id":null,
-                "data_sync_id":"synthetic", "client_version":"synthetic"
+                "authuser":"0", "delegated_session_id":delegated,
+                "data_sync_id":identity, "client_version":"synthetic"
             }))
             .unwrap(),
         )
+    }
+
+    fn continuation(
+        watch_source: bool,
+        token: &str,
+        session: Option<Arc<Session>>,
+    ) -> SourceContinuation {
+        if watch_source {
+            return SourceContinuation::Watch(
+                watch(&["abcdefghijk"], Some(token), session)
+                    .continuation
+                    .unwrap(),
+            );
+        }
+        let continuation = Catalog::with_session(session)
+            .unwrap()
+            .bind_page(page(&[], Some(token)), &json!({}), None)
+            .unwrap()
+            .continuation
+            .unwrap();
+        SourceContinuation::Page {
+            page: PageRequest::Browse,
+            continuation,
+        }
+    }
+
+    #[test]
+    fn renewal_preserves_the_source_and_queue_but_rejects_a_delivered_old_reply() {
+        for watch_source in [false, true] {
+            let expected = session();
+            let mut next = (*expected).clone();
+            next.client_version = "renewed".into();
+            let next = Arc::new(next);
+            let renewed = next.clone();
+            let mut calls = 0;
+            let (mut worker, completed) = Worker::spawn(move |request| {
+                calls += 1;
+                if calls == 1 {
+                    return Ok(next_page(&["stale-tail"], None));
+                }
+                assert!(same_session(request.session.as_ref(), Some(&renewed)));
+                request
+                    .continuation
+                    .clone()
+                    .renew_session(&renewed, &renewed)?;
+                Ok(QueuePage {
+                    tracks: vec![track("b"), track("a")],
+                    continuation: Some(continuation(watch_source, "more", Some(renewed.clone()))),
+                })
+            });
+            let mut queue = Queue::default();
+            queue.replace(vec![track("a"), track("a"), track("b")], 1);
+            worker.set_source(
+                &mut queue,
+                Some(continuation(watch_source, "tail", Some(expected.clone()))),
+                Some(expected.clone()),
+            );
+            worker.load(Some(&expected), false).unwrap();
+            let old_reply = completed.recv_blocking().unwrap();
+            let source_id = queue.source_id.clone().unwrap();
+            assert!(worker.renew_session(&expected, next.clone()).unwrap());
+            let source = worker.source.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&source.id, &source_id));
+            assert_eq!(source.continuation.token(), "tail");
+            assert_eq!(source.seen, HashSet::from(["tail".to_owned()]));
+            assert!(!worker.apply(old_reply, &mut queue, Some(&next)).unwrap());
+            assert_eq!(ids(&queue), ["a", "a", "b"]);
+            assert_eq!(queue.index, Some(1));
+            worker.load(Some(&next), false).unwrap();
+            worker
+                .apply(completed.recv_blocking().unwrap(), &mut queue, Some(&next))
+                .unwrap();
+            assert_eq!(ids(&queue), ["a", "a", "b", "b", "a"]);
+            assert_eq!(queue.index, Some(1));
+            assert!(queue.incomplete);
+            assert!(Arc::ptr_eq(queue.source_id.as_ref().unwrap(), &source_id));
+            assert_eq!(
+                worker.source.as_ref().unwrap().seen,
+                HashSet::from(["tail".to_owned(), "more".to_owned()])
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_discards_in_flight_and_queued_requests() {
+        for watch_source in [false, true] {
+            let expected = session();
+            let next = Arc::new((*expected).clone());
+            let renewed = next.clone();
+            let (started, began) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let mut calls = 0;
+            let (mut worker, completed) = Worker::spawn(move |request| {
+                calls += 1;
+                started.send(request.id).unwrap();
+                if calls == 1 {
+                    resume.recv().unwrap();
+                } else {
+                    assert!(same_session(request.session.as_ref(), Some(&renewed)));
+                    request
+                        .continuation
+                        .clone()
+                        .renew_session(&renewed, &renewed)?;
+                }
+                Ok(next_page(
+                    &[if calls == 1 { "stale" } else { "tail" }],
+                    None,
+                ))
+            });
+            let mut queue = Queue::default();
+            queue.replace(vec![track("loaded")], 0);
+            worker.set_source(
+                &mut queue,
+                Some(continuation(watch_source, "tail", Some(expected.clone()))),
+                Some(expected.clone()),
+            );
+            worker.load(Some(&expected), false).unwrap();
+            began.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.renew_session(&expected, next.clone()).unwrap();
+            worker.load(Some(&next), false).unwrap();
+            worker.renew_session(&next, next.clone()).unwrap();
+            worker.load(Some(&next), false).unwrap();
+            let latest = worker.generation.load(Ordering::Acquire);
+            release.send(()).unwrap();
+            assert_eq!(began.recv_timeout(Duration::from_secs(2)).unwrap(), latest);
+            worker
+                .apply(completed.recv_blocking().unwrap(), &mut queue, Some(&next))
+                .unwrap();
+            assert_eq!(ids(&queue), ["loaded", "tail"]);
+            assert!(!queue.incomplete);
+            assert!(completed.try_recv().is_err());
+            assert!(began.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn renewal_rejects_unrelated_bindings_without_changing_failed_source_state() {
+        let expected = session();
+        let equivalent = Arc::new((*expected).clone());
+        let brand = account("brand-one||synthetic-user", Some("brand-one"));
+        for watch_source in [false, true] {
+            for (bound, source_session, expected, next) in [
+                (None, None, expected.clone(), expected.clone()),
+                (
+                    None,
+                    Some(expected.clone()),
+                    expected.clone(),
+                    expected.clone(),
+                ),
+                (
+                    Some(equivalent.clone()),
+                    Some(expected.clone()),
+                    expected.clone(),
+                    expected.clone(),
+                ),
+                (
+                    Some(equivalent.clone()),
+                    Some(equivalent.clone()),
+                    expected.clone(),
+                    expected.clone(),
+                ),
+                (
+                    Some(expected.clone()),
+                    Some(expected.clone()),
+                    expected.clone(),
+                    account("other-primary||", None),
+                ),
+                (
+                    Some(brand.clone()),
+                    Some(brand.clone()),
+                    brand.clone(),
+                    account("brand-two||synthetic-user", Some("brand-two")),
+                ),
+                (
+                    Some(brand.clone()),
+                    Some(brand.clone()),
+                    brand.clone(),
+                    account("brand-one||other-primary", Some("brand-one")),
+                ),
+            ] {
+                let (mut worker, completed) =
+                    Worker::spawn(|_| anyhow::bail!("synthetic page failure"));
+                let mut queue = Queue::default();
+                queue.replace(vec![track("loaded")], 0);
+                worker.set_source(
+                    &mut queue,
+                    Some(continuation(watch_source, "tail", bound.clone())),
+                    source_session.clone(),
+                );
+                worker.load(source_session.as_ref(), false).unwrap();
+                assert!(
+                    worker
+                        .apply(
+                            completed.recv_blocking().unwrap(),
+                            &mut queue,
+                            source_session.as_ref()
+                        )
+                        .is_err()
+                );
+                let generation = worker.generation.load(Ordering::Acquire);
+                let source_id = queue.source_id.clone().unwrap();
+                assert!(worker.renew_session(&expected, next).is_err());
+                let source = worker.source.as_ref().unwrap();
+                assert!(Arc::ptr_eq(&source.id, &source_id));
+                assert!(same_session(
+                    source.session.as_ref(),
+                    source_session.as_ref()
+                ));
+                assert_eq!(source.continuation.token(), "tail");
+                assert_eq!(source.seen, HashSet::from(["tail".to_owned()]));
+                if let Some(bound) = bound {
+                    source
+                        .continuation
+                        .clone()
+                        .renew_session(&bound, &bound)
+                        .unwrap();
+                }
+                assert_eq!(worker.generation.load(Ordering::Acquire), generation);
+                assert_eq!(
+                    worker.load(source_session.as_ref(), false).unwrap_err(),
+                    "synthetic page failure"
+                );
+                assert_eq!(ids(&queue), ["loaded"]);
+                assert!(queue.incomplete);
+            }
+        }
+    }
+
+    #[test]
+    fn healthy_same_snapshot_renewal_retries_a_failed_page() {
+        for watch_source in [false, true] {
+            let expected = session();
+            let mut calls = 0;
+            let (mut worker, completed) = Worker::spawn(move |_| {
+                calls += 1;
+                if calls == 1 {
+                    return Err(auth::RejectedSession.into());
+                }
+                Ok(next_page(&["tail"], None))
+            });
+            let mut queue = Queue::default();
+            queue.replace(vec![track("loaded")], 0);
+            worker.set_source(
+                &mut queue,
+                Some(continuation(watch_source, "tail", Some(expected.clone()))),
+                Some(expected.clone()),
+            );
+            worker.load(Some(&expected), false).unwrap();
+            let rejected = completed.recv_blocking().unwrap();
+            assert!(rejected.rejected_for(Some(&expected)));
+            assert!(worker.apply(rejected, &mut queue, Some(&expected)).is_err());
+            assert!(worker.load(Some(&expected), false).is_err());
+            assert!(worker.renew_session(&expected, expected.clone()).unwrap());
+            worker.load(Some(&expected), false).unwrap();
+            worker
+                .apply(
+                    completed.recv_blocking().unwrap(),
+                    &mut queue,
+                    Some(&expected),
+                )
+                .unwrap();
+            assert_eq!(ids(&queue), ["loaded", "tail"]);
+            assert!(!queue.incomplete);
+            assert!(!worker.renew_session(&expected, expected.clone()).unwrap());
+        }
     }
 
     #[test]

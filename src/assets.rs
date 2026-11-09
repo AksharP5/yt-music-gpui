@@ -59,6 +59,18 @@ impl AssetSource for Assets {
             "wordmark" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/wordmark.svg"
             ))),
+            "radio" => Some(Cow::Borrowed(include_bytes!("../assets/icons/radio.svg"))),
+            "album" => Some(Cow::Borrowed(include_bytes!("../assets/icons/album.svg"))),
+            "playlist-add" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/playlist-add.svg"
+            ))),
+            "play-next" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/play-next.svg"
+            ))),
+            "link" => Some(Cow::Borrowed(include_bytes!("../assets/icons/link.svg"))),
+            "description" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/description.svg"
+            ))),
             _ => None,
         })
     }

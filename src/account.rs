@@ -202,6 +202,38 @@ fn restore_connection(
     Ok((connection, true))
 }
 
+fn refresh_connection(
+    shared: &SharedSession,
+    expected: &Arc<Session>,
+    operation: &Operation,
+    verify: impl Fn(Session) -> Result<Connection>,
+    read_profile: impl FnOnce(&auth::BrowserProfile) -> Result<Session>,
+) -> Result<(Connection, bool)> {
+    require_current_session(shared, expected)?;
+    let (mut connection, renewed) = restore_connection(
+        (**expected).clone(),
+        operation,
+        |candidate| {
+            require_current_session(shared, expected)?;
+            let result = verify(candidate);
+            require_current_session(shared, expected)?;
+            result
+        },
+        |profile| {
+            require_current_session(shared, expected)?;
+            let result = read_profile(profile);
+            require_current_session(shared, expected)?;
+            result
+        },
+    )?;
+    require_current_session(shared, expected)?;
+    let renewed = renewed && !connection.session.same_credentials(expected);
+    if !renewed {
+        connection.session = expected.clone();
+    }
+    Ok((connection, renewed))
+}
+
 pub enum Command {
     Connect(Operation),
     ReadBrowser {
@@ -213,6 +245,10 @@ pub enum Command {
         mutation: Box<Mutation>,
     },
     Restore(Operation),
+    Refresh {
+        operation: Operation,
+        expected: Arc<Session>,
+    },
     Disconnect {
         operation: Operation,
         playback: Result<Option<async_channel::Receiver<Result<(), String>>>, String>,
@@ -245,6 +281,7 @@ pub enum Event {
         session: Arc<Session>,
         mutation: Box<Mutation>,
         result: Result<Effect, String>,
+        session_rejected: bool,
     },
     Persisted {
         session: Arc<Session>,
@@ -254,6 +291,7 @@ pub enum Event {
         session: Arc<Session>,
         video_id: String,
         result: Result<(), String>,
+        session_rejected: bool,
     },
 }
 
@@ -323,6 +361,23 @@ pub fn start(
                         })();
                         Event::Connected { operation, result: result.map_err(|error| format!("{error:#}")), save_session: refreshed }
                     }
+                    Command::Refresh { operation, expected } => {
+                        let mut refreshed = false;
+                        let result = (|| {
+                            ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is unavailable");
+                            let catalog = catalog.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                            let (connection, renewed) = refresh_connection(
+                                &session,
+                                &expected,
+                                &operation,
+                                |candidate| Connection::verify(candidate, catalog),
+                                |profile| profile.read_session(&operation),
+                            )?;
+                            refreshed = renewed;
+                            Ok(Some(connection))
+                        })();
+                        Event::Connected { operation, result: result.map_err(|error: anyhow::Error| format!("{error:#}")), save_session: refreshed }
+                    }
                     Command::Disconnect { operation, playback } => {
                         // End in-memory authority even if keyring removal needs another attempt.
                         if let Ok(mut current) = session.write() { *current = None; }
@@ -334,8 +389,10 @@ pub fn start(
                         let result = (|| {
                             catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?
                                 .for_session(Some(expected.clone())).mutate(&mutation, &session)
-                        })().map_err(|e| format!("{e:#}"));
-                        Event::Applied { session: expected, mutation, result }
+                        })();
+                        let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                        let result = result.map_err(|error| format!("{error:#}"));
+                        Event::Applied { session: expected, mutation, result, session_rejected }
                     }
                     Command::Persist(expected) => {
                         let result = (|| {
@@ -348,8 +405,10 @@ pub fn start(
                         let result = (|| {
                             catalog.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?
                                 .for_session(Some(expected.clone())).report_playback(&video_id, &session)
-                        })().map_err(|error| format!("{error:#}"));
-                        Event::PlaybackReported { session: expected, video_id, result }
+                        })();
+                        let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                        let result = result.map_err(|error| format!("{error:#}"));
+                        Event::PlaybackReported { session: expected, video_id, result, session_rejected }
                     }
                 };
                 // Closing the UI must not discard a queued sign-out behind this event.
@@ -1061,6 +1120,175 @@ mod tests {
                 name: "Synthetic account".into(),
                 handle: String::new(),
             },
+        }
+    }
+
+    #[test]
+    fn active_recheck_keeps_the_verified_session_without_browser_access() {
+        let shared = auth::shared(Some(sourced_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let (connection, renewed) = refresh_connection(
+            &shared,
+            &expected,
+            &Operation::default(),
+            |candidate| Ok(synthetic_connection(candidate)),
+            |_| panic!("A valid current session must not read browser cookies"),
+        )
+        .unwrap();
+        assert!(!renewed);
+        assert!(Arc::ptr_eq(&connection.session, &expected));
+        assert!(require_current_session(&shared, &expected).is_ok());
+    }
+
+    #[test]
+    fn unchanged_profile_credentials_do_not_restart_active_renewal() {
+        let shared = auth::shared(Some(sourced_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let checks = std::cell::Cell::new(0);
+        let reads = std::cell::Cell::new(0);
+        let (connection, renewed) = refresh_connection(
+            &shared,
+            &expected,
+            &Operation::default(),
+            |candidate| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    return Err(auth::RejectedSession.into());
+                }
+                Ok(synthetic_connection(candidate))
+            },
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok((*expected).clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(checks.get(), 2);
+        assert_eq!(reads.get(), 1);
+        assert!(!renewed);
+        assert!(Arc::ptr_eq(&connection.session, &expected));
+        assert!(require_current_session(&shared, &expected).is_ok());
+    }
+
+    #[test]
+    fn active_renewal_is_verified_once_without_publishing_credentials() {
+        let shared = auth::shared(Some(sourced_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let checks = std::cell::Cell::new(0);
+        let reads = std::cell::Cell::new(0);
+        let (connection, renewed) = refresh_connection(
+            &shared,
+            &expected,
+            &Operation::default(),
+            |candidate| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    return Err(auth::RejectedSession.into());
+                }
+                assert_eq!(candidate.client_version, "renewed");
+                Ok(synthetic_connection(candidate))
+            },
+            |source| {
+                reads.set(reads.get() + 1);
+                assert_eq!(source.name, "Confirmed profile");
+                let mut candidate = (*expected).clone();
+                candidate.client_version = "renewed".into();
+                Ok(candidate)
+            },
+        )
+        .unwrap();
+        assert!(renewed);
+        assert_eq!(checks.get(), 2);
+        assert_eq!(reads.get(), 1);
+        assert!(!Arc::ptr_eq(&connection.session, &expected));
+        assert!(require_current_session(&shared, &expected).is_ok());
+        assert!(require_current_session(&shared, &connection.session).is_err());
+    }
+
+    #[test]
+    fn cancelled_active_rechecks_cannot_read_the_profile_or_publish() {
+        for during_verification in [false, true] {
+            let shared = auth::shared(Some(sourced_session()));
+            let expected = shared.read().unwrap().clone().unwrap();
+            let operation = Operation::default();
+            if !during_verification {
+                operation.cancel();
+            }
+            let checks = std::cell::Cell::new(0);
+            let result = refresh_connection(
+                &shared,
+                &expected,
+                &operation,
+                |_| {
+                    checks.set(checks.get() + 1);
+                    operation.cancel();
+                    Err(auth::RejectedSession.into())
+                },
+                |_| panic!("A cancelled recheck must not read the browser profile"),
+            );
+            assert!(result.err().unwrap().to_string().contains("cancelled"));
+            assert_eq!(checks.get(), usize::from(during_verification));
+            assert!(require_current_session(&shared, &expected).is_ok());
+        }
+    }
+
+    #[test]
+    fn active_renewal_rejects_replacement_at_every_io_boundary() {
+        for replaced_at in ["before", "verification", "profile", "renewal"] {
+            let shared = auth::shared(Some(sourced_session()));
+            let expected = shared.read().unwrap().clone().unwrap();
+            // Byte-identical credentials still belong to a different connection.
+            let replacement = Arc::new((*expected).clone());
+            let replace = || *shared.write().unwrap() = Some(replacement.clone());
+            if replaced_at == "before" {
+                replace();
+            }
+            let checks = std::cell::Cell::new(0);
+            let reads = std::cell::Cell::new(0);
+            let result = refresh_connection(
+                &shared,
+                &expected,
+                &Operation::default(),
+                |candidate| {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 1 {
+                        if replaced_at == "verification" {
+                            replace();
+                        }
+                        return Err(auth::RejectedSession.into());
+                    }
+                    if replaced_at == "renewal" {
+                        replace();
+                    }
+                    Ok(synthetic_connection(candidate))
+                },
+                |_| {
+                    reads.set(reads.get() + 1);
+                    if replaced_at == "profile" {
+                        replace();
+                    }
+                    Ok((*expected).clone())
+                },
+            );
+            assert!(
+                format!("{:#}", result.err().unwrap()).contains("account changed"),
+                "{replaced_at}"
+            );
+            assert_eq!(
+                reads.get(),
+                usize::from(matches!(replaced_at, "profile" | "renewal")),
+                "{replaced_at}"
+            );
+            assert_eq!(
+                checks.get(),
+                match replaced_at {
+                    "before" => 0,
+                    "renewal" => 2,
+                    _ => 1,
+                },
+                "{replaced_at}"
+            );
+            assert!(require_current_session(&shared, &replacement).is_ok());
         }
     }
 

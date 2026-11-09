@@ -34,7 +34,9 @@ Connection requires Python 3, xdg-utils, libsecret's `secret-tool` and a running
 
 The app reads YouTube cookies from the named browser profile and saves the confirmed session in your desktop keyring. It uses your browser session rather than OAuth, so it has that session's YouTube access. It creates no persistent plaintext cookie export. Private windows, containers and partitioned sessions are unsupported.
 
-The account returned by YouTube can differ from the one selected in an open tab. Use **Check another account** to retry, or **Cancel connection** to keep your existing connection. Confirmed connections remember their browser profile and can refresh an expired session when the app reopens. Older saved connections need one reconnect to enable this. A different browser account still requires your confirmation.
+Once connected, the browser can stay closed. The app restores your saved account and can renew rejected sessions from its confirmed profile. Google can still revoke a sign-in. Older saved connections need one reconnect to enable renewal.
+
+The account returned by YouTube can differ from the one selected in an open tab. Use **Check another account** to retry, or **Cancel connection** to keep your existing connection. A different account still requires confirmation.
 
 Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
 

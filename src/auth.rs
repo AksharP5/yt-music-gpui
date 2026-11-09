@@ -72,6 +72,28 @@ pub(crate) fn session_was_rejected(error: &anyhow::Error) -> bool {
         })
 }
 
+pub(crate) fn reject_logged_out(response: &Value) -> Result<()> {
+    let logged_out = response
+        .pointer("/responseContext/serviceTrackingParams")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|service| service["params"].as_array())
+        .flatten()
+        .any(|parameter| {
+            matches!(parameter["key"].as_str(), Some("logged_in" | "yt_li"))
+                && parameter["value"] == "0"
+        });
+    if logged_out
+        || response.get("LOGGED_IN") == Some(&json!(false))
+        || response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+            == Some(&json!(true))
+    {
+        return Err(RejectedSession.into());
+    }
+    Ok(())
+}
+
 // Never derive Debug for reusable account credentials.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -202,6 +224,14 @@ impl Session {
         );
         Ok(())
     }
+    pub(crate) fn same_credentials(&self, other: &Self) -> bool {
+        self.cookie == other.cookie
+            && self.playback_cookie == other.playback_cookie
+            && self.authuser == other.authuser
+            && self.data_sync_id == other.data_sync_id
+            && self.delegated_session_id == other.delegated_session_id
+            && self.client_version == other.client_version
+    }
     pub(crate) fn require_same_account(&self, refreshed: &Self) -> Result<()> {
         self.validate_playback_identity()?;
         refreshed.validate_playback_identity()?;
@@ -210,6 +240,11 @@ impl Session {
                 && self.delegated_session_id == refreshed.delegated_session_id,
             "The saved browser profile now has a different YouTube account. Reconnect to choose an account."
         );
+        Ok(())
+    }
+    /// Ordinary API responses may omit proof, but any supplied identity must match.
+    pub(crate) fn check_response_identity(&self, response: &Value) -> Result<()> {
+        self.server_identity_confirmed(response)?;
         Ok(())
     }
     pub fn verify_server_identity(&self, response: &Value) -> Result<()> {
@@ -278,24 +313,7 @@ impl Session {
     }
     fn server_identity_confirmed(&self, response: &Value) -> Result<bool> {
         self.validate_playback_identity()?;
-        let logged_out = response
-            .pointer("/responseContext/serviceTrackingParams")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|service| service["params"].as_array())
-            .flatten()
-            .any(|parameter| {
-                matches!(parameter["key"].as_str(), Some("logged_in" | "yt_li"))
-                    && parameter["value"] == "0"
-            });
-        if logged_out
-            || response.get("LOGGED_IN") == Some(&json!(false))
-            || response.pointer("/responseContext/mainAppWebResponseContext/loggedOut")
-                == Some(&json!(true))
-        {
-            return Err(RejectedSession.into());
-        }
+        reject_logged_out(response)?;
         ensure!(
             response.get("LOGGED_IN").is_none_or(|value| value == true)
                 && response
@@ -1157,6 +1175,64 @@ mod tests {
     }
 
     #[test]
+    fn credential_comparison_covers_authority_without_profile_metadata() {
+        let saved = session("SAPISID=synthetic");
+        let mut candidate = saved.clone();
+        candidate.source_profile = Some(BrowserProfile {
+            browser: "Zen".into(),
+            name: "Confirmed profile".into(),
+            path: PathBuf::from("/synthetic/confirmed-profile"),
+        });
+        assert!(saved.same_credentials(&candidate));
+        let changes: [fn(&mut Session); 6] = [
+            |session| session.cookie.push_str("; SID=rotated"),
+            |session| session.playback_cookie.push_str("rotated"),
+            |session| session.authuser = "2".into(),
+            |session| session.data_sync_id = "other-user||".into(),
+            |session| session.delegated_session_id = Some("other-brand".into()),
+            |session| session.client_version = "renewed".into(),
+        ];
+        for change in changes {
+            let mut candidate = saved.clone();
+            change(&mut candidate);
+            assert!(!saved.same_credentials(&candidate));
+        }
+    }
+
+    #[test]
+    fn ordinary_responses_reject_only_explicit_logged_out_signals() {
+        for response in [
+            json!({}),
+            json!({"LOGGED_IN":true}),
+            json!({"contents":[]}),
+            json!({"LOGGED_IN":"false"}),
+            json!({"DATASYNC_ID":"unverified||"}),
+            json!({"responseContext":{"mainAppWebResponseContext":{"loggedOut":false}}}),
+            json!({"responseContext":{"serviceTrackingParams":[{
+                "params":[{"key":"logged_in", "value":"1"}, {"key":"other", "value":"0"}]
+            }]}}),
+        ] {
+            reject_logged_out(&response).unwrap();
+        }
+        for response in [
+            json!({"LOGGED_IN":false}),
+            json!({"responseContext":{"mainAppWebResponseContext":{"loggedOut":true}}}),
+            json!({"responseContext":{"serviceTrackingParams":[{
+                "params":[{"key":"logged_in", "value":"0"}]
+            }]}}),
+            json!({"responseContext":{"serviceTrackingParams":[{
+                "params":[{"key":"yt_li", "value":"0"}]
+            }]}}),
+        ] {
+            assert!(
+                reject_logged_out(&response)
+                    .unwrap_err()
+                    .is::<RejectedSession>()
+            );
+        }
+    }
+
+    #[test]
     fn only_explicit_session_rejection_allows_browser_refresh() {
         let saved = session("SAPISID=synthetic");
         for rejected in [
@@ -1198,6 +1274,35 @@ mod tests {
         s.data_sync_id.clear();
         assert!(s.validate_playback_identity().is_err());
     }
+    #[test]
+    fn optional_api_identity_accepts_missing_proof_and_rejects_supplied_conflicts() {
+        let saved = session("SAPISID=synthetic");
+        for response in [
+            json!({}),
+            json!({"contents":[]}),
+            json!({"LOGGED_IN":true, "SESSION_INDEX":0}),
+            json!({"responseContext":{"mainAppWebResponseContext":{
+                "datasyncId":"synthetic-user||", "loggedOut":false
+            }}}),
+        ] {
+            saved.check_response_identity(&response).unwrap();
+        }
+        for response in [
+            json!({"DATASYNC_ID":"other||"}),
+            json!({"DATASYNC_ID":null}),
+            json!({"SESSION_INDEX":1}),
+            json!({"SESSION_INDEX":false}),
+            json!({"LOGGED_IN":"true"}),
+        ] {
+            let error = saved.check_response_identity(&response).unwrap_err();
+            assert!(!session_was_rejected(&error));
+        }
+        let logout = saved
+            .check_response_identity(&json!({"LOGGED_IN":false}))
+            .unwrap_err();
+        assert!(session_was_rejected(&logout));
+    }
+
     #[test]
     fn account_menu_proof_distinguishes_absence_from_conflicting_identity() {
         let s = session("SAPISID=synthetic");

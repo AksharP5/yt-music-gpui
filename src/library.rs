@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fs,
-    io::Write,
+    io::{BufWriter, Write},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -237,8 +237,12 @@ impl Store {
         let directory = self.path.parent().context("Missing data directory")?;
         fs::create_dir_all(directory).context("Could not create the music data directory")?;
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        serde_json::to_writer(&mut file, library)?;
-        file.write_all(b"\n")?;
+        {
+            let mut writer = BufWriter::new(&mut file);
+            serde_json::to_writer(&mut writer, library)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
         file.as_file().sync_all()?;
         file.persist(&self.path)
             .context("Could not save your music library")?;
@@ -344,11 +348,14 @@ mod tests {
     }
 
     #[test]
-    fn writer_flushes_the_latest_snapshot_before_exit() {
+    fn writer_flushes_the_latest_large_snapshot_before_exit() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("library.json");
         let (writer, errors) = LibraryWriter::new(Store { path: path.clone() });
         let mut library = Library::new();
+        let mut song = track("saved");
+        song.title = "Café \"live\"\n".repeat(1024);
+        library.queue.replace(vec![song.clone(), song], 1);
         for n in 0..40 {
             library.volume = n as f64;
             writer.save(&library);
@@ -357,6 +364,8 @@ mod tests {
         assert!(errors.try_recv().is_err());
         let saved: Library = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved.volume, 39.);
+        assert_eq!(saved.queue.index, Some(1));
+        assert_eq!(saved.queue.tracks, library.queue.tracks);
     }
 
     #[test]

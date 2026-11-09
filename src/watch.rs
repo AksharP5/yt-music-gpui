@@ -47,6 +47,22 @@ impl WatchContinuation {
             .as_str()
             .expect("validated watch continuation token")
     }
+
+    pub(crate) fn renew_session(
+        &mut self,
+        expected: &Arc<Session>,
+        next: &Arc<Session>,
+    ) -> Result<()> {
+        ensure!(
+            self.session
+                .as_ref()
+                .is_some_and(|session| Arc::ptr_eq(session, expected)),
+            "The account changed before this radio queue could continue"
+        );
+        expected.require_same_account(next)?;
+        self.session = Some(next.clone());
+        Ok(())
+    }
 }
 
 pub struct WatchPage {

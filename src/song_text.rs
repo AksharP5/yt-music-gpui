@@ -1,5 +1,5 @@
 use crate::{
-    auth::Session,
+    auth::{self, Session},
     catalog::{Catalog, text},
 };
 use anyhow::{Context, Result, ensure};
@@ -38,6 +38,7 @@ struct Request {
 pub struct Event {
     pub id: u64,
     pub result: Result<Content, String>,
+    pub session_rejected: bool,
 }
 
 pub struct Worker {
@@ -77,12 +78,15 @@ impl Worker {
                     if request.id != current.load(Ordering::Acquire) {
                         continue;
                     }
-                    let result = load(&request).map_err(|error| format!("{error:#}"));
+                    let result = load(&request);
+                    let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                    let result = result.map_err(|error| format!("{error:#}"));
                     if request.id == current.load(Ordering::Acquire)
                         && events
                             .send_blocking(Event {
                                 id: request.id,
                                 result,
+                                session_rejected,
                             })
                             .is_err()
                     {

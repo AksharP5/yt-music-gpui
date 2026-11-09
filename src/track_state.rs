@@ -1,5 +1,5 @@
 use crate::{
-    auth::Session,
+    auth::{self, Session},
     catalog::{Catalog, Track},
     watch::WatchMode,
 };
@@ -21,6 +21,7 @@ struct Request {
 pub struct Event {
     pub id: u64,
     pub result: Result<Track, String>,
+    pub session_rejected: bool,
 }
 
 /// Refresh the current song without replacing radio or text requests.
@@ -31,6 +32,16 @@ pub struct Worker {
 }
 
 impl Worker {
+    #[cfg(test)]
+    pub(crate) fn idle() -> Self {
+        let (requests, pending) = async_channel::bounded(1);
+        Self {
+            requests,
+            pending,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     pub fn start() -> (Self, async_channel::Receiver<Event>) {
         let (requests, pending) = async_channel::bounded::<Request>(1);
         let (events, completed) = async_channel::unbounded();
@@ -56,13 +67,15 @@ impl Worker {
                             .context(
                                 "YouTube Music did not return the current song's account state",
                             )
-                    })()
-                    .map_err(|error| format!("{error:#}"));
+                    })();
+                    let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                    let result = result.map_err(|error| format!("{error:#}"));
                     if request.id == current.load(Ordering::Acquire)
                         && events
                             .send_blocking(Event {
                                 id: request.id,
                                 result,
+                                session_rejected,
                             })
                             .is_err()
                     {

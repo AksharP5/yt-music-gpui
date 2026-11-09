@@ -3,8 +3,8 @@ use crate::{
     artwork::Artwork,
     auth::{self, Operation, Session, SharedSession},
     catalog::{
-        BrowseLink, Catalog, Collection, Continuation, Item, Page, PlaylistTarget, Rating, Shelf,
-        ShelfLayout, Track,
+        BrowseLink, Catalog, Collection, Continuation, HeaderArtist, Item, Page, PlaylistTarget,
+        Rating, Shelf, ShelfLayout, Track, WatchTarget,
     },
     country_picker::{CountryPicker, CountryPickerEvent},
     library::{Library, LibraryWriter, Queue, Repeat, Store},
@@ -32,12 +32,18 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const CARD_WIDTH: f32 = 180.;
 const CARD_GAP: f32 = 24.;
 const SHELF_HEIGHT: f32 = 350.;
+
+#[derive(Clone, Copy)]
+enum ArtworkShape {
+    Square,
+    Circle,
+}
 
 #[derive(Clone, PartialEq)]
 struct Search {
@@ -101,6 +107,7 @@ struct CatalogResult {
     account_revision: u64,
     append: bool,
     result: Result<Page, String>,
+    session_rejected: bool,
     target: CatalogTarget,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -176,6 +183,7 @@ impl CatalogRequests {
         self.loading[target as usize]
     }
 }
+#[derive(Clone)]
 enum PlaybackQuery {
     Watch { track: Box<Track>, mode: WatchMode },
     Playlist(Arc<PlaylistTarget>),
@@ -208,10 +216,12 @@ enum PlaybackResult {
         account_revision: u64,
         update: QueueUpdate,
         result: Result<Box<Watch>, String>,
+        session_rejected: bool,
     },
     More {
         id: u64,
         result: Result<WatchPage, String>,
+        session_rejected: bool,
     },
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -324,10 +334,68 @@ enum Drag {
 enum AccountOperation {
     Restoring(Operation),
     RestoreFailed,
+    Refreshing {
+        operation: Operation,
+        retry_change: bool,
+        resume: Option<PlaybackIntent>,
+    },
+    RefreshFailed {
+        resume: Option<PlaybackIntent>,
+    },
     Connecting(Operation, BrowserConnection),
-    Activating(Operation),
+    Activating {
+        operation: Operation,
+        resume: Option<PlaybackIntent>,
+    },
     Disconnecting(Operation),
     DisconnectFailed,
+}
+
+impl AccountOperation {
+    fn pending_playback(&mut self) -> Option<&mut Option<PlaybackIntent>> {
+        match self {
+            Self::Refreshing { resume, .. }
+            | Self::Activating { resume, .. }
+            | Self::RefreshFailed { resume } => Some(resume),
+            _ => None,
+        }
+    }
+}
+
+enum PlaybackIntent {
+    Track(PlaybackResume),
+    Advance(QueueAdvance),
+    Queue {
+        query: PlaybackQuery,
+        paused: bool,
+        advance: Option<QueueAdvance>,
+    },
+}
+impl PlaybackIntent {
+    fn is_paused(&self) -> bool {
+        match self {
+            Self::Track(track) => track.paused,
+            Self::Advance(intent) => intent.playback.is_paused(),
+            Self::Queue { paused, .. } => *paused,
+        }
+    }
+    fn toggle_pause(&mut self) {
+        match self {
+            Self::Advance(intent) => intent.playback = intent.playback.toggled(),
+            Self::Track(track) => track.paused = !track.paused,
+            Self::Queue { paused, .. } => *paused = !*paused,
+        }
+    }
+}
+
+struct PlaybackResume {
+    video_id: String,
+    position: f64,
+    paused: bool,
+    mode: WatchMode,
+    watch: Option<Arc<WatchTarget>>,
+    record_history: bool,
+    advance: Option<QueueAdvance>,
 }
 
 enum BrowserConnection {
@@ -348,6 +416,7 @@ pub enum Startup {
 }
 
 enum ListRow {
+    Featured(usize),
     Heading(usize),
     Item(usize),
     Shelf(usize),
@@ -406,6 +475,7 @@ pub struct Music {
     account_commands: async_channel::Sender<account::Command>,
     account_worker: Option<account::Worker>,
     account_operation: Option<AccountOperation>,
+    next_session_refresh: Option<Instant>,
     pending_mutations: HashSet<String>,
     ratings: HashMap<String, Rating>,
     account_revision: u64,
@@ -442,7 +512,7 @@ pub struct Music {
     queue_source: queue_source::Worker,
     queue_waiting: Option<QueueAdvance>,
     autoplay_tracks: VecDeque<Track>,
-    watch_pending: Option<QueueUpdate>,
+    watch_pending: Option<PlaybackQuery>,
     song_text: song_text::Worker,
     artwork: Artwork,
     library: Library,
@@ -559,7 +629,7 @@ impl Music {
                             Query::More { .. } | Query::PlaylistChoicesMore(_)
                         );
                         let result = match &catalog {
-                            Err(e) => Err(format!("{e:#}")),
+                            Err(e) => Err(anyhow::anyhow!("{e:#}")),
                             Ok(catalog) => {
                                 let catalog = catalog.for_session(job.session);
                                 match &job.query {
@@ -590,15 +660,18 @@ impl Music {
                                         search: None,
                                     } => catalog.more(token),
                                 }
-                                .map_err(|e| format!("{e:#}"))
                             }
                         };
+                        let session_rejected =
+                            result.as_ref().is_err_and(auth::session_was_rejected);
+                        let result = result.map_err(|error| format!("{error:#}"));
                         if results
                             .send_blocking(CatalogResult {
                                 id: job.id,
                                 account_revision: job.account_revision,
                                 append,
                                 result,
+                                session_rejected,
                                 target,
                             })
                             .is_err()
@@ -643,38 +716,47 @@ impl Music {
                     let catalog = catalog
                         .as_ref()
                         .map(|catalog| catalog.for_session(job.session))
-                        .map_err(|error| format!("{error:#}"));
+                        .map_err(|error| anyhow::anyhow!("{error:#}"));
                     let result = match job.query {
-                        PlaybackQuery::Watch { track, mode } => PlaybackResult::Watch {
-                            id: job.id,
-                            account_revision: job.account_revision,
-                            update: mode.into(),
-                            result: catalog.and_then(|catalog| {
-                                catalog
-                                    .watch(&track, mode)
-                                    .map(Box::new)
-                                    .map_err(|error| format!("{error:#}"))
-                            }),
-                        },
-                        PlaybackQuery::Playlist(target) => PlaybackResult::Watch {
-                            id: job.id,
-                            account_revision: job.account_revision,
-                            update: QueueUpdate::Replace,
-                            result: catalog.and_then(|catalog| {
-                                catalog
-                                    .watch_playlist(&target)
-                                    .map(Box::new)
-                                    .map_err(|error| format!("{error:#}"))
-                            }),
-                        },
-                        PlaybackQuery::More(continuation) => PlaybackResult::More {
-                            id: job.id,
-                            result: catalog.and_then(|catalog| {
-                                catalog
-                                    .watch_more(&continuation)
-                                    .map_err(|error| format!("{error:#}"))
-                            }),
-                        },
+                        PlaybackQuery::Watch { track, mode } => {
+                            let result = catalog
+                                .and_then(|catalog| catalog.watch(&track, mode))
+                                .map(Box::new);
+                            let session_rejected =
+                                result.as_ref().is_err_and(auth::session_was_rejected);
+                            PlaybackResult::Watch {
+                                id: job.id,
+                                account_revision: job.account_revision,
+                                update: mode.into(),
+                                session_rejected,
+                                result: result.map_err(|error| format!("{error:#}")),
+                            }
+                        }
+                        PlaybackQuery::Playlist(target) => {
+                            let result = catalog
+                                .and_then(|catalog| catalog.watch_playlist(&target))
+                                .map(Box::new);
+                            let session_rejected =
+                                result.as_ref().is_err_and(auth::session_was_rejected);
+                            PlaybackResult::Watch {
+                                id: job.id,
+                                account_revision: job.account_revision,
+                                update: QueueUpdate::Replace,
+                                session_rejected,
+                                result: result.map_err(|error| format!("{error:#}")),
+                            }
+                        }
+                        PlaybackQuery::More(continuation) => {
+                            let result =
+                                catalog.and_then(|catalog| catalog.watch_more(&continuation));
+                            PlaybackResult::More {
+                                id: job.id,
+                                session_rejected: result
+                                    .as_ref()
+                                    .is_err_and(auth::session_was_rejected),
+                                result: result.map_err(|error| format!("{error:#}")),
+                            }
+                        }
                     };
                     if playback_results.send_blocking(result).is_err() {
                         break;
@@ -731,6 +813,9 @@ impl Music {
                             }
                             Ok(_) => {}
                             Err(error) => {
+                                if event.session_rejected {
+                                    view.refresh_session(false, cx);
+                                }
                                 view.error =
                                     Some(format!("Could not refresh the current song: {error}"))
                             }
@@ -749,10 +834,11 @@ impl Music {
             while let Ok(event) = text_events.recv().await {
                 if view
                     .update_in(cx, |view, _, cx| {
-                        if let Some(Overlay::SongText { id, content, .. }) = &mut view.overlay
-                            && *id == event.id
-                        {
-                            *content = Some(event.result);
+                        if matches!(&view.overlay, Some(Overlay::SongText { id, .. }) if *id == event.id) {
+                            if event.session_rejected { view.refresh_session(false, cx); }
+                            if let Some(Overlay::SongText { content, .. }) = &mut view.overlay {
+                                *content = Some(event.result);
+                            }
                             cx.notify();
                         }
                     })
@@ -850,6 +936,7 @@ impl Music {
             account_commands,
             account_worker: Some(account_worker),
             account_operation,
+            next_session_refresh: None,
             pending_mutations: HashSet::new(),
             ratings: HashMap::new(),
             account_revision: 0,
@@ -927,11 +1014,46 @@ impl Music {
             _subscriptions: vec![subscription, activation],
         };
         window.focus(&view.focus, cx);
-        view.request(Query::Home, cx);
+        if startup != Startup::Restore || !auth::ACCOUNT_LOGIN_ENABLED {
+            view.request(Query::Home, cx);
+        }
         view
     }
 
     fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
+        if let Some(resume) = self
+            .account_operation
+            .as_mut()
+            .and_then(AccountOperation::pending_playback)
+        {
+            *resume = Some(PlaybackIntent::Queue {
+                query,
+                paused: false,
+                advance: None,
+            });
+            self.playback = Playback::Loading {
+                paused: false,
+                retried: false,
+            };
+            self.notice = Some("Loading music…".into());
+            self.player_command(Player::stop);
+            self.active_id = None;
+            self.seekable = false;
+            self.pending_seek = None;
+            self.playback_generation.fetch_add(1, Ordering::Relaxed);
+            self.watch_pending = None;
+            self.discard_pending_playback();
+            if matches!(
+                self.account_operation,
+                Some(AccountOperation::RefreshFailed { .. })
+            ) {
+                self.next_session_refresh = None;
+                self.refresh_session(false, cx);
+            }
+            cx.notify();
+            return;
+        }
+
         self.reset_radio();
         self.player_command(Player::stop);
         self.active_id = None;
@@ -959,11 +1081,7 @@ impl Music {
             self.radio_generation.fetch_add(1, Ordering::Relaxed) + 1
         } else {
             self.discard_pending_playback();
-            self.watch_pending = match &query {
-                PlaybackQuery::Watch { mode, .. } => Some((*mode).into()),
-                PlaybackQuery::Playlist(_) => Some(QueueUpdate::Replace),
-                PlaybackQuery::More(_) => None,
-            };
+            self.watch_pending = Some(query.clone());
             self.playback_generation.fetch_add(1, Ordering::Relaxed) + 1
         };
         let session = self
@@ -1090,9 +1208,21 @@ impl Music {
                 account_revision,
                 update,
                 result,
+                session_rejected,
             } => {
                 if id != self.playback_generation.load(Ordering::Relaxed) {
                     return;
+                }
+                if session_rejected && account_revision == self.account_revision {
+                    self.refresh_session(false, cx);
+                    if matches!(
+                        self.account_operation,
+                        Some(AccountOperation::Refreshing { .. })
+                    ) {
+                        self.watch_pending = None;
+                        cx.notify();
+                        return;
+                    }
                 }
                 self.watch_pending = None;
                 let advance = if update != QueueUpdate::Preserve {
@@ -1218,9 +1348,24 @@ impl Music {
                     }
                 }
             }
-            PlaybackResult::More { id, result } => {
+            PlaybackResult::More {
+                id,
+                result,
+                session_rejected,
+            } => {
                 if id != self.radio_generation.load(Ordering::Relaxed) {
                     return;
+                }
+                if session_rejected {
+                    self.refresh_session(false, cx);
+                    if matches!(
+                        self.account_operation,
+                        Some(AccountOperation::Refreshing { .. })
+                    ) {
+                        self.radio_loading = false;
+                        cx.notify();
+                        return;
+                    }
                 }
                 self.radio_loading = false;
                 match result {
@@ -1242,6 +1387,7 @@ impl Music {
     }
 
     fn clear_account_state(&mut self, cx: &mut Context<Self>) {
+        self.next_session_refresh = None;
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -1391,30 +1537,32 @@ impl Music {
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         self.list_rows.clear();
-        let artist = self.route.is_artist();
+        let sectioned = self.page.header.is_some();
+        let search_all =
+            matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
         for (index, shelf) in self.page.shelves.iter().enumerate() {
-            let carousel = artist && shelf.layout != ShelfLayout::Songs;
-            if carousel {
+            let featured = search_all && shelf.layout == ShelfLayout::Featured;
+            let carousel =
+                sectioned && matches!(shelf.layout, ShelfLayout::Cards | ShelfLayout::Videos);
+            if featured {
+                self.list_rows.push(ListRow::Featured(index));
+            } else if carousel {
                 self.list_rows.push(ListRow::Shelf(index));
             } else if !shelf.title.is_empty() {
                 self.list_rows.push(ListRow::Heading(index));
             }
-            for item in &shelf.items {
-                if !carousel {
+            for (item_index, item) in shelf.items.iter().enumerate() {
+                if !carousel && !(featured && item_index == 0) {
                     self.list_rows.push(ListRow::Item(self.rows.len()));
                 }
                 self.rows.push(item.clone());
             }
-            if artist && !carousel && shelf.more.is_some() {
+            if sectioned && !carousel && shelf.more.is_some() {
                 self.list_rows.push(ListRow::More(index));
             }
         }
-        if self.page.header.is_some() {
-            self.detail_list.reset_rows(if artist {
-                self.list_rows.len()
-            } else {
-                self.rows.len()
-            });
+        if self.page.header.is_some() || search_all {
+            self.detail_list.reset_rows(self.list_rows.len());
         } else {
             self.detail_list = DetailList::new();
         }
@@ -1504,6 +1652,9 @@ impl Music {
     fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
         if !self.catalog_requests.finish(result.target, result.id) {
             return;
+        }
+        if result.session_rejected && result.account_revision == self.account_revision {
+            self.refresh_session(false, cx);
         }
         if result.target == CatalogTarget::Sidebar {
             match result.result {
@@ -1620,7 +1771,223 @@ impl Music {
             self.library.liked.iter().any(|t| t.id == track.id)
         }
     }
+    fn finish_account_playback(
+        &mut self,
+        intent: Option<PlaybackIntent>,
+        same_account: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match intent {
+            Some(PlaybackIntent::Track(resume))
+                if self
+                    .library
+                    .queue
+                    .current()
+                    .is_some_and(|track| track.id == resume.video_id) =>
+            {
+                if same_account && let Some(index) = self.library.queue.index {
+                    self.library.queue.tracks[index].details.watch = resume.watch;
+                }
+                if let Some(mut intent) = resume.advance {
+                    intent.playback = intent.playback.with_pause(resume.paused);
+                    if same_account && resume.mode == WatchMode::Issued {
+                        self.queue_waiting = Some(intent);
+                        self.playback = intent.playback;
+                        if let Some(track) = self.library.queue.current().cloned() {
+                            self.playback_request(
+                                PlaybackQuery::Watch {
+                                    track: Box::new(track),
+                                    mode: WatchMode::Issued,
+                                },
+                                cx,
+                            );
+                        }
+                    } else {
+                        self.finish_account_playback(
+                            Some(PlaybackIntent::Advance(intent)),
+                            same_account,
+                            cx,
+                        );
+                    }
+                } else {
+                    self.play_current_at(
+                        resume.position,
+                        resume.paused,
+                        if same_account {
+                            resume.mode
+                        } else {
+                            WatchMode::Details
+                        },
+                        cx,
+                    );
+                    if !resume.record_history {
+                        self.history_track = self.active_id;
+                    }
+                }
+            }
+            Some(PlaybackIntent::Queue {
+                query,
+                paused,
+                advance,
+            }) => {
+                self.start_queue(query, cx);
+                self.playback = self.playback.with_pause(paused);
+                if let Some(mut intent) = advance {
+                    intent.playback = intent.playback.with_pause(paused);
+                    self.advance_queue(intent, cx);
+                }
+            }
+            Some(PlaybackIntent::Advance(intent)) => {
+                let at_end = self
+                    .library
+                    .queue
+                    .index
+                    .is_none_or(|index| index + 1 >= self.library.queue.tracks.len());
+                if at_end
+                    && !self.library.queue.incomplete
+                    && self.library.repeat == Repeat::Off
+                    && self.library.music_autoplay()
+                    && self.now_playing.is_none()
+                    && let Some(track) = self.library.queue.current().cloned()
+                {
+                    self.autoplay_waiting = Some(intent);
+                    self.playback = Playback::Loading {
+                        paused: intent.playback.is_paused(),
+                        retried: false,
+                    };
+                    self.playback_request(
+                        PlaybackQuery::Watch {
+                            track: Box::new(track),
+                            mode: WatchMode::Details,
+                        },
+                        cx,
+                    );
+                } else {
+                    self.advance_queue(intent, cx);
+                }
+            }
+            _ if self.active_id.is_none() => self.playback = Playback::Stopped,
+            _ => {}
+        }
+        self.prefetch_queue(cx);
+    }
+
+    fn load_guest_home(&mut self, cx: &mut Context<Self>) {
+        if self.account.is_none()
+            && self.rows.is_empty()
+            && self.route.is_home()
+            && !self.catalog_requests.is_loading(CatalogTarget::Page)
+            && !matches!(
+                self.account_operation,
+                Some(AccountOperation::Restoring(_) | AccountOperation::Activating { .. })
+            )
+        {
+            self.request(Query::Home, cx);
+        }
+    }
+
+    fn refresh_session(&mut self, retry_change: bool, cx: &mut Context<Self>) -> bool {
+        if let Some(AccountOperation::Refreshing {
+            retry_change: pending,
+            ..
+        }) = &mut self.account_operation
+        {
+            *pending |= retry_change;
+            return false;
+        }
+        if self
+            .account_operation
+            .as_ref()
+            .is_some_and(|operation| !matches!(operation, AccountOperation::RefreshFailed { .. }))
+            || self
+                .next_session_refresh
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return false;
+        }
+        let Some(account) = &self.account else {
+            return false;
+        };
+        let operation = Operation::default();
+        let command = account::Command::Refresh {
+            operation: operation.clone(),
+            expected: account.session.clone(),
+        };
+        let advance = self.queue_waiting.take().or(self.autoplay_waiting.take());
+        let pending_query = self.watch_pending.take();
+        if pending_query.is_some() {
+            self.playback_generation.fetch_add(1, Ordering::Relaxed);
+            self.discard_pending_playback();
+        }
+        let pending = match pending_query {
+            Some(PlaybackQuery::Watch {
+                track,
+                mode: WatchMode::Issued,
+            }) => Some(PlaybackIntent::Track(PlaybackResume {
+                video_id: track.id,
+                position: self.playback_position(),
+                paused: self.playback.is_paused(),
+                mode: WatchMode::Issued,
+                watch: track.details.watch,
+                record_history: false,
+                advance,
+            })),
+            Some(
+                query @ (PlaybackQuery::Watch {
+                    mode: WatchMode::Radio,
+                    ..
+                }
+                | PlaybackQuery::Playlist(_)),
+            ) => Some(PlaybackIntent::Queue {
+                query,
+                paused: self.playback.is_paused(),
+                advance,
+            }),
+            _ => advance.map(PlaybackIntent::Advance),
+        };
+        let resume = match &mut self.account_operation {
+            Some(AccountOperation::RefreshFailed { resume }) => resume.take(),
+            _ => None,
+        }
+        .or(pending);
+        if let Some(intent) = &resume {
+            self.playback = Playback::Loading {
+                paused: intent.is_paused(),
+                retried: false,
+            };
+            self.player_command(Player::stop);
+            self.active_id = None;
+            self.pending_seek = None;
+            self.seekable = false;
+        }
+        self.next_session_refresh = Some(Instant::now() + Duration::from_secs(60));
+        match self.account_commands.try_send(command) {
+            Ok(()) => {
+                self.account_operation = Some(AccountOperation::Refreshing {
+                    operation,
+                    retry_change,
+                    resume,
+                });
+                self.notice = Some("Reconnecting account…".into());
+            }
+            Err(_) => {
+                self.account_operation = Some(AccountOperation::RefreshFailed { resume });
+                self.error = Some("Could not reconnect the account. Retry from Settings.".into());
+            }
+        }
+        cx.notify();
+        true
+    }
+
     fn connect_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::RefreshFailed { .. })
+        ) {
+            self.next_session_refresh = None;
+            self.refresh_session(false, cx);
+            return;
+        }
         if !auth::ACCOUNT_LOGIN_ENABLED {
             self.error = Some("Account connection is unavailable.".into());
             cx.notify();
@@ -1719,8 +2086,14 @@ impl Music {
         }
     }
     fn cancel_connection(&mut self, cx: &mut Context<Self>) {
+        let refreshing = matches!(
+            self.account_operation,
+            Some(AccountOperation::Refreshing { .. })
+        );
         let Some(
-            AccountOperation::Connecting(operation, _) | AccountOperation::Restoring(operation),
+            AccountOperation::Connecting(operation, _)
+            | AccountOperation::Restoring(operation)
+            | AccountOperation::Refreshing { operation, .. },
         ) = self.account_operation.as_ref()
         else {
             return;
@@ -1729,9 +2102,11 @@ impl Music {
         if let Ok(mut session) = self.session.write() {
             *session = self.account.as_ref().map(|account| account.session.clone());
         }
-        self.account_operation = None;
+        self.account_operation =
+            refreshing.then_some(AccountOperation::RefreshFailed { resume: None });
         self.notice = None;
         self.error = None;
+        self.load_guest_home(cx);
         cx.notify();
     }
     fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) -> bool {
@@ -1774,7 +2149,8 @@ impl Music {
         if let Some(
             AccountOperation::Connecting(operation, _)
             | AccountOperation::Restoring(operation)
-            | AccountOperation::Activating(operation),
+            | AccountOperation::Refreshing { operation, .. }
+            | AccountOperation::Activating { operation, .. },
         ) = self.account_operation.take()
         {
             operation.cancel();
@@ -2068,14 +2444,65 @@ impl Music {
                 result,
                 save_session,
             } => {
-                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active, BrowserConnection::Review { .. }) | AccountOperation::Restoring(active)) if active.matches(&operation))
+                let (restoring, renewing, retry_change, pending) = match &mut self.account_operation
                 {
-                    return;
-                }
-                let restoring =
-                    matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
+                    Some(AccountOperation::Restoring(active)) if active.matches(&operation) => {
+                        (true, false, false, None)
+                    }
+                    Some(AccountOperation::Refreshing {
+                        operation: active,
+                        retry_change,
+                        resume,
+                    }) if active.matches(&operation) => (false, true, *retry_change, resume.take()),
+                    Some(AccountOperation::Connecting(
+                        active,
+                        BrowserConnection::Review { .. },
+                    )) if active.matches(&operation) => (false, false, false, None),
+                    _ => return,
+                };
+                let pending = pending.or_else(|| {
+                    renewing
+                        .then(|| self.queue_waiting.take().or(self.autoplay_waiting.take()))
+                        .flatten()
+                        .map(PlaybackIntent::Advance)
+                });
                 match result {
                     Ok(Some(connection)) => {
+                        if renewing
+                            && self.account.as_ref().is_some_and(|account| {
+                                Arc::ptr_eq(&account.session, &connection.session)
+                            })
+                        {
+                            self.account_operation = None;
+                            self.notice = None;
+                            self.error = retry_change.then(|| {
+                                "Your account is connected. Retry the failed change.".into()
+                            });
+                            if let Err(error) = self
+                                .queue_source
+                                .renew_session(&connection.session, connection.session.clone())
+                            {
+                                self.queue_source.cancel();
+                                self.error = Some(error);
+                            }
+                            self.refresh_remote(cx);
+                            self.finish_account_playback(pending, true, cx);
+                            if self.active_id.is_some()
+                                && self.watch_pending.is_none()
+                                && self.now_playing.is_none()
+                                && let Some(track) = self.library.queue.current().cloned()
+                            {
+                                self.playback_request(
+                                    PlaybackQuery::Watch {
+                                        track: Box::new(track),
+                                        mode: WatchMode::Details,
+                                    },
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                            return;
+                        }
                         let installation =
                             connection
                                 .session
@@ -2093,18 +2520,51 @@ impl Music {
                         let response = match installation {
                             Ok(response) => response,
                             Err(error) => {
-                                self.account_operation =
-                                    restoring.then_some(AccountOperation::RestoreFailed);
+                                self.account_operation = if renewing {
+                                    Some(AccountOperation::RefreshFailed { resume: pending })
+                                } else {
+                                    restoring.then_some(AccountOperation::RestoreFailed)
+                                };
                                 self.notice = None;
                                 self.error = Some(format!(
                                     "Could not activate playback credentials: {error:#}"
                                 ));
+                                self.load_guest_home(cx);
                                 cx.notify();
                                 return;
                             }
                         };
-                        self.account_operation =
-                            Some(AccountOperation::Activating(operation.clone()));
+                        let resume = pending.or_else(|| {
+                            if renewing
+                                && self.active_id.is_some()
+                                && self.playback != Playback::Stopped
+                            {
+                                self.library.queue.current().map(|track| {
+                                    PlaybackIntent::Track(PlaybackResume {
+                                        video_id: track.id.clone(),
+                                        position: self.playback_position(),
+                                        paused: self.playback.is_paused(),
+                                        mode: WatchMode::Details,
+                                        watch: track.details.watch.clone(),
+                                        record_history: false,
+                                        advance: None,
+                                    })
+                                })
+                            } else {
+                                None
+                            }
+                        });
+                        self.playback =
+                            resume
+                                .as_ref()
+                                .map_or(Playback::Stopped, |resume| Playback::Loading {
+                                    paused: resume.is_paused(),
+                                    retried: false,
+                                });
+                        self.account_operation = Some(AccountOperation::Activating {
+                            operation: operation.clone(),
+                            resume,
+                        });
                         self.notice = Some("Preparing account playback…".into());
                         self.playback_generation.fetch_add(1, Ordering::Relaxed);
                         self.watch_pending = None;
@@ -2114,38 +2574,66 @@ impl Music {
                         self.active_id = None;
                         self.pending_seek = None;
                         self.seekable = false;
-                        self.playback = Playback::Stopped;
                         cx.spawn_in(window, async move |view, cx| {
-                            let result = response.recv().await.unwrap_or_else(|_| {
-                                Err("The player stopped before confirming the account. Restart the app.".into())
-                            });
+                            let result = response.recv().await.unwrap_or_else(|_| Err("The player stopped before confirming the account. Restart the app.".into()));
                             let _ = view.update_in(cx, |view, window, cx| {
-                                if !matches!(&view.account_operation, Some(AccountOperation::Activating(active)) if active.matches(&operation)) {
-                                    return;
-                                }
-                                view.account_operation = None;
+                                if !matches!(&view.account_operation, Some(AccountOperation::Activating { operation: active, .. }) if active.matches(&operation)) { return; }
+                                let resume = match view.account_operation.take() {
+                                    Some(AccountOperation::Activating { resume, .. }) => resume,
+                                    _ => unreachable!("activation checked above"),
+                                };
                                 view.notice = None;
+                                let previous_session = view.account.as_ref().map(|account| account.session.clone());
                                 match connection.activate(&view.session, &operation, result) {
                                     Ok(connection) => {
-                                        let label = format!("Connected as {}", connection.account.name);
                                         let session = connection.session.clone();
+                                        let label = format!("Connected as {}", connection.account.name);
                                         view.account = Some(connection);
-                                        view.clear_account_state(cx);
-                                        window.focus(&view.focus, cx);
-                                        view.navigate(Route::Home, cx);
-                                        view.request(Query::SidebarPlaylists,cx);
-                                        view.back.clear();
+                                        if renewing {
+                                            // Rebind only this verified account's queue; discard other in-flight reads.
+                                            view.catalog_requests.cancel(CatalogTarget::Page);
+                                            view.catalog_requests.cancel(CatalogTarget::Sidebar);
+                                            view.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
+                                            if let Some(expected) = &previous_session
+                                                && let Err(error) = view.queue_source.renew_session(expected, session.clone())
+                                            { view.queue_source.cancel(); view.error = Some(error); }
+                                            view.track_state.cancel();
+                                            view.track_state_id = None;
+                                            view.song_text.cancel();
+                                            view.now_playing = None;
+                                            view.media_pair = None;
+                                            view.ratings.clear();
+                                            view.pending_mutations.clear();
+                                            for track in &mut view.library.queue.tracks { track.details.clear_account_state(); }
+                                            if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::SongText { .. })) {
+                                                view.overlay = None;
+                                            }
+                                            view.search.update(cx, |search, cx| search.set_session(Some(session.clone()), cx));
+                                            view.error = retry_change.then(|| "Your account reconnected. Retry the failed change.".into());
+                                            view.refresh_remote(cx);
+                                        } else {
+                                            view.clear_account_state(cx);
+                                            window.focus(&view.focus, cx);
+                                            view.navigate(Route::Home, cx);
+                                            view.request(Query::SidebarPlaylists, cx);
+                                            view.back.clear();
+                                            view.notice = (!restoring).then_some(label);
+                                            view.refresh_current_account(cx);
+                                        }
+                                        view.finish_account_playback(resume, renewing, cx);
+                                        if retry_change { view.error = Some("Your account is connected. Retry the failed change.".into()); }
                                         if save_session && view.account_commands.try_send(account::Command::Persist(session)).is_err() {
                                             view.error = Some("Connected for this session, but the account could not be queued for keyring storage.".into());
                                         }
-                                        view.notice = (!restoring).then_some(label);
-                                        view.refresh_current_account(cx);
                                     }
                                     Err(error) => {
-                                        view.account_operation=restoring.then_some(AccountOperation::RestoreFailed);
-                                        view.error=Some(format!("Could not activate the account: {error:#}"));
+                                        view.account_operation = if renewing { Some(AccountOperation::RefreshFailed { resume }) }
+                                            else { restoring.then_some(AccountOperation::RestoreFailed) };
+                                        view.playback = Playback::Stopped;
+                                        view.error = Some(format!("Could not activate the account: {error:#}"));
                                     }
                                 }
+                                view.load_guest_home(cx);
                                 cx.notify();
                             });
                         }).detach();
@@ -2155,8 +2643,11 @@ impl Music {
                         self.notice = None;
                     }
                     Err(error) => {
-                        self.account_operation =
-                            restoring.then_some(AccountOperation::RestoreFailed);
+                        self.account_operation = if renewing {
+                            Some(AccountOperation::RefreshFailed { resume: pending })
+                        } else {
+                            restoring.then_some(AccountOperation::RestoreFailed)
+                        };
                         self.notice = None;
                         self.error = Some(error);
                     }
@@ -2166,6 +2657,7 @@ impl Music {
                 session,
                 mutation,
                 result,
+                session_rejected,
             } => {
                 if !self
                     .account
@@ -2173,6 +2665,9 @@ impl Music {
                     .is_some_and(|connection| Arc::ptr_eq(&connection.session, &session))
                 {
                     return;
+                }
+                if session_rejected {
+                    self.refresh_session(true, cx);
                 }
                 let mutation = *mutation;
                 self.pending_mutations.remove(&mutation.key());
@@ -2261,6 +2756,7 @@ impl Music {
                 session,
                 video_id,
                 result,
+                session_rejected,
             } => {
                 if !self
                     .account
@@ -2268,6 +2764,9 @@ impl Music {
                     .is_some_and(|connection| Arc::ptr_eq(&connection.session, &session))
                 {
                     return;
+                }
+                if session_rejected {
+                    self.refresh_session(true, cx);
                 }
                 match result {
                     Ok(())
@@ -2296,6 +2795,7 @@ impl Music {
                 }
             }
         }
+        self.load_guest_home(cx);
         cx.notify();
     }
     fn player_command(&mut self, command: impl FnOnce(&Player) -> anyhow::Result<()>) {
@@ -2311,6 +2811,17 @@ impl Music {
             .map_or(self.position, |seek| seek.seconds)
     }
     fn seek_current(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        if let Some(Some(PlaybackIntent::Track(resume))) = self
+            .account_operation
+            .as_mut()
+            .and_then(AccountOperation::pending_playback)
+        {
+            resume.position = seconds.max(0.);
+            resume.advance = None;
+            self.position = resume.position;
+            cx.notify();
+            return;
+        }
         let Some(track_id) = self.active_id else {
             return;
         };
@@ -2347,10 +2858,42 @@ impl Music {
         watch_mode: WatchMode,
         cx: &mut Context<Self>,
     ) {
-        if matches!(
-            self.account_operation,
-            Some(AccountOperation::Activating(_))
-        ) {
+        if let Some(resume) = self
+            .account_operation
+            .as_mut()
+            .and_then(AccountOperation::pending_playback)
+        {
+            *resume = self.library.queue.current().map(|track| {
+                PlaybackIntent::Track(PlaybackResume {
+                    video_id: track.id.clone(),
+                    position: start,
+                    paused,
+                    mode: watch_mode,
+                    watch: track.details.watch.clone(),
+                    record_history: true,
+                    advance: None,
+                })
+            });
+            self.position = start;
+            self.playback = Playback::Loading {
+                paused,
+                retried: false,
+            };
+            self.player_command(Player::stop);
+            self.active_id = None;
+            self.seekable = false;
+            self.pending_seek = None;
+            self.playback_generation.fetch_add(1, Ordering::Relaxed);
+            self.watch_pending = None;
+            self.discard_pending_playback();
+            if matches!(
+                self.account_operation,
+                Some(AccountOperation::RefreshFailed { .. })
+            ) {
+                self.next_session_refresh = None;
+                self.refresh_session(false, cx);
+            }
+            cx.notify();
             return;
         }
         self.queue_waiting = None;
@@ -2480,6 +3023,25 @@ impl Music {
         let position = self.playback_position();
         let paused = self.playback.is_paused();
         self.library.video = enabled;
+        let pending = self
+            .account_operation
+            .as_mut()
+            .and_then(AccountOperation::pending_playback)
+            .and_then(|resume| resume.as_ref());
+        let deferred_source = matches!(
+            pending,
+            Some(PlaybackIntent::Queue { .. } | PlaybackIntent::Advance(_))
+                | Some(PlaybackIntent::Track(PlaybackResume {
+                    mode: WatchMode::Issued,
+                    ..
+                }))
+        );
+        let pending_track = matches!(pending, Some(PlaybackIntent::Track(_)));
+        if deferred_source {
+            self.save();
+            cx.notify();
+            return;
+        }
         let alternative = self
             .media_pair
             .as_ref()
@@ -2499,7 +3061,7 @@ impl Music {
             *current = track;
             self.reset_radio();
             self.now_playing = None;
-            if self.active_id.is_some() {
+            if self.active_id.is_some() || pending_track {
                 self.play_current_at(position, paused, WatchMode::Details, cx);
             }
         } else if changed
@@ -2615,6 +3177,7 @@ impl Music {
 
     fn queue_source_result(&mut self, event: queue_source::Event, cx: &mut Context<Self>) {
         let session = self.account.as_ref().map(|account| &account.session);
+        let session_rejected = event.rejected_for(session);
         match self
             .queue_source
             .apply(event, &mut self.library.queue, session)
@@ -2634,6 +3197,17 @@ impl Music {
                 }
             }
             Err(error) => {
+                if session_rejected {
+                    self.refresh_session(false, cx);
+                    if matches!(
+                        self.account_operation,
+                        Some(AccountOperation::Refreshing { .. })
+                    ) {
+                        self.notice = Some("Reconnecting account…".into());
+                        cx.notify();
+                        return;
+                    }
+                }
                 if self.queue_waiting.take().is_some() {
                     self.playback = Playback::Stopped;
                     self.notice = None;
@@ -2654,24 +3228,13 @@ impl Music {
         self.play_current(cx);
     }
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.stop_playback(cx);
         self.queue_source.cancel();
-        self.queue_waiting = None;
         self.track_state.cancel();
         self.track_state_id = None;
-        self.player_command(Player::stop);
-        self.active_id = None;
-        self.seekable = false;
-        self.playback = Playback::Stopped;
-        self.position = 0.;
         self.duration = 0.;
-        self.notice = None;
         self.library.queue = Default::default();
-        self.now_playing = None;
         self.media_pair = None;
-        self.reset_radio();
-        self.playback_generation.fetch_add(1, Ordering::Relaxed);
-        self.watch_pending = None;
-        self.discard_pending_playback();
         self.save();
         cx.notify();
     }
@@ -2733,6 +3296,52 @@ impl Music {
         }
     }
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        let pending = match &self.account_operation {
+            Some(AccountOperation::Activating { .. }) => true,
+            Some(AccountOperation::RefreshFailed { resume }) => {
+                resume.is_some() || self.active_id.is_none()
+            }
+            Some(AccountOperation::Refreshing { resume, .. }) => resume.is_some(),
+            _ => false,
+        };
+        if pending
+            && let Some(resume) = self
+                .account_operation
+                .as_mut()
+                .and_then(AccountOperation::pending_playback)
+        {
+            if let Some(intent) = resume {
+                intent.toggle_pause();
+            } else {
+                *resume = self.library.queue.current().map(|track| {
+                    PlaybackIntent::Track(PlaybackResume {
+                        video_id: track.id.clone(),
+                        position: 0.,
+                        paused: false,
+                        mode: WatchMode::Details,
+                        watch: track.details.watch.clone(),
+                        record_history: true,
+                        advance: None,
+                    })
+                });
+            }
+            self.playback = resume
+                .as_ref()
+                .map_or(Playback::Stopped, |intent| Playback::Loading {
+                    paused: intent.is_paused(),
+                    retried: false,
+                });
+            if matches!(
+                self.account_operation,
+                Some(AccountOperation::RefreshFailed { .. })
+            ) {
+                self.next_session_refresh = None;
+                self.refresh_session(false, cx);
+            }
+            cx.notify();
+            return;
+        }
+
         if let Some(intent) = self
             .queue_waiting
             .as_mut()
@@ -2776,6 +3385,37 @@ impl Music {
             && matches!(self.playback, Playback::Loading { .. })
     }
     fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
+        let playback = self.playback;
+        if let Some(resume) = self
+            .account_operation
+            .as_mut()
+            .and_then(AccountOperation::pending_playback)
+        {
+            let intent = QueueAdvance { natural, playback };
+            match resume {
+                Some(PlaybackIntent::Queue { advance, .. }) => *advance = Some(intent),
+                Some(PlaybackIntent::Track(track)) => track.advance = Some(intent),
+                Some(PlaybackIntent::Advance(pending)) => *pending = intent,
+                None => *resume = Some(PlaybackIntent::Advance(intent)),
+            }
+            self.playback = Playback::Loading {
+                paused: playback.is_paused(),
+                retried: false,
+            };
+            self.player_command(Player::stop);
+            self.active_id = None;
+            self.pending_seek = None;
+            self.seekable = false;
+            if matches!(
+                self.account_operation,
+                Some(AccountOperation::RefreshFailed { .. })
+            ) {
+                self.next_session_refresh = None;
+                self.refresh_session(false, cx);
+            }
+            cx.notify();
+            return;
+        }
         let playback = self
             .queue_waiting
             .take()
@@ -2786,13 +3426,26 @@ impl Music {
 
     fn advance_queue(&mut self, intent: QueueAdvance, cx: &mut Context<Self>) {
         let autoplay = self.library.music_autoplay();
-        let wait_for_queue = self.watch_pending == Some(QueueUpdate::Replace)
-            || (self.watch_pending == Some(QueueUpdate::Adopt)
-                && self
-                    .library
-                    .queue
-                    .index
-                    .is_none_or(|index| index + 1 >= self.library.queue.tracks.len()));
+        let wait_for_queue = matches!(
+            &self.watch_pending,
+            Some(
+                PlaybackQuery::Playlist(_)
+                    | PlaybackQuery::Watch {
+                        mode: WatchMode::Radio,
+                        ..
+                    }
+            )
+        ) || (matches!(
+            &self.watch_pending,
+            Some(PlaybackQuery::Watch {
+                mode: WatchMode::Issued,
+                ..
+            })
+        ) && self
+            .library
+            .queue
+            .index
+            .is_none_or(|index| index + 1 >= self.library.queue.tracks.len()));
         if !wait_for_queue
             && self.library.queue.advance_with_autoplay(
                 self.library.repeat,
@@ -2891,6 +3544,14 @@ impl Music {
     }
 
     fn stop_playback(&mut self, cx: &mut Context<Self>) {
+        if let Some(resume) = self
+            .account_operation
+            .as_mut()
+            .and_then(AccountOperation::pending_playback)
+        {
+            *resume = None;
+        }
+
         self.player_command(Player::stop);
         self.active_id = None;
         self.seekable = false;
@@ -3070,8 +3731,14 @@ impl Music {
             });
         let can_go_next = loaded_next
             || matches!(
-                self.watch_pending,
-                Some(QueueUpdate::Adopt | QueueUpdate::Replace)
+                &self.watch_pending,
+                Some(
+                    PlaybackQuery::Playlist(_)
+                        | PlaybackQuery::Watch {
+                            mode: WatchMode::Issued | WatchMode::Radio,
+                            ..
+                        }
+                )
             )
             || (queue.incomplete && self.queue_source.can_continue())
             || (!queue.incomplete
@@ -3409,16 +4076,25 @@ impl Music {
             _ => {}
         }
     }
-    fn art(&mut self, url: Option<&str>, edge: f32) -> AnyElement {
+    fn art(&mut self, url: Option<&str>, edge: f32, shape: ArtworkShape) -> AnyElement {
+        let radius = match shape {
+            ArtworkShape::Square => 5.,
+            ArtworkShape::Circle => edge / 2.,
+        };
         let image = url.and_then(|url| self.artwork.get(url));
         let mut element = div()
             .size(px(edge))
             .flex_shrink_0()
-            .rounded(px(5.))
+            .rounded(px(radius))
             .overflow_hidden()
             .bg(self.theme.raised);
         element = if let Some(image) = image {
-            element.child(img(image).size_full().object_fit(ObjectFit::Cover))
+            element.child(
+                img(image)
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .rounded(px(radius)),
+            )
         } else {
             element.flex().items_center().justify_center().child(
                 icon("music", edge.min(32.) * 0.6, self.theme.muted).text_color(self.theme.muted),
@@ -3710,16 +4386,16 @@ impl Music {
                             .cursor_pointer()
                             .child(
                                 div()
-                                    .size(px(26.))
+                                    .size(px(24.))
                                     .rounded_full()
                                     .bg(self.theme.accent)
-                                    .child(icon("brand", 26., self.theme.text)),
+                                    .child(icon("brand", 24., self.theme.text)),
                             )
                             .child(
                                 svg()
                                     .path("wordmark")
-                                    .w(px(47.))
-                                    .h(px(26.))
+                                    .w(px(43.4))
+                                    .h(px(24.))
                                     .text_color(self.theme.text),
                             )
                             .on_click(cx.listener(|view, _, _, cx| view.navigate(Route::Home, cx))),
@@ -3803,7 +4479,7 @@ impl Music {
         let title = item.title().to_owned();
         let subtitle = item.subtitle().to_owned();
         if layout == ShelfLayout::Songs {
-            let art = self.art(item.thumbnail(), 48.);
+            let art = self.art(item.thumbnail(), 48., ArtworkShape::Square);
             return div()
                 .id(("quick-pick", id))
                 .w(px(width))
@@ -3874,7 +4550,12 @@ impl Music {
             .overflow_hidden()
             .bg(self.theme.raised);
         art = if let Some(image) = image {
-            art.child(img(image).size_full().object_fit(ObjectFit::Cover))
+            art.child(
+                img(image)
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .when(artist, |image| image.rounded_full()),
+            )
         } else {
             art.flex()
                 .items_center()
@@ -3981,7 +4662,7 @@ impl Music {
             240.
         } else {
             match layout {
-                ShelfLayout::Cards => CARD_WIDTH,
+                ShelfLayout::Cards | ShelfLayout::Featured => CARD_WIDTH,
                 ShelfLayout::Videos => 256.,
                 ShelfLayout::Songs => 360.,
             }
@@ -4175,15 +4856,31 @@ impl Music {
                     .as_ref()
                     .and_then(|header| header.thumbnail.clone())
             });
-            self.art(thumbnail.as_deref(), if artist { 40. } else { 48. })
+            self.art(
+                thumbnail.as_deref(),
+                if artist { 40. } else { 48. },
+                if matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"))
+                {
+                    ArtworkShape::Circle
+                } else {
+                    ArtworkShape::Square
+                },
+            )
         };
         let title = item.title().to_owned();
-        let subtitle = item.subtitle().to_owned();
+        let subtitle = match &item {
+            Item::Track(track) if !artist => match &track.details.plays {
+                Some(plays) => format!("{} • {plays}", track.artist),
+                None => track.artist.clone(),
+            },
+            _ => item.subtitle().to_owned(),
+        };
         let mut row = div()
             .id(("song", index))
             .group("music-row")
+            .relative()
             .w_full()
-            .h(px(if artist { 50. } else { 64. }))
+            .h(px(if artist || numbered { 50. } else { 64. }))
             .flex()
             .items_center()
             .gap(px(if artist { 24. } else { 14. }))
@@ -4213,12 +4910,29 @@ impl Music {
                     )
                     .child(
                         div()
-                            .w(px(180.))
+                            .w(px(150.))
                             .min_w_0()
                             .truncate()
                             .text_size(px(16.))
                             .text_color(self.theme.muted)
                             .child(subtitle),
+                    )
+                    .when_some(
+                        match &item {
+                            Item::Track(track) => track.details.plays.clone(),
+                            _ => None,
+                        },
+                        |d, plays| {
+                            d.child(
+                                div()
+                                    .w(px(130.))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(16.))
+                                    .text_color(self.theme.muted)
+                                    .child(plays),
+                            )
+                        },
                     )
                     .when_some(
                         match &item {
@@ -4252,13 +4966,15 @@ impl Music {
                             .when(active, |d| d.text_color(self.theme.accent))
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(14.))
-                            .text_color(self.theme.muted)
-                            .child(subtitle),
-                    )
+                    .when(!numbered, |d| {
+                        d.child(
+                            div()
+                                .truncate()
+                                .text_size(px(14.))
+                                .text_color(self.theme.muted)
+                                .child(subtitle),
+                        )
+                    })
                     .into_any_element()
             });
         match item {
@@ -4275,8 +4991,8 @@ impl Music {
                 let liked = self.is_liked(&track);
                 let like_track = track.clone();
                 let menu_track = track.clone();
-                row = row
-                    .child(
+                if !artist {
+                    row = row.child(
                         div()
                             .w(px(if track.details.episode.is_some() {
                                 100.
@@ -4293,14 +5009,19 @@ impl Music {
                                     .map(|episode| episode.duration_text.clone())
                                     .unwrap_or_default()
                             })),
-                    )
+                    );
+                }
+                let controls = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .child(
                         button(
                             ("like", index),
                             if liked { "thumb-up-filled" } else { "thumb-up" },
                             self.theme,
                         )
-                        .when(!liked, |d| {
+                        .when(!liked && !artist, |d| {
                             d.invisible().group_hover("music-row", |d| d.visible())
                         })
                         .on_click(cx.listener(move |view, _, _, cx| {
@@ -4308,33 +5029,39 @@ impl Music {
                             view.toggle_like(&like_track, cx);
                         })),
                     )
+                    .when(!artist, |d| {
+                        d.child(
+                            button(("add", index), "plus", self.theme)
+                                .invisible()
+                                .group_hover("music-row", |d| d.visible())
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    view.enqueue(track.clone(), cx);
+                                })),
+                        )
+                    })
                     .child(
-                        button(("add", index), "plus", self.theme)
-                            .invisible()
-                            .group_hover("music-row", |d| d.visible())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                cx.stop_propagation();
-                                view.enqueue(track.clone(), cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(("track-menu", index))
-                            .invisible()
-                            .group_hover("music-row", |d| d.visible())
-                            .w(px(32.))
-                            .h(px(36.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(22.))
-                            .child("⋯")
+                        button(("track-menu", index), "more", self.theme)
+                            .when(!artist, |d| {
+                                d.invisible().group_hover("music-row", |d| d.visible())
+                            })
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
-                                window.focus(&view.focus, cx);
                                 view.open_track_menu(menu_track.clone(), Some(index), window, cx);
                             })),
                     );
+                row = row.child(if artist {
+                    controls
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .h_full()
+                        .bg(self.theme.raised)
+                        .invisible()
+                        .group_hover("music-row", |d| d.visible())
+                } else {
+                    controls
+                });
             }
             Item::Collection(collection) => {
                 let saved = self.is_saved(&collection);
@@ -4462,8 +5189,8 @@ impl Music {
                     .gap(px(4.))
                     .child(
                         div()
-                            .text_size(px(32.))
-                            .line_height(relative(1.2))
+                            .text_size(px(28.))
+                            .line_height(px(38.))
                             .font_weight(FontWeight::BOLD)
                             .child(self.page.title.clone()),
                     )
@@ -4481,8 +5208,9 @@ impl Music {
                 d.child(
                     div()
                         .id("artist-description")
-                        .max_w(px(700.))
+                        .max_w(px(640.))
                         .line_clamp(2)
+                        .text_ellipsis()
                         .max_h(px(40.))
                         .overflow_hidden()
                         .text_size(px(14.))
@@ -4502,6 +5230,88 @@ impl Music {
             .child(actions)
             .into_any_element()
     }
+    fn featured_result(&mut self, shelf: usize, inset: f32, cx: &mut Context<Self>) -> AnyElement {
+        let index = self.page.shelves[..shelf]
+            .iter()
+            .map(|shelf| shelf.items.len())
+            .sum::<usize>();
+        let item = self.rows[index].clone();
+        let artist =
+            matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
+        let art = self.art(
+            item.thumbnail(),
+            120.,
+            if artist {
+                ArtworkShape::Circle
+            } else {
+                ArtworkShape::Square
+            },
+        );
+        let title = item.title().to_owned();
+        let subtitle = item.subtitle().to_owned();
+        div()
+            .id(("featured-result", shelf))
+            .w_full()
+            .px(px(inset))
+            .py(px(20.))
+            .flex()
+            .items_center()
+            .gap(px(24.))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .when(artist, |d| d.rounded_full().overflow_hidden())
+                    .child(art),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id("featured-title")
+                            .truncate()
+                            .text_size(px(28.))
+                            .font_weight(FontWeight::BOLD)
+                            .cursor_pointer()
+                            .child(title)
+                            .on_click(cx.listener(move |view, _, _, cx| view.play_item(index, cx))),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(16.))
+                            .text_color(self.theme.muted)
+                            .child(subtitle),
+                    )
+                    .when(matches!(item, Item::Track(_)), |d| {
+                        d.child(
+                            div()
+                                .id("featured-play")
+                                .mt(px(8.))
+                                .w(px(120.))
+                                .h(px(36.))
+                                .rounded_full()
+                                .bg(self.theme.text)
+                                .text_color(self.theme.bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(8.))
+                                .cursor_pointer()
+                                .child(icon("play", 20., self.theme.bg))
+                                .child("Play")
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| view.play_item(index, cx)),
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
     fn list_row(
         &mut self,
         index: usize,
@@ -4510,6 +5320,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match self.list_rows[index] {
+            ListRow::Featured(index) => self.featured_result(index, inset, cx),
             ListRow::Heading(shelf) => div()
                 .h(px(64.))
                 .px(px(inset))
@@ -4557,14 +5368,27 @@ impl Music {
         let title = self.page.title.clone();
         let has_tracks = self.rows.iter().any(|item| matches!(item, Item::Track(_)));
         let mut cover = None;
+        let mut creator = None;
         let mut heading = div()
             .flex()
             .flex_col()
             .gap(px(16.))
             .when(stacked, |d| d.items_center().text_center());
         if let Some(header) = header {
+            creator = header.artist.map(|artist| match artist {
+                HeaderArtist::Link(link) => div()
+                    .id("collection-artist")
+                    .text_size(px(14.))
+                    .cursor_pointer()
+                    .child(link.title.clone())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.navigate(Route::Browse(link.clone()), cx)
+                    }))
+                    .into_any_element(),
+                HeaderArtist::Text(text) => div().text_size(px(14.)).child(text).into_any_element(),
+            });
             if let Some(url) = header.thumbnail {
-                cover = Some(self.art(Some(&url), edge));
+                cover = Some(self.art(Some(&url), edge, ArtworkShape::Square));
             }
             heading = heading.child(
                 div()
@@ -4573,12 +5397,17 @@ impl Music {
                     .font_weight(FontWeight::BOLD)
                     .child(title),
             );
-            if !header.subtitle.is_empty() {
+            if !header.subtitle.is_empty() || !header.stats.is_empty() {
                 heading = heading.child(
                     div()
+                        .flex()
+                        .flex_col()
+                        .when(stacked, |d| d.items_center())
                         .text_size(px(14.))
+                        .line_height(px(20.))
                         .text_color(self.theme.muted)
-                        .child(header.subtitle),
+                        .when(!header.subtitle.is_empty(), |d| d.child(header.subtitle))
+                        .when(!header.stats.is_empty(), |d| d.child(header.stats)),
                 );
             }
         } else {
@@ -4597,6 +5426,9 @@ impl Music {
                     .w_full()
                     .text_size(px(14.))
                     .text_color(self.theme.muted)
+                    .line_height(px(20.))
+                    .line_clamp(2)
+                    .text_ellipsis()
                     .max_h(px(40.))
                     .overflow_hidden()
                     .cursor_pointer()
@@ -4714,17 +5546,39 @@ impl Music {
                 .flex_col()
                 .items_center()
                 .gap(px(20.))
-                .child(cover)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(16.))
+                        .children(creator)
+                        .child(cover),
+                )
                 .child(heading)
                 .into_any_element(),
             Some(cover) => div()
                 .flex()
                 .items_start()
                 .gap(px(24.))
-                .child(cover)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(16.))
+                        .children(creator)
+                        .child(cover),
+                )
                 .child(heading.flex_1().min_w_0())
                 .into_any_element(),
-            None => heading.into_any_element(),
+            None => div()
+                .flex()
+                .flex_col()
+                .gap(px(16.))
+                .children(creator)
+                .child(heading)
+                .into_any_element(),
         }
     }
     fn content(&mut self, inset: f32, available: f32, cx: &mut Context<Self>) -> AnyElement {
@@ -4738,7 +5592,7 @@ impl Music {
         if !home && !artist {
             content = content.child(
                 div()
-                    .h(px(48.))
+                    .h(px(if collection { 24. } else { 48. }))
                     .px(px(inset))
                     .flex_shrink_0()
                     .flex()
@@ -4977,7 +5831,13 @@ impl Music {
                     .child(notice.clone()),
             );
         }
-        if self.catalog_requests.is_loading(CatalogTarget::Page) && self.rows.is_empty() {
+        if self.rows.is_empty()
+            && (self.catalog_requests.is_loading(CatalogTarget::Page)
+                || matches!(
+                    self.account_operation,
+                    Some(AccountOperation::Restoring(_) | AccountOperation::Activating { .. })
+                ))
+        {
             return content
                 .child(
                     div()
@@ -5114,7 +5974,7 @@ impl Music {
                                 ))
                                 .into_any_element();
                         }
-                        view.row(
+                        view.list_row(
                             index - usize::from(inline),
                             if stacked { 0. } else { inset },
                             window,
@@ -5126,16 +5986,13 @@ impl Music {
                 .min_h_0()
                 .into_any_element()
             } else if grouped {
-                uniform_list(
-                    ("search-results", self.list_id),
-                    self.list_rows.len(),
-                    cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
-                        range
-                            .map(|index| view.list_row(index, inset, window, cx))
-                            .collect::<Vec<_>>()
+                self.detail_list.set_inline_header(false);
+                list(
+                    self.detail_list.state.clone(),
+                    cx.processor(move |view, index, window, cx| {
+                        view.list_row(index, inset, window, cx)
                     }),
                 )
-                .track_scroll(&self.list_scroll)
                 .flex_1()
                 .min_h_0()
                 .into_any_element()
@@ -5355,7 +6212,11 @@ impl Music {
                                 if index >= view.library.queue.tracks.len() {
                                     let index = index - view.library.queue.tracks.len();
                                     let track = view.autoplay_tracks[index].clone();
-                                    let art = view.art(track.thumbnail.as_deref(), 40.);
+                                    let art = view.art(
+                                        track.thumbnail.as_deref(),
+                                        40.,
+                                        ArtworkShape::Square,
+                                    );
                                     return div()
                                         .id(("autoplay-row", index))
                                         .h(px(64.))
@@ -5406,7 +6267,8 @@ impl Music {
                                 }
                                 let track = view.library.queue.tracks[index].clone();
                                 let active = view.library.queue.index == Some(index);
-                                let art = view.art(track.thumbnail.as_deref(), 40.);
+                                let art =
+                                    view.art(track.thumbnail.as_deref(), 40., ArtworkShape::Square);
                                 div()
                                     .id(("queue-row", index))
                                     .w_full()
@@ -5711,7 +6573,8 @@ impl Music {
             .child(viewport)
             .into_any_element()
     }
-    fn player_bar(&mut self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn player_bar(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let compact = width < 1120.;
         let current = self.library.queue.current().cloned();
         let progress = if self.duration > 0. {
             (self
@@ -5733,7 +6596,7 @@ impl Music {
             .items_center()
             .gap(px(16.));
         if let Some(track) = current {
-            let art = self.art(track.thumbnail.as_deref(), 40.);
+            let art = self.art(track.thumbnail.as_deref(), 40., ArtworkShape::Square);
             let liked = self.is_liked(&track);
             let disliked = self
                 .ratings
@@ -5815,7 +6678,7 @@ impl Music {
         let seek_bounds = self.seek_bounds.clone();
         let volume_bounds = self.volume_bounds.clone();
         div()
-            .h(px(74.))
+            .h(px(if width < 936. { 64. } else { 72. }))
             .flex_shrink_0()
             .relative()
             .bg(self.theme.panel)
@@ -6005,15 +6868,40 @@ impl Music {
         cx: &Context<Self>,
         action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
+        let id = id.into();
+        let glyph = match &id {
+            ElementId::Name(name) => match name.as_ref() {
+                "menu-radio" => Some("radio"),
+                "menu-next" => Some("play-next"),
+                "menu-enqueue" => Some("queue"),
+                "menu-playlist" | "menu-library" => Some("playlist-add"),
+                "menu-artist" | "menu-show" => Some("person"),
+                "menu-album" => Some("album"),
+                "menu-like" => Some("thumb-up"),
+                "menu-dislike" => Some("thumb-down"),
+                "menu-history" => Some("history"),
+                "menu-remove-occurrence" => Some("close"),
+                "menu-share" => Some("link"),
+                "menu-credits" | "menu-lyrics" | "menu-episode" | "menu-chapters" => {
+                    Some("description")
+                }
+                "menu-related" => Some("music"),
+                _ => None,
+            },
+            _ => None,
+        };
         div()
             .id(id)
             .w_full()
-            .px(px(10.))
-            .py(px(11.))
-            .rounded(px(5.))
+            .h(px(48.))
+            .px(px(8.))
+            .flex()
+            .items_center()
             .cursor_pointer()
+            .text_size(px(14.))
             .hover(|d| d.bg(self.theme.raised))
-            .child(label.into())
+            .children(glyph.map(|glyph| div().mx(px(8.)).child(icon(glyph, 18., self.theme.text))))
+            .child(div().mx(px(8.)).flex_1().min_w_0().child(label.into()))
             .on_click(cx.listener(move |view, _, window, cx| action(view, window, cx)))
     }
     fn backdrop(&self, body: AnyElement, cx: &Context<Self>) -> AnyElement {
@@ -6136,10 +7024,13 @@ impl Music {
                 self.account_operation,
                 Some(AccountOperation::Connecting(_, _))
             );
-            let restoring = matches!(self.account_operation, Some(AccountOperation::Restoring(_)));
+            let restoring = matches!(
+                self.account_operation,
+                Some(AccountOperation::Restoring(_) | AccountOperation::Refreshing { .. })
+            );
             let activating = matches!(
                 self.account_operation,
-                Some(AccountOperation::Activating(_))
+                Some(AccountOperation::Activating { .. })
             );
             let (connect_label, instructions) = match &self.account_operation {
                 Some(AccountOperation::Connecting(_, BrowserConnection::Opening)) => {
@@ -6166,8 +7057,12 @@ impl Music {
                     )),
                 ),
                 Some(AccountOperation::Restoring(_)) => ("Restoring account…".to_owned(), None),
+                Some(AccountOperation::Refreshing { .. }) => {
+                    ("Reconnecting account…".to_owned(), None)
+                }
+                Some(AccountOperation::RefreshFailed { .. }) => ("Retry account".to_owned(), None),
                 Some(AccountOperation::RestoreFailed) => ("Retry saved account".to_owned(), None),
-                Some(AccountOperation::Activating(_)) => {
+                Some(AccountOperation::Activating { .. }) => {
                     ("Preparing account playback…".to_owned(), None)
                 }
                 Some(AccountOperation::Disconnecting(_)) => ("Signing out…".to_owned(), None),
@@ -6189,7 +7084,7 @@ impl Music {
                     .child(connect_label)
                     .on_click(cx.listener(|view,_,window,cx|view.connect_account(window,cx))))
                 .when_some(instructions, |body, text| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child(text)))
-                .when(matches!(self.account_operation,Some(AccountOperation::RestoreFailed)),|body|body.child(
+                .when(matches!(self.account_operation,Some(AccountOperation::RestoreFailed | AccountOperation::RefreshFailed { .. })),|body|body.child(
                     div().id("reconnect-browser-account").mt(px(16.)).cursor_pointer().child("Connect in browser")
                         .on_click(cx.listener(|view,_,window,cx|{
                             view.account_operation=None;
@@ -6893,8 +7788,10 @@ impl Music {
                         .position(position)
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            body.w(px(320.))
-                                .p(px(8.))
+                            body.w(px(240.))
+                                .px(px(0.))
+                                .py(px(16.))
+                                .rounded(px(2.))
                                 .max_h(window.viewport_size().height - px(16.)),
                         ),
                 )
@@ -6909,7 +7806,8 @@ impl Drop for Music {
         if let Some(
             AccountOperation::Connecting(operation, _)
             | AccountOperation::Restoring(operation)
-            | AccountOperation::Activating(operation),
+            | AccountOperation::Refreshing { operation, .. }
+            | AccountOperation::Activating { operation, .. },
         ) = &self.account_operation
         {
             operation.cancel();
@@ -7007,7 +7905,7 @@ impl Render for Music {
             .queue
             .current()
             .is_some()
-            .then(|| self.player_bar(width < 1120., cx));
+            .then(|| self.player_bar(width, cx));
         div()
             .size_full()
             .relative()
@@ -7642,3 +8540,7 @@ mod tests {
         assert_eq!(loading.toggled().toggled(), loading);
     }
 }
+
+#[cfg(test)]
+#[path = "native_account_tests.rs"]
+mod native_account_tests;

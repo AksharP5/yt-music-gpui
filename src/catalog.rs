@@ -1,4 +1,4 @@
-use crate::auth::Session;
+use crate::auth::{self, Session};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{blocking::Client, header::HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -261,6 +261,8 @@ impl Rating {
 #[serde(default)]
 pub struct TrackDetails {
     #[serde(skip)]
+    pub plays: Option<String>,
+    #[serde(skip)]
     pub watch: Option<Arc<WatchTarget>>,
     #[serde(skip)]
     pub rating: Option<Rating>,
@@ -438,6 +440,10 @@ pub struct BrowseChoice {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Song lists dominate; keep tracks inline to avoid an allocation per row."
+)]
 pub enum Item {
     Track(Track),
     Collection(Collection),
@@ -489,12 +495,21 @@ pub enum ShelfLayout {
     Cards,
     Videos,
     Songs,
+    Featured,
+}
+
+#[derive(Clone, Debug)]
+pub enum HeaderArtist {
+    Link(BrowseLink),
+    Text(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct PageHeader {
     pub thumbnail: Option<String>,
+    pub artist: Option<HeaderArtist>,
     pub subtitle: String,
+    pub stats: String,
     pub shuffle: Option<Arc<PlaylistTarget>>,
     pub mix: Option<Arc<PlaylistTarget>>,
     pub subscribed: Option<bool>,
@@ -522,6 +537,17 @@ impl Continuation {
 
     pub(crate) fn token(&self) -> &str {
         &self.token
+    }
+
+    pub(crate) fn renew_session(
+        &mut self,
+        expected: &Arc<Session>,
+        next: &Arc<Session>,
+    ) -> Result<()> {
+        self.require_session(Some(expected))?;
+        expected.require_same_account(next)?;
+        self.session = Some(next.clone());
+        Ok(())
     }
 
     fn require_session(&self, session: Option<&Arc<Session>>) -> Result<()> {
@@ -707,6 +733,15 @@ impl Catalog {
             .json()
             .map_err(reqwest::Error::without_url)
             .context("YouTube Music returned an unreadable response")?;
+        if let Some(session) = &self.session {
+            session.check_response_identity(&value)?;
+            if matches!(
+                value.pointer("/error/code").and_then(Value::as_u64),
+                Some(401 | 403)
+            ) {
+                return Err(auth::RejectedSession.into());
+            }
+        }
         if let Some(error) = value.get("error") {
             bail!(
                 "YouTube Music: {}",
@@ -1109,16 +1144,32 @@ fn parse_item(value: &Value) -> Option<Item> {
                     && episode.show_id.is_some()
             })
         });
-        let artist = show
-            .or_else(|| {
-                runs.iter().find(|r| {
-                    r.pointer("/navigationEndpoint/browseEndpoint/browseId")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| id.starts_with("UC"))
-                })
+        let show_id = show.and_then(|run| {
+            run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(Value::as_str)
+        });
+        let is_creator = |run: &Value| {
+            run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| show_id.map_or_else(|| id.starts_with("UC"), |show| id == show))
+        };
+        let artist = metadata
+            .iter()
+            .find_map(|column| {
+                let runs = column["runs"].as_array()?;
+                let first = runs.iter().position(&is_creator)?;
+                let last = runs.iter().rposition(&is_creator)?;
+                let creators = &runs[first..=last];
+                creators
+                    .iter()
+                    .all(|run| run.get("navigationEndpoint").is_none() || is_creator(run))
+                    .then(|| {
+                        creators
+                            .iter()
+                            .filter_map(|run| run["text"].as_str())
+                            .collect::<String>()
+                    })
             })
-            .and_then(|r| r["text"].as_str())
-            .map(str::to_owned)
             .or_else(|| {
                 if episode.is_some() {
                     return None;
@@ -1267,6 +1318,23 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> Tra
             .map(str::to_owned)
     };
     let mut details = TrackDetails {
+        plays: row["flexColumns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .skip(1)
+            .filter_map(|column| column.pointer("/musicResponsiveListItemFlexColumnRenderer/text"))
+            .map(text)
+            .find(|label| {
+                label.starts_with(|c: char| c.is_ascii_digit())
+                    && (label.ends_with(" plays") || label.ends_with(" views"))
+            })
+            .or_else(|| {
+                ["viewCountText", "shortViewCountText"]
+                    .into_iter()
+                    .map(|key| text(&row[key]))
+                    .find(|label| !label.is_empty())
+            }),
         watch: WatchTarget::from_row(row, video_id).map(Arc::new),
         rating: item_rating(row),
         set_video_id: row
@@ -1391,9 +1459,13 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                         shelves.push(Shelf {
                             title,
                             items,
-                            layout: contents
-                                .and_then(Value::as_array)
-                                .map_or(ShelfLayout::Cards, |items| shelf_layout(items)),
+                            layout: if key == "musicCardShelfRenderer" {
+                                ShelfLayout::Featured
+                            } else {
+                                contents
+                                    .and_then(Value::as_array)
+                                    .map_or(ShelfLayout::Cards, |items| shelf_layout(items))
+                            },
                             more,
                         });
                     }
@@ -1405,19 +1477,33 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
             }
         }
         Value::Array(items) => {
-            let rows: Vec<_> = items.iter().filter_map(parse_item).collect();
+            let mut rows = Vec::new();
+            let mut start = 0;
+            for (index, item) in items.iter().enumerate() {
+                if item.get("musicCardShelfRenderer").is_none()
+                    && let Some(row) = parse_item(item)
+                {
+                    rows.push(row);
+                    continue;
+                }
+                if !rows.is_empty() {
+                    shelves.push(Shelf {
+                        title: String::new(),
+                        items: std::mem::take(&mut rows),
+                        layout: shelf_layout(&items[start..index]),
+                        more: None,
+                    });
+                }
+                parse_shelves(item, shelves);
+                start = index + 1;
+            }
             if !rows.is_empty() {
                 shelves.push(Shelf {
                     title: String::new(),
                     items: rows,
-                    layout: shelf_layout(items),
+                    layout: shelf_layout(&items[start..]),
                     more: None,
                 });
-            }
-            for item in items {
-                if parse_item(item).is_none() {
-                    parse_shelves(item, shelves);
-                }
             }
         }
         _ => {}
@@ -1515,17 +1601,29 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         title,
         header: header.map(|header| PageHeader {
             thumbnail: thumbnail(&header["thumbnail"]),
-            subtitle: [
-                "straplineTextOne",
-                "subtitle",
-                "secondSubtitle",
-                "monthlyListenerCount",
-            ]
-            .into_iter()
-            .map(|key| text(&header[key]))
-            .filter(|part| !part.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" • "),
+            artist: {
+                let artist = text(&header["straplineTextOne"]);
+                (!artist.is_empty()).then(|| {
+                    header["straplineTextOne"]["runs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|run| {
+                            BrowseLink::from_endpoint(
+                                &run["navigationEndpoint"]["browseEndpoint"],
+                                artist.clone(),
+                            )
+                        })
+                        .map_or(HeaderArtist::Text(artist), HeaderArtist::Link)
+                })
+            },
+            stats: text(&header["secondSubtitle"]),
+            subtitle: ["subtitle", "monthlyListenerCount"]
+                .into_iter()
+                .map(|key| text(&header[key]))
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" • "),
             shuffle: artist_header
                 .and_then(|header| header.pointer("/playButton/buttonRenderer"))
                 .filter(|button| {
@@ -1799,7 +1897,11 @@ mod tests {
                 header.thumbnail.as_deref(),
                 Some("https://lh3.googleusercontent.com/collection")
             );
-            assert_eq!(header.subtitle, "Artist • Album • 2026 • 10 songs");
+            assert_eq!(header.subtitle, "Album • 2026");
+            assert_eq!(header.stats, "10 songs");
+            assert!(
+                matches!(header.artist, Some(HeaderArtist::Text(artist)) if artist == "Artist")
+            );
         }
         let page = parse_page(
             &json!({"contents":[{"musicShelfRenderer":{"contents":[{
@@ -1994,6 +2096,111 @@ mod tests {
             parse_page(&response, "Artist").unwrap().shelves[0]
                 .more
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn creator_columns_keep_collaborators_and_separate_play_counts() {
+        let row = json!({"musicResponsiveListItemRenderer":{
+            "flexColumns":[
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"A song","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}}}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+                    {"text":"Artist A","navigationEndpoint":{"browseEndpoint":{"browseId":"UCfirst"}}},
+                    {"text":" & "},
+                    {"text":"Artist B","navigationEndpoint":{"browseEndpoint":{"browseId":"UCsecond"}}}
+                ]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"1.2B plays"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"The album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}}]}}}
+            ]
+        }});
+        let Some(Item::Track(track)) = parse_item(&row) else {
+            panic!("expected a song");
+        };
+        assert_eq!(track.artist, "Artist A & Artist B");
+        assert_eq!(track.details.plays.as_deref(), Some("1.2B plays"));
+        assert_eq!(track.album.as_deref(), Some("The album"));
+        assert_eq!(track.details.artist_id.as_deref(), Some("UCfirst"));
+        let restored: Track =
+            serde_json::from_value(serde_json::to_value(&track).unwrap()).unwrap();
+        assert!(restored.details.plays.is_none());
+        assert_eq!(restored.artist, track.artist);
+
+        let mixed = json!({"musicResponsiveListItemRenderer":{
+            "title":{"runs":[{"text":"A song","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}}}]},
+            "subtitle":{"runs":[
+                {"text":"Song • "},
+                {"text":"Artist A","navigationEndpoint":{"browseEndpoint":{"browseId":"UCfirst"}}},
+                {"text":" & "},
+                {"text":"Artist B","navigationEndpoint":{"browseEndpoint":{"browseId":"UCsecond"}}},
+                {"text":" • "},
+                {"text":"The album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}},
+                {"text":" • 1.2B plays"}
+            ]}
+        }});
+        let Some(Item::Track(track)) = parse_item(&mixed) else {
+            panic!("expected a song");
+        };
+        assert_eq!(track.artist, "Artist A & Artist B");
+        assert!(
+            track.details.plays.is_none(),
+            "A mixed subtitle is not a dedicated play-count column"
+        );
+    }
+
+    #[test]
+    fn responsive_header_keeps_linked_artist_and_stats_on_separate_lines() {
+        let page = parse_page(&json!({
+            "header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"An album"},
+                "straplineTextOne":{"runs":[{"text":"The artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist", "params":"issued%3D"}}}]},
+                "subtitle":{"simpleText":"Album • 2013"},
+                "secondSubtitle":{"simpleText":"13 songs • 1 hour, 14 minutes"}
+            }},
+            "contents":[]
+        }), "Album").unwrap();
+        let header = page.header.unwrap();
+        assert_eq!(header.subtitle, "Album • 2013");
+        assert_eq!(header.stats, "13 songs • 1 hour, 14 minutes");
+        let Some(HeaderArtist::Link(artist)) = header.artist else {
+            panic!("expected linked artist");
+        };
+        assert_eq!(artist.title, "The artist");
+        assert_eq!(artist.id, "UCartist");
+        assert_eq!(artist.params.as_deref(), Some("issued%3D"));
+    }
+
+    #[test]
+    fn featured_search_result_keeps_its_own_item_before_associated_tracks() {
+        let page = parse_page(&json!({"contents":[
+            {"musicCardShelfRenderer":{
+                "title":{"runs":[{"text":"The artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}]},
+                "subtitle":{"simpleText":"Artist • 67M monthly audience"},
+                "contents":[
+                    {"musicResponsiveListItemRenderer":{"title":{"simpleText":"First song"},"playlistItemData":{"videoId":"abcdefghijk"}}},
+                    {"musicResponsiveListItemRenderer":{"title":{"simpleText":"Second song"},"playlistItemData":{"videoId":"lmnopqrstuv"}}}
+                ]
+            }},
+            {"itemSectionRenderer":{"contents":[
+                {"musicResponsiveListItemRenderer":{"title":{"runs":[{"text":"Another artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCanother"}}}]}}}
+            ]}}
+        ]}), "Search").unwrap();
+        assert_eq!(page.shelves[0].layout, ShelfLayout::Featured);
+        assert_eq!(
+            page.shelves[0]
+                .items
+                .iter()
+                .map(Item::title)
+                .collect::<Vec<_>>(),
+            ["The artist", "First song", "Second song"]
+        );
+        assert_eq!(
+            page.shelves[0].items[0].subtitle(),
+            "Artist • 67M monthly audience"
+        );
+        assert_eq!(page.shelves[1].items[0].title(), "Another artist");
+        assert!(
+            page.shelves[1].title.is_empty(),
+            "Untitled service sections must not invent headings"
         );
     }
 
@@ -3325,6 +3532,56 @@ mod tests {
         assert_eq!(tracks[0].credits_id().as_deref(), Some("MPTCcanonical"));
         tracks[0].details.credits_id = None;
         assert_eq!(tracks[0].credits_id().as_deref(), Some("MPTCabcdefghijk"));
+    }
+
+    #[test]
+    #[ignore = "reads public artist, album and search display metadata without an account"]
+    fn live_public_visual_metadata() {
+        let catalog = Catalog::new().unwrap();
+        let artist = catalog
+            .browse(&BrowseLink::new("UCRr1xG_2WIDs18a6cIiCxeA", "Daft Punk"))
+            .unwrap();
+        assert!(
+            artist
+                .tracks()
+                .iter()
+                .any(|track| track.details.plays.is_some())
+        );
+        let album = catalog
+            .browse(&BrowseLink::new(
+                "MPREb_K8qWMWVqXGi",
+                "Random Access Memories",
+            ))
+            .unwrap();
+        let header = album.header.unwrap();
+        assert!(
+            matches!(header.artist, Some(HeaderArtist::Link(artist)) if artist.id == "UCRr1xG_2WIDs18a6cIiCxeA")
+        );
+        assert!(header.subtitle.contains("Album"));
+        assert!(!header.stats.is_empty());
+        let search = catalog
+            .search_filtered(
+                "Daft Punk",
+                crate::search::SearchFilter::All,
+                crate::search::SearchScope::Catalog,
+            )
+            .unwrap();
+        let featured = search
+            .shelves
+            .iter()
+            .find(|shelf| shelf.layout == ShelfLayout::Featured)
+            .expect("Public search must retain its featured result");
+        assert!(
+            matches!(featured.items.first(), Some(Item::Collection(collection)) if collection.id == "UCRr1xG_2WIDs18a6cIiCxeA")
+        );
+        assert!(
+            featured
+                .items
+                .iter()
+                .skip(1)
+                .any(|item| matches!(item, Item::Track(_)))
+        );
+        println!("Public artist counts, album artist/stats and featured-search metadata passed");
     }
 
     #[test]
