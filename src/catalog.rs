@@ -6,12 +6,25 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
+
+// Share only transport; account and continuation authority belongs to each request.
+static CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
+    Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36",
+        )
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("{error:#}"))
+});
 
 #[derive(Clone)]
 pub struct Account {
@@ -623,13 +636,11 @@ impl Catalog {
     }
 
     pub fn with_session(session: Option<Arc<Session>>) -> Result<Self> {
-        Ok(Self {
-            session, client: Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(25))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()? })
+        let client = CLIENT
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .clone();
+        Ok(Self { session, client })
     }
 
     pub fn for_session(&self, session: Option<Arc<Session>>) -> Self {
@@ -2204,6 +2215,88 @@ mod tests {
             page.shelves[1].title.is_empty(),
             "Untitled service sections must not invent headings"
         );
+    }
+
+    #[test]
+    fn shared_transport_keeps_guest_and_account_requests_separate() {
+        let session = |cookie, authuser, identity, delegated, version| {
+            Arc::new(
+                serde_json::from_value::<Session>(json!({
+                    "cookie": cookie,
+                    "playback_cookie": "# Netscape HTTP Cookie File\n",
+                    "authuser": authuser,
+                    "data_sync_id": identity,
+                    "delegated_session_id": delegated,
+                    "client_version": version
+                }))
+                .unwrap(),
+            )
+        };
+        let first = Catalog::with_session(Some(session(
+            "SAPISID=synthetic-a",
+            "1",
+            "user-a||",
+            None::<&str>,
+            "client-a",
+        )))
+        .unwrap();
+        let second = Catalog::with_session(Some(session(
+            "SAPISID=synthetic-b",
+            "2",
+            "brand-b||user-b",
+            Some("brand-b"),
+            "client-b",
+        )))
+        .unwrap();
+        let request = |catalog: &Catalog| {
+            catalog
+                .page_request("browse", json!({"browseId":"FEmusic_home"}), None)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let first = request(&first);
+        let guest = request(&Catalog::new().unwrap());
+        let second = request(&second);
+        let next_guest = request(&Catalog::new().unwrap());
+        for guest in [&guest, &next_guest] {
+            for header in [
+                "Cookie",
+                "Authorization",
+                "X-Goog-AuthUser",
+                "X-Goog-PageId",
+                "X-Goog-Visitor-Id",
+            ] {
+                assert!(guest.headers().get(header).is_none());
+            }
+            let body: Value =
+                serde_json::from_slice(guest.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body["context"]["client"]["clientVersion"], CLIENT_VERSION);
+            assert!(body["context"].get("user").is_none());
+        }
+        assert_eq!(first.headers()["Cookie"], "SAPISID=synthetic-a");
+        assert_eq!(second.headers()["Cookie"], "SAPISID=synthetic-b");
+        assert_eq!(first.headers()["X-Goog-AuthUser"], "1");
+        assert_eq!(second.headers()["X-Goog-AuthUser"], "2");
+        assert_ne!(
+            first.headers()["Authorization"],
+            second.headers()["Authorization"]
+        );
+        for request in [&first, &second] {
+            assert!(request.headers()["Cookie"].is_sensitive());
+            assert!(request.headers()["Authorization"].is_sensitive());
+        }
+        let first_body: Value =
+            serde_json::from_slice(first.body().unwrap().as_bytes().unwrap()).unwrap();
+        let second_body: Value =
+            serde_json::from_slice(second.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(first_body["context"]["client"]["clientVersion"], "client-a");
+        assert_eq!(
+            second_body["context"]["client"]["clientVersion"],
+            "client-b"
+        );
+        assert!(first_body["context"].get("user").is_none());
+        assert_eq!(second_body["context"]["user"]["onBehalfOfUser"], "brand-b");
     }
 
     #[test]

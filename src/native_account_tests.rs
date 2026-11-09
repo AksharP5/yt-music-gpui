@@ -1,6 +1,6 @@
 use super::{
-    AccountOperation, BrowserConnection, CatalogRequests, CatalogTarget, Music, Overlay, Playback,
-    PlaybackQuery, PlaybackResult, QueueUpdate, Route, Startup,
+    AccountOperation, BrowserConnection, CatalogRequests, CatalogTarget, Drag, Music, Overlay,
+    Playback, PlaybackQuery, PlaybackResult, QueueUpdate, Route, Startup,
 };
 use crate::{
     account::{self, Connection, Mutation},
@@ -8,7 +8,8 @@ use crate::{
     auth::{BrowserProfile, Operation, Session},
     catalog::{Account, BrowseLink, Rating, Track},
     input,
-    library::Repeat,
+    library::{LibraryWriter, Repeat, Store},
+    mpris,
     player::{Player, PlayerOptions},
     track_state,
     watch::{MediaPair, Watch, WatchMode},
@@ -180,6 +181,34 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
             view
         })).unwrap();
         cx.spawn(async move |cx| {
+            window.update(cx, |view, _, cx| {
+                let path = data.join("yt-music-gpui/library.json");
+                assert!(!path.exists());
+                let (store, _) = Store::load().unwrap();
+                let (writer, errors) = LibraryWriter::new(store);
+                view.store = Some(writer);
+                view.desktop_event(mpris::Event::Volume(view.library.volume), cx);
+                view.drag = Some(Drag::Seek);
+                view.drag_position = Some(42.);
+                view.end_drag(cx);
+                drop(view.store.take());
+                assert!(errors.is_empty());
+                assert!(!path.exists(), "Seeking and unchanged volume must not save an identical library");
+
+                let (store, _) = Store::load().unwrap();
+                let (writer, errors) = LibraryWriter::new(store);
+                view.store = Some(writer);
+                assert!(view.set_volume(40., cx));
+                view.drag = Some(Drag::Volume);
+                view.end_drag(cx);
+                drop(view.store.take());
+                assert!(errors.is_empty());
+                let (_, saved) = Store::load().unwrap();
+                assert_eq!(saved.volume, 40., "Changed volume must still be saved on release");
+                assert_eq!(saved.queue.index, view.library.queue.index);
+                view.pending_seek = None;
+                view.set_volume(0., cx);
+            }).unwrap();
             let signed_in = window.update(cx, |view, window, cx| {
                 let previous = view.account.as_ref().unwrap().session.clone();
                 let profile: BrowserProfile = serde_json::from_value(json!({

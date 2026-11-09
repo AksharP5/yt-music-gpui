@@ -9,8 +9,8 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File},
-    io::{ErrorKind, Read, Seek, Write},
-    os::fd::{AsRawFd, FromRawFd},
+    io::{self, ErrorKind, Read, Seek, Write},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -277,8 +277,97 @@ enum PlayerCommand {
     Quit,
 }
 
+#[derive(Clone)]
+struct CommandSender {
+    sender: Sender<PlayerCommand>,
+    wake: Arc<OwnedFd>,
+}
+
+fn command_channel() -> Result<(CommandSender, Receiver<PlayerCommand>)> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error())
+            .context("Could not create the player command wakeup");
+    }
+    let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    let (sender, receiver) = mpsc::channel();
+    Ok((CommandSender { sender, wake }, receiver))
+}
+
+impl CommandSender {
+    fn send(&self, command: PlayerCommand) -> Result<(), mpsc::SendError<PlayerCommand>> {
+        self.sender.send(command)?;
+        let increment = 1_u64.to_ne_bytes();
+        loop {
+            let result = unsafe {
+                libc::write(
+                    self.wake.as_raw_fd(),
+                    increment.as_ptr().cast(),
+                    increment.len(),
+                )
+            };
+            if result == increment.len() as isize {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                ErrorKind::Interrupted => continue,
+                // A saturated eventfd is already readable, so no wakeup is lost.
+                ErrorKind::WouldBlock => return Ok(()),
+                _ => unreachable!("The owned player wakeup must remain writable: {error}"),
+            }
+        }
+    }
+}
+
+fn wait_for_player_input(socket: &UnixStream, wake: &OwnedFd) -> Result<bool> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 80) };
+        if result >= 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error).context("Could not wait for the player");
+        }
+    }
+    ensure!(
+        descriptors[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0,
+        "The player command wakeup stopped"
+    );
+    if descriptors[1].revents & libc::POLLIN != 0 {
+        let mut count = [0_u8; 8];
+        loop {
+            let result =
+                unsafe { libc::read(wake.as_raw_fd(), count.as_mut_ptr().cast(), count.len()) };
+            if result == count.len() as isize {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                ErrorKind::Interrupted => continue,
+                ErrorKind::WouldBlock => break,
+                _ => return Err(error).context("Could not read the player command wakeup"),
+            }
+        }
+    }
+    Ok(descriptors[0].revents != 0)
+}
+
 pub struct Player {
-    commands: Sender<PlayerCommand>,
+    commands: CommandSender,
     events: async_channel::Receiver<PlayerEvent>,
     next_id: AtomicU64,
     worker: Option<thread::JoinHandle<()>>,
@@ -286,12 +375,13 @@ pub struct Player {
 
 impl Player {
     pub fn new(options: PlayerOptions) -> Result<Self> {
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver) = command_channel()?;
+        let wake = commands.wake.clone();
         let (events, event_receiver) = async_channel::unbounded();
         let worker = thread::Builder::new()
             .name("music-player".into())
             .spawn(move || {
-                if let Err(error) = run(options, receiver, &events) {
+                if let Err(error) = run(options, receiver, &wake, &events) {
                     let _ = events.send_blocking(PlayerEvent::Error {
                         track_id: None,
                         message: format!("{error:#}"),
@@ -441,7 +531,7 @@ impl Drop for Player {
 
 pub struct VideoAttachment {
     binding: Rc<RefCell<VideoState>>,
-    commands: Sender<PlayerCommand>,
+    commands: CommandSender,
     window: AnyWindowHandle,
     _quit: Subscription,
 }
@@ -537,7 +627,7 @@ impl Drop for VideoAttachment {
 
 struct VideoBinding {
     video: Arc<NativeVideo>,
-    commands: Sender<PlayerCommand>,
+    commands: CommandSender,
 }
 
 impl Drop for VideoBinding {
@@ -882,6 +972,7 @@ fn replace_playback_credentials(
 fn run(
     options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
+    wake: &OwnedFd,
     events: &async_channel::Sender<PlayerEvent>,
 ) -> Result<()> {
     let runtime = tempfile::Builder::new()
@@ -1075,7 +1166,9 @@ fn run(
             }
         }
         state.write_seek(&mut socket)?;
-        state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
+        if pending.contains(&b'\n') || wait_for_player_input(&socket, wake)? {
+            state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
+        }
         let _ = &credentials;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
     }
@@ -1530,6 +1623,41 @@ impl PlaybackState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn command_wakeups_coalesce_without_losing_commands_or_socket_readiness() {
+        let (commands, received) = command_channel().unwrap();
+        let (mut mpv, socket) = UnixStream::pair().unwrap();
+        commands.send(PlayerCommand::Stop).unwrap();
+        commands.clone().send(PlayerCommand::Pause(true)).unwrap();
+        assert!(!wait_for_player_input(&socket, &commands.wake).unwrap());
+        assert!(matches!(received.try_recv(), Ok(PlayerCommand::Stop)));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerCommand::Pause(true))
+        ));
+        let mut wake = libc::pollfd {
+            fd: commands.wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut wake, 1, 0) }, 0);
+        assert_ne!(
+            unsafe { libc::fcntl(wake.fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+
+        mpv.write_all(b"mpv reply\n").unwrap();
+        commands.send(PlayerCommand::Quit).unwrap();
+        assert!(wait_for_player_input(&socket, &commands.wake).unwrap());
+        let mut reply = [0; 10];
+        (&socket).read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"mpv reply\n");
+        assert!(matches!(received.try_recv(), Ok(PlayerCommand::Quit)));
+        drop(received);
+        assert!(commands.send(PlayerCommand::Stop).is_err());
+        assert_eq!(unsafe { libc::poll(&mut wake, 1, 0) }, 0);
+    }
+
     fn seek_request(revision: u64, seconds: f64) -> SeekRequest {
         SeekRequest {
             track_id: 1,
@@ -1674,7 +1802,7 @@ mod tests {
 
     #[test]
     fn seek_has_a_validated_track_bound_revision() {
-        let (commands, received) = mpsc::channel();
+        let (commands, received) = command_channel().unwrap();
         let (_, events) = async_channel::unbounded();
         let player = Player {
             commands,
@@ -2022,11 +2150,12 @@ mod tests {
     #[test]
     #[ignore = "requires libmpv and yt-dlp; no network or display"]
     fn headless_worker_shuts_down_after_ipc_controls() {
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver) = command_channel().unwrap();
+        let wake = commands.wake.clone();
         let (events, received) = async_channel::unbounded();
         let (finished, completion) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let result = run(PlayerOptions::default(), receiver, &events);
+            let result = run(PlayerOptions::default(), receiver, &wake, &events);
             finished.send(result).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2048,7 +2177,7 @@ mod tests {
 
     #[test]
     fn every_play_has_its_own_validated_options_and_track_id() {
-        let (commands, received) = mpsc::channel();
+        let (commands, received) = command_channel().unwrap();
         let (_, events) = async_channel::unbounded();
         let player = Player {
             commands,
@@ -2770,7 +2899,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
 
     #[test]
     fn credential_responses_close_if_the_worker_cannot_handle_them() {
-        let (commands, received) = mpsc::channel();
+        let (commands, received) = command_channel().unwrap();
         let (_, events) = async_channel::unbounded();
         let player = Player {
             commands,

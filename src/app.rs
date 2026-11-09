@@ -450,6 +450,15 @@ impl DetailList {
         self.state.reset(rows + usize::from(self.inline_header));
         self.state.scroll_to(top);
     }
+    fn append_rows(&self, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        let top = self.state.logical_scroll_top();
+        let end = self.state.item_count();
+        self.state.splice(end..end, rows);
+        self.state.scroll_to(top);
+    }
     fn set_inline_header(&mut self, inline: bool) {
         if self.inline_header == inline {
             return;
@@ -1548,10 +1557,21 @@ impl Music {
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         self.list_rows.clear();
+        self.append_rows(0);
+        if self.page.header.is_some()
+            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
+        {
+            self.detail_list.reset_rows(self.list_rows.len());
+        } else {
+            self.detail_list = DetailList::new();
+        }
+    }
+
+    fn append_rows(&mut self, first_shelf: usize) {
         let sectioned = self.page.header.is_some();
         let search_all =
             matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
-        for (index, shelf) in self.page.shelves.iter().enumerate() {
+        for (index, shelf) in self.page.shelves.iter().enumerate().skip(first_shelf) {
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
             let carousel =
                 sectioned && matches!(shelf.layout, ShelfLayout::Cards | ShelfLayout::Videos);
@@ -1571,11 +1591,6 @@ impl Music {
             if sectioned && !carousel && shelf.more.is_some() {
                 self.list_rows.push(ListRow::More(index));
             }
-        }
-        if self.page.header.is_some() || search_all {
-            self.detail_list.reset_rows(self.list_rows.len());
-        } else {
-            self.detail_list = DetailList::new();
         }
     }
 
@@ -1727,17 +1742,7 @@ impl Music {
                         track.details.clear_account_state();
                     }
                 }
-                if result.append {
-                    self.page.continuation = page.continuation;
-                    self.page.shelves.extend(page.shelves);
-                } else {
-                    self.page = page;
-                    if matches!(self.overlay, Some(Overlay::Track { .. })) {
-                        self.overlay = None;
-                    }
-                }
-                for track in self
-                    .page
+                for track in page
                     .shelves
                     .iter()
                     .flat_map(|shelf| &shelf.items)
@@ -1759,7 +1764,25 @@ impl Music {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                self.rebuild_rows();
+                if result.append {
+                    let first_shelf = self.page.shelves.len();
+                    let previous_rows = self.list_rows.len();
+                    self.page.continuation = page.continuation;
+                    self.page.shelves.extend(page.shelves);
+                    self.append_rows(first_shelf);
+                    if self.page.header.is_some()
+                        || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
+                    {
+                        self.detail_list
+                            .append_rows(self.list_rows.len() - previous_rows);
+                    }
+                } else {
+                    self.page = page;
+                    if matches!(self.overlay, Some(Overlay::Track { .. })) {
+                        self.overlay = None;
+                    }
+                    self.rebuild_rows();
+                }
             }
             Err(error) => self.error = Some(error),
         }
@@ -3831,7 +3854,9 @@ impl Music {
             }
             mpris::Event::Seek { .. } | mpris::Event::SetPosition { .. } => {}
             mpris::Event::Volume(volume) => {
-                self.set_volume(volume, cx);
+                if !self.set_volume(volume, cx) {
+                    return;
+                }
                 self.save();
             }
             mpris::Event::Rate(speed) => self.player_command(|player| player.set_speed(speed)),
@@ -3941,13 +3966,15 @@ impl Music {
             )
         ))
     }
-    fn set_volume(&mut self, volume: f64, cx: &mut Context<Self>) {
+    fn set_volume(&mut self, volume: f64, cx: &mut Context<Self>) -> bool {
         let volume = volume.clamp(0., 100.).round();
-        if self.library.volume != volume {
-            self.library.volume = volume;
-            self.player_command(|p| p.set_volume(volume));
-            cx.notify();
+        if self.library.volume == volume {
+            return false;
         }
+        self.library.volume = volume;
+        self.player_command(|player| player.set_volume(volume));
+        cx.notify();
+        true
     }
     fn drag_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         match self.drag {
@@ -3970,15 +3997,16 @@ impl Music {
         }
     }
     fn end_drag(&mut self, cx: &mut Context<Self>) {
-        if self.drag == Some(Drag::Seek)
-            && let Some(seconds) = self.drag_position.take()
-        {
-            self.seek_current(seconds, cx);
+        match self.drag.take() {
+            Some(Drag::Seek) => {
+                if let Some(seconds) = self.drag_position.take() {
+                    self.seek_current(seconds, cx);
+                }
+            }
+            Some(Drag::Volume) => self.save(),
+            None => return,
         }
-        if self.drag.take().is_some() {
-            self.save();
-            cx.notify();
-        }
+        cx.notify();
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
@@ -4051,12 +4079,14 @@ impl Music {
                 self.seek_current(seconds, cx);
             }
             "up" => {
-                self.set_volume(self.library.volume + 5., cx);
-                self.save();
+                if self.set_volume(self.library.volume + 5., cx) {
+                    self.save();
+                }
             }
             "down" => {
-                self.set_volume(self.library.volume - 5., cx);
-                self.save();
+                if self.set_volume(self.library.volume - 5., cx) {
+                    self.save();
+                }
             }
             "l" => {
                 if let Some(track) = self.library.queue.current().cloned() {
@@ -8715,6 +8745,34 @@ mod tests {
         details.reset_rows(200);
         assert_eq!(details.state.item_count(), 201);
         assert_eq!(details.state.logical_scroll_top().item_ix, 31);
+    }
+
+    #[test]
+    fn appended_rows_preserve_scroll_and_the_empty_list_origin() {
+        let mut details = DetailList::new();
+        details.reset_rows(100);
+        details.set_inline_header(true);
+        details.state.scroll_to(ListOffset {
+            item_ix: 31,
+            offset_in_item: px(8.),
+        });
+        details.append_rows(100);
+        assert_eq!(details.state.item_count(), 201);
+        assert_eq!(details.state.logical_scroll_top().item_ix, 31);
+        assert_eq!(details.state.logical_scroll_top().offset_in_item, px(8.));
+        details.append_rows(0);
+        assert_eq!(details.state.item_count(), 201);
+        assert_eq!(details.state.logical_scroll_top().item_ix, 31);
+
+        let empty = DetailList::new();
+        empty.state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
+        empty.append_rows(5);
+        assert_eq!(empty.state.item_count(), 5);
+        assert_eq!(empty.state.logical_scroll_top().item_ix, 0);
+        assert_eq!(empty.state.logical_scroll_top().offset_in_item, px(0.));
     }
 
     #[test]
