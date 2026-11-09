@@ -17,6 +17,7 @@ const CLIENT_VERSION: &str = "1.20261014.01.00";
 pub struct Account {
     pub name: String,
     pub handle: String,
+    pub thumbnail: Option<String>,
 }
 
 impl Account {
@@ -28,6 +29,7 @@ impl Account {
         Ok(Self {
             name,
             handle: text(&header["channelHandle"]),
+            thumbnail: thumbnail(&header["accountPhoto"]),
         })
     }
 }
@@ -2327,11 +2329,26 @@ mod tests {
     fn account_name_requires_a_signed_in_header() {
         let mut response = json!({"activeAccountHeaderRenderer":{
             "accountName":{"simpleText":"Test account"},
-            "channelHandle":{"simpleText":"@test"}
+            "channelHandle":{"simpleText":"@test"},
+            "accountPhoto":{"thumbnails":[{"url":"https://yt3.ggpht.com/test-account", "width":88}]}
         }});
         let account = Account::from_response(&response).unwrap();
         assert_eq!(account.name, "Test account");
         assert_eq!(account.handle, "@test");
+        assert_eq!(
+            account.thumbnail.as_deref(),
+            Some("https://yt3.ggpht.com/test-account")
+        );
+        response["activeAccountHeaderRenderer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accountPhoto");
+        assert!(
+            Account::from_response(&response)
+                .unwrap()
+                .thumbnail
+                .is_none()
+        );
         response["activeAccountHeaderRenderer"]["accountName"] = json!({});
         assert!(Account::from_response(&response).is_err());
         assert!(Account::from_response(&json!({})).is_err());

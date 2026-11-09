@@ -27,16 +27,15 @@ Builds default to two jobs. Set `CARGO_BUILD_JOBS` to change that. For an Arch p
 
 Connection requires Python 3, xdg-utils, libsecret's `secret-tool` and a running Secret Service keyring. Signed-in playback currently requires yt-dlp **2026.08.19**.
 
-1. Open Settings and choose **Connect in browser**, or launch with `--connect`.
+1. Choose **Sign in**, or launch with `--connect`.
 2. Sign in to YouTube Music in your default browser. Zen and Firefox are supported, including Omarchy's default-browser launcher.
-3. Return to Settings and choose **Read YouTube session**.
-4. Check the displayed name and handle, then choose **Connect as [account name]**.
+3. Return to Music. Your account is verified and saved automatically.
 
 The app reads YouTube cookies from the named browser profile and saves the confirmed session in your desktop keyring. It uses your browser session rather than OAuth, so it has that session's YouTube access. It creates no persistent plaintext cookie export. Private windows, containers and partitioned sessions are unsupported.
 
 Once connected, the browser can stay closed. The app restores your saved account and can renew rejected sessions from its confirmed profile. Google can still revoke a sign-in. Older saved connections need one reconnect to enable renewal.
 
-The account returned by YouTube can differ from the one selected in an open tab. Use **Check another account** to retry, or **Cancel connection** to keep your existing connection. A different account still requires confirmation.
+Your profile menu shows the connected name and handle. Use **Switch account** to connect another account. Closing the sign-in dialog cancels an unfinished connection.
 
 Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
 

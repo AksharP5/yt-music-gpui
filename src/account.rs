@@ -1117,6 +1117,7 @@ mod tests {
         Connection {
             session: Arc::new(session),
             account: Account {
+                thumbnail: None,
                 name: "Synthetic account".into(),
                 handle: String::new(),
             },
@@ -1529,6 +1530,7 @@ mod tests {
             let candidate = Connection {
                 session: Arc::new(synthetic_session()),
                 account: Account {
+                    thumbnail: None,
                     name: "Candidate".into(),
                     handle: String::new(),
                 },
@@ -1562,6 +1564,7 @@ mod tests {
         let candidate = Connection {
             session: Arc::new(synthetic_session()),
             account: Account {
+                thumbnail: None,
                 name: "Synthetic account".into(),
                 handle: String::new(),
             },

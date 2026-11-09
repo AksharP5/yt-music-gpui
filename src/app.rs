@@ -190,6 +190,19 @@ enum PlaybackQuery {
     More(WatchContinuation),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Playback,
+    About,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingMenu {
+    Speed,
+    AudioQuality,
+    VideoQuality,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum QueueUpdate {
     Preserve,
     Adopt,
@@ -297,6 +310,8 @@ impl Playback {
 enum Overlay {
     Help,
     Settings,
+    SignIn,
+    Account,
     CountryPicker(Entity<CountryPicker>),
     Description {
         title: String,
@@ -399,13 +414,9 @@ struct PlaybackResume {
 }
 
 enum BrowserConnection {
-    Opening,
+    Opening { left_app: bool },
     Ready(auth::BrowserProfile),
     Reading(auth::BrowserProfile),
-    Review {
-        profile: auth::BrowserProfile,
-        connection: Connection,
-    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -534,6 +545,8 @@ pub struct Music {
     duration: f64,
     show_queue: bool,
     overlay: Option<Overlay>,
+    settings_section: SettingsSection,
+    settings_menu: Option<SettingMenu>,
     overlay_anchor: Option<Point<Pixels>>,
     overlay_subscription: Option<Subscription>,
     drag: Option<Drag>,
@@ -580,7 +593,10 @@ impl Music {
                 };
                 let _ = account_commands.try_send(command);
                 if startup == Startup::Connect {
-                    AccountOperation::Connecting(operation, BrowserConnection::Opening)
+                    AccountOperation::Connecting(
+                        operation,
+                        BrowserConnection::Opening { left_app: false },
+                    )
                 } else {
                     AccountOperation::Restoring(operation)
                 }
@@ -921,14 +937,7 @@ impl Music {
                 }
                 SearchBoxEvent::Blur => window.focus(&view.focus, cx),
             });
-        let activation = cx.observe_window_activation(window, |view, window, cx| {
-            if window.is_window_active()
-                && view.account.is_some()
-                && view.account_operation.is_none()
-            {
-                view.refresh_remote(cx);
-            }
-        });
+        let activation = cx.observe_window_activation(window, Self::window_activated);
         let mut view = Self {
             theme: Theme::load(),
             session,
@@ -1004,7 +1013,9 @@ impl Music {
             pending_seek: None,
             duration: 0.,
             show_queue: false,
-            overlay: (startup == Startup::Connect).then_some(Overlay::Settings),
+            overlay: (startup == Startup::Connect).then_some(Overlay::SignIn),
+            settings_section: SettingsSection::General,
+            settings_menu: None,
             overlay_anchor: None,
             overlay_subscription: None,
             drag: None,
@@ -1972,83 +1983,78 @@ impl Music {
             }
             Err(_) => {
                 self.account_operation = Some(AccountOperation::RefreshFailed { resume });
-                self.error = Some("Could not reconnect the account. Retry from Settings.".into());
+                self.error =
+                    Some("Could not reconnect. Choose Switch account in your profile menu.".into());
             }
         }
         cx.notify();
         true
     }
 
-    fn connect_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(
-            self.account_operation,
-            Some(AccountOperation::RefreshFailed { .. })
-        ) {
-            self.next_session_refresh = None;
-            self.refresh_session(false, cx);
-            return;
-        }
-        if !auth::ACCOUNT_LOGIN_ENABLED {
-            self.error = Some("Account connection is unavailable.".into());
-            cx.notify();
-            return;
-        }
-        if matches!(
-            self.account_operation,
-            Some(AccountOperation::RestoreFailed)
-        ) {
-            let operation = Operation::default();
-            match self
-                .account_commands
-                .try_send(account::Command::Restore(operation.clone()))
+    fn window_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active() {
+            if let Some(AccountOperation::Connecting(_, BrowserConnection::Opening { left_app })) =
+                &mut self.account_operation
             {
-                Ok(()) => {
-                    self.account_operation = Some(AccountOperation::Restoring(operation));
-                    self.error = None;
-                    self.notice = Some("Restoring your saved account…".into());
-                }
-                Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
+                *left_app = true;
             }
+            return;
+        }
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::Connecting(_, BrowserConnection::Ready(_)))
+        ) {
+            self.read_browser_account(cx);
+        } else if self.account.is_some() && self.account_operation.is_none() {
+            self.refresh_remote(cx);
+        }
+    }
+
+    fn read_browser_account(&mut self, cx: &mut Context<Self>) {
+        let Some(AccountOperation::Connecting(operation, BrowserConnection::Ready(profile))) =
+            &self.account_operation
+        else {
+            return;
+        };
+        let operation = operation.clone();
+        let profile = profile.clone();
+        match self
+            .account_commands
+            .try_send(account::Command::ReadBrowser {
+                operation: operation.clone(),
+                profile: profile.clone(),
+            }) {
+            Ok(()) => {
+                self.account_operation = Some(AccountOperation::Connecting(
+                    operation,
+                    BrowserConnection::Reading(profile),
+                ));
+                self.error = None;
+                self.notice = None;
+            }
+            Err(_) => self.error = Some("Could not check your sign-in. Try again.".into()),
+        }
+        cx.notify();
+    }
+
+    fn connect_account(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !auth::ACCOUNT_LOGIN_ENABLED {
+            self.error = Some("Sign-in is unavailable.".into());
             cx.notify();
             return;
         }
-        if let Some(AccountOperation::Connecting(operation, stage)) = &self.account_operation {
-            match stage {
-                BrowserConnection::Ready(profile) => {
-                    let operation = operation.clone();
-                    let profile = profile.clone();
-                    match self
-                        .account_commands
-                        .try_send(account::Command::ReadBrowser {
-                            operation: operation.clone(),
-                            profile: profile.clone(),
-                        }) {
-                        Ok(()) => {
-                            self.account_operation = Some(AccountOperation::Connecting(
-                                operation,
-                                BrowserConnection::Reading(profile),
-                            ));
-                            self.error = None;
-                            self.notice = Some("Checking the browser's YouTube account…".into());
-                        }
-                        Err(_) => {
-                            self.error = Some("The account connection is busy. Try again.".into())
-                        }
-                    }
-                }
-                BrowserConnection::Review { connection, .. } => {
-                    let event = account::Event::Connected {
-                        operation: operation.clone(),
-                        result: Ok(Some(connection.clone())),
-                        save_session: true,
-                    };
-                    self.error = None;
-                    self.account_event(event, window, cx);
-                }
-                BrowserConnection::Opening | BrowserConnection::Reading(_) => {}
-            }
-            cx.notify();
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::Connecting(_, BrowserConnection::Ready(_)))
+        ) {
+            self.read_browser_account(cx);
             return;
+        }
+        if matches!(
+            self.account_operation,
+            Some(AccountOperation::RestoreFailed | AccountOperation::RefreshFailed { .. })
+        ) {
+            self.account_operation = None;
         }
         if self.account_operation.is_some() {
             return;
@@ -2061,29 +2067,15 @@ impl Music {
             Ok(()) => {
                 self.account_operation = Some(AccountOperation::Connecting(
                     operation,
-                    BrowserConnection::Opening,
+                    BrowserConnection::Opening { left_app: false },
                 ));
+                self.overlay = Some(Overlay::SignIn);
                 self.error = None;
-                self.notice = Some("Opening your default browser…".into());
+                self.notice = None;
             }
-            Err(_) => self.error = Some("The account connection is busy. Try again.".into()),
+            Err(_) => self.error = Some("Could not start sign-in. Try again.".into()),
         }
         cx.notify();
-    }
-    fn retry_browser_account(&mut self, cx: &mut Context<Self>) {
-        if let Some(AccountOperation::Connecting(
-            operation,
-            BrowserConnection::Review { profile, .. },
-        )) = &self.account_operation
-        {
-            self.account_operation = Some(AccountOperation::Connecting(
-                operation.clone(),
-                BrowserConnection::Ready(profile.clone()),
-            ));
-            self.error = None;
-            self.notice = None;
-            cx.notify();
-        }
     }
     fn cancel_connection(&mut self, cx: &mut Context<Self>) {
         let refreshing = matches!(
@@ -2345,9 +2337,13 @@ impl Music {
     }
 
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::SignIn)) {
+            self.cancel_connection(cx);
+        }
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.song_text.cancel();
         self.overlay = None;
+        self.settings_menu = None;
         self.overlay_anchor = None;
         self.overlay_subscription = None;
         window.focus(&self.focus, cx);
@@ -2381,17 +2377,23 @@ impl Music {
     ) {
         match event {
             account::Event::BrowserReady { operation, result } => {
-                if !matches!(&self.account_operation, Some(AccountOperation::Connecting(active, BrowserConnection::Opening)) if active.matches(&operation))
-                {
-                    return;
-                }
+                let returned = match &self.account_operation {
+                    Some(AccountOperation::Connecting(
+                        active,
+                        BrowserConnection::Opening { left_app },
+                    )) if active.matches(&operation) => *left_app && window.is_window_active(),
+                    _ => return,
+                };
                 self.notice = None;
                 match result {
                     Ok(profile) => {
                         self.account_operation = Some(AccountOperation::Connecting(
                             operation,
                             BrowserConnection::Ready(profile),
-                        ))
+                        ));
+                        if returned {
+                            self.read_browser_account(cx);
+                        }
                     }
                     Err(error) => {
                         self.account_operation = None;
@@ -2410,17 +2412,28 @@ impl Music {
                 }
                 let profile = profile.clone();
                 self.notice = None;
-                let stage = match result {
-                    Ok(connection) => BrowserConnection::Review {
-                        profile,
-                        connection,
-                    },
+                match result {
+                    Ok(connection) => {
+                        self.error = None;
+                        self.overlay = None;
+                        self.account_event(
+                            account::Event::Connected {
+                                operation,
+                                result: Ok(Some(connection)),
+                                save_session: true,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
                     Err(error) => {
                         self.error = Some(error);
-                        BrowserConnection::Ready(profile)
+                        self.account_operation = Some(AccountOperation::Connecting(
+                            operation,
+                            BrowserConnection::Ready(profile),
+                        ));
                     }
-                };
-                self.account_operation = Some(AccountOperation::Connecting(operation, stage));
+                }
             }
             account::Event::Disconnected { operation, result } => {
                 if !matches!(&self.account_operation, Some(AccountOperation::Disconnecting(active)) if active.matches(&operation))
@@ -2454,10 +2467,11 @@ impl Music {
                         retry_change,
                         resume,
                     }) if active.matches(&operation) => (false, true, *retry_change, resume.take()),
-                    Some(AccountOperation::Connecting(
-                        active,
-                        BrowserConnection::Review { .. },
-                    )) if active.matches(&operation) => (false, false, false, None),
+                    Some(AccountOperation::Connecting(active, BrowserConnection::Reading(_)))
+                        if active.matches(&operation) =>
+                    {
+                        (false, false, false, None)
+                    }
                     _ => return,
                 };
                 let pending = pending.or_else(|| {
@@ -4054,6 +4068,10 @@ impl Music {
                 cx.notify();
             }
             "escape" => {
+                if self.settings_menu.take().is_some() {
+                    cx.notify();
+                    return;
+                }
                 if self.overlay.is_some() {
                     self.close_overlay(window, cx);
                     return;
@@ -4127,7 +4145,7 @@ impl Music {
             .text_size(px(if compact { 10. } else { 16. }))
             .text_color(self.theme.text)
             .when(active, |d| d.bg(self.theme.selection))
-            .hover(|d| d.bg(self.theme.raised))
+            .hover(|d| d.bg(gpui::white().opacity(0.1)))
             .cursor_pointer()
             .child(icon(glyph, 24., self.theme.text))
             .child(label)
@@ -4185,7 +4203,7 @@ impl Music {
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
-                    .hover(|d| d.bg(self.theme.raised))
+                    .hover(|d| d.bg(gpui::white().opacity(0.1)))
                     .child(icon("plus", 20., self.theme.text))
                     .child("New playlist")
                     .on_click(cx.listener(|view, _, window, cx| {
@@ -4193,8 +4211,7 @@ impl Music {
                         if view.account.is_some() {
                             view.playlist_form(false, None, window, cx);
                         } else {
-                            view.overlay = Some(Overlay::Settings);
-                            cx.notify();
+                            view.connect_account(window, cx);
                         }
                     })),
             );
@@ -4217,7 +4234,7 @@ impl Music {
                     .gap(px(4.))
                     .cursor_pointer()
                     .when(self.route == route, |d| d.bg(self.theme.selection))
-                    .hover(|d| d.bg(self.theme.raised))
+                    .hover(|d| d.bg(gpui::white().opacity(0.1)))
                     .child(
                         div()
                             .text_size(px(14.))
@@ -4248,7 +4265,7 @@ impl Music {
                     .justify_center()
                     .gap(px(4.))
                     .cursor_pointer()
-                    .hover(|d| d.bg(self.theme.raised))
+                    .hover(|d| d.bg(gpui::white().opacity(0.1)))
                     .child(
                         div()
                             .text_size(px(14.))
@@ -4346,12 +4363,46 @@ impl Music {
         }
         sidebar.into_any_element()
     }
-    fn header(&self, inset: f32, cx: &Context<Self>) -> impl IntoElement {
+    fn account_avatar(&mut self, edge: f32) -> AnyElement {
+        let thumbnail = self
+            .account
+            .as_ref()
+            .and_then(|connection| connection.account.thumbnail.as_deref());
+        let image = thumbnail.and_then(|url| self.artwork.get(url));
         let initial = self
             .account
             .as_ref()
             .and_then(|connection| connection.account.name.chars().next())
-            .map(|initial| initial.to_uppercase().to_string());
+            .map(|initial| initial.to_uppercase().to_string())
+            .unwrap_or_default();
+        div()
+            .size(px(edge))
+            .flex_shrink_0()
+            .rounded_full()
+            .overflow_hidden()
+            .bg(rgb(0x3f3f3f))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(edge * 0.5))
+            .when_some(image.clone(), |avatar, image| {
+                avatar.child(
+                    img(image)
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .rounded_full(),
+                )
+            })
+            .when(image.is_none(), |avatar| avatar.child(initial))
+            .into_any_element()
+    }
+    fn header(&mut self, inset: f32, compact: bool, width: f32, cx: &Context<Self>) -> AnyElement {
+        let avatar = self.account.is_some().then(|| self.account_avatar(26.));
+        let account_inset = if matches!(self.route, Route::Search(_)) {
+            if width < 936. { 50. } else { 68. }
+        } else {
+            100.
+        };
         div()
             .h(px(64.))
             .w_full()
@@ -4363,7 +4414,7 @@ impl Music {
             })
             .child(
                 div()
-                    .w(px(240.))
+                    .w(px(if compact { 148. } else { 240. }))
                     .flex_shrink_0()
                     .px(px(16.))
                     .flex()
@@ -4405,8 +4456,8 @@ impl Music {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .pl(px(inset))
-                    .pr(px(32.))
+                    .pl(px(if compact { 0. } else { inset }))
+                    .pr(px(account_inset))
                     .flex()
                     .items_center()
                     .gap(px(24.))
@@ -4431,36 +4482,78 @@ impl Music {
                             .child(div().flex_1().min_w_0().child(self.search.clone())),
                     )
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("account-menu")
-                            .size(px(32.))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(rgb(0x3f3f3f))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .when_some(initial, |d, initial| d.child(initial))
-                            .when(self.account.is_none(), |d| {
-                                d.child(icon("person", 24., self.theme.text))
-                            })
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Hint {
-                                    text: "Account and settings",
-                                    theme: Theme::load(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                window.focus(&view.focus, cx);
-                                view.overlay = Some(Overlay::Settings);
-                                cx.notify();
-                            })),
-                    ),
+                    .when_some(avatar, |header, avatar| {
+                        header.child(
+                            div()
+                                .id("account-menu")
+                                .size(px(40.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(avatar)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    window.focus(&view.focus, cx);
+                                    view.overlay_anchor = Some(point(
+                                        window.viewport_size().width
+                                            - px(if matches!(view.route, Route::Search(_)) {
+                                                68.
+                                            } else {
+                                                100.
+                                            })
+                                            - px(300.),
+                                        px(56.),
+                                    ));
+                                    view.overlay = Some(Overlay::Account);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(self.account.is_none(), |header| {
+                        header.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(button("guest-account-menu", "more", self.theme).on_click(
+                                    cx.listener(move |view, _, window, cx| {
+                                        window.focus(&view.focus, cx);
+                                        view.overlay_anchor = Some(point(
+                                            window.viewport_size().width - px(account_inset + 380.),
+                                            px(56.),
+                                        ));
+                                        view.overlay = Some(Overlay::Account);
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(
+                                    div()
+                                        .id("sign-in")
+                                        .h(px(32.))
+                                        .px(px(16.))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(rgb(0xf1f1f1))
+                                        .text_color(rgb(0x0f0f0f))
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0xd9d9d9)))
+                                        .child("Sign in")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.connect_account(window, cx)
+                                        })),
+                                ),
+                        )
+                    }),
             )
+            .into_any_element()
     }
+
     fn card(
         &mut self,
         item: Item,
@@ -5149,8 +5242,7 @@ impl Music {
                     .on_click(cx.listener(move |view, _, window, cx| {
                         window.focus(&view.focus, cx);
                         if view.account.is_none() {
-                            view.overlay = Some(Overlay::Settings);
-                            cx.notify();
+                            view.connect_account(window, cx);
                             return;
                         }
                         let Route::Browse(link) = &view.route else {
@@ -5800,7 +5892,9 @@ impl Music {
                     ),
             );
         }
-        if let Some(error) = &self.error {
+        if !matches!(self.overlay, Some(Overlay::SignIn))
+            && let Some(error) = &self.error
+        {
             content = content.child(
                 div()
                     .mx(px(inset))
@@ -6541,6 +6635,7 @@ impl Music {
                             .child(self.library.video_quality.label())
                             .on_click(cx.listener(|view, _, window, cx| {
                                 window.focus(&view.focus, cx);
+                                view.settings_section = SettingsSection::Playback;
                                 view.overlay = Some(Overlay::Settings);
                                 cx.notify();
                             })),
@@ -6560,16 +6655,21 @@ impl Music {
                         })),
                     ),
             )
-            .when_some(self.error.as_ref(), |content, error| {
-                content.child(
-                    div()
-                        .px(px(24.))
-                        .py(px(12.))
-                        .bg(self.theme.panel)
-                        .text_color(rgb(0xf1a6ae))
-                        .child(error.clone()),
-                )
-            })
+            .when_some(
+                self.error
+                    .as_ref()
+                    .filter(|_| !matches!(self.overlay, Some(Overlay::SignIn))),
+                |content, error| {
+                    content.child(
+                        div()
+                            .px(px(24.))
+                            .py(px(12.))
+                            .bg(self.theme.panel)
+                            .text_color(rgb(0xf1a6ae))
+                            .child(error.clone()),
+                    )
+                },
+            )
             .child(viewport)
             .into_any_element()
     }
@@ -6922,7 +7022,586 @@ impl Music {
             .child(body)
             .into_any_element()
     }
+    fn account_action(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        label: &'static str,
+        cx: &Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .h(px(40.))
+            .px(px(16.))
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .text_size(px(14.))
+            .cursor_pointer()
+            .hover(|row| row.bg(gpui::white().opacity(0.1)))
+            .child(icon(glyph, 18., self.theme.text))
+            .child(label)
+            .on_click(cx.listener(move |view, _, window, cx| action(view, window, cx)))
+    }
+
+    fn account_popup(&mut self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let account = self
+            .account
+            .as_ref()
+            .map(|connection| connection.account.clone());
+        let separator = gpui::white().opacity(0.2);
+        let mut body = div()
+            .w(px(300.))
+            .rounded(px(12.))
+            .overflow_hidden()
+            .bg(rgb(0x282828))
+            .text_color(rgb(0xf1f1f1))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        if let Some(account) = account {
+            let avatar = self.account_avatar(40.);
+            body = body
+                .child(
+                    div()
+                        .p(px(16.))
+                        .border_b_1()
+                        .border_color(separator)
+                        .flex()
+                        .items_start()
+                        .gap(px(16.))
+                        .child(avatar)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(16.))
+                                .line_height(px(22.))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .truncate()
+                                        .child(account.name),
+                                )
+                                .child(div().truncate().child(account.handle))
+                                .child(
+                                    div()
+                                        .id("manage-google-account")
+                                        .mt(px(8.))
+                                        .text_size(px(14.))
+                                        .text_color(rgb(0x3ea6ff))
+                                        .cursor_pointer()
+                                        .child("Manage your Google Account")
+                                        .on_click(|_, _, cx| {
+                                            cx.open_url("https://myaccount.google.com")
+                                        }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .py(px(8.))
+                        .border_b_1()
+                        .border_color(separator)
+                        .child(self.account_action(
+                            "switch-account",
+                            "switch-account",
+                            "Switch account",
+                            cx,
+                            |view, window, cx| view.connect_account(window, cx),
+                        ))
+                        .child(self.account_action(
+                            "sign-out",
+                            "logout",
+                            "Sign out",
+                            cx,
+                            |view, _, cx| {
+                                view.overlay = None;
+                                view.disconnect_account(cx);
+                            },
+                        )),
+                );
+        }
+        body = body
+            .child(div().py(px(8.)).border_b_1().border_color(separator).child(
+                self.account_action(
+                    "account-settings",
+                    "settings",
+                    "Settings",
+                    cx,
+                    |view, _, cx| {
+                        view.settings_menu = None;
+                        view.overlay = Some(Overlay::Settings);
+                        cx.notify();
+                    },
+                ),
+            ))
+            .child(div().py(px(8.)).child(self.account_action(
+                "account-help",
+                "help",
+                "Help",
+                cx,
+                |view, _, cx| {
+                    view.overlay = None;
+                    cx.open_url("https://support.google.com/youtubemusic");
+                    cx.notify();
+                },
+            )));
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.close_overlay(window, cx);
+                }),
+            )
+            .child(
+                anchored()
+                    .position(
+                        self.overlay_anchor.unwrap_or_else(|| {
+                            point(window.viewport_size().width - px(400.), px(56.))
+                        }),
+                    )
+                    .snap_to_window_with_margin(px(8.))
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn sign_in_dialog(&self, cx: &Context<Self>) -> AnyElement {
+        let checking = matches!(
+            self.account_operation,
+            Some(AccountOperation::Connecting(
+                _,
+                BrowserConnection::Reading(_)
+            ))
+        );
+        let ready = matches!(
+            self.account_operation,
+            Some(AccountOperation::Connecting(_, BrowserConnection::Ready(_)))
+        );
+        let title = if checking {
+            "Signing in…"
+        } else {
+            "Sign in to YouTube Music"
+        };
+        let body = div()
+            .w(px(480.))
+            .max_w(relative(0.9))
+            .p(px(24.))
+            .rounded(px(3.))
+            .bg(self.theme.panel)
+            .border_1()
+            .border_color(gpui::white().opacity(0.2))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(16.))
+                    .child(div().text_size(px(20.)).child(title))
+                    .child(button("close-sign-in", "close", self.theme).on_click(
+                        cx.listener(|view, _, window, cx| view.close_overlay(window, cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .mt(px(20.))
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .text_color(self.theme.muted)
+                    .child(if checking {
+                        "Checking your account."
+                    } else {
+                        "Finish signing in in your browser, then return to Music."
+                    }),
+            )
+            .when_some(self.error.as_ref(), |body, error| {
+                body.child(
+                    div()
+                        .mt(px(16.))
+                        .text_size(px(14.))
+                        .text_color(rgb(0xf1a6ae))
+                        .child(error.clone()),
+                )
+            })
+            .when(
+                (ready || self.account_operation.is_none()) && self.error.is_some(),
+                |body| {
+                    body.child(
+                        div().mt(px(24.)).flex().justify_end().child(
+                            div()
+                                .id("retry-sign-in")
+                                .px(px(16.))
+                                .h(px(36.))
+                                .flex()
+                                .items_center()
+                                .rounded_full()
+                                .bg(self.theme.text)
+                                .text_color(self.theme.bg)
+                                .cursor_pointer()
+                                .child("Try again")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.connect_account(window, cx)
+                                })),
+                        ),
+                    )
+                },
+            );
+        self.backdrop(body.into_any_element(), cx)
+    }
+
+    fn setting_row(
+        &self,
+        title: &'static str,
+        kind: SettingMenu,
+        field_width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let field_bounds = Rc::new(Cell::new(Bounds::default()));
+        let measured_bounds = field_bounds.clone();
+        let value = match kind {
+            SettingMenu::Speed => format!("{}×", f64::from(self.library.speed)),
+            SettingMenu::AudioQuality => self.library.quality.label().to_owned(),
+            SettingMenu::VideoQuality => self.library.video_quality.label().to_owned(),
+        };
+        div()
+            .py(px(20.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(20.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_size(px(16.)).child(title)),
+            )
+            .child(
+                div()
+                    .id(("setting-value", kind as usize))
+                    .relative()
+                    .w(px(field_width))
+                    .min_w(px(100.))
+                    .flex_shrink_0()
+                    .py(px(8.))
+                    .border_b_1()
+                    .border_color(gpui::white().opacity(0.2))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(14.))
+                    .cursor_pointer()
+                    .child(
+                        canvas(
+                            move |bounds, _, _| measured_bounds.set(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(value)
+                    .child(icon("back", 18., self.theme.muted).with_transformation(
+                        Transformation::rotate(Radians(-std::f32::consts::FRAC_PI_2)),
+                    ))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.settings_menu = Some(kind);
+                        let bounds = field_bounds.get();
+                        view.overlay_anchor = Some(point(bounds.left(), bounds.bottom()));
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn settings_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let field_width = if window.viewport_size().width < px(936.) {
+            128.
+        } else {
+            186.
+        };
+        let mut categories = div().w(px(234.)).py(px(24.));
+        for (section, label) in [
+            (SettingsSection::General, "General"),
+            (SettingsSection::Playback, "Playback"),
+            (SettingsSection::About, "About"),
+        ] {
+            categories = categories.child(
+                div()
+                    .id(("settings-category", section as usize))
+                    .h(px(48.))
+                    .px(px(24.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(14.))
+                    .cursor_pointer()
+                    .when(self.settings_section == section, |row| {
+                        row.bg(rgb(0x4e4e4e))
+                    })
+                    .hover(|row| row.bg(gpui::white().opacity(0.1)))
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.settings_section = section;
+                        view.settings_menu = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut content = div()
+            .id("settings-content")
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(rgb(0x4e4e4e))
+            .pl(px(48.))
+            .pr(px(24.))
+            .py(px(24.));
+        match self.settings_section {
+            SettingsSection::General => {
+                content = content.child(
+                    div()
+                        .py(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(20.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(16.))
+                                .child("Don't play music videos"),
+                        )
+                        .child(
+                            div()
+                                .id("audio-only-setting")
+                                .w(px(36.))
+                                .h(px(24.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(px(36.))
+                                        .h(px(14.))
+                                        .rounded_full()
+                                        .bg(if self.library.video {
+                                            rgb(0x606060)
+                                        } else {
+                                            rgb(0x7d2436)
+                                        })
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(-3.))
+                                                .left(px(if self.library.video { 0. } else { 16. }))
+                                                .size(px(20.))
+                                                .rounded_full()
+                                                .bg(if self.library.video {
+                                                    rgb(0xaaaaaa)
+                                                } else {
+                                                    rgb(0xff0033)
+                                                }),
+                                        ),
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.set_video_mode(!view.library.video, cx)
+                                })),
+                        ),
+                );
+            }
+            SettingsSection::Playback => {
+                content = content
+                    .child(self.setting_row(
+                        "Audio quality",
+                        SettingMenu::AudioQuality,
+                        field_width,
+                        cx,
+                    ))
+                    .child(self.setting_row(
+                        "Video quality",
+                        SettingMenu::VideoQuality,
+                        field_width,
+                        cx,
+                    ))
+                    .child(self.setting_row("Playback speed", SettingMenu::Speed, field_width, cx));
+            }
+            SettingsSection::About => {
+                content = content
+                    .child(div().py(px(20.)).text_size(px(16.)).child("YouTube Music"))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(self.theme.muted)
+                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child(
+                        div()
+                            .id("music-project")
+                            .mt(px(24.))
+                            .text_size(px(14.))
+                            .text_color(rgb(0x3ea6ff))
+                            .cursor_pointer()
+                            .child("Project website")
+                            .on_click(|_, _, cx| {
+                                cx.open_url("https://github.com/AksharP5/yt-music-gpui")
+                            }),
+                    );
+            }
+        }
+        let body = div()
+            .w(px(if window.viewport_size().width >= px(936.) {
+                900.
+            } else {
+                568.
+            }))
+            .max_w(window.viewport_size().width - px(48.))
+            .h(px(583.))
+            .max_h(window.viewport_size().height - px(48.))
+            .flex()
+            .flex_col()
+            .rounded(px(3.))
+            .bg(self.theme.panel)
+            .border_1()
+            .border_color(gpui::white().opacity(0.2))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(24.))
+                    .py(px(19.))
+                    .border_b_1()
+                    .border_color(gpui::white().opacity(0.2))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(20.)).child("Settings"))
+                    .child(
+                        button("close-settings", "close", self.theme)
+                            .size(px(24.))
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.close_overlay(window, cx)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(categories)
+                    .child(content),
+            );
+        let mut overlay = div()
+            .absolute()
+            .inset_0()
+            .child(self.backdrop(body.into_any_element(), cx));
+        if let Some(kind) = self.settings_menu {
+            let (choices, selected): (Vec<String>, Option<usize>) = match kind {
+                SettingMenu::Speed => (
+                    PlaybackSpeed::ALL
+                        .map(|speed| format!("{}×", f64::from(speed)))
+                        .to_vec(),
+                    PlaybackSpeed::ALL
+                        .iter()
+                        .position(|speed| *speed == self.library.speed),
+                ),
+                SettingMenu::AudioQuality => (
+                    AudioQuality::ALL
+                        .map(|quality| quality.label().to_owned())
+                        .to_vec(),
+                    AudioQuality::ALL
+                        .iter()
+                        .position(|quality| *quality == self.library.quality),
+                ),
+                SettingMenu::VideoQuality => (
+                    VideoQuality::ALL
+                        .map(|quality| quality.label().to_owned())
+                        .to_vec(),
+                    VideoQuality::ALL
+                        .iter()
+                        .position(|quality| *quality == self.library.video_quality),
+                ),
+            };
+            let menu = div()
+                .id("settings-options")
+                .w(px(186.))
+                .max_h(px(320.))
+                .overflow_y_scroll()
+                .py(px(8.))
+                .bg(rgb(0x4e4e4e))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(choices.into_iter().enumerate().map(|(index, label)| {
+                    div()
+                        .id(("setting-option", index))
+                        .px(px(16.))
+                        .h(px(40.))
+                        .flex()
+                        .items_center()
+                        .text_size(px(14.))
+                        .cursor_pointer()
+                        .when(selected == Some(index), |row| {
+                            row.bg(gpui::white().opacity(0.1))
+                        })
+                        .hover(|row| row.bg(gpui::white().opacity(0.1)))
+                        .child(label)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.settings_menu = None;
+                            match kind {
+                                SettingMenu::Speed => {
+                                    let speed = PlaybackSpeed::ALL[index];
+                                    view.library.speed = speed;
+                                    view.player_command(|player| player.set_speed(speed));
+                                    view.save();
+                                    cx.notify();
+                                }
+                                SettingMenu::AudioQuality => {
+                                    view.set_audio_quality(AudioQuality::ALL[index], cx)
+                                }
+                                SettingMenu::VideoQuality => {
+                                    view.set_video_quality(VideoQuality::ALL[index], cx)
+                                }
+                            }
+                        }))
+                }));
+            overlay = overlay.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.settings_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        anchored()
+                            .position(self.overlay_anchor.unwrap_or_else(|| {
+                                point(window.viewport_size().width / 2., px(200.))
+                            }))
+                            .snap_to_window_with_margin(px(24.))
+                            .child(menu),
+                    ),
+            );
+        }
+        overlay.into_any_element()
+    }
+
     fn overlay(&self, kind: &Overlay, window: &Window, cx: &Context<Self>) -> AnyElement {
+        match kind {
+            Overlay::Account => unreachable!("Account artwork is prepared by the renderer"),
+            Overlay::SignIn => return self.sign_in_dialog(cx),
+            Overlay::Settings => return self.settings_dialog(window, cx),
+            _ => {}
+        }
         if let Overlay::CountryPicker(picker) = kind {
             return self.backdrop(picker.clone().into_any_element(), cx);
         }
@@ -6970,7 +7649,9 @@ impl Music {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(match kind {
                                 Overlay::Help => "Keyboard shortcuts".to_owned(),
-                                Overlay::Settings => "Settings".into(),
+                                Overlay::Settings | Overlay::Account | Overlay::SignIn => {
+                                    unreachable!()
+                                }
                                 Overlay::Description { .. } => "Description".into(),
                                 Overlay::Chapters(_) => "Chapters".into(),
                                 Overlay::Track { track, .. } => track.title.clone(),
@@ -7010,187 +7691,6 @@ impl Music {
                         .child(div().text_color(self.theme.muted).child(key)),
                 );
             }
-        } else if matches!(kind, Overlay::Settings) {
-            let label = self
-                .account
-                .as_ref()
-                .map(|a| format!("{} {}", a.account.name, a.account.handle))
-                .unwrap_or_else(|| "Connect your Google account to sync with YouTube Music".into());
-            let disconnect_failed = matches!(
-                self.account_operation,
-                Some(AccountOperation::DisconnectFailed)
-            );
-            let connecting = matches!(
-                self.account_operation,
-                Some(AccountOperation::Connecting(_, _))
-            );
-            let restoring = matches!(
-                self.account_operation,
-                Some(AccountOperation::Restoring(_) | AccountOperation::Refreshing { .. })
-            );
-            let activating = matches!(
-                self.account_operation,
-                Some(AccountOperation::Activating { .. })
-            );
-            let (connect_label, instructions) = match &self.account_operation {
-                Some(AccountOperation::Connecting(_, BrowserConnection::Opening)) => {
-                    ("Opening browser…".to_owned(), None)
-                }
-                Some(AccountOperation::Connecting(_, BrowserConnection::Ready(profile))) => (
-                    "Read YouTube session".to_owned(),
-                    Some(format!(
-                        "Reads your YouTube sign-in session from {} · {}. After you confirm, Music can refresh this account from that profile when restoring an expired saved session.",
-                        profile.browser, profile.name
-                    )),
-                ),
-                Some(AccountOperation::Connecting(_, BrowserConnection::Reading(_))) => {
-                    ("Checking account…".to_owned(), None)
-                }
-                Some(AccountOperation::Connecting(
-                    _,
-                    BrowserConnection::Review { connection, .. },
-                )) => (
-                    format!("Connect as {}", connection.account.name),
-                    Some(format!(
-                        "{} {}",
-                        connection.account.name, connection.account.handle
-                    )),
-                ),
-                Some(AccountOperation::Restoring(_)) => ("Restoring account…".to_owned(), None),
-                Some(AccountOperation::Refreshing { .. }) => {
-                    ("Reconnecting account…".to_owned(), None)
-                }
-                Some(AccountOperation::RefreshFailed { .. }) => ("Retry account".to_owned(), None),
-                Some(AccountOperation::RestoreFailed) => ("Retry saved account".to_owned(), None),
-                Some(AccountOperation::Activating { .. }) => {
-                    ("Preparing account playback…".to_owned(), None)
-                }
-                Some(AccountOperation::Disconnecting(_)) => ("Signing out…".to_owned(), None),
-                Some(AccountOperation::DisconnectFailed) => {
-                    ("Sign-out incomplete".to_owned(), None)
-                }
-                None if self.account.is_some() => ("Switch or reconnect account".to_owned(), None),
-                None => ("Connect in browser".to_owned(), None),
-            };
-            let reviewing = matches!(
-                self.account_operation,
-                Some(AccountOperation::Connecting(
-                    _,
-                    BrowserConnection::Review { .. }
-                ))
-            );
-            body=body.child(div().text_size(px(15.)).child(label))
-                .child(div().id("connect-account").mt(px(22.)).px(px(15.)).py(px(11.)).bg(self.theme.text).text_color(self.theme.bg).rounded(px(5.)).cursor_pointer()
-                    .child(connect_label)
-                    .on_click(cx.listener(|view,_,window,cx|view.connect_account(window,cx))))
-                .when_some(instructions, |body, text| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(self.theme.muted).child(text)))
-                .when(matches!(self.account_operation,Some(AccountOperation::RestoreFailed | AccountOperation::RefreshFailed { .. })),|body|body.child(
-                    div().id("reconnect-browser-account").mt(px(16.)).cursor_pointer().child("Connect in browser")
-                        .on_click(cx.listener(|view,_,window,cx|{
-                            view.account_operation=None;
-                            view.connect_account(window,cx);
-                        }))))
-                .when(reviewing, |body| body.child(div().id("retry-browser-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Check another account").on_click(cx.listener(|view,_,_,cx|view.retry_browser_account(cx)))))
-                .when(connecting || restoring, |body| body.child(div().id("cancel-connection").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child("Cancel connection").on_click(cx.listener(|view,_,_,cx|view.cancel_connection(cx)))))
-                .when_some(self.error.as_ref(), |body, error| body.child(div().mt(px(12.)).text_size(px(13.)).text_color(rgb(0xf1a6ae)).child(error.clone())))
-                .when(self.account.is_some() || disconnect_failed || activating, |body| body.child(div().id("disconnect-account").mt(px(16.)).text_color(self.theme.accent).cursor_pointer().child(if disconnect_failed {"Retry sign-out"} else {"Sign out"}).on_click(cx.listener(|view,_,_,cx|view.disconnect_account(cx)))))
-                .child(div().mt(px(16.)).text_size(px(13.)).text_color(self.theme.muted).child(if self.account.is_some(){"Library changes are saved to your Google account. Returning to this window loads changes made on the web."}else{"Guest likes and saved collections stay on this computer. Connecting shows your account library."}))
-                .child(div().id("settings-open-web").mt(px(24.)).text_color(self.theme.accent).cursor_pointer().child("Open YouTube Music").on_click(|_,_,cx|cx.open_url("https://music.youtube.com")));
-            let mut speeds = div().mt(px(12.)).flex().flex_wrap().gap(px(4.));
-            for (index, speed) in PlaybackSpeed::ALL.into_iter().enumerate() {
-                speeds = speeds.child(
-                    div()
-                        .id(("playback-speed", index))
-                        .w(px(44.))
-                        .py(px(10.))
-                        .text_center()
-                        .text_size(px(13.))
-                        .border_b_2()
-                        .border_color(if self.library.speed == speed {
-                            self.theme.accent
-                        } else {
-                            self.theme.panel
-                        })
-                        .when(self.library.speed == speed, |button| {
-                            button.text_color(self.theme.accent)
-                        })
-                        .hover(|button| button.bg(self.theme.raised))
-                        .cursor_pointer()
-                        .child(format!("{}×", f64::from(speed)))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.library.speed = speed;
-                            view.player_command(|player| player.set_speed(speed));
-                            view.save();
-                            cx.notify();
-                        })),
-                );
-            }
-            body = body
-                .child(div().mt(px(32.)).text_size(px(15.)).child("Playback speed"))
-                .child(speeds);
-            let mut qualities = div().mt(px(12.)).flex().gap(px(12.));
-            for (index, quality) in AudioQuality::ALL.into_iter().enumerate() {
-                qualities = qualities.child(
-                    div()
-                        .id(("audio-quality", index))
-                        .px(px(14.))
-                        .py(px(10.))
-                        .text_size(px(13.))
-                        .border_b_2()
-                        .border_color(if self.library.quality == quality {
-                            self.theme.accent
-                        } else {
-                            self.theme.panel
-                        })
-                        .when(self.library.quality == quality, |button| {
-                            button.text_color(self.theme.accent)
-                        })
-                        .hover(|button| button.bg(self.theme.raised))
-                        .cursor_pointer()
-                        .child(quality.label())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.set_audio_quality(quality, cx);
-                        })),
-                );
-            }
-            body = body
-                .child(div().mt(px(24.)).text_size(px(15.)).child("Audio quality"))
-                .child(qualities)
-                .child(
-                    div()
-                        .mt(px(12.))
-                        .text_size(px(13.))
-                        .text_color(self.theme.muted)
-                        .child("Available quality depends on the song and your membership."),
-                );
-            let mut video_qualities = div().mt(px(12.)).flex().flex_wrap().gap(px(4.));
-            for (index, quality) in VideoQuality::ALL.into_iter().enumerate() {
-                video_qualities = video_qualities.child(
-                    div()
-                        .id(("video-quality", index))
-                        .px(px(12.))
-                        .py(px(10.))
-                        .text_size(px(13.))
-                        .border_b_2()
-                        .border_color(if self.library.video_quality == quality {
-                            self.theme.accent
-                        } else {
-                            self.theme.panel
-                        })
-                        .when(self.library.video_quality == quality, |button| {
-                            button.text_color(self.theme.accent)
-                        })
-                        .hover(|button| button.bg(self.theme.raised))
-                        .cursor_pointer()
-                        .child(quality.label())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.set_video_quality(quality, cx);
-                        })),
-                );
-            }
-            body = body
-                .child(div().mt(px(24.)).text_size(px(15.)).child("Video quality"))
-                .child(video_qualities);
         } else if let Overlay::Description { title, text } = kind {
             body = body
                 .child(
@@ -7855,7 +8355,7 @@ impl Render for Music {
         }
         let fullscreen = self.video_open && window.is_fullscreen();
         let width: f32 = window.viewport_size().width.into();
-        let compact = self.sidebar_collapsed || width < 1090. || (self.show_queue && width < 1440.);
+        let compact = self.sidebar_collapsed || width < 1150. || (self.show_queue && width < 1440.);
         let queue_compact = width < 1200.;
         let available = width
             - if compact { 72. } else { 240. }
@@ -7892,7 +8392,7 @@ impl Render for Music {
                     linear_color_stop(self.theme.bg, 1.),
                 )))
         });
-        let header = (!fullscreen).then(|| self.header(inset, cx).into_any_element());
+        let header = (!fullscreen).then(|| self.header(inset, compact, width, cx));
         let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
         let content = if self.video_open {
             self.video_content(window, cx)
@@ -7906,6 +8406,13 @@ impl Render for Music {
             .current()
             .is_some()
             .then(|| self.player_bar(width, cx));
+        let overlay = if matches!(self.overlay, Some(Overlay::Account)) {
+            Some(self.account_popup(window, cx))
+        } else {
+            self.overlay
+                .as_ref()
+                .map(|kind| self.overlay(kind, window, cx))
+        };
         div()
             .size_full()
             .relative()
@@ -7944,11 +8451,7 @@ impl Render for Music {
                     .children(queue),
             )
             .children(player)
-            .children(
-                self.overlay
-                    .as_ref()
-                    .map(|kind| self.overlay(kind, window, cx)),
-            )
+            .children(overlay)
     }
 }
 fn icon(name: &'static str, edge: f32, color: Hsla) -> Svg {

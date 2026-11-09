@@ -1,11 +1,11 @@
 use super::{
-    AccountOperation, CatalogRequests, CatalogTarget, Music, Playback, PlaybackQuery,
-    PlaybackResult, QueueUpdate, Route, Startup,
+    AccountOperation, BrowserConnection, CatalogRequests, CatalogTarget, Music, Overlay, Playback,
+    PlaybackQuery, PlaybackResult, QueueUpdate, Route, Startup,
 };
 use crate::{
     account::{self, Connection, Mutation},
     assets::Assets,
-    auth::{Operation, Session},
+    auth::{BrowserProfile, Operation, Session},
     catalog::{Account, BrowseLink, Rating, Track},
     input,
     library::Repeat,
@@ -41,6 +41,7 @@ fn connection(session: Arc<Session>) -> Connection {
         account: Account {
             name: "Synthetic account".into(),
             handle: String::new(),
+            thumbnail: None,
         },
     }
 }
@@ -179,6 +180,70 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
             view
         })).unwrap();
         cx.spawn(async move |cx| {
+            let signed_in = window.update(cx, |view, window, cx| {
+                let previous = view.account.as_ref().unwrap().session.clone();
+                let profile: BrowserProfile = serde_json::from_value(json!({
+                    "browser":"Synthetic browser", "name":"Confirmed profile", "path":"/synthetic/profile"
+                })).unwrap();
+                let cancelled = Operation::default();
+                view.account_operation = Some(AccountOperation::Connecting(cancelled.clone(), BrowserConnection::Opening { left_app: false }));
+                view.account_event(account::Event::BrowserReady { operation: cancelled.clone(), result: Ok(profile.clone()) }, window, cx);
+                assert!(commands.is_empty(), "Opening the browser must not import its existing account before a return");
+                assert!(matches!(view.account_operation, Some(AccountOperation::Connecting(_, BrowserConnection::Ready(_)))));
+                view.read_browser_account(cx);
+                let account::Command::ReadBrowser { operation, profile: requested } = commands.try_recv().unwrap() else { panic!("Returning from sign-in must read the resolved profile"); };
+                assert!(operation.matches(&cancelled));
+                assert_eq!(serde_json::to_value(requested).unwrap(), serde_json::to_value(&profile).unwrap());
+                view.read_browser_account(cx);
+                assert!(commands.is_empty(), "Repeated activation must not duplicate an in-flight read");
+                view.overlay = Some(Overlay::SignIn);
+                view.close_overlay(window, cx);
+                assert!(view.overlay.is_none());
+                assert!(cancelled.is_cancelled());
+                view.account_event(account::Event::AccountPreview { operation: cancelled, result: Ok(connection(session("cancelled-browser"))) }, window, cx);
+                assert!(view.account_operation.is_none() && commands.is_empty());
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &previous));
+
+                let operation = Operation::default();
+                view.account_operation = Some(AccountOperation::Connecting(operation.clone(), BrowserConnection::Opening { left_app: false }));
+                view.account_event(account::Event::BrowserReady { operation: operation.clone(), result: Ok(profile.clone()) }, window, cx);
+                view.read_browser_account(cx);
+                assert!(matches!(commands.try_recv().unwrap(), account::Command::ReadBrowser { .. }));
+                view.account_event(account::Event::AccountPreview { operation: Operation::default(), result: Err("Superseded account read".into()) }, window, cx);
+                assert!(matches!(view.account_operation, Some(AccountOperation::Connecting(_, BrowserConnection::Reading(_)))));
+                view.account_event(account::Event::AccountPreview { operation: operation.clone(), result: Err("Finish signing in".into()) }, window, cx);
+                assert!(matches!(view.account_operation, Some(AccountOperation::Connecting(_, BrowserConnection::Ready(_)))));
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &previous));
+                view.read_browser_account(cx);
+                let account::Command::ReadBrowser { operation: retry, profile: requested } = commands.try_recv().unwrap() else { panic!("Returning after a failed read must retry the same profile"); };
+                assert!(retry.matches(&operation));
+                assert_eq!(serde_json::to_value(requested).unwrap(), serde_json::to_value(&profile).unwrap());
+                let mut candidate = session("browser-sign-in");
+                Arc::get_mut(&mut candidate).unwrap().source_profile = Some(profile);
+                view.account_event(account::Event::AccountPreview { operation, result: Ok(connection(candidate.clone())) }, window, cx);
+                assert!(matches!(view.account_operation, Some(AccountOperation::Activating { .. })), "A verified sign-in must activate without another confirmation button");
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &previous));
+                assert!(commands.is_empty(), "Saving must wait for the actual player acknowledgment");
+                candidate
+            }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                cx.background_executor().timer(Duration::from_millis(10)).await;
+                let pending = window.update(cx, |view, _, _| matches!(view.account_operation, Some(AccountOperation::Activating { .. }))).unwrap();
+                if !pending { break; }
+                assert!(Instant::now() < deadline, "Player did not acknowledge browser sign-in");
+            }
+            window.update(cx, |view, _, cx| {
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &signed_in));
+                assert!(Arc::ptr_eq(view.session.read().unwrap().as_ref().unwrap(), &signed_in));
+                let account::Command::Persist(saved) = commands.try_recv().unwrap() else { panic!("Successful sign-in must persist without another button"); };
+                assert!(Arc::ptr_eq(&saved, &signed_in));
+                assert!(saved.source_profile.is_some());
+                view.read_browser_account(cx);
+                assert!(commands.is_empty());
+                view.stop_playback(cx);
+                prepare(view, signed_in.clone());
+            }).unwrap();
             let original = window.update(cx, |view, window, cx| {
                 let current = view.account.as_ref().unwrap().session.clone();
                 let mutation = Mutation::RateSong { track: track("invalid-first"), rating: Rating::Like };
@@ -293,7 +358,17 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 window.update(cx, |view, window, cx| {
                     view.stop_playback(cx);
                     prepare(view, original.clone());
-                    renew(view, replacement.clone(), &commands, window, cx);
+                    if case == "signout" {
+                        let operation = Operation::default();
+                        let profile: BrowserProfile = serde_json::from_value(json!({
+                            "browser":"Synthetic browser", "name":"Confirmed profile", "path":"/synthetic/profile"
+                        })).unwrap();
+                        view.account_operation = Some(AccountOperation::Connecting(operation.clone(), BrowserConnection::Reading(profile)));
+                        view.account_event(account::Event::AccountPreview { operation, result: Ok(connection(replacement.clone())) }, window, cx);
+                        assert!(matches!(view.account_operation, Some(AccountOperation::Activating { .. })));
+                    } else {
+                        renew(view, replacement.clone(), &commands, window, cx);
+                    }
                     match case {
                         "stopped" => view.stop_playback(cx),
                         "restart" => view.play_current_at(0., false, WatchMode::Details, cx),

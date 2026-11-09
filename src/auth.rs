@@ -654,7 +654,8 @@ fn page_config(page: impl Read) -> Result<Value> {
 }
 
 impl BrowserProfile {
-    /// Reads profile metadata only. Cookie access requires a separate user action.
+    /// Opens the configured profile for an explicit sign-in request.
+    /// That request authorizes reading its session when the user returns.
     pub fn open(operation: &Operation) -> Result<Self> {
         ensure!(ACCOUNT_LOGIN_ENABLED, "Account connection is unavailable");
         ensure!(
