@@ -1,4 +1,4 @@
-//! Song details loaded on demand: lyrics, credits and related music.
+//! Song details loaded on demand: lyrics, comments, credits and related music.
 
 use crate::{
     auth::{self, Session},
@@ -18,6 +18,7 @@ pub enum Query {
     Lyrics(String),
     Credits(String),
     Related(String),
+    Comments(crate::catalog::Continuation),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +39,7 @@ pub enum Content {
     Lyrics(Lyrics),
     Credits(Vec<CreditSection>),
     Related(Box<Page>),
+    Comments(Box<crate::comments::Page>),
 }
 
 struct Request {
@@ -68,6 +70,9 @@ impl Worker {
                 .map_err(|error| anyhow::anyhow!("{error:#}"))?
                 .for_session(request.session.clone());
             match &request.query {
+                Query::Comments(token) => catalog
+                    .comments(token)
+                    .map(|page| Content::Comments(Box::new(page))),
                 Query::Lyrics(id) => catalog.lyrics(id).map(Content::Lyrics),
                 Query::Credits(id) => catalog.credits(id).map(Content::Credits),
                 Query::Related(id) => catalog

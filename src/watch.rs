@@ -18,6 +18,7 @@ pub struct Watch {
     pub source: Option<String>,
     pub lyrics: Option<String>,
     pub related: Option<String>,
+    pub comments: Option<crate::catalog::Continuation>,
     pub alternatives: Option<Box<MediaPair>>,
     pub continuation: Option<WatchContinuation>,
     pub source_target: Option<crate::catalog::WatchTarget>,
@@ -331,6 +332,7 @@ fn parse_watch(
         source,
         lyrics,
         related,
+        comments: crate::comments::watch_comments(response, session.clone())?,
         alternatives,
         continuation: watch_continuation(panel, request, session),
     })

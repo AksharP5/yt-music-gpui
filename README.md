@@ -5,7 +5,7 @@ A native YouTube Music client for Linux, built with Rust and GPUI. Audio and vid
 ![Home page with Quick picks and playlist shelves](docs/screenshot.webp)
 
 - Browse Home, Explore, charts, artists, albums and playlists, with search suggestions and category filters.
-- Play audio and video with a persistent, drag-to-reorder queue, shuffle, repeat, radio and autoplay. Click the player bar to open the player page with Up next, lyrics and related music.
+- Play audio and video with a persistent, drag-to-reorder queue, shuffle, repeat, radio and autoplay. Click the player bar to open the player page with Up next, lyrics, read-only comments and related music.
 - Read lyrics and credits, and browse podcasts with episode descriptions and chapters.
 - Connect your account to access your library, edit playlists and record playback history.
 - Control playback with keyboard shortcuts, media keys and MPRIS desktop controls.

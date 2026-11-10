@@ -1,0 +1,134 @@
+{
+  "onResponseReceivedEndpoints": [
+    {
+      "appendContinuationItemsAction": {
+        "targetId": "comment-replies-item-top-comment",
+        "continuationItems": [
+          {
+            "commentThreadRenderer": {
+              "commentViewModel": {
+                "commentViewModel": {
+                  "commentKey": "reply-1-key",
+                  "commentId": "reply-1"
+                }
+              },
+              "replies": {
+                "commentRepliesRenderer": {
+                  "viewReplies": {
+                    "buttonRenderer": {
+                      "text": {
+                        "simpleText": "1 reply"
+                      }
+                    }
+                  },
+                  "subThreads": [
+                    {
+                      "commentThreadRenderer": {
+                        "commentViewModel": {
+                          "commentViewModel": {
+                            "commentKey": "nested-key",
+                            "commentId": "nested"
+                          }
+                        },
+                        "replies": {
+                          "commentRepliesRenderer": {
+                            "viewReplies": {
+                              "buttonRenderer": {
+                                "text": {
+                                  "simpleText": "Show more replies"
+                                }
+                              }
+                            },
+                            "subThreads": [
+                              {
+                                "continuationItemRenderer": {
+                                  "button": {
+                                    "buttonRenderer": {
+                                      "command": {
+                                        "continuationCommand": {
+                                          "token": "nested-tail"
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "continuationItemRenderer": {
+              "trigger": "CONTINUATION_TRIGGER_ON_ITEM_SHOWN",
+              "continuationEndpoint": {
+                "continuationCommand": {
+                  "token": "replies-page-2"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "frameworkUpdates": {
+    "entityBatchUpdate": {
+      "mutations": [
+        {
+          "entityKey": "reply-1-key",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "commentEntityPayload": {
+              "key": "reply-1-key",
+              "properties": {
+                "commentId": "reply-1",
+                "content": {
+                  "content": "Thank you for sharing this."
+                },
+                "publishedTime": "2 days ago (edited)",
+                "toolbarStateKey": "reply-1-state"
+              },
+              "author": {
+                "displayName": "@fan",
+                "avatarThumbnailUrl": "https://yt3.googleusercontent.com/synthetic=s88-c-k-c0x00ffffff-no-rj",
+                "isCreator": false,
+                "isVerified": false
+              },
+              "toolbar": {
+                "likeCountNotliked": "1.2K",
+                "likeCountLiked": "1.2K",
+                "replyCount": "2"
+              }
+            }
+          }
+        },
+        {
+          "entityKey": "nested-key",
+          "payload": {
+            "commentEntityPayload": {
+              "properties": {
+                "commentId": "nested",
+                "content": {
+                  "content": "A reply to the reply."
+                },
+                "publishedTime": "1 day ago"
+              },
+              "author": {
+                "displayName": "@nested"
+              },
+              "toolbar": {
+                "likeCountNotliked": "3"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

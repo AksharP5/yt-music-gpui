@@ -2,14 +2,14 @@
 
 mod account;
 mod playback;
-mod render;
+pub(in crate::app) mod render;
 mod restart;
 mod sync;
 
 use anyhow::{Context as _, Result, ensure};
 use std::{fs, os::unix::fs::MetadataExt, path::PathBuf};
 
-fn isolate() -> Result<()> {
+pub(in crate::app) fn isolate() -> Result<()> {
     ensure!(
         std::env::var("YT_MUSIC_NATIVE_TESTS").as_deref() == Ok("1"),
         "Set YT_MUSIC_NATIVE_TESTS=1 in a fresh isolated environment"

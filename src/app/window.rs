@@ -39,7 +39,10 @@ impl Music {
     pub(super) fn restore_keyboard_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A scroll request can land between frames. The target handle is already focused,
         // but its virtual row has not entered the dispatch tree yet.
-        if self.queue_focus.reveal_pending(window) || self.sidebar_focus.reveal_pending(window) {
+        if self.queue_focus.reveal_pending(window)
+            || self.sidebar_focus.reveal_pending(window)
+            || self.comments_reveal_pending(window)
+        {
             #[cfg(test)]
             eprintln!(
                 "FOCUS_LOST pending_reveal queue={:?} sidebar={:?}",

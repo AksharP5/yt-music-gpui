@@ -609,6 +609,30 @@ pub struct Continuation {
 }
 
 impl Continuation {
+    /// Bind an opaque read continuation to the response's visitor and exact account snapshot.
+    pub(crate) fn from_response(
+        token: &str,
+        response: &Value,
+        session: Option<Arc<Session>>,
+    ) -> Result<Continuation> {
+        ensure!(
+            !token.is_empty() && token.len() <= 32768 && !token.chars().any(char::is_whitespace),
+            "YouTube Music returned an invalid read continuation"
+        );
+        let mut continuation = Continuation::new(token);
+        continuation.session = session;
+        continuation.visitor = response
+            .pointer("/responseContext/visitorData")
+            .and_then(Value::as_str)
+            .map(HeaderValue::from_str)
+            .transpose()
+            .context("YouTube Music returned an invalid page visitor")?;
+        if let Some(visitor) = &mut continuation.visitor {
+            visitor.set_sensitive(true);
+        }
+        Ok(continuation)
+    }
+
     fn new(token: &str) -> Self {
         Self {
             token: token.to_owned(),

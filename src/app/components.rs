@@ -216,6 +216,9 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.move_comments_focus(reverse, window, cx) {
+            return;
+        }
         let sidebar_count = if self.account.is_some() {
             self.sidebar_playlists.len()
         } else {

@@ -1,0 +1,22 @@
+{
+  "onResponseReceivedEndpoints": [
+    {
+      "reloadContinuationItemsCommand": {
+        "targetId": "comments-section",
+        "continuationItems": [
+          {
+            "messageRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "Comments are turned off."
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

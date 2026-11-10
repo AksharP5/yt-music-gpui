@@ -1,0 +1,55 @@
+{
+  "onResponseReceivedEndpoints": [
+    {
+      "appendContinuationItemsAction": {
+        "targetId": "comments-section",
+        "continuationItems": [
+          {
+            "commentThreadRenderer": {
+              "comment": {
+                "commentRenderer": {
+                  "commentId": "legacy-comment",
+                  "authorText": {
+                    "simpleText": "@guest"
+                  },
+                  "contentText": {
+                    "runs": [
+                      {
+                        "text": "A classic."
+                      }
+                    ]
+                  },
+                  "publishedTimeText": {
+                    "simpleText": "1 year ago"
+                  },
+                  "voteCount": {
+                    "simpleText": "42"
+                  },
+                  "authorThumbnail": {
+                    "thumbnails": [
+                      {
+                        "url": "https://example.com/avatar.png",
+                        "width": 88
+                      }
+                    ]
+                  },
+                  "authorIsChannelOwner": false
+                }
+              }
+            }
+          },
+          {
+            "continuationItemRenderer": {
+              "trigger": "CONTINUATION_TRIGGER_ON_ITEM_SHOWN",
+              "continuationEndpoint": {
+                "continuationCommand": {
+                  "token": "comments-page-3"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
