@@ -460,11 +460,7 @@ impl Music {
         let page = self.page_layout(window);
         let text_size = page.text_size();
         let style = if self.route.is_artist() {
-            if window.viewport_size().width >= px(1200.) {
-                RowStyle::ArtistTable
-            } else {
-                RowStyle::List
-            }
+            RowStyle::ArtistTable
         } else if matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"))
             && matches!(item, Item::Track(_))
         {

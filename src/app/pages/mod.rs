@@ -145,7 +145,8 @@ impl PageLayout {
         } else if window < 616. {
             available - 32.
         } else {
-            available - 112.
+            // 112px page margins plus the web's 12px scrollbar reservation.
+            available - 124.
         }
         .max(0.);
         Self {
@@ -346,7 +347,7 @@ impl Music {
         let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let collection = !home && self.page.header.is_some();
         let artist = collection && self.route.is_artist();
-        let stacked = collection && !artist && available >= 980.;
+        let stacked = collection && !artist && layout.tier >= Tier::Wide;
         // Library pages open on their chips, without a back button or heading.
         let library = !collection && matches!(self.route, Route::Saved | Route::Library(_));
         let mut content = div()
@@ -390,7 +391,7 @@ impl Music {
             );
         }
         if !home && !search && !collection && !library {
-            let heading = self.page_heading(false, 128., layout.text_size(), cx);
+            let heading = self.page_heading(false, 128., layout, cx);
             content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
         }
         if !home {
@@ -472,8 +473,7 @@ impl Music {
                 .into_any_element();
         }
         let (header_width, list_width, cover) = layout.collection_columns();
-        let heading =
-            (collection && stacked).then(|| self.page_heading(true, cover, layout.text_size(), cx));
+        let heading = (collection && stacked).then(|| self.page_heading(true, cover, layout, cx));
         if self.rows.is_empty()
             && !collection
             && let Some(empty) = self.library_empty()
@@ -542,7 +542,12 @@ impl Music {
                             };
                         }
                         if inline && index == 0 {
-                            let heading = view.page_heading(true, 200., layout.text_size(), cx);
+                            let cover = if layout.tier >= Tier::Medium {
+                                240.
+                            } else {
+                                200.
+                            };
+                            let heading = view.page_heading(true, cover, layout, cx);
                             return div()
                                 .w_full()
                                 .px(px(inset))

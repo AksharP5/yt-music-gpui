@@ -57,7 +57,15 @@ impl Music {
     /// Explore's New releases, Charts, Moods & genres and Podcasts tiles.
     fn explore_tiles(&self, shelf: usize, layout: PageLayout, cx: &Context<Self>) -> AnyElement {
         let gap = if layout.tier >= Tier::Wide { 24. } else { 16. };
-        let tiles = div().flex().gap(px(gap)).children(
+        let text_size = match layout.tier {
+            Tier::Narrow | Tier::Medium => 16.,
+            Tier::Wide => 20.,
+            Tier::Large | Tier::Huge => 24.,
+        };
+        let max_columns = if layout.tier == Tier::Narrow { 2 } else { 4 };
+        let columns = self.page.shelves[shelf].items.len().clamp(1, max_columns) as f32;
+        let width = (layout.column - (columns - 1.) * gap) / columns;
+        let tiles = div().flex().flex_wrap().gap(px(gap)).children(
             self.page.shelves[shelf]
                 .items
                 .iter()
@@ -78,15 +86,11 @@ impl Music {
                         div()
                             .id(("discovery-link", shelf * 1000 + item))
                             .keyboard_control(self.theme)
-                            .flex_grow(1.)
-                            .flex_basis(px(0.))
+                            .w(px(width))
+                            .flex_shrink_0()
                             .min_w_0()
-                            .h(px(if layout.tier >= Tier::Large {
-                                132.
-                            } else {
-                                110.
-                            }))
-                            .p(px(20.))
+                            .h(px(text_size * 5.5))
+                            .p(px(text_size))
                             .rounded(px(16.))
                             .bg(gpui::white().opacity(0.15))
                             .hover(|style| style.bg(gpui::white().opacity(0.2)))
@@ -94,12 +98,12 @@ impl Music {
                             .flex_col()
                             .justify_between()
                             .cursor_pointer()
-                            .child(icon(glyph, 26., self.theme.text))
+                            .child(icon(glyph, text_size * 1.3, self.theme.text))
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(20.))
-                                    .line_height(px(24.))
+                                    .text_size(px(text_size))
+                                    .line_height(relative(1.2))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(link.title.clone()),
                             )
