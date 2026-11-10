@@ -64,8 +64,9 @@ impl Music {
             cx.quit();
             return;
         }
-        if self.overlay.is_some() && key != "escape" {
-            let menu = self.settings_menu.is_some()
+        if (self.overlay.is_some() || self.sort_menu) && key != "escape" {
+            let menu = self.sort_menu
+                || self.settings_menu.is_some()
                 || matches!(
                     self.overlay,
                     Some(Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Account)
@@ -171,6 +172,10 @@ impl Music {
             }
             "q" => self.toggle_player_page(cx),
             "escape" => {
+                if self.sort_menu {
+                    self.dismiss_sort_menu(window, cx);
+                    return;
+                }
                 if self.settings_menu.take().is_some() {
                     window.focus(&self.overlay_focus, cx);
                     cx.notify();

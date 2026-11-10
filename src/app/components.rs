@@ -9,7 +9,12 @@ pub(in crate::app) trait KeyboardControl:
         self.tab_index(0)
             .border_1()
             .border_color(gpui::transparent_black())
-            .focus_visible(move |style| style.border_color(theme.text))
+            .focus_visible(move |style| {
+                style.border_color(theme.text).shadow(vec![
+                    BoxShadow::new(px(0.), px(0.), theme.text).spread_radius(px(4.)),
+                    BoxShadow::new(px(0.), px(0.), theme.bg).spread_radius(px(2.)),
+                ])
+            })
     }
 }
 
@@ -20,6 +25,7 @@ impl<T: StatefulInteractiveElement + Styled> KeyboardControl for T {}
 #[derive(Default)]
 pub(in crate::app) struct VirtualListFocus {
     handles: HashMap<usize, FocusHandle>,
+    revealing: Option<(usize, Rc<Cell<bool>>)>,
 }
 
 impl VirtualListFocus {
@@ -41,6 +47,13 @@ impl VirtualListFocus {
         if rows == (0..1) {
             return;
         }
+        if self
+            .revealing
+            .as_ref()
+            .is_some_and(|(index, _)| rows.contains(&row_for(*index)))
+        {
+            self.revealing = None;
+        }
         self.handles
             .retain(|index, handle| rows.contains(&row_for(*index)) || handle.is_focused(window));
     }
@@ -49,6 +62,27 @@ impl VirtualListFocus {
         self.handles
             .iter()
             .find_map(|(index, handle)| handle.is_focused(window).then_some(*index))
+    }
+
+    pub(in crate::app) fn reveal_pending(&self, window: &Window) -> bool {
+        self.revealing.as_ref().is_some_and(|(index, pending)| {
+            pending.get()
+                && self
+                    .handles
+                    .get(index)
+                    .is_some_and(|handle| handle.is_focused(window))
+        })
+    }
+
+    pub(in crate::app) fn focus(&mut self, index: usize, window: &mut Window, cx: &mut App) {
+        let pending = Rc::new(Cell::new(true));
+        self.revealing = Some((index, pending.clone()));
+        window.focus(&self.handle(index, cx), cx);
+        // The measurement pass can be the only 0..1 range in a one-row list.
+        // Expire protection after presentation even when retain cannot clear it.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |_, _| pending.set(false));
+        });
     }
 
     fn advance(&mut self, reverse: bool, count: usize, window: &mut Window, cx: &mut App) -> bool {
@@ -66,7 +100,7 @@ impl VirtualListFocus {
         let Some(next) = next else {
             return false;
         };
-        window.focus(&self.handle(next, cx), cx);
+        self.focus(next, window, cx);
         true
     }
 }
@@ -102,7 +136,7 @@ impl Music {
         {
             if !advanced {
                 index = if reverse { sidebar_count - 1 } else { 0 };
-                window.focus(&self.sidebar_focus.handle(index, cx), cx);
+                self.sidebar_focus.focus(index, window, cx);
             }
             self.sidebar_scroll
                 .scroll_to_item(index, ScrollStrategy::Nearest);
@@ -115,7 +149,7 @@ impl Music {
         {
             if !advanced {
                 index = if reverse { queue_count - 1 } else { 0 };
-                window.focus(&self.queue_focus.handle(index, cx), cx);
+                self.queue_focus.focus(index, window, cx);
             }
             let row = index / 2;
             let row = row + usize::from(row >= self.library.queue.tracks.len());

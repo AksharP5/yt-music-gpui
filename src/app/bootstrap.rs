@@ -252,6 +252,8 @@ impl Music {
         let mut view = Self {
             #[cfg(test)]
             renders: 0,
+            #[cfg(test)]
+            focus_restores: 0,
             content_view,
             player_bar,
             theme: Theme::load(),
@@ -323,6 +325,7 @@ impl Music {
             video,
             player_open: false,
             sort_menu: false,
+            sort_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             video_fullscreen: false,
             video_transparent: false,
             video_error: None,

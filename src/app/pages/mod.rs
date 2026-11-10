@@ -544,6 +544,7 @@ impl Music {
                                     .h(px(row_height))
                                     .px(px(inset))
                                     .flex()
+                                    .items_start()
                                     .gap(px(gap))
                                     .children(
                                         items

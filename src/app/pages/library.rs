@@ -78,9 +78,18 @@ impl Music {
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = self.theme;
+        let bounds = Rc::new(Cell::new(Bounds::default()));
+        let measured = bounds.clone();
         let button = div()
             .id("library-sort")
             .keyboard_control(theme)
+            .track_focus(&self.sort_focus)
+            .relative()
+            .child(
+                canvas(move |rect, _, _| measured.set(rect), |_, _, _, _| {})
+                    .absolute()
+                    .inset_0(),
+            )
             .h(px(38.))
             .pl(px(16.))
             .pr(px(12.))
@@ -98,9 +107,8 @@ impl Music {
             .cursor_pointer()
             .child(label)
             .child(icon("expand-more", 24., theme.text))
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.sort_menu = !view.sort_menu;
-                cx.notify();
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.toggle_sort_menu(window, cx);
             }));
         let mut anchor = div().relative().flex_shrink_0().child(button);
         if self.sort_menu {
@@ -125,8 +133,8 @@ impl Music {
                             .when(selected, |mark| mark.child(icon("check", 24., theme.text))),
                     )
                     .child(choice.label.clone())
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.sort_menu = false;
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.dismiss_sort_menu(window, cx);
                         if !selected {
                             view.request(Query::Reload(reload.clone()), cx);
                         }
@@ -135,6 +143,9 @@ impl Music {
             });
             let menu = div()
                 .id("library-sort-menu")
+                .track_focus(&self.overlay_focus)
+                .tab_group()
+                .tab_stop(false)
                 .absolute()
                 .top(px(46.))
                 .right_0()
@@ -157,13 +168,46 @@ impl Music {
                         .child("Sort by"),
                 )
                 .child(div().py(px(8.)).children(options))
-                .on_mouse_down_out(cx.listener(|view, _, _, cx| {
-                    view.sort_menu = false;
-                    cx.notify();
-                }));
+                .on_mouse_down_out(
+                    cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                        if !bounds.get().contains(&event.position) {
+                            view.dismiss_sort_menu(window, cx);
+                        }
+                    }),
+                );
             anchor = anchor.child(deferred(menu).with_priority(1));
         }
         anchor
+    }
+
+    pub(in crate::app) fn toggle_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sort_menu {
+            self.dismiss_sort_menu(window, cx);
+            return;
+        }
+        self.sort_menu = true;
+        window.focus(&self.overlay_focus, cx);
+        let view = cx.weak_entity();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    if view.sort_menu && view.overlay_focus.is_focused(window) {
+                        view.move_overlay_focus(false, window, cx);
+                    }
+                });
+            });
+        });
+        cx.notify();
+    }
+
+    pub(in crate::app) fn dismiss_sort_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sort_menu = false;
+        window.focus(&self.sort_focus, cx);
+        cx.notify();
     }
 
     /// The web's centered empty library message.

@@ -83,6 +83,8 @@ pub enum Startup {
 pub struct Music {
     #[cfg(test)]
     renders: usize,
+    #[cfg(test)]
+    focus_restores: usize,
     content_view: Entity<MusicContent>,
     player_bar: Entity<PlayerBar>,
     theme: Theme,
@@ -144,6 +146,7 @@ pub struct Music {
     player_open: bool,
     /// The library sort menu is open.
     sort_menu: bool,
+    sort_focus: FocusHandle,
     video_fullscreen: bool,
     video_transparent: bool,
     video_error: Option<String>,
