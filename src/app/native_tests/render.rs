@@ -1,13 +1,31 @@
 use crate::app::{CatalogTarget, Music, Playback, PlayerTab, Startup};
 use crate::player::PlayerEvent;
 use anyhow::{Result, ensure};
-use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
+use gpui::{
+    AppContext, AsyncApp, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
+    point, px, size,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::AtomicBool;
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
+
+async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    let (sender, received) = async_channel::bounded(1);
+    cx.update_window(window.into(), |_, window, _| {
+        // GPUI invokes next-frame callbacks before drawing. The second callback
+        // runs after the first frame has finished drawing and presenting.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |_, _| {
+                let _ = sender.try_send(());
+            });
+        });
+    })
+    .unwrap();
+    received.recv().await.unwrap();
+}
 
 fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let id = match HasWindowHandle::window_handle(window).unwrap().as_raw() {
@@ -287,29 +305,44 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     window
                         .update(cx, |music, _, cx| music.show_player_tab(tab, cx))
                         .unwrap();
-                    cx.background_executor()
-                        .timer(Duration::from_millis(200))
-                        .await;
+                    wait_for_presented_frame(window, cx).await;
                     let baseline = window
-                        .update(cx, |_, window, _| {
+                        .update(cx, |music, window, cx| {
+                            println!(
+                                "BASELINE requested={tab:?} model={:?} body_renders={}",
+                                music.player_page.selected_tab(),
+                                music.content_view.read(cx).renders
+                            );
+                            assert_eq!(music.player_page.selected_tab(), tab);
                             capture(window, &format!("{tab:?}-before"))
                         })
                         .unwrap();
                     for step in 0..16 {
-                        cx.update_window(window.into(), |_, window, cx| {
+                        cx.update_window(window.into(), |root, window, cx| {
+                            let music = root.downcast::<Music>().unwrap();
+                            let before_tab = music.read(cx).player_page.selected_tab();
                             let before = window.focused(cx);
                             assert!(
                                 window
                                     .dispatch_keystroke(gpui::Keystroke::parse("tab").unwrap(), cx)
                             );
                             assert_ne!(window.focused(cx), before, "Tab must move focus");
+                            assert_eq!(
+                                music.read(cx).player_page.selected_tab(),
+                                before_tab,
+                                "Tab must preserve the selected player tab"
+                            );
+                            assert_eq!(before_tab, tab);
                         })
                         .unwrap();
-                        cx.background_executor()
-                            .timer(Duration::from_millis(20))
-                            .await;
+                        wait_for_presented_frame(window, cx).await;
                         let focused = window
-                            .update(cx, |_, window, _| {
+                            .update(cx, |music, window, _| {
+                                assert_eq!(
+                                    music.player_page.selected_tab(),
+                                    tab,
+                                    "Focus must preserve the selected player tab"
+                                );
                                 capture(window, &format!("{tab:?}-focus-{step}"))
                             })
                             .unwrap();
@@ -325,11 +358,14 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                                 )
                             })
                             .unwrap();
-                        cx.background_executor()
-                            .timer(Duration::from_millis(100))
-                            .await;
+                        wait_for_presented_frame(window, cx).await;
                         let image = window
-                            .update(cx, |_, window, _| {
+                            .update(cx, |music, window, _| {
+                                assert_eq!(
+                                    music.player_page.selected_tab(),
+                                    tab,
+                                    "Position redraws must preserve the selected player tab"
+                                );
                                 capture(window, &format!("{tab:?}-tab-{step}"))
                             })
                             .unwrap();

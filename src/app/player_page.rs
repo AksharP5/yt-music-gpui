@@ -53,6 +53,11 @@ pub(in crate::app) struct PlayerPage {
 }
 
 impl PlayerPage {
+    #[cfg(test)]
+    pub(in crate::app) fn selected_tab(&self) -> PlayerTab {
+        self.tab
+    }
+
     pub(in crate::app) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let (worker, events) = song_text::Worker::start();
         cx.spawn_in(window, async move |view, cx| {
