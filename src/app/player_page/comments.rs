@@ -34,6 +34,21 @@ fn comment_preview(text: &str) -> Option<String> {
     None
 }
 
+fn comment_indent(depth: usize) -> f32 {
+    if depth == 0 {
+        0.
+    } else {
+        48. + (depth.saturating_sub(1).min(3) as f32 * 36.)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Guide {
+    Comment,
+    Continue,
+    End,
+}
+
 struct Pending {
     id: u64,
     load: Load,
@@ -46,6 +61,7 @@ struct Entry {
     replies_open: bool,
     replies: Vec<usize>,
     depth: usize,
+    parent: Option<usize>,
     error: Option<String>,
 }
 
@@ -53,6 +69,7 @@ struct Entry {
 enum Row {
     Comment(usize),
     Replies(usize),
+    Toggle(usize),
     More,
 }
 
@@ -65,6 +82,7 @@ pub(super) struct State {
     count: String,
     sorts: Vec<Sort>,
     menu: bool,
+    sort_bounds: Rc<Cell<Bounds<Pixels>>>,
     entries: Vec<Entry>,
     roots: Vec<usize>,
     continuation: Option<Continuation>,
@@ -90,6 +108,7 @@ impl State {
             count: "Comments".into(),
             sorts: Vec::new(),
             menu: false,
+            sort_bounds: Rc::new(Cell::new(Bounds::default())),
             entries: Vec::new(),
             roots: Vec::new(),
             continuation: None,
@@ -130,6 +149,7 @@ impl State {
             if let Row::Comment(index) = row {
                 let entry = &self.entries[index];
                 if entry.replies_open {
+                    pending.push(Row::Toggle(index));
                     if entry.thread.replies.is_some() || entry.error.is_some() {
                         pending.push(Row::Replies(index));
                     }
@@ -148,12 +168,15 @@ impl State {
                     if entry.preview.is_some() {
                         self.controls.push((row, Control::Read(index)));
                     }
-                    if entry.thread.replies.is_some() || !entry.replies.is_empty() {
+                    if !entry.replies_open
+                        && (entry.thread.replies.is_some() || !entry.replies.is_empty())
+                    {
                         self.controls.push((row, Control::Toggle(index)));
                     }
                 }
                 Row::More => self.controls.push((row, Control::More)),
                 Row::Replies(parent) => self.controls.push((row, Control::Replies(parent))),
+                Row::Toggle(index) => self.controls.push((row, Control::Toggle(index))),
             }
         }
         self.focus.retain(|control, _| {
@@ -235,7 +258,8 @@ impl State {
         Some(event.session_rejected)
     }
 
-    fn insert(&mut self, mut thread: Thread, depth: usize) -> usize {
+    fn insert(&mut self, mut thread: Thread, parent: Option<usize>) -> usize {
+        let depth = parent.map_or(0, |parent| self.entries[parent].depth + 1);
         let children = std::mem::take(&mut thread.children);
         let index = self.entries.len();
         let preview = comment_preview(&thread.comment.text);
@@ -246,10 +270,11 @@ impl State {
             replies_open: false,
             replies: Vec::new(),
             depth,
+            parent,
             error: None,
         });
         for child in children {
-            let reply = self.insert(child, depth + 1);
+            let reply = self.insert(child, Some(index));
             self.entries[index].replies.push(reply);
         }
         index
@@ -258,14 +283,13 @@ impl State {
     fn apply(&mut self, page: Page, load: Load) {
         let previous_count = self.entries.len();
         if let Load::Replies(index) = load {
-            let depth = self.entries[index].depth + 1;
             for thread in page.comments {
                 if !self.entries[index]
                     .replies
                     .iter()
                     .any(|reply| self.entries[*reply].thread.comment.id == thread.comment.id)
                 {
-                    let reply = self.insert(thread, depth);
+                    let reply = self.insert(thread, Some(index));
                     self.entries[index].replies.push(reply);
                 }
             }
@@ -295,7 +319,7 @@ impl State {
                     .iter()
                     .any(|root| self.entries[*root].thread.comment.id == thread.comment.id)
                 {
-                    let root = self.insert(thread, 0);
+                    let root = self.insert(thread, None);
                     self.roots.push(root);
                 }
             }
@@ -476,15 +500,22 @@ impl Music {
             .sorts
             .iter()
             .enumerate()
-            .map(|(index, sort)| (index, sort.label.clone(), sort.selected))
+            .map(|(index, sort)| {
+                (
+                    index,
+                    match sort.label.as_str() {
+                        "Top" => "Top comments".to_owned(),
+                        "Newest" => "Newest first".to_owned(),
+                        _ => sort.label.clone(),
+                    },
+                    sort.selected,
+                    sort.subtitle.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        let selected = state
-            .sorts
-            .iter()
-            .find(|sort| sort.selected)
-            .map(|sort| sort.label.clone())
-            .unwrap_or_else(|| "Top comments".into());
         let menu = state.menu;
+        let sort_bounds = state.sort_bounds.clone();
+        let measured_sort = sort_bounds.clone();
         let loading = state.pending.is_some();
         let message = state
             .message
@@ -494,13 +525,14 @@ impl Music {
         let sort_focus = self.player_page.comments.handle(Control::Sort, cx);
         let option_focus = sorts
             .iter()
-            .map(|(index, _, _)| {
+            .map(|(index, _, _, _)| {
                 self.player_page
                     .comments
                     .handle(Control::SortOption(*index), cx)
             })
             .collect::<Vec<_>>();
         div()
+            .relative()
             .id("comments-tab")
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 let state = &mut view.player_page.comments;
@@ -541,15 +573,17 @@ impl Music {
             .flex_col()
             .child(
                 div()
-                    .py(px(16.))
+                    .pt(px(24.))
+                    .pb(px(32.))
                     .flex()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(px(32.))
                     .child(
                         div()
-                            .flex_1()
                             .font_weight(FontWeight::BOLD)
-                            .text_size(px(16.))
+                            .text_color(rgb(0xf1f1f1))
+                            .text_size(px(20.))
+                            .line_height(px(28.))
                             .child(count),
                     )
                     .when(!sorts.is_empty(), |header| {
@@ -559,10 +593,20 @@ impl Music {
                                 .track_focus(&sort_focus)
                                 .keyboard_control(self.theme)
                                 .cursor_pointer()
-                                .px(px(4.))
-                                .py(px(6.))
-                                .text_size(px(13.))
-                                .child(format!("{selected} ▾"))
+                                .relative()
+                                .child(
+                                    canvas(
+                                        move |bounds, _, _| measured_sort.set(bounds),
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
+                                .size(px(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon("sort", 24., rgb(0xf1f1f1).into()).flex_shrink_0())
                                 .on_click(cx.listener(|view, _, _, cx| {
                                     view.player_page.comments.menu =
                                         !view.player_page.comments.menu;
@@ -573,37 +617,106 @@ impl Music {
             )
             .when(menu, |body| {
                 body.child(
-                    div()
-                        .pb(px(12.))
-                        .flex()
-                        .flex_col()
-                        .children(sorts.into_iter().map(|(index, label, selected)| {
-                            div()
-                                .id(("comment-sort-option", index))
-                                .track_focus(&option_focus[index])
-                                .keyboard_control(self.theme)
-                                .cursor_pointer()
-                                .px(px(12.))
-                                .py(px(10.))
-                                .bg(if selected {
-                                    self.theme.raised
-                                } else {
-                                    self.theme.bg
-                                })
-                                .text_size(px(14.))
-                                .child(label)
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.player_page.comments.menu = false;
-                                    if let Some(sort) = view.player_page.comments.sorts.get(index) {
-                                        let token = sort.continuation.clone();
-                                        if view.player_page.comments.cancel() {
-                                            view.player_page.worker.cancel();
-                                        }
-                                        view.request_comments(Load::Sort(index), token);
-                                    }
-                                    cx.notify();
-                                }))
-                        })),
+                    deferred(
+                        anchored()
+                            .position(point(
+                                sort_bounds.get().left(),
+                                sort_bounds.get().bottom() + px(10.),
+                            ))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(
+                                div()
+                                    .id("comments-sort-menu")
+                                    .w(px(294.))
+                                    .py(px(8.))
+                                    .rounded(px(12.))
+                                    .bg(rgb(0x282828))
+                                    .shadow_lg()
+                                    .occlude()
+                                    .children(sorts.into_iter().map(
+                                        |(index, label, selected, subtitle)| {
+                                            div()
+                                                .id(("comment-sort-option", index))
+                                                .track_focus(&option_focus[index])
+                                                .keyboard_control(self.theme)
+                                                .cursor_pointer()
+                                                .min_h(px(72.))
+                                                .px(px(16.))
+                                                .flex()
+                                                .flex_col()
+                                                .justify_center()
+                                                .text_size(px(14.))
+                                                .line_height(px(20.))
+                                                .bg(if selected {
+                                                    rgb(0x3e3e3e)
+                                                } else {
+                                                    rgb(0x282828)
+                                                })
+                                                .hover(|style| style.bg(rgb(0x3e3e3e)))
+                                                .child(label)
+                                                .when_some(subtitle, |row, subtitle| {
+                                                    row.child(
+                                                        div()
+                                                            .whitespace_normal()
+                                                            .text_size(px(12.))
+                                                            .line_height(px(18.))
+                                                            .text_color(rgb(0xaaaaaa))
+                                                            .child(subtitle),
+                                                    )
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        view.player_page.comments.menu = false;
+                                                        let focus = view
+                                                            .player_page
+                                                            .comments
+                                                            .handle(Control::Sort, cx);
+                                                        window.focus(&focus, cx);
+                                                        if let Some(sort) = view
+                                                            .player_page
+                                                            .comments
+                                                            .sorts
+                                                            .get(index)
+                                                        {
+                                                            let token = sort.continuation.clone();
+                                                            if view.player_page.comments.cancel() {
+                                                                view.player_page.worker.cancel();
+                                                            }
+                                                            view.request_comments(
+                                                                Load::Sort(index),
+                                                                token,
+                                                            );
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                        },
+                                    ))
+                                    .on_mouse_down_out(cx.listener(
+                                        |view, event: &MouseDownEvent, window, cx| {
+                                            if view.player_page.comments.menu
+                                                && !view
+                                                    .player_page
+                                                    .comments
+                                                    .sort_bounds
+                                                    .get()
+                                                    .contains(&event.position)
+                                            {
+                                                view.player_page.comments.menu = false;
+                                                window.focus(
+                                                    &view
+                                                        .player_page
+                                                        .comments
+                                                        .handle(Control::Sort, cx),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
+                            ),
+                    )
+                    .with_priority(1),
                 )
             })
             .when_some(message, |body, message| {
@@ -634,6 +747,18 @@ impl Music {
         };
         match row {
             Row::Comment(index) => self.comment_row(index, cx),
+            Row::Toggle(index) => {
+                let indent = comment_indent(self.player_page.comments.entries[index].depth);
+                div()
+                    .relative()
+                    .h(px(72.))
+                    .pl(px(indent + if indent == 0. { 52. } else { 40. }))
+                    .pt(px(12.))
+                    .pb(px(24.))
+                    .child(self.comment_guides(index, Guide::End))
+                    .child(self.comment_reply_toggle(index, cx))
+                    .into_any_element()
+            }
             Row::More | Row::Replies(_) => {
                 let state = &self.player_page.comments;
                 let (load, token, error) = match row {
@@ -675,7 +800,18 @@ impl Music {
                     _ => Control::More,
                 };
                 let focus = self.player_page.comments.handle(control, cx);
+                let replies = match row {
+                    Row::Replies(parent) => Some(parent),
+                    _ => None,
+                };
                 div()
+                    .relative()
+                    .when_some(replies, |body, parent| {
+                        body.pl(px(comment_indent(
+                            self.player_page.comments.entries[parent].depth,
+                        ) + 52.))
+                            .child(self.comment_guides(parent, Guide::Continue))
+                    })
                     .id(("comments-more", index))
                     .track_focus(&focus)
                     .keyboard_control(self.theme)
@@ -700,13 +836,151 @@ impl Music {
         }
     }
 
+    fn comment_reply_toggle(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let entry = &self.player_page.comments.entries[index];
+        let expanded = entry.replies_open;
+        let label = if expanded {
+            "Hide replies".to_owned()
+        } else if entry.thread.replies_label.is_empty() {
+            "Replies".to_owned()
+        } else {
+            entry.thread.replies_label.clone()
+        };
+        let focus = self.player_page.comments.handle(Control::Toggle(index), cx);
+        div()
+            .id(("comment-replies", index))
+            .track_focus(&focus)
+            .keyboard_control(self.theme)
+            .h(px(36.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(18.))
+            .text_size(px(14.))
+            .line_height(px(20.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(0xf1f1f1))
+            .cursor_pointer()
+            .hover(|style| style.bg(gpui::white().opacity(0.1)))
+            .child(label)
+            .child(icon(
+                if expanded {
+                    "comment-collapse"
+                } else {
+                    "comment-expand"
+                },
+                24.,
+                rgb(0xf1f1f1).into(),
+            ))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.player_page.comments.entries[index].replies_open = !expanded;
+                view.player_page.comments.rebuild(false);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Each virtual row paints the part of its ancestors' thread lines that crosses it.
+    fn comment_guides(&self, index: usize, guide: Guide) -> AnyElement {
+        let entries = &self.player_page.comments.entries;
+        let entry = &entries[index];
+        let stroke = rgb(0x3f3f3f);
+        let mut lines = Vec::new();
+        let mut parent = entry.parent;
+        while let Some(index) = parent {
+            let ancestor = &entries[index];
+            let center =
+                comment_indent(ancestor.depth) + if ancestor.depth == 0 { 18. } else { 12. };
+            lines.push(
+                div()
+                    .absolute()
+                    .left(px(center))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.))
+                    .bg(stroke)
+                    .into_any_element(),
+            );
+            parent = ancestor.parent;
+        }
+        if matches!(guide, Guide::Comment)
+            && let Some(parent) = entry.parent
+        {
+            let parent = &entries[parent];
+            let half_avatar = if parent.depth == 0 { 18. } else { 12. };
+            lines.push(
+                div()
+                    .absolute()
+                    .left(px(comment_indent(parent.depth) + half_avatar))
+                    .top_0()
+                    .h(px(12.))
+                    .w(px(half_avatar))
+                    .border_l_1()
+                    .border_b_1()
+                    .border_color(stroke)
+                    .rounded_bl(px(16.))
+                    .into_any_element(),
+            );
+        }
+        let has_replies = entry.thread.replies.is_some() || !entry.replies.is_empty();
+        let center = comment_indent(entry.depth) + if entry.depth == 0 { 18. } else { 12. };
+        let radius = if entry.depth == 0 { 18. } else { 12. };
+        match guide {
+            Guide::Comment if has_replies => {
+                let line = div()
+                    .absolute()
+                    .left(px(center))
+                    .top(px(if entry.depth == 0 { 40. } else { 28. }));
+                lines.push(if entry.replies_open {
+                    line.bottom_0().w(px(1.)).bg(stroke).into_any_element()
+                } else {
+                    line.bottom(px(if entry.depth == 0 { 42. } else { 30. }))
+                        .w(px(radius))
+                        .border_l_1()
+                        .border_b_1()
+                        .border_color(stroke)
+                        .rounded_bl(px(16.))
+                        .into_any_element()
+                });
+            }
+            Guide::Continue => lines.push(
+                div()
+                    .absolute()
+                    .left(px(center))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.))
+                    .bg(stroke)
+                    .into_any_element(),
+            ),
+            Guide::End => lines.push(
+                div()
+                    .absolute()
+                    .left(px(center))
+                    .top_0()
+                    .h(px(30.))
+                    .w(px(radius))
+                    .border_l_1()
+                    .border_b_1()
+                    .border_color(stroke)
+                    .rounded_bl(px(16.))
+                    .into_any_element(),
+            ),
+            _ => {}
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .children(lines)
+            .into_any_element()
+    }
+
     fn comment_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let entry = &self.player_page.comments.entries[index];
         let comment = entry.thread.comment.clone();
         let expanded = entry.expanded;
         let depth = entry.depth;
-        let replies_open = entry.replies_open;
-        let replies_label = entry.thread.replies_label.clone();
+        let open = entry.replies_open;
         let has_replies = entry.thread.replies.is_some() || !entry.replies.is_empty();
         let long = entry.preview.is_some();
         let content = if expanded {
@@ -718,21 +992,23 @@ impl Music {
                 .unwrap_or_else(|| comment.text.clone())
         };
         let read_focus = long.then(|| self.player_page.comments.handle(Control::Read(index), cx));
-        let reply_focus =
-            has_replies.then(|| self.player_page.comments.handle(Control::Toggle(index), cx));
-        let id = SharedString::from(comment.id.clone());
+        let toggle = (has_replies && !open).then(|| self.comment_reply_toggle(index, cx));
+        let guides = self.comment_guides(index, Guide::Comment);
         let art = self.art(
             comment.avatar.as_deref(),
-            if depth > 0 { 24. } else { 32. },
+            if depth == 0 { 36. } else { 24. },
             ArtworkShape::Circle,
         );
         div()
+            .relative()
             .w_full()
-            .py(px(12.))
-            .when(depth > 0, |row| row.pl(px((depth.min(3) * 32) as f32)))
+            .pb(px(if depth > 0 || open { 12. } else { 24. }))
+            .pl(px(comment_indent(depth)))
+            .pr(px(44.))
             .flex()
             .items_start()
             .gap(px(16.))
+            .child(guides)
             .child(art)
             .child(
                 div()
@@ -740,14 +1016,16 @@ impl Music {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(5.))
-                    .text_size(px(13.))
-                    .line_height(px(18.))
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .text_color(rgb(0xf1f1f1))
                     .when_some(comment.pinned, |body, pinned| {
                         body.child(
                             div()
+                                .mb(px(4.))
                                 .text_size(px(12.))
-                                .text_color(self.theme.muted)
+                                .line_height(px(18.))
+                                .text_color(rgb(0xaaaaaa))
                                 .child(pinned),
                         )
                     })
@@ -755,98 +1033,91 @@ impl Music {
                         div()
                             .flex()
                             .flex_wrap()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(div().font_weight(FontWeight::MEDIUM).child(comment.author))
-                            .when(comment.creator, |line| {
-                                line.child(div().text_color(self.theme.muted).child("Creator"))
-                            })
-                            .when(comment.verified, |line| {
-                                line.child(div().text_color(self.theme.muted).child("✓"))
-                            })
+                            .items_start()
+                            .gap(px(4.))
+                            .min_h(px(20.))
+                            .mb(px(2.))
+                            .text_size(px(12.))
+                            .line_height(px(18.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .text_color(self.theme.muted)
-                                    .child(comment.published),
-                            ),
+                                    .pb(px(2.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(comment.author),
+                            )
+                            .when(comment.creator, |line| {
+                                line.child(div().text_color(rgb(0xaaaaaa)).child("Creator"))
+                            })
+                            .when(comment.verified, |line| {
+                                line.child(div().text_color(rgb(0xaaaaaa)).child("✓"))
+                            })
+                            .child(div().text_color(rgb(0xaaaaaa)).child(comment.published)),
                     )
                     .child(
                         div()
                             .whitespace_normal()
                             .when(long && !expanded, |text| {
-                                text.line_clamp(4).max_h(px(72.)).overflow_hidden()
+                                text.line_clamp(4).max_h(px(80.)).overflow_hidden()
                             })
                             .child(content),
                     )
                     .when(long, |body| {
                         body.child(
                             div()
-                                .id((ElementId::Name("comment-expand".into()), id.clone()))
+                                .id(("comment-expand", index))
                                 .when_some(read_focus, |body, focus| body.track_focus(&focus))
                                 .keyboard_control(self.theme)
                                 .cursor_pointer()
-                                .text_color(self.theme.muted)
+                                .text_color(rgb(0xaaaaaa))
+                                .font_weight(FontWeight::MEDIUM)
                                 .child(if expanded { "Show less" } else { "Read more" })
                                 .on_click(cx.listener(move |view, _, _, cx| {
-                                    let state = &mut view.player_page.comments;
-                                    state.entries[index].expanded = !expanded;
-                                    state.list.remeasure();
+                                    view.player_page.comments.entries[index].expanded = !expanded;
+                                    view.player_page.comments.list.remeasure();
                                     cx.notify();
                                 })),
                         )
                     })
-                    .when(!comment.likes.is_empty(), |body| {
-                        body.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .py(px(3.))
-                                .child(icon(
-                                    if comment.liked {
-                                        "thumb-up-filled"
-                                    } else {
-                                        "thumb-up"
-                                    },
-                                    16.,
-                                    if comment.liked {
-                                        self.theme.text
-                                    } else {
-                                        self.theme.muted
-                                    },
-                                ))
-                                .child(comment.likes),
-                        )
-                    })
-                    .when(has_replies, |body| {
-                        body.child(
-                            div()
-                                .id((ElementId::Name("comment-replies".into()), id))
-                                .when_some(reply_focus, |body, focus| body.track_focus(&focus))
-                                .keyboard_control(self.theme)
-                                .cursor_pointer()
-                                .text_color(rgb(0x3ea6ff))
-                                .py(px(6.))
-                                .child(if replies_open {
-                                    "▴ Hide replies".to_owned()
-                                } else {
-                                    format!(
-                                        "▾ {}",
-                                        if replies_label.is_empty() {
-                                            "Replies"
+                    // Reaction icons are deliberately plain elements, with no focus or write actions.
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .child(
+                                div()
+                                    .min_w(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .child(icon(
+                                        if comment.liked {
+                                            "thumb-up-filled"
                                         } else {
-                                            &replies_label
-                                        }
-                                    )
-                                })
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.player_page.comments.entries[index].replies_open =
-                                        !replies_open;
-                                    view.player_page.comments.rebuild(false);
-                                    cx.notify();
-                                })),
-                        )
+                                            "thumb-up"
+                                        },
+                                        16.,
+                                        rgb(0xf1f1f1).into(),
+                                    ))
+                                    .when(!comment.likes.is_empty(), |row| {
+                                        row.child(
+                                            div()
+                                                .ml(px(8.))
+                                                .text_color(rgb(0xaaaaaa))
+                                                .child(comment.likes),
+                                        )
+                                    }),
+                            )
+                            .child(div().ml(px(16.)).child(icon(
+                                "thumb-down",
+                                16.,
+                                rgb(0xf1f1f1).into(),
+                            ))),
+                    )
+                    .when_some(toggle, |body, toggle| {
+                        body.child(div().h(px(48.)).pt(px(12.)).child(toggle))
                     }),
             )
             .into_any_element()
@@ -979,18 +1250,6 @@ mod tests {
         assert!(state.continuation.is_none());
     }
 
-    fn cpu_seconds() -> f64 {
-        let mut time = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) },
-            0
-        );
-        time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
-    }
-
     async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
         cx.update_window(window.into(), |_, window, cx| {
             let keystroke = Keystroke::parse(key).unwrap();
@@ -999,6 +1258,45 @@ mod tests {
         })
         .unwrap();
         wait_for_presented_frame(window, cx).await;
+    }
+
+    async fn settle_artwork(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            wait_for_presented_frame(window, cx).await;
+            if window
+                .update(cx, |music, _, _| music.artwork.is_idle())
+                .unwrap()
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "Comment avatars did not settle");
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    }
+
+    fn capture_panel(music: &Music, window: &gpui::Window, label: &str) {
+        let width = f32::from(window.viewport_size().width);
+        let image = capture(window, &format!("comments-{label}-{width:.0}"));
+        let spacing = super::super::Spacing::for_width(width);
+        let sidebar = if music.sidebar_compact(width) {
+            72.
+        } else {
+            240.
+        };
+        let panel = (width - sidebar - spacing.horizontal * 2.) * spacing.side;
+        let x = (width - spacing.horizontal - panel).round() as u32;
+        let y = (64. + spacing.vertical) as u32;
+        image::imageops::crop_imm(&image, x, y, panel.round() as u32, image.height() - 72 - y)
+            .to_image()
+            .save(
+                std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+                    .join(format!("comments-panel-{label}-{width:.0}.png")),
+            )
+            .unwrap();
+        println!("COMMENTS_PANEL label={label} width={width} x={x} y={y} panel={panel:.2}");
     }
 
     #[test]
@@ -1010,7 +1308,7 @@ mod tests {
             cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/Roboto.ttf").as_slice())]).unwrap();
             crate::input::init(cx);
             let window = cx.open_window(WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(20.), px(20.)), size(px(1320.), px(860.))))),
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(20.), px(20.)), size(px(1280.), px(800.))))),
                 titlebar: Some(TitlebarOptions { title: Some("Music comments integration test".into()), ..Default::default() }),
                 focus: false,
                 kind: WindowKind::PopUp,
@@ -1045,33 +1343,100 @@ mod tests {
                             ensure!(Instant::now() < deadline, "Comments did not load");
                             cx.background_executor().timer(Duration::from_millis(50)).await;
                         }
-                        // Artwork decoding and catalog completions are outside the steady sample.
-                        cx.background_executor().timer(Duration::from_secs(2)).await;
-                        let start = Instant::now();
-                        let cpu = cpu_seconds();
-                        let before = window.update(cx, |music, _, cx| music.content_view.read(cx).renders)?;
-                        cx.background_executor().timer(Duration::from_secs(5)).await;
-                        let cost = 100. * (cpu_seconds() - cpu) / start.elapsed().as_secs_f64();
-                        let after = window.update(cx, |music, _, cx| music.content_view.read(cx).renders)?;
-                        println!("COMMENTS_PLAYING_CPU tab={tab:?} percent_one_core={cost:.2} body_renders={}", after-before);
+                        settle_artwork(window, cx).await;
+                        if std::env::var_os("YT_MUSIC_COMMENTS_PROFILE").is_some() {
+                            cx.background_executor().timer(Duration::from_secs(3)).await;
+                            let output = cx.background_executor().spawn(async {
+                                std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/bin/profile"))
+                                    .args([std::process::id().to_string(), "30".into()]).output()
+                            }).await?;
+                            ensure!(output.status.success(), "CPU sampling failed: {}", String::from_utf8_lossy(&output.stderr));
+                            println!("COMMENTS_PROFILE tab={tab:?} {}", String::from_utf8_lossy(&output.stdout));
+                        }
+                    }
+                    let sample = window.update(cx, |music, _, _| {
+                        music.player_page.comments.roots.iter().copied()
+                            .find(|index| music.player_page.comments.entries[*index].thread.comment.author == "@bdr8823")
+                            .unwrap_or(music.player_page.comments.roots[0])
+                    })?;
+                    for (width, height) in [(1280., 800.), (1920., 1080.)] {
+                        window.update(cx, |music, window, cx| {
+                            window.resize(size(px(width), px(height)));
+                            let state = &music.player_page.comments;
+                            let row = state.rows.iter().position(|row| matches!(row, super::Row::Comment(index) if *index == sample)).unwrap();
+                            state.list.scroll_to(gpui::ListOffset { item_ix: row, offset_in_item: px(0.) });
+                            cx.notify();
+                        })?;
+                        settle_artwork(window, cx).await;
+                        window.update(cx, |music, window, _| capture_panel(music, window, "live"))?;
+                        window.update(cx, |music, window, cx| {
+                            music.player_page.comments.focus_control(Control::Toggle(sample), window, cx);
+                            cx.notify();
+                        })?;
+                        wait_for_presented_frame(window, cx).await;
+                        key(window, cx, "enter").await;
+                        window.update(cx, |music, _, _| assert!(music.player_page.comments.entries[sample].replies_open))?;
+                        let deadline = Instant::now() + Duration::from_secs(30);
+                        loop {
+                            let ready = window.update(cx, |music, _, _| !music.player_page.comments.entries[sample].replies.is_empty() && music.player_page.comments.pending.is_none())?;
+                            if ready { break; }
+                            ensure!(Instant::now() < deadline, "Public replies did not load");
+                            cx.background_executor().timer(Duration::from_millis(50)).await;
+                        }
+                        window.update(cx, |music, _, cx| {
+                            let state = &music.player_page.comments;
+                            let row = state.rows.iter().position(|row| matches!(row, super::Row::Comment(index) if *index == sample)).unwrap();
+                            state.list.scroll_to(gpui::ListOffset { item_ix: row, offset_in_item: px(0.) });
+                            cx.notify();
+                        })?;
+                        settle_artwork(window, cx).await;
+                        window.update(cx, |music, window, _| capture_panel(music, window, "replies"))?;
+                        window.update(cx, |music, window, cx| { music.player_page.comments.focus_control(Control::Toggle(sample), window, cx); cx.notify(); })?;
+                        wait_for_presented_frame(window, cx).await;
+                        key(window, cx, "enter").await;
+                        window.update(cx, |music, _, cx| {
+                            let state = &music.player_page.comments;
+                            assert!(!state.entries[sample].replies_open);
+                            let row = state.rows.iter().position(|row| matches!(row, super::Row::Comment(index) if *index == sample)).unwrap();
+                            state.list.scroll_to(gpui::ListOffset { item_ix: row, offset_in_item: px(0.) });
+                            cx.notify();
+                        })?;
                     }
                     wait_for_presented_frame(window, cx).await;
-                    window.update(cx, |music, window, _| {
-                        assert!(!music.player_page.comments.entries.is_empty());
-                        let image = capture(window, "comments-live");
-                        let width = image.width();
-                        image::imageops::crop_imm(&image, width.saturating_sub(485), 65, 460.min(width), image.height().saturating_sub(160)).to_image()
-                            .save(std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("comments-native-crop.png")).unwrap();
+                    let position = window.update(cx, |music, _, _| {
+                        music.player_page.comments.sort_bounds.get().center()
                     })?;
-                    window.update(cx, |music, window, cx| {
-                        let focus = music.player_page.comments.handle(Control::Sort, cx);
-                        window.focus(&focus, cx);
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                            button: gpui::MouseButton::Left,
+                            position,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }), cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                            button: gpui::MouseButton::Left,
+                            position,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                        }), cx);
+                    })?;
+                    wait_for_presented_frame(window, cx).await;
+                    window.update(cx, |music, window, _| {
+                        assert!(music.player_page.comments.menu);
+                        capture_panel(music, window, "sort");
+                    })?;
+                    key(window, cx, "escape").await;
+                    window.update(cx, |music, window, _| {
+                        assert!(!music.player_page.comments.menu && music.player_open);
+                        assert!(music.player_page.comments.focus[&Control::Sort].is_focused(window));
                     })?;
                     key(window, cx, "enter").await;
-                    window.update(cx, |music, window, cx| {
-                        assert!(music.player_page.comments.menu);
-                        let focus = music.player_page.comments.handle(Control::SortOption(1), cx);
-                        window.focus(&focus, cx);
+                    key(window, cx, "down").await;
+                    key(window, cx, "down").await;
+                    window.update(cx, |music, window, _| {
+                        assert!(music.player_page.comments.focus[&Control::SortOption(1)].is_focused(window));
+                        assert_eq!(music.library.volume, 0.);
                     })?;
                     key(window, cx, "enter").await;
                     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1126,7 +1491,7 @@ mod tests {
                         state.entries = (0..500).map(|index| {
                             let mut comment = template.clone(); comment.id = format!("virtual-{index}");
                             let preview = super::comment_preview(&comment.text);
-                            super::Entry { preview, thread: crate::comments::Thread { comment, replies_label: String::new(), replies: None, children: Vec::new() }, expanded: false, replies_open: false, replies: Vec::new(), depth: 0, error: None }
+                            super::Entry { preview, thread: crate::comments::Thread { comment, replies_label: String::new(), replies: None, children: Vec::new() }, expanded: false, replies_open: false, replies: Vec::new(), depth: 0, parent: None, error: None }
                         }).collect();
                         state.roots = (0..500).collect();
                         state.continuation = None;

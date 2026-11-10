@@ -7,6 +7,13 @@ pub struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         Ok(match path {
+            "sort" => Some(Cow::Borrowed(include_bytes!("../assets/icons/sort.svg"))),
+            "comment-expand" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/comment-expand.svg"
+            ))),
+            "comment-collapse" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/comment-collapse.svg"
+            ))),
             "play" => Some(Cow::Borrowed(include_bytes!("../assets/icons/play.svg"))),
             "pause" => Some(Cow::Borrowed(include_bytes!("../assets/icons/pause.svg"))),
             "next" => Some(Cow::Borrowed(include_bytes!("../assets/icons/next.svg"))),

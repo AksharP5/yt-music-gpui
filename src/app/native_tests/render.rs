@@ -1736,6 +1736,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 source: None,
                 lyrics: None,
                 related: None,
+                comments: None,
                 alternatives: None,
                 continuation: None,
                 source_target: None,

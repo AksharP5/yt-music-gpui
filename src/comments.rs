@@ -33,6 +33,7 @@ pub struct Thread {
 #[derive(Clone, Debug)]
 pub struct Sort {
     pub label: String,
+    pub subtitle: Option<String>,
     pub selected: bool,
     pub continuation: Continuation,
 }
@@ -169,6 +170,7 @@ fn parse_items(
                 {
                     page.sorts.push(Sort {
                         label: sort["title"].as_str().unwrap_or("Top comments").to_owned(),
+                        subtitle: sort["subtitle"].as_str().map(str::to_owned),
                         selected: sort["selected"] == true,
                         continuation: token,
                     });
