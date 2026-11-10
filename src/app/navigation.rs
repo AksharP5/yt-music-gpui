@@ -232,6 +232,11 @@ impl Music {
         self.page.countries.clear();
         self.rows.clear();
         self.list_rows.clear();
+        if !matches!(route, Route::Search(_)) {
+            // Like the web, the search box only keeps a query on its results.
+            self.search
+                .update(cx, |input, cx| input.set_query(String::new(), cx));
+        }
         match route {
             Route::Home => {
                 self.page.title = "Home".into();
@@ -363,6 +368,7 @@ impl Music {
             privacy: None,
             chips: Vec::new(),
             countries: Vec::new(),
+            search_filters: Vec::new(),
         };
         self.rebuild_rows();
     }
@@ -380,10 +386,12 @@ impl Music {
             self.artwork.cancel_pending();
             self.list_id = self.list_id.wrapping_add(1);
             self.route = state.route;
-            if let Route::Search(search) = &self.route {
-                self.search
-                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
-            }
+            let query = match &self.route {
+                Route::Search(search) => search.query.clone(),
+                _ => String::new(),
+            };
+            self.search
+                .update(cx, |input, cx| input.set_query(query, cx));
             self.page = page;
             self.sync.page_fetched_at = state.fetched_at;
             self.sync.page_coverage = state.coverage;

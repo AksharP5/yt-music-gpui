@@ -913,6 +913,7 @@ mod tests {
             editable: true,
             chips: Vec::new(),
             countries: Vec::new(),
+            search_filters: Vec::new(),
         }
     }
 

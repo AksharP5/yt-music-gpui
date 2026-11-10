@@ -2,7 +2,7 @@ use crate::catalog::{Catalog, Continuation, Page, parse_page};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchFilter {
     #[default]
     All,
@@ -13,6 +13,9 @@ pub enum SearchFilter {
     Playlists,
     Podcasts,
     Episodes,
+    CommunityPlaylists,
+    FeaturedPlaylists,
+    Profiles,
 }
 
 impl SearchFilter {
@@ -27,6 +30,26 @@ impl SearchFilter {
         Self::Episodes,
     ];
 
+    /// Catalog categories, used when a response names none of its own.
+    pub const CATALOG: [Self; 10] = [
+        Self::All,
+        Self::Songs,
+        Self::Videos,
+        Self::Albums,
+        Self::Artists,
+        Self::CommunityPlaylists,
+        Self::FeaturedPlaylists,
+        Self::Episodes,
+        Self::Profiles,
+        Self::Podcasts,
+    ];
+
+    fn from_label(label: &str) -> Option<Self> {
+        Self::CATALOG
+            .into_iter()
+            .find(|filter| filter.label() == label)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::All => "All",
@@ -37,6 +60,9 @@ impl SearchFilter {
             Self::Playlists => "Playlists",
             Self::Podcasts => "Podcasts",
             Self::Episodes => "Episodes",
+            Self::CommunityPlaylists => "Community playlists",
+            Self::FeaturedPlaylists => "Featured playlists",
+            Self::Profiles => "Profiles",
         }
     }
 
@@ -50,6 +76,8 @@ impl SearchFilter {
             Self::Playlists => Some("Io"),
             Self::Podcasts => Some("JQ"),
             Self::Episodes => Some("JI"),
+            Self::Profiles => Some("JY"),
+            Self::CommunityPlaylists | Self::FeaturedPlaylists => None,
         }
     }
 }
@@ -79,13 +107,15 @@ impl SearchScope {
 
     pub fn supported_filters(self) -> &'static [SearchFilter] {
         match self {
-            Self::Catalog | Self::Library => &SearchFilter::ALL,
+            Self::Catalog => &SearchFilter::CATALOG,
+            Self::Library => &SearchFilter::ALL,
             Self::Uploads => &[SearchFilter::All],
         }
     }
 
     pub fn supports(self, filter: SearchFilter) -> bool {
-        self.supported_filters().contains(&filter)
+        // The catalog still answers the combined Playlists category.
+        self == Self::Catalog || self.supported_filters().contains(&filter)
     }
 
     fn tab_index(self, filter: SearchFilter) -> usize {
@@ -174,10 +204,16 @@ fn search_request(
         "Uploads search does not support category filters"
     );
     let params = match (scope, filter.param()) {
-        (SearchScope::Catalog, None) => None,
         (SearchScope::Catalog, _) if filter == SearchFilter::Playlists => {
             Some("Eg-KAQwIABAAGAAgACgBMABqChAEEAMQCRAFEAo%3D".into())
         }
+        (SearchScope::Catalog, _) if filter == SearchFilter::CommunityPlaylists => {
+            Some("EgeKAQQoAEABagwQDhAKEAMQBBAJEAU%3D".into())
+        }
+        (SearchScope::Catalog, _) if filter == SearchFilter::FeaturedPlaylists => {
+            Some("EgeKAQQoADgBagwQDhAKEAMQBBAJEAU%3D".into())
+        }
+        (SearchScope::Catalog, None) => None,
         (SearchScope::Catalog, Some(param)) => Some(format!("EgWKAQ{param}AWoMEA4QChADEAQQCRAF")),
         (SearchScope::Library, None) => Some("agIYBA%3D%3D".into()),
         (SearchScope::Library, Some(param)) => {
@@ -239,7 +275,20 @@ fn parse_search_page(
         );
         contents
     };
-    parse_page(results, &title)
+    let mut page = parse_page(results, &title)?;
+    // The service orders categories by relevance to each query.
+    page.search_filters = results
+        .pointer("/sectionListRenderer/header/chipCloudRenderer/chips")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|chip| {
+            SearchFilter::from_label(&crate::catalog::text(
+                &chip["chipCloudChipRenderer"]["text"],
+            ))
+        })
+        .collect();
+    Ok(page)
 }
 
 fn parse_suggestions(response: &Value) -> Result<Vec<String>> {
@@ -320,6 +369,42 @@ mod tests {
         assert_eq!(
             search_request("an upload", SearchFilter::All, SearchScope::Uploads, None).unwrap()["params"],
             "agIYAw%3D%3D"
+        );
+    }
+
+    #[test]
+    fn catalog_categories_keep_the_services_order_and_skip_the_clear_chip() {
+        let chip =
+            |label: &str| json!({"chipCloudChipRenderer":{"text":{"runs":[{"text":label}]}}});
+        let response = json!({"contents":{"tabbedSearchResultsRenderer":{"tabs":[{"tabRenderer":{
+            "tabIdentifier":"music_search_catalog",
+            "content":{"sectionListRenderer":{
+                "header":{"chipCloudRenderer":{"chips":[
+                    {"chipCloudChipRenderer":{"icon":{"iconType":"CLOSE"}}},
+                    chip("Videos"), chip("Community playlists"), chip("Songs"), chip("Profiles")
+                ]}},
+                "contents":[]
+            }}
+        }}]}}});
+        let page = parse_search_page(
+            &response,
+            "a song",
+            SearchFilter::Videos,
+            SearchScope::Catalog,
+        )
+        .unwrap();
+        assert_eq!(
+            page.search_filters,
+            [
+                SearchFilter::Videos,
+                SearchFilter::CommunityPlaylists,
+                SearchFilter::Songs,
+                SearchFilter::Profiles
+            ]
+        );
+        assert_eq!(
+            search_request("a song", SearchFilter::Profiles, SearchScope::Catalog, None).unwrap()["params"],
+            "EgWKAQJYAWoMEA4QChADEAQQCRAF"
         );
     }
 

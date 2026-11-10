@@ -155,6 +155,17 @@ impl PageLayout {
         }
     }
 
+    /// The web narrows search results to a centered column.
+    pub(in crate::app) fn search_width(self) -> f32 {
+        match self.tier {
+            Tier::Narrow if self.window < 616. => self.column,
+            Tier::Narrow => 560.,
+            Tier::Medium => 720.,
+            _ => 860.,
+        }
+        .min(self.column + 2. * self.inset - 32.)
+    }
+
     /// Card title and subtitle each reserve two lines, like the web's line clamp.
     pub(in crate::app) fn card_text_height(self) -> f32 {
         16. + 3. + 4. * self.text_size() * 1.2
@@ -233,20 +244,18 @@ impl Music {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let layout = PageLayout::new(window, available);
-        let inset = layout.inset;
-        let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let search = matches!(self.route, Route::Search(_));
+        let inset = if search {
+            (available - layout.search_width()) / 2.
+        } else {
+            layout.inset
+        };
+        let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let collection = !home && self.page.header.is_some();
         let artist = collection && self.route.is_artist();
         let stacked = collection && !artist && available >= 980.;
-        let mut content = div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .when(search, |content| content.max_w(px(1060.)).mx_auto());
-        if !home && !artist {
+        let mut content = div().flex_1().min_w_0().min_h_0().flex().flex_col();
+        if !home && !artist && !search {
             content = content.child(
                 div()
                     .h(px(if collection { 24. } else { 48. }))

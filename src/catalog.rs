@@ -625,6 +625,7 @@ pub struct Page {
     pub privacy: Option<String>,
     pub chips: Vec<BrowseChoice>,
     pub countries: Vec<BrowseChoice>,
+    pub search_filters: Vec<crate::search::SearchFilter>,
 }
 
 impl Page {
@@ -1418,9 +1419,11 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
             .or_else(|| row.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint"))
             .or_else(|| find(&row["buttons"], "musicPlayButtonRenderer").and_then(|button| button.get("playNavigationEndpoint")))
             .and_then(PlaylistTarget::from_navigation)
+            .or_else(|| card_action(row, "PLAY_ARROW"))
             .map(Arc::new),
-        shuffle: collection_action(row, "MUSIC_SHUFFLE"),
-        mix: collection_action(row, "MIX"),
+        shuffle: collection_action(row, "MUSIC_SHUFFLE")
+            .or_else(|| card_action(row, "MUSIC_SHUFFLE").map(Arc::new)),
+        mix: collection_action(row, "MIX").or_else(|| card_action(row, "MIX").map(Arc::new)),
         playlist_id: playlist_id.map(str::to_owned),
         saved: subscribed.or_else(|| item_rating(row).map(|rating| rating == Rating::Like)),
         explicit: explicit(row),
@@ -1435,6 +1438,16 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
                 })
         }),
     }
+}
+
+/// A top search result's own Play, Shuffle or Mix button.
+fn card_action(row: &Value, icon: &str) -> Option<PlaylistTarget> {
+    row["buttons"]
+        .as_array()?
+        .iter()
+        .filter_map(|button| button.get("buttonRenderer"))
+        .find(|button| button.pointer("/icon/iconType").and_then(Value::as_str) == Some(icon))
+        .and_then(|button| PlaylistTarget::from_navigation(&button["command"]))
 }
 
 fn collection_action(row: &Value, icon: &str) -> Option<Arc<PlaylistTarget>> {
@@ -1867,6 +1880,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
             .map(str::to_owned),
         chips: Vec::new(),
         countries: Vec::new(),
+        search_filters: Vec::new(),
     };
     if let Some(album) = header.and_then(|header| {
         let kind = text(&header["subtitle"]);
@@ -2503,6 +2517,46 @@ mod tests {
     }
 
     #[test]
+    fn top_result_cards_keep_their_own_play_shuffle_and_mix() {
+        let button = |icon: &str, playlist: &str| {
+            json!({"buttonRenderer":{
+                "icon":{"iconType":icon},
+                "command":{"watchPlaylistEndpoint":{"playlistId":playlist}}
+            }})
+        };
+        let card = json!({"musicCardShelfRenderer":{
+            "title":{"runs":[{"text":"An artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}]},
+            "buttons":[
+                button("MUSIC_SHUFFLE", "RDAOshuffle"),
+                button("MIX", "RDEMmix")
+            ]
+        }});
+        let Some(Item::Collection(artist)) = parse_item(&card) else {
+            panic!("expected an artist");
+        };
+        let playlist = |target: &Option<Arc<PlaylistTarget>>| {
+            target
+                .as_ref()
+                .and_then(|target| target.0.playlist_id.clone())
+        };
+        assert_eq!(
+            playlist(&artist.details.shuffle).as_deref(),
+            Some("RDAOshuffle")
+        );
+        assert_eq!(playlist(&artist.details.mix).as_deref(), Some("RDEMmix"));
+        assert!(artist.details.play.is_none());
+
+        let card = json!({"musicCardShelfRenderer":{
+            "title":{"runs":[{"text":"An album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}}]},
+            "buttons":[button("PLAY_ARROW", "OLAKalbum")]
+        }});
+        let Some(Item::Collection(album)) = parse_item(&card) else {
+            panic!("expected an album");
+        };
+        assert_eq!(playlist(&album.details.play).as_deref(), Some("OLAKalbum"));
+    }
+
+    #[test]
     fn collection_header_keeps_save_state_and_distinct_issued_actions() {
         for saved in [false, true] {
             let page = parse_page(&json!({
@@ -2740,6 +2794,7 @@ mod tests {
             privacy: None,
             chips: Vec::new(),
             countries: Vec::new(),
+            search_filters: Vec::new(),
         };
         page.shelves = vec![
             Shelf {

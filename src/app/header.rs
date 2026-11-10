@@ -139,7 +139,7 @@ impl Music {
                             .on_click(cx.listener(|view, _, window, cx| {
                                 window.focus(&view.search.focus_handle(cx), cx)
                             }))
-                            .child(icon("search", 24., self.theme.text))
+                            .child(icon("search", 20., gpui::white().opacity(0.5)))
                             .child(div().flex_1().min_w_0().child(self.search.clone())),
                     )
                     .child(div().flex_1())

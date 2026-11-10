@@ -260,6 +260,7 @@ impl Music {
                 privacy: None,
                 chips: Vec::new(),
                 countries: Vec::new(),
+                search_filters: Vec::new(),
             },
             rows: Vec::new(),
             list_rows: Vec::new(),

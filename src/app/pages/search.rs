@@ -2,6 +2,49 @@
 
 use super::super::*;
 
+/// A top result action: the web fills the first and outlines the second.
+fn result_action(
+    id: &'static str,
+    glyph: &'static str,
+    label: &'static str,
+    filled: bool,
+    theme: Theme,
+) -> Stateful<Div> {
+    let ink: Hsla = if filled {
+        rgb(0x0f0f0f).into()
+    } else {
+        rgb(0xf1f1f1).into()
+    };
+    div()
+        .id(id)
+        .keyboard_control(theme)
+        .h(px(36.))
+        .pl(px(12.))
+        .pr(px(16.))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .text_size(px(14.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ink)
+        .cursor_pointer()
+        .when(filled, |action| {
+            action
+                .bg(rgb(0xf1f1f1))
+                .hover(|style| style.bg(rgb(0xd9d9d9)))
+        })
+        .when(!filled, |action| {
+            action
+                .border_color(gpui::white().opacity(0.2))
+                .hover(|style| style.bg(gpui::white().opacity(0.1)))
+        })
+        .child(icon(glyph, 24., ink))
+        .child(label)
+}
+
 impl Music {
     pub(in crate::app) fn featured_result(
         &mut self,
@@ -26,12 +69,37 @@ impl Music {
             },
         );
         let title = item.title().to_owned();
-        let subtitle = item.subtitle().to_owned();
+        let subtitle = match &item {
+            Item::Track(track) => track
+                .details
+                .byline
+                .clone()
+                .unwrap_or_else(|| track.artist.clone()),
+            _ => item.subtitle().to_owned(),
+        };
         let mut related = Vec::new();
         for offset in 1..self.page.shelves[shelf].items.len().min(4) {
             let id = index + offset;
             let item = self.rows[id].clone();
-            let art = self.art(item.thumbnail(), 48., ArtworkShape::Square);
+            let (byline, explicit, wide) = match &item {
+                Item::Track(track) => (
+                    track
+                        .details
+                        .byline
+                        .clone()
+                        .unwrap_or_else(|| track.artist.clone()),
+                    track.details.explicit,
+                    track.details.wide_thumbnail,
+                ),
+                _ => (item.subtitle().to_owned(), false, false),
+            };
+            let art = self.row_thumbnail(
+                item.thumbnail(),
+                56.,
+                ArtworkShape::Square,
+                wide,
+                "featured-row",
+            );
             related.push(
                 div()
                     .id(("featured-related", id))
@@ -44,7 +112,7 @@ impl Music {
                     .items_center()
                     .gap(px(16.))
                     .cursor_pointer()
-                    .hover(|style| style.bg(self.theme.raised))
+                    .hover(|style| style.bg(gpui::white().opacity(0.1)))
                     .child(art)
                     .child(
                         div()
@@ -57,16 +125,11 @@ impl Music {
                                 div()
                                     .truncate()
                                     .text_size(px(14.))
+                                    .line_height(relative(1.2))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(item.title().to_owned()),
                             )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(14.))
-                                    .text_color(self.theme.muted)
-                                    .child(item.subtitle().to_owned()),
-                            ),
+                            .child(self.byline(explicit, byline, 14.)),
                     )
                     .child(
                         button(("featured-menu", id), "more", self.theme)
@@ -88,6 +151,98 @@ impl Music {
                     .on_click(cx.listener(move |view, _, _, cx| view.play_item(id, cx))),
             );
         }
+        let mut actions = div().mt(px(12.)).flex().items_center().gap(px(16.));
+        match &item {
+            Item::Collection(collection) if artist => {
+                for (id, glyph, label, filled, target) in [
+                    (
+                        "featured-shuffle",
+                        "shuffle",
+                        "Shuffle",
+                        true,
+                        collection.details.shuffle.clone(),
+                    ),
+                    (
+                        "featured-mix",
+                        "mix",
+                        "Mix",
+                        false,
+                        collection.details.mix.clone(),
+                    ),
+                ] {
+                    let Some(target) = target else { continue };
+                    actions = actions.child(
+                        result_action(id, glyph, label, filled, self.theme).on_click(cx.listener(
+                            move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                            },
+                        )),
+                    );
+                }
+            }
+            Item::Collection(collection) => {
+                let saved = self.is_saved(collection);
+                let selected = collection.clone();
+                actions = actions
+                    .child(
+                        result_action("featured-play", "play", "Play", true, self.theme).on_click(
+                            cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&view.focus, cx);
+                                match view.rows.get(index) {
+                                    Some(Item::Collection(collection)) => {
+                                        if let Some(target) = collection.details.play.clone() {
+                                            view.start_queue(PlaybackQuery::Playlist(target), cx);
+                                        } else {
+                                            view.play_item(index, cx);
+                                        }
+                                    }
+                                    _ => view.play_item(index, cx),
+                                }
+                            }),
+                        ),
+                    )
+                    .child(
+                        result_action(
+                            "featured-save",
+                            if saved { "bookmark-filled" } else { "bookmark" },
+                            if saved { "Saved" } else { "Save" },
+                            false,
+                            self.theme,
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.save_collection(selected.clone(), cx);
+                        })),
+                    );
+            }
+            Item::Track(track) => {
+                let track = track.clone();
+                actions = actions
+                    .child(
+                        result_action("featured-play", "play", "Play", true, self.theme).on_click(
+                            cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&view.focus, cx);
+                                view.play_item(index, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        result_action("featured-save", "playlist-add", "Save", false, self.theme)
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                if view.account.is_none() {
+                                    view.connect_account(window, cx);
+                                    return;
+                                }
+                                view.playlist_picker(vec![track.clone()], cx);
+                            })),
+                    );
+            }
+            Item::Navigation(_) => {}
+        }
         let panel = div()
             .w_full()
             .rounded(px(8.))
@@ -106,10 +261,10 @@ impl Music {
                     .flex_1()
                     .min_w(px(280.))
                     .h(px(232.))
-                    .px(px(20.))
+                    .px(px(16.))
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(px(20.))
                     .cursor_pointer()
                     .child(art)
                     .child(
@@ -123,6 +278,7 @@ impl Music {
                                 div()
                                     .truncate()
                                     .text_size(px(24.))
+                                    .line_height(relative(1.2))
                                     .font_weight(FontWeight::BOLD)
                                     .child(title),
                             )
@@ -130,29 +286,11 @@ impl Music {
                                 div()
                                     .truncate()
                                     .text_size(px(14.))
+                                    .line_height(relative(1.2))
                                     .text_color(self.theme.muted)
                                     .child(subtitle),
                             )
-                            .child(
-                                filter_chip(
-                                    "featured-details",
-                                    if matches!(item, Item::Track(_)) {
-                                        "Play"
-                                    } else {
-                                        "See details"
-                                    },
-                                    true,
-                                    self.theme,
-                                )
-                                .rounded_full()
-                                .w(px(120.))
-                                .on_click(cx.listener(
-                                    move |view, _, _, cx| {
-                                        cx.stop_propagation();
-                                        view.play_item(index, cx);
-                                    },
-                                )),
-                            ),
+                            .child(actions),
                     )
                     .on_mouse_down(
                         MouseButton::Right,
@@ -222,43 +360,86 @@ impl Music {
                         )),
                 );
             }
+            let filters = if self.page.search_filters.is_empty() {
+                search.scope.supported_filters()
+            } else {
+                self.page.search_filters.as_slice()
+            }
+            .iter()
+            .copied()
+            .filter(|filter| *filter != SearchFilter::All)
+            .collect::<Vec<_>>();
+            let clear = Search {
+                filter: SearchFilter::All,
+                ..search.clone()
+            };
             content = content.child(
                 div()
                     .id("search-filters")
                     .mx(px(inset))
-                    .mb(px(24.))
+                    .mt(px(23.))
+                    .mb(px(6.))
                     .flex_shrink_0()
                     .flex()
                     .gap(px(12.))
                     .overflow_x_scroll()
                     .restrict_scroll_to_axis()
-                    .children(
-                        search
-                            .scope
-                            .supported_filters()
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .map(|(index, filter)| {
-                                let next = Search {
-                                    filter,
-                                    ..search.clone()
-                                };
-                                filter_chip(
-                                    ("search-filter", index),
-                                    filter.label(),
-                                    filter == search.filter,
-                                    self.theme,
-                                )
-                                .on_click(cx.listener(
-                                    move |view, _, _, cx| {
-                                        view.navigate(Route::Search(next.clone()), cx)
-                                    },
-                                ))
-                            }),
-                    ),
+                    .when(search.filter != SearchFilter::All, |chips| {
+                        chips.child(
+                            search_chip("search-filter-clear", None, false, self.theme).on_click(
+                                cx.listener(move |view, _, _, cx| {
+                                    view.navigate(Route::Search(clear.clone()), cx)
+                                }),
+                            ),
+                        )
+                    })
+                    .children(filters.into_iter().enumerate().map(|(index, filter)| {
+                        let selected = filter == search.filter;
+                        let next = Search {
+                            filter: if selected { SearchFilter::All } else { filter },
+                            ..search.clone()
+                        };
+                        search_chip(
+                            ("search-filter", index),
+                            Some(filter.label()),
+                            selected,
+                            self.theme,
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.navigate(Route::Search(next.clone()), cx)
+                        }))
+                    })),
             );
         }
         content
     }
+}
+
+/// The web's 32px search category chip; with no label it is the clear chip.
+fn search_chip(
+    id: impl Into<ElementId>,
+    label: Option<&'static str>,
+    selected: bool,
+    theme: Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .keyboard_control(theme)
+        .h(px(32.))
+        .px(px(if label.is_some() { 12. } else { 6. }))
+        .flex_shrink_0()
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .text_size(px(14.))
+        .cursor_pointer()
+        .when(selected, |chip| chip.bg(theme.text).text_color(theme.bg))
+        .when(!selected, |chip| {
+            chip.bg(gpui::white().opacity(0.1))
+                .hover(|style| style.bg(gpui::white().opacity(0.2)))
+        })
+        .map(|chip| match label {
+            Some(label) => chip.child(label),
+            None => chip.child(icon("close", 20., theme.text)),
+        })
 }
