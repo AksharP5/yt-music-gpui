@@ -325,7 +325,7 @@ impl Worker {
             source.state = State::Failed(error.clone());
             return Err(error);
         }
-        queue.tracks.extend(page.tracks);
+        queue.append_source(page.tracks);
         queue.incomplete = page.continuation.is_some();
         match page.continuation {
             Some(continuation) => {
@@ -337,7 +337,22 @@ impl Worker {
                 queue.source_id = None;
             }
         }
+        if queue.shuffled && queue.incomplete {
+            self.load(session, false)?;
+        }
         Ok(true)
+    }
+
+    /// Shuffle the entire source, including pages that have not arrived yet.
+    #[allow(dead_code)] // The app's Shuffle action can call this after its module split.
+    pub fn shuffle(
+        &mut self,
+        queue: &mut Queue,
+        session: Option<&Arc<Session>>,
+    ) -> Result<(), String> {
+        queue.shuffle_upcoming();
+        self.load(session, true)?;
+        Ok(())
     }
 
     pub fn can_continue(&self) -> bool {
@@ -1116,6 +1131,39 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_fetches_all_continuations_and_keeps_played_tracks_fixed() {
+        let (mut worker, completed) = Worker::spawn(|request| {
+            Ok(match request.continuation.token() {
+                "first" => next_page(&["d", "e"], Some("second")),
+                "second" => next_page(&["f", "g"], None),
+                _ => panic!("unexpected continuation"),
+            })
+        });
+        let mut queue = Queue::default();
+        worker.replace_queue(
+            &mut queue,
+            &page(&["a", "b", "c"], Some("first")),
+            1,
+            PageRequest::Browse,
+            None,
+        );
+        worker.shuffle(&mut queue, None).unwrap();
+        for _ in 0..2 {
+            worker
+                .apply(completed.recv_blocking().unwrap(), &mut queue, None)
+                .unwrap();
+        }
+        assert!(!queue.incomplete);
+        assert!(!worker.can_continue());
+        assert_eq!(queue.index, Some(1));
+        assert_eq!(&ids(&queue)[..2], ["a", "b"]);
+        let mut all = ids(&queue);
+        all.sort_unstable();
+        assert_eq!(all, ["a", "b", "c", "d", "e", "f", "g"]);
+        assert!(queue.shuffled);
+    }
+
+    #[test]
     fn queue_edits_keep_the_source_and_persistence_omits_request_context() {
         let (mut worker, completed) = Worker::spawn(|_| Ok(next_page(&["a", "tail"], None)));
         let mut queue = Queue::default();
@@ -1133,7 +1181,7 @@ mod tests {
         let saved = serde_json::to_value(&queue).unwrap();
         let mut keys = saved.as_object().unwrap().keys().collect::<Vec<_>>();
         keys.sort();
-        assert_eq!(keys, ["incomplete", "index", "playing_from", "tracks"]);
+        assert_eq!(keys, ["incomplete", "index", "playing_from", "shuffled", "tracks"]);
         let mut restored: Queue = serde_json::from_value(saved).unwrap();
         assert!(restored.incomplete);
         assert!(restored.source_id.is_none());
@@ -1149,8 +1197,10 @@ mod tests {
                 session.as_ref(),
             )
             .unwrap();
-        assert_eq!(queue.tracks[..loaded.len()], loaded);
-        assert_eq!(&ids(&queue)[loaded.len()..], ["a", "tail"]);
+        assert_eq!(queue.tracks[0], loaded[0]);
+        let mut all = ids(&queue);
+        all.sort_unstable();
+        assert_eq!(all, ["a", "a", "b", "c", "play-next", "tail"]);
         assert_eq!(queue.current().unwrap().id, "a");
     }
 }

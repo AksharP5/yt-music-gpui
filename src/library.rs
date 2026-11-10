@@ -104,6 +104,8 @@ pub struct Queue {
     /// The album, playlist or mix this queue came from, shown as "Playing from".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playing_from: Option<String>,
+    /// Keep continuation pages mixed into the remaining queue after Shuffle.
+    pub(crate) shuffled: bool,
     #[serde(skip)]
     pub(crate) source_id: Option<Arc<()>>,
 }
@@ -117,6 +119,7 @@ impl Queue {
         self.tracks = tracks;
         self.incomplete = false;
         self.playing_from = None;
+        self.shuffled = false;
         self.source_id = None;
     }
     pub fn select(&mut self, index: usize) -> bool {
@@ -190,6 +193,18 @@ impl Queue {
         true
     }
     pub fn shuffle_upcoming(&mut self) {
+        self.shuffled = true;
+        self.shuffle_remaining();
+    }
+
+    pub(crate) fn append_source(&mut self, tracks: Vec<Track>) {
+        self.tracks.extend(tracks);
+        if self.shuffled {
+            self.shuffle_remaining();
+        }
+    }
+
+    fn shuffle_remaining(&mut self) {
         let start = self.index.map_or(0, |i| i + 1);
         let mut seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
