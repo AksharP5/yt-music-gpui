@@ -1,4 +1,4 @@
-use crate::app::{CatalogTarget, Music, Playback, PlayerTab, Startup};
+use crate::app::{CatalogTarget, Music, Playback, Startup, player_page::PlayerTab};
 use crate::player::PlayerEvent;
 use anyhow::{Result, ensure};
 use gpui::{
@@ -303,7 +303,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 );
                 for tab in [PlayerTab::Lyrics, PlayerTab::Related] {
                     window
-                        .update(cx, |music, _, cx| music.show_player_tab(tab, cx))
+                        .update(cx, |music, _, cx| music.select_player_tab(tab, cx))
                         .unwrap();
                     wait_for_presented_frame(window, cx).await;
                     let baseline = window

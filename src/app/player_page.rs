@@ -169,6 +169,13 @@ impl Spacing {
 const TOGGLE_HEIGHT: f32 = 56.;
 
 impl Music {
+    pub(in crate::app) fn select_player_tab(&mut self, tab: PlayerTab, cx: &mut Context<Self>) {
+        if self.player_page.tab != tab {
+            self.player_page.tab = tab;
+            cx.notify();
+        }
+    }
+
     pub(in crate::app) fn toggle_player_page(&mut self, cx: &mut Context<Self>) {
         if self.player_open {
             self.player_open = false;
@@ -546,9 +553,8 @@ impl Music {
                         )
                     })
                     .on_click(cx.listener(move |view, _, _, cx| {
-                        if enabled && view.player_page.tab != tab {
-                            view.player_page.tab = tab;
-                            cx.notify();
+                        if enabled {
+                            view.select_player_tab(tab, cx);
                         }
                     }))
             }))
