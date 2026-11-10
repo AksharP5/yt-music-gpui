@@ -2,14 +2,16 @@ use crate::app::{CatalogTarget, Music, Playback, Startup, player_page::PlayerTab
 use crate::player::PlayerEvent;
 use anyhow::{Result, ensure};
 use gpui::{
-    AppContext, AsyncApp, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowHandle,
+    App, AppContext, AsyncApp, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowHandle,
     WindowKind, WindowOptions, point, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::AtomicBool;
 use std::{
+    cell::Cell,
+    rc::Rc,
     sync::{Arc, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(super) async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp) {
@@ -25,6 +27,45 @@ pub(super) async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &m
     })
     .unwrap();
     received.recv().await.unwrap();
+}
+
+fn render_counts(music: &Music, cx: &App) -> (usize, usize, usize) {
+    (
+        music.content_view.read(cx).renders,
+        music.player_bar.read(cx).renders,
+        music.renders,
+    )
+}
+
+async fn wait_for_quiescence(
+    window: WindowHandle<Music>,
+    cx: &mut AsyncApp,
+) -> (usize, usize, usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut previous = None;
+    loop {
+        wait_for_presented_frame(window, cx).await;
+        let (counts, idle) = window
+            .update(cx, |music, _, cx| {
+                let idle = music.artwork.is_idle()
+                    && CatalogTarget::ALL
+                        .into_iter()
+                        .all(|target| !music.catalog_requests.is_loading(target))
+                    && music.watch_pending.is_none()
+                    && !music.radio_loading
+                    && !music.queue_source.can_continue();
+                (render_counts(music, cx), idle)
+            })
+            .unwrap();
+        if idle && previous == Some(counts) {
+            return counts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Render measurement did not settle: counts={counts:?}, workers_idle={idle}"
+        );
+        previous = idle.then_some(counts);
+    }
 }
 
 async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
@@ -727,7 +768,11 @@ fn assert_page_retained(baseline: &image::RgbaImage, image: &image::RgbaImage) {
     );
 }
 
-async fn scrolled_artist_survives_tab(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+async fn scrolled_artist_survives_tab(
+    window: WindowHandle<Music>,
+    cx: &mut AsyncApp,
+    bounds_changes: &Cell<u64>,
+) {
     use crate::app::{ListRow, Route};
     use crate::catalog::{BrowseLink, Collection, Item, PageHeader, Shelf, ShelfLayout};
     use sha1::{Digest, Sha1};
@@ -862,40 +907,46 @@ async fn scrolled_artist_survives_tab(window: WindowHandle<Music>, cx: &mut Asyn
             })
             .unwrap();
         if !paused {
-            let before = window
-                .update(cx, |music, _, cx| {
-                    (
-                        music.content_view.read(cx).renders,
-                        music.player_bar.read(cx).renders,
-                        music.renders,
-                    )
-                })
-                .unwrap();
-            for seconds in 20..25 {
-                window
-                    .update(cx, |music, _, cx| {
-                        music.player_event(
-                            PlayerEvent::Position {
-                                track_id: 42,
-                                seconds: f64::from(seconds),
-                            },
-                            cx,
-                        )
-                    })
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (before, after) = loop {
+                let before = wait_for_quiescence(window, cx).await;
+                let bounds_before = bounds_changes.get();
+                for seconds in 20..25 {
+                    window
+                        .update(cx, |music, _, cx| {
+                            music.player_event(
+                                PlayerEvent::Position {
+                                    track_id: 42,
+                                    seconds: f64::from(seconds),
+                                },
+                                cx,
+                            );
+                        })
+                        .unwrap();
+                    wait_for_presented_frame(window, cx).await;
+                }
+                let after = window
+                    .update(cx, |music, _, cx| render_counts(music, cx))
                     .unwrap();
-                wait_for_presented_frame(window, cx).await;
-            }
-            window
-                .update(cx, |music, _, cx| {
-                    assert_eq!(music.content_view.read(cx).renders, before.0);
-                    assert!(music.player_bar.read(cx).renders >= before.1 + 5);
-                    println!(
-                        "BROWSE_POSITION_RENDERS body=0 bar={} root={}",
-                        music.player_bar.read(cx).renders - before.1,
-                        music.renders - before.2
-                    );
-                })
-                .unwrap();
+                if bounds_changes.get() == bounds_before {
+                    break (before, after);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Window bounds kept changing during artist position measurement"
+                );
+                println!("BROWSE_POSITION_MEASUREMENT_RETRY window_bounds_changed=true");
+            };
+            assert_eq!(
+                after.0, before.0,
+                "Position samples must reuse the artist page body"
+            );
+            assert!(after.1 >= before.1 + 5);
+            println!(
+                "BROWSE_POSITION_RENDERS body=0 bar={} root={}",
+                after.1 - before.1,
+                after.2 - before.2
+            );
         }
         for step in 0..24 {
             let before = cx
@@ -1161,44 +1212,53 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     },
                 )
                 .unwrap();
+            let bounds_changes = Rc::new(Cell::new(0_u64));
+            let observed_changes = bounds_changes.clone();
+            let bounds_subscription = window
+                .update(cx, |_, window, cx| {
+                    cx.observe_window_bounds(window, move |_, window, _| {
+                        observed_changes.set(observed_changes.get() + 1);
+                        println!("MEASUREMENT_BOUNDS_CHANGED bounds={:?}", window.bounds());
+                    })
+                })
+                .unwrap();
             cx.spawn(async move |cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
-                let before = window
-                    .update(cx, |music, _, cx| {
-                        (
-                            music.content_view.read(cx).renders,
-                            music.player_bar.read(cx).renders,
-                            music.renders,
-                        )
-                    })
-                    .unwrap();
-                for seconds in 1..=5 {
-                    window
-                        .update(cx, |music, _, cx| {
-                            music.player_event(
-                                PlayerEvent::Position {
-                                    track_id: 42,
-                                    seconds: seconds as f64,
-                                },
-                                cx,
-                            );
-                        })
+                let _bounds_subscription = bounds_subscription;
+                // X11 ConfigureNotify can arrive after the first frame. It refreshes
+                // every view, independently of playback samples or wheel events.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (before, after) = loop {
+                    let before = wait_for_quiescence(window, cx).await;
+                    let bounds_before = bounds_changes.get();
+                    for seconds in 1..=5 {
+                        window
+                            .update(cx, |music, _, cx| {
+                                music.player_event(
+                                    PlayerEvent::Position {
+                                        track_id: 42,
+                                        seconds: seconds as f64,
+                                    },
+                                    cx,
+                                );
+                            })
+                            .unwrap();
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                    }
+                    wait_for_presented_frame(window, cx).await;
+                    let after = window
+                        .update(cx, |music, _, cx| render_counts(music, cx))
                         .unwrap();
-                    cx.background_executor()
-                        .timer(Duration::from_millis(100))
-                        .await;
-                }
-                let after = window
-                    .update(cx, |music, _, cx| {
-                        (
-                            music.content_view.read(cx).renders,
-                            music.player_bar.read(cx).renders,
-                            music.renders,
-                        )
-                    })
-                    .unwrap();
+                    if bounds_changes.get() == bounds_before {
+                        break (before, after);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Window bounds kept changing during position measurement"
+                    );
+                    println!("POSITION_MEASUREMENT_RETRY window_bounds_changed=true");
+                };
                 assert_eq!(
                     after.0, before.0,
                     "Position samples must reuse the page body"
@@ -1226,9 +1286,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                         );
                     })
                     .unwrap();
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
+                wait_for_quiescence(window, cx).await;
                 window
                     .update(cx, |music, _, cx| {
                         assert!(
@@ -1244,42 +1302,53 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     after.1 - before.1,
                     after.2 - before.2
                 );
-                // A wheel tick over artwork has no scrolling work to do.
-                let before_wheel = window
-                    .update(cx, |music, _, cx| {
-                        (
-                            music.content_view.read(cx).renders,
-                            music.player_bar.read(cx).renders,
-                            music.renders,
-                        )
-                    })
-                    .unwrap();
-                for _ in 0..10 {
+                // Settle pointer hover before measuring stationary wheel input.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (before_wheel, after_wheel) = loop {
                     cx.update_window(window.into(), |_, window, cx| {
                         window.dispatch_event(
-                            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
                                 position: point(window.viewport_size().width * 0.4, px(300.)),
-                                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-50.))),
+                                pressed_button: None,
                                 modifiers: Default::default(),
-                                touch_phase: gpui::TouchPhase::Moved,
                             }),
                             cx,
                         );
                     })
                     .unwrap();
-                    cx.background_executor()
-                        .timer(Duration::from_millis(40))
-                        .await;
-                }
-                let after_wheel = window
-                    .update(cx, |music, _, cx| {
-                        (
-                            music.content_view.read(cx).renders,
-                            music.player_bar.read(cx).renders,
-                            music.renders,
-                        )
-                    })
-                    .unwrap();
+                    let before = wait_for_quiescence(window, cx).await;
+                    let bounds_before = bounds_changes.get();
+                    // A wheel tick over artwork has no scrolling work to do.
+                    for _ in 0..10 {
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.dispatch_event(
+                                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                    position: point(window.viewport_size().width * 0.4, px(300.)),
+                                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-50.))),
+                                    modifiers: Default::default(),
+                                    touch_phase: gpui::TouchPhase::Moved,
+                                }),
+                                cx,
+                            );
+                        })
+                        .unwrap();
+                        cx.background_executor()
+                            .timer(Duration::from_millis(40))
+                            .await;
+                    }
+                    wait_for_presented_frame(window, cx).await;
+                    let after = window
+                        .update(cx, |music, _, cx| render_counts(music, cx))
+                        .unwrap();
+                    if bounds_changes.get() == bounds_before {
+                        break (before, after);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Window bounds kept changing during wheel measurement"
+                    );
+                    println!("WHEEL_MEASUREMENT_RETRY window_bounds_changed=true");
+                };
                 println!(
                     "IDLE_WHEEL_RENDERS body={} bar={} root={}",
                     after_wheel.0 - before_wheel.0,
@@ -1361,7 +1430,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                         assert_page_retained(&baseline, &image);
                     }
                 }
-                scrolled_artist_survives_tab(window, cx).await;
+                scrolled_artist_survives_tab(window, cx, &bounds_changes).await;
                 window
                     .update(cx, |music, _, cx| {
                         music.player_open = false;

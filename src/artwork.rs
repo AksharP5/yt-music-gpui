@@ -54,6 +54,11 @@ enum CachedArtwork {
 }
 
 impl Artwork {
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     pub fn new() -> (Self, async_channel::Receiver<LoadedArtwork>) {
         let (requests, receiver) = async_channel::bounded::<ArtworkRequest>(64);
         let (results, loaded) = async_channel::bounded(WORKERS);
