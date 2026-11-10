@@ -1,0 +1,575 @@
+//! Routes, catalog workers, request generations, navigation history, and page loading.
+
+use super::*;
+
+#[derive(Clone, PartialEq)]
+pub(in crate::app) struct Search {
+    pub(in crate::app) query: String,
+    pub(in crate::app) filter: SearchFilter,
+    pub(in crate::app) scope: SearchScope,
+}
+
+#[derive(Clone, PartialEq)]
+pub(in crate::app) enum Route {
+    Home,
+    Explore,
+    Search(Search),
+    Browse(BrowseLink),
+    Liked,
+    Recent,
+    Saved,
+    Library(Section),
+}
+impl Route {
+    pub(in crate::app) fn is_artist(&self) -> bool {
+        matches!(self, Self::Browse(link) if link.id.starts_with("UC"))
+    }
+    pub(in crate::app) fn is_home(&self) -> bool {
+        matches!(self, Self::Home)
+            || matches!(self, Self::Browse(link) if link.id == "FEmusic_home")
+    }
+}
+#[derive(Clone)]
+pub(in crate::app) enum Query {
+    Home,
+    Explore,
+    Search(Search),
+    Browse(BrowseLink),
+    More {
+        token: Continuation,
+        search: Option<Search>,
+    },
+    Library(Section),
+    PlaylistChoices,
+    SidebarPlaylists,
+    PlaylistChoicesMore(Continuation),
+}
+impl Query {
+    pub(in crate::app) fn target(&self) -> CatalogTarget {
+        match self {
+            Self::PlaylistChoices | Self::PlaylistChoicesMore(_) => CatalogTarget::PlaylistPicker,
+            Self::SidebarPlaylists => CatalogTarget::Sidebar,
+            _ => CatalogTarget::Page,
+        }
+    }
+}
+pub(in crate::app) struct Job {
+    pub(in crate::app) id: u64,
+    pub(in crate::app) account_revision: u64,
+    pub(in crate::app) query: Query,
+    pub(in crate::app) session: Option<Arc<Session>>,
+}
+pub(in crate::app) struct CatalogResult {
+    pub(in crate::app) id: u64,
+    pub(in crate::app) account_revision: u64,
+    pub(in crate::app) append: bool,
+    pub(in crate::app) result: Result<Page, String>,
+    pub(in crate::app) session_rejected: bool,
+    pub(in crate::app) target: CatalogTarget,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum CatalogTarget {
+    Page,
+    PlaylistPicker,
+    Sidebar,
+}
+impl CatalogTarget {
+    pub(in crate::app) const ALL: [Self; 3] = [Self::Page, Self::PlaylistPicker, Self::Sidebar];
+}
+pub(in crate::app) struct CatalogRequests {
+    pub(in crate::app) generations: Arc<[AtomicU64; CatalogTarget::ALL.len()]>,
+    pub(in crate::app) loading: [bool; CatalogTarget::ALL.len()],
+    pub(in crate::app) jobs: async_channel::Sender<Job>,
+    pub(in crate::app) pending: async_channel::Receiver<Job>,
+}
+impl CatalogRequests {
+    pub(in crate::app) fn new() -> Self {
+        let (jobs, pending) = async_channel::bounded(CatalogTarget::ALL.len());
+        Self {
+            generations: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            loading: [false; CatalogTarget::ALL.len()],
+            jobs,
+            pending,
+        }
+    }
+
+    pub(in crate::app) fn request(
+        &mut self,
+        query: Query,
+        account_revision: u64,
+        session: Option<Arc<Session>>,
+    ) -> Result<(), String> {
+        let target = query.target();
+        self.cancel(target);
+        let id = self.generations[target as usize].load(Ordering::Relaxed);
+        let mut other = Vec::with_capacity(CatalogTarget::ALL.len() - 1);
+        while let Ok(job) = self.pending.try_recv() {
+            if job.query.target() != target {
+                other.push(job);
+            }
+        }
+        // Keep one pending request per destination, including sidebar and picker reads.
+        for job in other.into_iter().chain(std::iter::once(Job {
+            id,
+            account_revision,
+            query,
+            session,
+        })) {
+            self.jobs.try_send(job).map_err(|_| {
+                "The music connection stopped. Restart the app to reconnect.".to_owned()
+            })?;
+        }
+        self.loading[target as usize] = true;
+        Ok(())
+    }
+
+    pub(in crate::app) fn cancel(&mut self, target: CatalogTarget) {
+        self.generations[target as usize].fetch_add(1, Ordering::Relaxed);
+        self.loading[target as usize] = false;
+    }
+
+    pub(in crate::app) fn finish(&mut self, target: CatalogTarget, id: u64) -> bool {
+        if id != self.generations[target as usize].load(Ordering::Relaxed) {
+            return false;
+        }
+        self.loading[target as usize] = false;
+        true
+    }
+
+    pub(in crate::app) fn is_loading(&self, target: CatalogTarget) -> bool {
+        self.loading[target as usize]
+    }
+}
+pub(in crate::app) struct NavigationState {
+    pub(in crate::app) route: Route,
+    pub(in crate::app) page: Option<Page>,
+    pub(in crate::app) list_scroll: UniformListScrollHandle,
+    pub(in crate::app) detail_list: DetailList,
+    pub(in crate::app) shelf_scroll: HashMap<usize, ScrollHandle>,
+}
+
+impl Music {
+    pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
+        let target = query.target();
+        let session = self
+            .account
+            .as_ref()
+            .map(|connection| connection.session.clone());
+        let result = self
+            .catalog_requests
+            .request(query, self.account_revision, session);
+        if target == CatalogTarget::PlaylistPicker {
+            if let Some(Overlay::PlaylistPicker { error, .. }) = &mut self.overlay {
+                *error = result.err();
+            }
+        } else if target == CatalogTarget::Sidebar {
+            self.sidebar_error = result.err();
+        } else if target == CatalogTarget::Page
+            && let Err(error) = result
+        {
+            self.error = Some(error);
+        }
+        cx.notify();
+    }
+
+    pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.artwork.cancel_pending();
+        self.video_open = false;
+        if self.route != route {
+            let cached = (self.account.is_none()
+                && !self.catalog_requests.is_loading(CatalogTarget::Page)
+                && self.error.is_none())
+            .then(|| self.page.clone());
+            self.back.push(NavigationState {
+                route: self.route.clone(),
+                page: cached,
+                list_scroll: std::mem::replace(
+                    &mut self.list_scroll,
+                    UniformListScrollHandle::new(),
+                ),
+                shelf_scroll: std::mem::take(&mut self.shelf_scroll),
+                detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
+            });
+            if self.back.len() > 12 {
+                self.back.remove(0);
+            }
+        }
+        self.list_id = self.list_id.wrapping_add(1);
+        self.route = route.clone();
+        self.error = None;
+        self.notice = None;
+        self.page.shelves.clear();
+        self.page.header = None;
+        self.page.continuation = None;
+        self.page.editable = false;
+        self.page.description.clear();
+        self.page.privacy = None;
+        self.page.chips.clear();
+        self.page.countries.clear();
+        self.rows.clear();
+        self.list_rows.clear();
+        match route {
+            Route::Home => {
+                self.page.title = "Home".into();
+                self.request(Query::Home, cx);
+            }
+            Route::Explore => {
+                self.page.title = "Explore".into();
+                self.request(Query::Explore, cx);
+            }
+            Route::Search(search) => {
+                self.page.title = format!("Results for \"{}\"", search.query);
+                self.search
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+                self.request(Query::Search(search), cx);
+            }
+            Route::Browse(link) => {
+                self.page.title = link.title.clone();
+                self.request(Query::Browse(link), cx);
+            }
+            Route::Library(section) => {
+                self.page.title = section.title().into();
+                self.request(Query::Library(section), cx);
+            }
+            Route::Liked | Route::Saved | Route::Recent if self.account.is_some() => {
+                let section = match route {
+                    Route::Liked => Section::Liked,
+                    Route::Recent => Section::History,
+                    _ => Section::Songs,
+                };
+                self.page.title = section.title().into();
+                self.request(Query::Library(section), cx);
+            }
+            _ => {
+                self.catalog_requests.cancel(CatalogTarget::Page);
+                self.refresh_local();
+                cx.notify();
+            }
+        }
+    }
+
+    pub(in crate::app) fn rebuild_rows(&mut self) {
+        self.rows.clear();
+        self.list_rows.clear();
+        self.append_rows(0);
+        if self.page.header.is_some()
+            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
+        {
+            self.detail_list.reset_rows(self.list_rows.len());
+        } else {
+            self.detail_list = DetailList::new();
+        }
+    }
+
+    pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) {
+        let sectioned = self.page.header.is_some();
+        let search_all =
+            matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
+        for (index, shelf) in self.page.shelves.iter().enumerate().skip(first_shelf) {
+            let featured = search_all && shelf.layout == ShelfLayout::Featured;
+            let carousel =
+                sectioned && matches!(shelf.layout, ShelfLayout::Cards | ShelfLayout::Videos);
+            if featured {
+                self.list_rows.push(ListRow::Featured(index));
+            } else if carousel {
+                self.list_rows.push(ListRow::Shelf(index));
+            } else if !shelf.title.is_empty() {
+                self.list_rows.push(ListRow::Heading(index));
+            }
+            for (item_index, item) in shelf.items.iter().enumerate() {
+                if !carousel && !(featured && item_index == 0) {
+                    self.list_rows.push(ListRow::Item(self.rows.len()));
+                }
+                self.rows.push(item.clone());
+            }
+            if sectioned && !carousel && shelf.more.is_some() {
+                self.list_rows.push(ListRow::More(index));
+            }
+        }
+    }
+
+    pub(in crate::app) fn refresh_local(&mut self) {
+        let (title, rows) = match self.route {
+            Route::Liked => (
+                "Liked songs",
+                self.library
+                    .liked
+                    .iter()
+                    .cloned()
+                    .map(Item::Track)
+                    .collect(),
+            ),
+            Route::Recent => (
+                "Recently played",
+                self.library
+                    .recent
+                    .iter()
+                    .cloned()
+                    .map(Item::Track)
+                    .collect(),
+            ),
+            Route::Saved => (
+                "Saved collections",
+                self.library
+                    .saved
+                    .iter()
+                    .cloned()
+                    .map(Item::Collection)
+                    .collect(),
+            ),
+            _ => return,
+        };
+        self.page = Page {
+            title: title.into(),
+            header: None,
+            shelves: vec![Shelf {
+                layout: ShelfLayout::Cards,
+                title: String::new(),
+                more: None,
+                items: rows,
+            }],
+            continuation: None,
+            editable: false,
+            description: String::new(),
+            privacy: None,
+            chips: Vec::new(),
+            countries: Vec::new(),
+        };
+        self.rebuild_rows();
+    }
+
+    pub(in crate::app) fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.video_open {
+            self.video_open = false;
+            cx.notify();
+            return;
+        }
+        let Some(state) = self.back.pop() else { return };
+        if let Some(page) = state.page.filter(|_| self.account.is_none()) {
+            self.catalog_requests.cancel(CatalogTarget::Page);
+            self.artwork.cancel_pending();
+            self.list_id = self.list_id.wrapping_add(1);
+            self.route = state.route;
+            if let Route::Search(search) = &self.route {
+                self.search
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+            }
+            self.page = page;
+            self.error = None;
+            self.notice = None;
+            self.rebuild_rows();
+            self.refresh_local();
+        } else {
+            self.route = state.route.clone();
+            self.navigate(state.route, cx);
+        }
+        self.list_scroll = state.list_scroll;
+        self.detail_list = state.detail_list;
+        self.shelf_scroll = state.shelf_scroll;
+        cx.notify();
+    }
+
+    pub(in crate::app) fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
+        if !self.catalog_requests.finish(result.target, result.id) {
+            return;
+        }
+        if result.session_rejected && result.account_revision == self.account_revision {
+            self.refresh_session(false, cx);
+        }
+        if result.target == CatalogTarget::Sidebar {
+            match result.result {
+                Ok(page) => {
+                    self.sidebar_playlists = page
+                        .shelves
+                        .into_iter()
+                        .flat_map(|shelf| shelf.items)
+                        .filter_map(|item| match item {
+                            Item::Collection(collection)
+                                if !matches!(collection.id.as_str(), "VLLM" | "VLSE") =>
+                            {
+                                Some(collection)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    self.sidebar_error = None;
+                }
+                Err(error) => self.sidebar_error = Some(error),
+            }
+            cx.notify();
+            return;
+        }
+        if matches!(result.target, CatalogTarget::PlaylistPicker) {
+            if let Some(Overlay::PlaylistPicker { page, error, .. }) = &mut self.overlay {
+                match result.result {
+                    Ok(choices) => {
+                        if result.append
+                            && let Some(current) = page
+                        {
+                            current.continuation = choices.continuation;
+                            current.shelves.extend(choices.shelves);
+                        } else {
+                            *page = Some(Box::new(choices));
+                        }
+                    }
+                    Err(message) => *error = Some(message),
+                }
+                cx.notify();
+            }
+            return;
+        }
+        match result.result {
+            Ok(mut page) => {
+                if result.account_revision != self.account_revision {
+                    for track in page
+                        .shelves
+                        .iter_mut()
+                        .flat_map(|shelf| &mut shelf.items)
+                        .filter_map(|item| {
+                            if let Item::Track(track) = item {
+                                Some(track)
+                            } else {
+                                None
+                            }
+                        })
+                    {
+                        track.details.clear_account_state();
+                    }
+                }
+                for track in page
+                    .shelves
+                    .iter()
+                    .flat_map(|shelf| &shelf.items)
+                    .filter_map(|item| match item {
+                        Item::Track(track) => Some(track),
+                        _ => None,
+                    })
+                {
+                    if self.account.is_some()
+                        && self
+                            .library
+                            .queue
+                            .current()
+                            .is_some_and(|current| current.id == track.id)
+                    {
+                        continue;
+                    }
+                    if let Some(rating) = track.details.rating {
+                        self.ratings.insert(track.id.clone(), rating);
+                    }
+                }
+                if result.append {
+                    let first_shelf = self.page.shelves.len();
+                    let previous_rows = self.list_rows.len();
+                    self.page.continuation = page.continuation;
+                    self.page.shelves.extend(page.shelves);
+                    self.append_rows(first_shelf);
+                    if self.page.header.is_some()
+                        || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
+                    {
+                        self.detail_list
+                            .append_rows(self.list_rows.len() - previous_rows);
+                    }
+                } else {
+                    self.page = page;
+                    if matches!(self.overlay, Some(Overlay::Track { .. })) {
+                        self.overlay = None;
+                    }
+                    self.rebuild_rows();
+                }
+            }
+            Err(error) => self.error = Some(error),
+        }
+        cx.notify();
+    }
+}
+
+impl CatalogRequests {
+    pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
+        let catalog_requests = CatalogRequests::new();
+        let (results, completed) = async_channel::unbounded::<CatalogResult>();
+        for worker in 0..2 {
+            let receiver = catalog_requests.pending.clone();
+            let results = results.clone();
+            let generations = catalog_requests.generations.clone();
+            thread::Builder::new()
+                .name(format!("catalog-{worker}"))
+                .spawn(move || {
+                    let catalog = Catalog::new();
+                    while let Ok(job) = receiver.recv_blocking() {
+                        let target = job.query.target();
+                        if generations[target as usize].load(Ordering::Relaxed) != job.id {
+                            continue;
+                        }
+                        let append = matches!(
+                            job.query,
+                            Query::More { .. } | Query::PlaylistChoicesMore(_)
+                        );
+                        let result = match &catalog {
+                            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+                            Ok(catalog) => {
+                                let catalog = catalog.for_session(job.session);
+                                match &job.query {
+                                    Query::Home => catalog.home(),
+                                    Query::Explore => catalog.explore(),
+                                    Query::Library(section) => catalog.library(*section),
+                                    Query::PlaylistChoices | Query::SidebarPlaylists => {
+                                        catalog.library(Section::Playlists)
+                                    }
+                                    Query::PlaylistChoicesMore(token) => catalog.more(token),
+                                    Query::Search(search) => catalog.search_filtered(
+                                        &search.query,
+                                        search.filter,
+                                        search.scope,
+                                    ),
+                                    Query::Browse(link) => catalog.browse(link),
+                                    Query::More {
+                                        token,
+                                        search: Some(search),
+                                    } => catalog.search_more(
+                                        &search.query,
+                                        search.filter,
+                                        search.scope,
+                                        token,
+                                    ),
+                                    Query::More {
+                                        token,
+                                        search: None,
+                                    } => catalog.more(token),
+                                }
+                            }
+                        };
+                        let session_rejected =
+                            result.as_ref().is_err_and(auth::session_was_rejected);
+                        let result = result.map_err(|error| format!("{error:#}"));
+                        if results
+                            .send_blocking(CatalogResult {
+                                id: job.id,
+                                account_revision: job.account_revision,
+                                append,
+                                result,
+                                session_rejected,
+                                target,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .expect("start catalog worker");
+        }
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(result) = completed.recv().await {
+                if view
+                    .update_in(cx, |view, _, cx| view.catalog_result(result, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        catalog_requests
+    }
+}
