@@ -153,8 +153,11 @@ impl Music {
         }
         self.autoplay_seeded = true;
         if let Some(current) = watch.current_index {
-            self.autoplay_tracks
-                .extend(watch.queue.iter().skip(current + 1).cloned());
+            append_recommendations(
+                &self.library.queue,
+                &mut self.autoplay_tracks,
+                watch.queue.iter().skip(current + 1).cloned(),
+            );
             self.radio = watch.continuation.clone();
         }
         if self.autoplay_waiting.is_some()
@@ -376,7 +379,14 @@ impl Music {
                 match result {
                     Ok(page) => {
                         self.radio = page.continuation;
-                        self.autoplay_tracks.extend(page.queue);
+                        append_recommendations(
+                            &self.library.queue,
+                            &mut self.autoplay_tracks,
+                            page.queue,
+                        );
+                        if self.autoplay_waiting.is_some() && self.autoplay_tracks.is_empty() {
+                            self.extend_autoplay(cx);
+                        }
                         self.resume_autoplay(cx);
                     }
                     Err(error) => {
@@ -788,6 +798,24 @@ impl Music {
         }
         self.queue_changed(cx);
     }
+}
+
+pub(in crate::app) fn append_recommendations(
+    queue: &Queue,
+    recommendations: &mut VecDeque<Track>,
+    tracks: impl IntoIterator<Item = Track>,
+) {
+    let mut seen: HashSet<_> = queue
+        .tracks
+        .iter()
+        .chain(recommendations.iter())
+        .map(|track| track.id.clone())
+        .collect();
+    recommendations.extend(
+        tracks
+            .into_iter()
+            .filter(|track| seen.insert(track.id.clone())),
+    );
 }
 
 pub(in crate::app) fn adopt_watch_queue(

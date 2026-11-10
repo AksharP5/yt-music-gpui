@@ -10,7 +10,43 @@ use crate::{
     watch::Watch,
 };
 use gpui::{ListOffset, px};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+#[test]
+fn regenerated_autoplay_skips_cached_and_pending_recommendations() {
+    let track = |id: &str| Track {
+        id: id.into(),
+        title: id.into(),
+        artist: String::new(),
+        album: None,
+        duration: None,
+        thumbnail: None,
+        details: Default::default(),
+    };
+    let mut queue = Queue::default();
+    queue.replace(vec![track("seed"), track("played-autoplay")], 1);
+    let mut recommendations = VecDeque::from([track("pending")]);
+    super::playback::queue::append_recommendations(
+        &queue,
+        &mut recommendations,
+        [
+            track("played-autoplay"),
+            track("seed"),
+            track("fresh"),
+            track("pending"),
+            track("fresh"),
+            track("next"),
+        ],
+    );
+    assert_eq!(
+        recommendations
+            .iter()
+            .map(|track| track.id.as_str())
+            .collect::<Vec<_>>(),
+        ["pending", "fresh", "next"]
+    );
+    assert_eq!(queue.index, Some(1));
+}
 
 #[test]
 fn errors_show_a_short_summary_with_the_diagnostic_left_intact() {
@@ -95,7 +131,7 @@ fn issued_queue_adoption_preserves_manual_edits_and_the_selected_occurrence() {
     let seed = track("abcdefghijk");
     let next = track("lmnopqrstuv");
     let watch = Watch {
-        issued_target: None,
+        source_target: None,
         current: Some(seed.clone()),
         current_index: Some(1),
         queue: vec![next.clone(), seed.clone(), next.clone()],

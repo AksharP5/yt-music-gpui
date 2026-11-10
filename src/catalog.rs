@@ -83,9 +83,20 @@ pub struct WatchTarget {
 
 impl WatchTarget {
     pub(crate) fn restorable(&self) -> bool {
-        self.playlist_id
-            .as_ref()
-            .is_some_and(|id| id.starts_with("PL") || id.starts_with("OLAK5uy"))
+        self.is_generated()
+            || self
+                .playlist_id
+                .as_ref()
+                .is_some_and(|id| id.starts_with("PL") || id.starts_with("OLAK5uy"))
+    }
+
+    pub(crate) fn is_generated(&self) -> bool {
+        match &self.playlist_id {
+            Some(id) => id.starts_with("RD"),
+            None => {
+                self.video_id.is_some() && self.music_video_type.as_deref() != Some(PODCAST_EPISODE)
+            }
+        }
     }
     pub fn is_single_video(&self) -> bool {
         self.playlist_id.is_none() && self.params.is_none() && self.index.is_none()

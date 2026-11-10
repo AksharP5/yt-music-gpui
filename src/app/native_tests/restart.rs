@@ -1,10 +1,11 @@
-//! A real process restart, using only a public playlist and isolated guest data.
+//! Real process restarts using public collections, mixes and isolated guest data.
 
 use crate::{
-    app::{CatalogTarget, Music, Playback, Startup},
+    app::{CatalogTarget, Music, Playback, PlaybackQuery, Startup},
     catalog::{BrowseLink, Catalog},
-    library::Library,
+    library::{Library, Repeat},
     queue_source::PageRequest,
+    search::{SearchFilter, SearchScope},
     watch::WatchMode,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -29,6 +30,12 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
             "restore-browse",
             "save-issued",
             "restore-issued",
+            "save-radio",
+            "restore-radio",
+            "save-search",
+            "restore-search",
+            "save-autoplay",
+            "restore-autoplay",
         ] {
             let output = Command::new(std::env::current_exe()?)
                 .args(["--ignored", "--exact", TEST, "--nocapture"])
@@ -46,7 +53,16 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
     ensure!(
         matches!(
             phase.as_str(),
-            "save-browse" | "restore-browse" | "save-issued" | "restore-issued"
+            "save-browse"
+                | "restore-browse"
+                | "save-issued"
+                | "restore-issued"
+                | "save-radio"
+                | "restore-radio"
+                | "save-search"
+                | "restore-search"
+                | "save-autoplay"
+                | "restore-autoplay"
         ),
         "Unknown restart phase"
     );
@@ -64,7 +80,6 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
             let mut music = Music::new(Startup::Guest, window, cx);
             for target in CatalogTarget::ALL { music.catalog_requests.cancel(target); }
             music.library.volume = 0.;
-            music.library.autoplay = false;
             music.player.as_ref().unwrap().set_volume(0.).unwrap();
             music.player_open = true;
             music
@@ -73,10 +88,18 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
             let outcome: Result<()> = async {
                 super::render::wait_for_presented_frame(window, cx).await;
                 let path = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").context("private data directory")?).join("yt-music-gpui/library.json");
+                let autoplay = phase.ends_with("-search") || phase.ends_with("-autoplay");
+                let radio = phase.ends_with("-radio");
                 if phase.starts_with("save-") {
                     let issued = phase.ends_with("-issued");
-                    let (page, watch) = cx.background_executor().spawn(async move {
+                    let (page, watch, seed) = cx.background_executor().spawn(async move {
                         let catalog = Catalog::new()?;
+                        if radio || autoplay {
+                            let seed = catalog.search_filtered("Khruangbin August 10", SearchFilter::Songs, SearchScope::Catalog)?.tracks().into_iter()
+                                .find(|track| track.details.watch.as_ref().is_some_and(|target| target.is_single_video()))
+                                .context("Public search must supply a single-song playback destination")?;
+                            return Ok::<_, anyhow::Error>((None, None, Some(seed)));
+                        }
                         let page = catalog.browse(&BrowseLink::new(PLAYLIST, "Top 500 Classic Rock songs"))?;
                         let watch = if issued {
                             let seed = page.tracks().into_iter().next().context("Public playlist must have a seed")?;
@@ -84,41 +107,83 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
                             ensure!(!watch.queue.is_empty() && watch.continuation.is_some(), "Issued restart fixture must have a continued first page");
                             Some(watch)
                         } else { None };
-                        Ok::<_, anyhow::Error>((page, watch))
+                        ensure!(page.tracks().len() == 100 && page.continuation.is_some(), "Public restart fixture must have 100 cached rows and a continuation");
+                        Ok((Some(page), watch, None))
                     }).await?;
-                    ensure!(page.tracks().len() == 100 && page.continuation.is_some(), "Public restart fixture must have 100 cached rows and a continuation");
-                    let cached_count = watch.as_ref().map_or(100, |watch| watch.queue.len());
                     window.update(cx, |music, _, cx| {
+                        music.library.autoplay = autoplay;
+                        music.library.repeat = if radio { Repeat::All } else { Repeat::Off };
+                        if let Some(seed) = seed {
+                            if radio {
+                                music.start_queue(PlaybackQuery::Watch { track: Box::new(seed), mode: WatchMode::Radio }, cx);
+                            } else {
+                                music.play_track(seed, cx);
+                            }
+                            return;
+                        }
                         if let Some(watch) = &watch {
                             music.library.queue.replace(watch.queue.clone(), watch.current_index.unwrap());
                             music.library.queue.playing_from = watch.source.clone();
                             music.queue_source.attach_watch(&mut music.library.queue, watch, None);
                         } else {
-                            music.queue_source.replace_queue(&mut music.library.queue, &page, 0, PageRequest::Collection(PLAYLIST.into()), None);
+                            music.queue_source.replace_queue(&mut music.library.queue, page.as_ref().unwrap(), 0, PageRequest::Collection(PLAYLIST.into()), None);
                         }
                         music.play_current(cx);
                         music.save();
                     })?;
                     let deadline = Instant::now() + Duration::from_secs(45);
+                    let mut advanced = false;
                     loop {
-                        let playing = window.update(cx, |music, _, _| music.position > 0. && matches!(music.playback, Playback::Loaded { .. }))?;
-                        let saved = std::fs::read(&path).ok().and_then(|data| serde_json::from_slice::<Library>(&data).ok()).is_some_and(|library| library.queue.tracks.len() == cached_count && library.queue.source.is_some() && library.volume == 0.);
-                        if playing && saved { break; }
-                        ensure!(Instant::now() < deadline, "Could not play and persist the first {cached_count} rows before quit");
+                        let (playing, ready, cached_count, index) = window.update(cx, |music, _, _| (
+                            music.position > 0. && matches!(music.playback, Playback::Loaded { .. }),
+                            music.watch_pending.is_none() && music.library.queue.playing_from.is_some() && (autoplay || music.library.queue.source.is_some()),
+                            music.library.queue.tracks.len(), music.library.queue.index,
+                        ))?;
+                        if playing && ready && phase == "save-autoplay" && !advanced {
+                            cx.update_window(window.into(), |_, window, cx| window.dispatch_keystroke(gpui::Keystroke::parse("ctrl-right").unwrap(), cx))?;
+                            advanced = true;
+                            continue;
+                        }
+                        let saved = std::fs::read(&path).ok().and_then(|data| serde_json::from_slice::<Library>(&data).ok()).is_some_and(|library| library.queue.tracks.len() == cached_count && library.volume == 0. && (autoplay || library.queue.source.is_some()));
+                        if playing && ready && saved && (phase != "save-autoplay" || index == Some(1)) {
+                            ensure!(!radio || cached_count == 50, "Radio fixture must reach its real 50-track cached boundary");
+                            ensure!(!autoplay || cached_count == if advanced { 2 } else { 1 }, "Single-song/autoplay fixture must retain only played tracks");
+                            println!("RESTART_SAVED phase={phase} cached={cached_count} playing=true source_persisted={} pid={}", !autoplay, std::process::id());
+                            break;
+                        }
+                        ensure!(Instant::now() < deadline, "Could not play and persist the queue before quit: phase={phase}, count={cached_count}, index={index:?}");
                         cx.background_executor().timer(Duration::from_millis(50)).await;
                     }
-                    println!("RESTART_SAVED phase={phase} cached={cached_count} playing=true source_persisted=true pid={}", std::process::id());
                 } else {
-                    let cached_count = window.update(cx, |music, _, cx| -> Result<usize> {
+                    let (cached_count, cached_ids) = window.update(cx, |music, _, cx| -> Result<_> {
                         let cached_count = music.library.queue.tracks.len();
-                        ensure!(cached_count > 0 && music.library.queue.incomplete, "Restart did not restore the partial queue");
-                        ensure!(phase.ends_with("-issued") || cached_count == 100, "Browse restart must restore exactly 100 cached tracks");
+                        let cached_ids = music.library.queue.tracks.iter().map(|track| track.id.clone()).collect::<Vec<_>>();
+                        ensure!(cached_count > 0 && music.library.queue.incomplete != autoplay, "Restart did not restore the expected queue completeness");
+                        ensure!(!phase.ends_with("-browse") || cached_count == 100, "Browse restart must restore exactly 100 cached tracks");
+                        ensure!(!radio || music.library.repeat == Repeat::All, "Radio must continue with Repeat All enabled");
                         ensure!(!music.queue_source.can_continue(), "The source must stay lazy on startup");
                         music.library.queue.select(cached_count - 1);
                         music.play_current(cx);
-                        Ok(cached_count)
+                        Ok((cached_count, cached_ids))
                     })??;
-                    // Use the same Next shortcut as the native UI, before prefetch can finish.
+                    if radio {
+                        let deadline = Instant::now() + Duration::from_secs(45);
+                        loop {
+                            let (playing, error, count) = window.update(cx, |music, _, _| (
+                                music.position > 0. && matches!(music.playback, Playback::Loaded { .. }),
+                                music.error.clone(), music.library.queue.tracks.len(),
+                            ))?;
+                            ensure!(error.is_none(), "Restored radio boundary failed: {error:?}");
+                            if playing {
+                                println!("RESTART_BOUNDARY phase={phase} cached={cached_count} selected={} loaded={count} playing=true repeat=All", cached_count - 1);
+                                break;
+                            }
+                            ensure!(Instant::now() < deadline, "Restored radio track {cached_count} did not play");
+                            cx.background_executor().timer(Duration::from_millis(50)).await;
+                        }
+                    }
+                    // Use the native Next shortcut. Other sources also exercise Next
+                    // before prefetch or playback details can finish.
                     cx.update_window(window.into(), |_, window, cx| {
                         window.dispatch_keystroke(gpui::Keystroke::parse("ctrl-right").unwrap(), cx);
                     })?;
@@ -127,14 +192,17 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
                         let (index, count, playing, error, current) = window.update(cx, |music, _, _| (music.library.queue.index, music.library.queue.tracks.len(), music.position > 0. && matches!(music.playback, Playback::Loaded { .. }), music.error.clone(), music.library.queue.current().map(|track| (track.id.clone(), track.title.clone()))))?;
                         ensure!(error.is_none(), "Restart continuation failed: {error:?}; index={index:?}, loaded={count}, current={current:?}");
                         if index == Some(cached_count) && playing {
-                            println!("RESTART_NEXT phase={phase} cached={cached_count} selected={cached_count} next={} loaded={count} playing=true pid={}", cached_count + 1, std::process::id());
+                            if radio || autoplay {
+                                ensure!(current.as_ref().is_some_and(|(id, _)| !cached_ids.contains(id)), "Regenerated recommendations repeated a cached song: {current:?}");
+                            }
+                            println!("RESTART_NEXT phase={phase} cached={cached_count} selected={cached_count} next={} loaded={count} playing=true current={current:?} pid={}", cached_count + 1, std::process::id());
                             break;
                         }
                         ensure!(Instant::now() < deadline, "Next from row {cached_count} did not play the following row: index={index:?}, count={count}");
                         cx.background_executor().timer(Duration::from_millis(50)).await;
                     }
                     cx.background_executor().timer(Duration::from_millis(300)).await;
-                    window.update(cx, |_, window, _| { super::render::capture(window, &format!("{phase}-track-101")); })?;
+                    window.update(cx, |_, window, _| { super::render::capture(window, &format!("{phase}-next")); })?;
                 }
                 Ok(())
             }.await;

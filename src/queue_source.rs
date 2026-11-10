@@ -27,8 +27,8 @@ pub enum PageRequest {
     },
 }
 
-/// Only public request fields and the consumed source order, never continuation
-/// tokens, visitor data or credentials. Queue edits do not change this prefix.
+/// Only public request fields and consumed track IDs, never continuation tokens,
+/// visitor data or credentials. Queue edits do not change the consumed source.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SavedSource {
     target: SavedTarget,
@@ -42,6 +42,10 @@ enum SavedTarget {
 }
 
 impl SavedTarget {
+    fn is_generated(&self) -> bool {
+        matches!(self, Self::Watch(target) if target.is_generated())
+    }
+
     fn load(&self, catalog: &Catalog) -> Result<QueuePage> {
         match self {
             Self::Browse(id) => {
@@ -109,7 +113,13 @@ fn load_page(catalog: &Catalog, continuation: &SourceContinuation) -> Result<Que
     match continuation {
         SourceContinuation::Restore(saved) => {
             let first = saved.target.load(catalog)?;
-            resume_prefix(saved, first, |next| load_page(catalog, next))
+            if saved.target.is_generated() {
+                // Mixes regenerate under the current session. The append boundary
+                // deduplicates them instead of requiring a static playlist prefix.
+                Ok(first)
+            } else {
+                resume_prefix(saved, first, |next| load_page(catalog, next))
+            }
         }
         SourceContinuation::Page { page, continuation } => {
             let response = match page {
@@ -320,7 +330,7 @@ impl Worker {
         watch: &Watch,
         session: Option<Arc<Session>>,
     ) {
-        queue.source = watch.issued_target.clone().map(|target| SavedSource {
+        queue.source = watch.source_target.clone().map(|target| SavedSource {
             target: SavedTarget::Watch(target),
             loaded: watch.queue.iter().map(|track| track.id.clone()).collect(),
         });
@@ -335,7 +345,7 @@ impl Worker {
     }
 
     /// Reacquire under the current session only when playback needs more tracks.
-    /// Prefix verification protects queues if the collection or account changed.
+    /// Static collections verify their prefix; mixes append fresh recommendations.
     pub fn restore(&mut self, queue: &mut Queue, session: Option<&Arc<Session>>) {
         if self.source.is_none()
             && queue.incomplete
@@ -434,7 +444,7 @@ impl Worker {
                 "The account changed. Open the playlist again to continue its queue.".into(),
             );
         }
-        let page = match event.result {
+        let mut page = match event.result {
             Ok(page) => page,
             Err(error) => {
                 source.state = State::Failed(error.clone());
@@ -449,7 +459,20 @@ impl Worker {
             source.state = State::Failed(error.clone());
             return Err(error);
         }
+        let generated = queue
+            .source
+            .as_ref()
+            .is_some_and(|saved| saved.target.is_generated());
         if let Some(saved) = &mut queue.source {
+            if generated {
+                let mut seen: HashSet<_> = saved
+                    .loaded
+                    .iter()
+                    .chain(queue.tracks.iter().map(|track| &track.id))
+                    .cloned()
+                    .collect();
+                page.tracks.retain(|track| seen.insert(track.id.clone()));
+            }
             saved
                 .loaded
                 .extend(page.tracks.iter().map(|track| track.id.clone()));
@@ -469,7 +492,7 @@ impl Worker {
                 queue.source_id = None;
             }
         }
-        if queue.shuffled && queue.incomplete {
+        if queue.shuffled && queue.incomplete && !generated {
             self.load(session, false)?;
         }
         Ok(true)
@@ -1490,6 +1513,188 @@ mod tests {
                 true,
                 &mut VecDeque::from([track("radio")])
             ));
+        }
+    }
+
+    #[test]
+    fn restarted_mixes_keep_edits_and_append_unique_fresh_recommendations() {
+        for endpoint in [
+            json!({"videoId":"abcdefghijk", "playlistId":"RDAMVMabcdefghijk", "params":"wAEB"}),
+            json!({"videoId":"abcdefghijk"}),
+        ] {
+            for shuffled in [false, true] {
+                let mut watch = watch(
+                    &["abcdefghijk", "removed0000", "lmnopqrstuv"],
+                    Some("private-old-token"),
+                    Some(session()),
+                );
+                watch.source_target = Some(WatchTarget::try_from(endpoint.clone()).unwrap());
+                let mut queue = Queue::default();
+                queue.replace(watch.queue.clone(), 0);
+                let (mut worker, _) = Worker::spawn(|_| unreachable!());
+                worker.attach_watch(&mut queue, &watch, Some(session()));
+                queue.remove(1);
+                queue.tracks.insert(1, track("manual-next"));
+                queue.move_track(2, 1);
+                if shuffled {
+                    queue.shuffle_upcoming();
+                }
+                let before = queue.tracks.clone();
+                let saved = serde_json::to_string(&queue).unwrap();
+                for secret in [
+                    "private-old-token",
+                    "cookie",
+                    "authuser",
+                    "synthetic-user",
+                    "data_sync_id",
+                ] {
+                    assert!(!saved.contains(secret));
+                }
+                drop(worker);
+                let mut queue: Queue = serde_json::from_str(&saved).unwrap();
+                queue.select(queue.tracks.len() - 1);
+                assert!(
+                    !queue.advance(Repeat::All, false),
+                    "Repeat All must wait for more mix tracks"
+                );
+                // Recommendations can change completely and include removed tracks,
+                // manual additions and duplicates, including on later pages.
+                let fresh_session = account("synthetic-user||", None);
+                let expected_session = fresh_session.clone();
+                let (mut worker, events) = Worker::spawn(move |request| {
+                    assert!(same_session(
+                        request.session.as_ref(),
+                        Some(&expected_session)
+                    ));
+                    match &request.continuation {
+                        SourceContinuation::Restore(saved) => {
+                            assert!(saved.target.is_generated());
+                            Ok(next_page(
+                                &[
+                                    "lmnopqrstuv",
+                                    "removed0000",
+                                    "manual-next",
+                                    "fresh-first",
+                                    "fresh-first",
+                                ],
+                                Some("fresh-token"),
+                            ))
+                        }
+                        _ => Ok(next_page(
+                            &["fresh-first", "fresh-next"],
+                            Some("next-token"),
+                        )),
+                    }
+                });
+                assert!(!worker.can_continue());
+                worker.restore(&mut queue, Some(&fresh_session));
+                for _ in 0..2 {
+                    worker.load(Some(&fresh_session), false).unwrap();
+                    worker
+                        .apply(
+                            events.recv_blocking().unwrap(),
+                            &mut queue,
+                            Some(&fresh_session),
+                        )
+                        .unwrap();
+                    assert!(
+                        matches!(worker.source.as_ref().unwrap().state, State::Ready),
+                        "Shuffling an endless mix must not eagerly load every page"
+                    );
+                }
+                assert_eq!(&queue.tracks[..before.len()], &before);
+                let mut appended = ids(&queue)[before.len()..].to_vec();
+                appended.sort_unstable();
+                assert_eq!(appended, ["fresh-first", "fresh-next"]);
+                assert!(queue.advance(Repeat::All, false));
+                assert!(matches!(
+                    queue.current().unwrap().id.as_str(),
+                    "fresh-first" | "fresh-next"
+                ));
+                assert!(queue.incomplete);
+                assert!(queue.source.is_some());
+                let saved_again: Queue =
+                    serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+                assert!(
+                    saved_again
+                        .source
+                        .unwrap()
+                        .loaded
+                        .iter()
+                        .any(|id| id == "fresh-next")
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "reacquires public radio and single-song mix queues under a fresh guest session"]
+    fn live_public_mix_restore() {
+        let catalog = Catalog::new().unwrap();
+        let seed = catalog
+            .search_filtered(
+                "Khruangbin August 10",
+                SearchFilter::Songs,
+                SearchScope::Catalog,
+            )
+            .unwrap()
+            .tracks()
+            .into_iter()
+            .find(|track| {
+                track
+                    .details
+                    .watch
+                    .as_ref()
+                    .is_some_and(|target| target.is_single_video())
+            })
+            .expect("Search must provide a single-song destination");
+        for mode in [
+            crate::watch::WatchMode::Radio,
+            crate::watch::WatchMode::Details,
+        ] {
+            let watch = catalog.watch(&seed, mode).unwrap();
+            assert!(watch.continuation.is_some());
+            let (mut worker, _) = Worker::start();
+            let mut queue = Queue::default();
+            queue.replace(watch.queue.clone(), 0);
+            worker.attach_watch(&mut queue, &watch, None);
+            let saved = serde_json::to_string(&queue).unwrap();
+            drop(worker);
+            let mut queue: Queue = serde_json::from_str(&saved).unwrap();
+            let cached = queue.tracks.clone();
+            let (mut worker, events) = Worker::start();
+            queue.select(cached.len() - 1);
+            assert!(!queue.advance(Repeat::All, false));
+            worker.restore(&mut queue, None);
+            for _ in 0..8 {
+                worker.load(None, false).unwrap();
+                worker
+                    .apply(events.recv_blocking().unwrap(), &mut queue, None)
+                    .unwrap();
+                if queue.tracks.len() > cached.len() {
+                    break;
+                }
+                assert!(
+                    queue.incomplete,
+                    "Public mix ended without fresh recommendations"
+                );
+            }
+            assert_eq!(&queue.tracks[..cached.len()], &cached);
+            let mut seen: HashSet<_> = cached.iter().map(|track| &track.id).collect();
+            assert!(
+                queue.tracks[cached.len()..]
+                    .iter()
+                    .all(|track| seen.insert(&track.id))
+            );
+            assert!(queue.advance(Repeat::All, false));
+            assert_eq!(queue.index, Some(cached.len()));
+            println!(
+                "PUBLIC_MIX_RESTORE mode={mode:?} seed={} cached={} loaded={} next={}",
+                seed.title,
+                cached.len(),
+                queue.tracks.len(),
+                queue.current().unwrap().title
+            );
         }
     }
 }

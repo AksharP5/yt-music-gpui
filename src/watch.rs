@@ -20,7 +20,7 @@ pub struct Watch {
     pub related: Option<String>,
     pub alternatives: Option<Box<MediaPair>>,
     pub continuation: Option<WatchContinuation>,
-    pub issued_target: Option<crate::catalog::WatchTarget>,
+    pub source_target: Option<crate::catalog::WatchTarget>,
 }
 
 #[derive(Clone)]
@@ -320,10 +320,11 @@ fn parse_watch(
         }
     }
     Ok(Watch {
-        issued_target: (mode == WatchMode::Issued)
-            .then(|| crate::catalog::WatchTarget::try_from(request.clone()).ok())
-            .flatten()
-            .filter(crate::catalog::WatchTarget::restorable),
+        source_target: crate::catalog::WatchTarget::try_from(request.clone())
+            .ok()
+            .filter(|target| {
+                target.restorable() && (seed.details.episode.is_none() || !target.is_generated())
+            }),
         current: current_index.map(|index| queue[index].clone()),
         current_index,
         queue,
@@ -560,6 +561,45 @@ mod tests {
         assert_eq!(radio["params"], "wAEB");
         assert!(radio.get("watchEndpointMusicSupportedConfigs").is_none());
         assert!(watch_request(&track("not a video ID"), WatchMode::Radio).is_err());
+    }
+
+    #[test]
+    fn generated_queues_keep_a_safe_restore_seed() {
+        for (mode, request) in [
+            (
+                WatchMode::Radio,
+                watch_request(&track("abcdefghijk"), WatchMode::Radio).unwrap(),
+            ),
+            (
+                WatchMode::Details,
+                watch_request(&track("abcdefghijk"), WatchMode::Details).unwrap(),
+            ),
+            (WatchMode::Issued, json!({"videoId":"abcdefghijk"})),
+            (
+                WatchMode::Issued,
+                json!({"playlistId":"RDAMVMabcdefghijk", "params":"wAEB"}),
+            ),
+        ] {
+            let mut request = request;
+            request["continuation"] = json!("private-token");
+            request["context"] = json!({"user":{"authuser":"private-account"}});
+            let watch = parse_watch(
+                &watch_response(json!([row("abcdefghijk", true), row("lmnopqrstuv", false)])),
+                &track("abcdefghijk"),
+                request,
+                None,
+                mode,
+            )
+            .unwrap();
+            let saved = serde_json::to_string(
+                &watch
+                    .source_target
+                    .expect("Generated queue must retain its seed"),
+            )
+            .unwrap();
+            assert!(saved.contains("abcdefghijk"));
+            assert!(!saved.contains("private"));
+        }
     }
 
     fn issued_track(endpoint: Value) -> Track {
