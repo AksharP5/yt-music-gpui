@@ -248,7 +248,7 @@ impl Music {
             }))
         });
         let content_view = cx.new(|cx| MusicContent::new(music.clone(), cx));
-        let player_bar = cx.new(|_| PlayerBar::new(music.downgrade()));
+        let player_bar = cx.new(|cx| PlayerBar::new(music.downgrade(), cx));
         let mut view = Self {
             #[cfg(test)]
             renders: 0,

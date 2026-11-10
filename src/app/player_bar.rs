@@ -4,14 +4,18 @@ use super::*;
 
 pub(super) struct PlayerBar {
     music: WeakEntity<Music>,
+    pub(super) controls_expanded: bool,
+    controls_focus: FocusHandle,
     #[cfg(test)]
     pub(super) renders: usize,
 }
 
 impl PlayerBar {
-    pub(super) fn new(music: WeakEntity<Music>) -> Self {
+    pub(super) fn new(music: WeakEntity<Music>, cx: &Context<Self>) -> Self {
         Self {
             music,
+            controls_expanded: false,
+            controls_focus: cx.focus_handle(),
             #[cfg(test)]
             renders: 0,
         }
@@ -25,8 +29,13 @@ impl Render for PlayerBar {
             self.renders += 1;
         }
         let width = window.viewport_size().width.into();
+        if width >= 1120. {
+            self.controls_expanded = false;
+        }
+        let expanded = self.controls_expanded && width < 1120.;
+        let focus = self.controls_focus.clone();
         self.music
-            .update(cx, |music, cx| music.player_bar(width, cx))
+            .update(cx, |music, cx| music.player_bar(width, expanded, focus, cx))
             .expect("Music owns its player bar")
     }
 }
@@ -72,7 +81,13 @@ impl Music {
         self.notify_playback(cx);
     }
 
-    pub(in crate::app) fn player_bar(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(in crate::app) fn player_bar(
+        &mut self,
+        width: f32,
+        expanded: bool,
+        controls_focus: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let compact = width < 1120.;
         let theme = self.theme;
         let current = self.library.queue.current().cloned();
@@ -213,15 +228,13 @@ impl Music {
                                 view.open_track_menu(menu_track.clone(), None, window, cx);
                             })
                             .size(px(36.))
-                            .ml(px(13.)),
+                            .ml(px(13.))
+                            .mr(px(16.)),
                         ),
                 );
         }
         let seek_bounds = self.seek_bounds.clone();
-        let volume_bounds = self.volume_bounds.clone();
-        let adjusting_volume = self.drag == Some(Drag::Volume);
         let seeking = self.drag == Some(Drag::Seek);
-        let repeat = self.library.repeat;
         div()
             .id("player-bar")
             .h(px(if width < 936. { 64. } else { 72. }))
@@ -254,13 +267,14 @@ impl Music {
             .child(
                 div()
                     .size_full()
-                    .pl(px(8.))
                     .pr(px(16.))
                     .flex()
                     .items_center()
-                    .gap(px(if compact { 16. } else { 32. }))
+                    .gap(px(if compact { 0. } else { 32. }))
                     .child(
                         div()
+                            .w(px(if compact { 241. } else { 280. }))
+                            .pl(px(8.))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
@@ -292,7 +306,11 @@ impl Music {
                             }))
                             .when(width >= 936., |d| {
                                 d.child(div().text_size(px(12.)).text_color(theme.muted).child(
-                                    format!("{} / {}", clock(position), clock(self.duration)),
+                                    format!(
+                                        "{} / {}",
+                                        clock(position.floor()),
+                                        clock(self.duration)
+                                    ),
                                 ))
                             }),
                     )
@@ -306,103 +324,67 @@ impl Music {
                     )
                     .child(
                         div()
-                            // Taffy under-measures this group's content, so size it from
-                            // its fixed controls: four 36 px buttons, gaps, and the slider.
-                            .w(px(if compact { 176. } else { 280. }))
+                            .w(px(if compact { 241. } else { 280. }))
+                            .relative()
                             .flex_shrink_0()
                             .flex()
                             .items_center()
+                            .justify_end()
                             .gap(px(12.))
-                            .child(
-                                div()
-                                    .id("volume")
-                                    .group("volume")
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .when(!compact, |d| {
-                                        d.child(
-                                            div()
-                                                .id("volume-track")
-                                                .w(px(100.))
-                                                .h(px(32.))
-                                                .when(!adjusting_volume, |d| {
-                                                    d.invisible()
-                                                        .group_hover("volume", |d| d.visible())
-                                                })
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(
-                                                        |view, event: &MouseDownEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            view.drag = Some(Drag::Volume);
-                                                            view.drag_to(event.position, cx);
-                                                        },
-                                                    ),
-                                                )
-                                                .child(slider(
-                                                    (self.library.volume / 100.) as f32,
-                                                    volume_bounds,
-                                                    theme,
-                                                )),
-                                        )
-                                    })
-                                    .child(tinted_control(
-                                        "mute-toggle",
-                                        if self.library.volume == 0. {
-                                            "mute"
-                                        } else {
-                                            "volume"
-                                        },
-                                        rgb(INACTIVE),
+                            .on_key_down(cx.listener(
+                                move |view, event: &KeyDownEvent, window, cx| {
+                                    if expanded && event.keystroke.key == "escape" {
+                                        view.player_bar.update(cx, |bar, cx| {
+                                            bar.controls_expanded = false;
+                                            window.focus(&bar.controls_focus, cx);
+                                            cx.notify();
+                                        });
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                            .when(!compact, |group| {
+                                group.child(self.player_controls(false, cx))
+                            })
+                            .when(compact, |group| {
+                                group.child(
+                                    control(
+                                        "more-player-controls",
+                                        "expand-more",
                                         theme,
                                         cx,
-                                        |view, _, cx| {
-                                            view.set_volume(
-                                                if view.library.volume > 0. { 0. } else { 60. },
-                                                cx,
-                                            );
-                                            view.save_preferences();
+                                        |view, window, cx| {
+                                            view.player_bar.update(cx, |bar, cx| {
+                                                bar.controls_expanded = !bar.controls_expanded;
+                                                window.focus(&bar.controls_focus, cx);
+                                                cx.notify();
+                                            });
                                         },
-                                    )),
-                            )
-                            .child(
-                                tinted_control(
-                                    "repeat",
-                                    "repeat",
-                                    if repeat == Repeat::Off {
-                                        rgb(INACTIVE).into()
-                                    } else {
-                                        theme.text
-                                    },
-                                    theme,
-                                    cx,
-                                    |view, _, cx| {
-                                        view.library.repeat = view.library.repeat.next();
-                                        view.save_preferences();
-                                        view.notify_playback(cx);
-                                    },
-                                )
-                                .when(repeat == Repeat::One, |d| {
-                                    d.child(
-                                        div()
-                                            .absolute()
-                                            .top_0()
-                                            .right_0()
-                                            .text_size(px(9.))
-                                            .child("1"),
                                     )
-                                }),
-                            )
-                            .child(tinted_control(
-                                "shuffle",
-                                "shuffle",
-                                rgb(INACTIVE),
-                                theme,
-                                cx,
-                                |view, _, cx| view.shuffle_queue(cx),
-                            ))
+                                    .track_focus(&controls_focus),
+                                )
+                            })
+                            .when(expanded, |group| {
+                                group.child(
+                                    div()
+                                        .id("expanded-player-controls")
+                                        .absolute()
+                                        .right(px(36.))
+                                        .w(px(260.))
+                                        .h(px(36.))
+                                        .px(px(12.))
+                                        .bg(theme.panel)
+                                        .child(self.player_controls(true, cx))
+                                        .occlude()
+                                        .on_click(|_, _, cx| cx.stop_propagation())
+                                        .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                                            view.player_bar.update(cx, |bar, cx| {
+                                                bar.controls_expanded = false;
+                                                cx.notify();
+                                            });
+                                        })),
+                                )
+                            })
                             .child(
                                 control(
                                     "player-page-toggle",
@@ -423,5 +405,101 @@ impl Music {
                     ),
             )
             .into_any_element()
+    }
+
+    fn player_controls(&self, expanded: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let volume_bounds = self.volume_bounds.clone();
+        let adjusting_volume = self.drag == Some(Drag::Volume);
+        let repeat = self.library.repeat;
+        div()
+            .w(px(236.))
+            .h(px(36.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(
+                div()
+                    .id("volume")
+                    .group("volume")
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id("volume-track")
+                            .w(px(100.))
+                            .h(px(32.))
+                            .when(!expanded && !adjusting_volume, |d| {
+                                d.invisible().group_hover("volume", |d| d.visible())
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    view.drag = Some(Drag::Volume);
+                                    view.drag_to(event.position, cx);
+                                }),
+                            )
+                            .child(slider(
+                                (self.library.volume / 100.) as f32,
+                                volume_bounds,
+                                theme,
+                            )),
+                    )
+                    .child(tinted_control(
+                        "mute-toggle",
+                        if self.library.volume == 0. {
+                            "mute"
+                        } else {
+                            "volume"
+                        },
+                        rgb(INACTIVE),
+                        theme,
+                        cx,
+                        |view, _, cx| {
+                            view.set_volume(if view.library.volume > 0. { 0. } else { 60. }, cx);
+                            view.save_preferences();
+                        },
+                    )),
+            )
+            .child(
+                tinted_control(
+                    "repeat",
+                    "repeat",
+                    if repeat == Repeat::Off {
+                        rgb(INACTIVE).into()
+                    } else {
+                        theme.text
+                    },
+                    theme,
+                    cx,
+                    |view, _, cx| {
+                        view.library.repeat = view.library.repeat.next();
+                        view.save_preferences();
+                        view.notify_playback(cx);
+                    },
+                )
+                .when(repeat == Repeat::One, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .text_size(px(9.))
+                            .child("1"),
+                    )
+                }),
+            )
+            .child(tinted_control(
+                "shuffle",
+                "shuffle",
+                rgb(INACTIVE),
+                theme,
+                cx,
+                |view, _, cx| view.shuffle_queue(cx),
+            ))
     }
 }

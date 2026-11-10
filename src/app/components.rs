@@ -533,7 +533,7 @@ pub(in crate::app) fn seek_bar(
         )
 }
 pub(in crate::app) fn clock(seconds: f64) -> String {
-    let seconds = seconds.max(0.) as u64;
+    let seconds = seconds.max(0.).round() as u64;
     if seconds >= 3600 {
         format!(
             "{}:{:02}:{:02}",
