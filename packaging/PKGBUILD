@@ -1,27 +1,48 @@
-pkgname=yt-music-gpui
-pkgver=0.1.0
+pkgname=yt-music-gpui-git
+_pkgname=yt-music-gpui
+pkgver=0.1.0.r0.g0000000
 pkgrel=1
 pkgdesc='Native YouTube Music client built with GPUI'
 arch=('x86_64')
 url='https://github.com/AksharP5/yt-music-gpui'
-license=('MIT' 'Apache-2.0' 'OFL-1.1')
+license=('MIT' 'Apache-2.0' 'ISC' 'OFL-1.1')
 depends=('libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'vulkan-driver' 'mpv' 'yt-dlp' 'libglvnd' 'wayland' 'libx11' 'libxext' 'python' 'xdg-utils' 'libsecret')
-makedepends=('rust' 'pkgconf')
+makedepends=('cargo' 'git' 'pkgconf')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+# makepkg's LTO flags turn cc-built C objects into GCC bitcode that rustc's link step cannot resolve.
+options=('!lto')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
 
 build() {
-  cd "$startdir/.."
-  cargo build --release --locked --jobs "${CARGO_BUILD_JOBS:-2}"
+  cd "$_pkgname"
+  cargo build --frozen --release --jobs "${CARGO_BUILD_JOBS:-2}"
+}
+
+check() {
+  cd "$_pkgname"
+  cargo test --frozen --release --jobs "${CARGO_BUILD_JOBS:-2}"
 }
 
 package() {
-  cd "$startdir/.."
-  install -Dm755 target/release/yt-music-gpui "$pkgdir/usr/bin/yt-music-gpui"
-  install -Dm644 packaging/yt-music-gpui.desktop "$pkgdir/usr/share/applications/yt-music-gpui.desktop"
-  install -Dm644 packaging/yt-music-gpui.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/yt-music-gpui.svg"
-  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
-  install -Dm644 LICENSE-VIEWPORTER "$pkgdir/usr/share/licenses/$pkgname/LICENSE-VIEWPORTER"
-  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/$pkgname/OFL.txt"
-  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  cd "$_pkgname"
+  install -Dm755 "target/release/$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm644 "packaging/$_pkgname.desktop" "$pkgdir/usr/share/applications/$_pkgname.desktop"
+  install -Dm644 "packaging/$_pkgname.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/$_pkgname.svg"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE* NOTICE assets/fonts/OFL.txt
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

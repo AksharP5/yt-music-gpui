@@ -10,4 +10,5 @@ __pycache__/
 
 /packaging/pkg/
 /packaging/src/
+/packaging/yt-music-gpui/
 /packaging/*.pkg.tar.*

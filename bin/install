@@ -10,5 +10,6 @@ music_data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"
 install -Dm755 target/release/yt-music-gpui "${music_bin_dir}/yt-music-gpui"
 install -Dm644 packaging/yt-music-gpui.svg "${music_data_dir}/icons/hicolor/scalable/apps/yt-music-gpui.svg"
 install -Dm644 packaging/yt-music-gpui.desktop "${music_data_dir}/applications/yt-music-gpui.desktop"
+install -Dm644 -t "${music_data_dir}/licenses/yt-music-gpui" LICENSE* NOTICE assets/fonts/OFL.txt
 if command -v update-desktop-database >/dev/null; then update-desktop-database "${music_data_dir}/applications"; fi
 printf '%s\n' 'YouTube Music is installed in your app launcher.'
