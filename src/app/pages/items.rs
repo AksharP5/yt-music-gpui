@@ -675,6 +675,15 @@ impl Music {
                     }),
             )
         };
+        let wrap_row = |row| {
+            div()
+                .w_full()
+                .px(px(inset))
+                .child(row)
+                .when(style == RowStyle::Search, |d| {
+                    d.child(div().h(px(1.)).bg(gpui::white().opacity(0.1)))
+                })
+        };
         let Some(track) = track.cloned() else {
             row = row.child(
                 self.menu_button(("collection-menu", index), cx, move |view, window, cx| {
@@ -684,12 +693,12 @@ impl Music {
                 .group_hover("music-row", |style| style.opacity(1.))
                 .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
             );
-            return div().w_full().px(px(inset)).child(row).into_any_element();
+            return wrap_row(row).into_any_element();
         };
         let liked = self.is_liked(&track);
         let like_track = track.clone();
         let menu_track = track.clone();
-        if style != RowStyle::ArtistTable {
+        if !matches!(style, RowStyle::Search | RowStyle::ArtistTable) {
             let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
                 track
                     .details
@@ -779,11 +788,8 @@ impl Music {
                 .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
             );
         row = row.child(controls.absolute().right_0().top_0().h_full());
-        div()
-            .w_full()
-            .px(px(inset))
+        wrap_row(row)
             .when(style.gap() > 0., |d| d.pb(px(style.gap())))
-            .child(row)
             .when(artist_table, |d| {
                 d.child(div().h(px(1.)).bg(gpui::white().opacity(0.1)))
             })
@@ -794,7 +800,7 @@ impl Music {
 /// Row geometry per page, measured from music.youtube.com.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowStyle {
-    /// Search results: 56px art on an 80px pitch.
+    /// Search results: 56px art in an 80px row, plus a 1px separator.
     Search,
     /// Album tracks: an index column instead of art.
     Album,

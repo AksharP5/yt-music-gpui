@@ -1207,6 +1207,72 @@ async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut Async
     wait_for_presented_frame(window, cx).await;
 }
 
+async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    for (width, left, column) in [(956., 154, 720), (1920., 650, 860)] {
+        window
+            .update(cx, |music, window, cx| {
+                window.resize(size(px(width), px(1050.)));
+                music.sidebar_collapsed = None;
+                music.account = None;
+                music.catalog_requests = crate::app::CatalogRequests::new();
+                music.player_open = false;
+                music.library.queue = Default::default();
+                music.route = crate::app::Route::Search(crate::app::Search {
+                    query: "Synthetic search".into(),
+                    filter: crate::search::SearchFilter::Songs,
+                    scope: crate::search::SearchScope::Catalog,
+                });
+                music.page = crate::app::sync::tests::page(3, false);
+                for item in &mut music.page.shelves[0].items {
+                    if let crate::catalog::Item::Track(track) = item {
+                        track.duration = Some(266);
+                        track.details.byline = Some("Synthetic artist • Album • 4:26".into());
+                    }
+                }
+                music.error = None;
+                music.notice = None;
+                music.detail_list = crate::app::DetailList::new();
+                music.rebuild_rows();
+                window.focus(&music.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let baseline = window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("search-songs-{width}"))
+            })
+            .unwrap();
+        // The web starts its first 80px row at y=172, then adds a 1px divider.
+        for y in [252, 333, 414] {
+            let separator = baseline.get_pixel(left, y);
+            assert!(separator.0[0] > baseline.get_pixel(left, y - 1).0[0] + 15);
+            assert!((left..left + column).all(|x| baseline.get_pixel(x, y) == separator));
+        }
+        window
+            .update(cx, |music, _, cx| {
+                let crate::catalog::Item::Track(track) = &mut music.rows[0] else {
+                    panic!("Expected a song search result");
+                };
+                // Only the byline should display duration in search results.
+                track.duration = Some(600);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let changed = window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("search-duration-{width}"))
+            })
+            .unwrap();
+        assert!(
+            baseline == changed,
+            "Search must not repeat duration in a column"
+        );
+    }
+    println!("SEARCH_ROWS widths=956,1920 first_row=172 pitch=81 duration=byline_only");
+}
+
 async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     for width in [956., 1920.] {
         for home in [true, false] {
@@ -1747,6 +1813,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 library_sort_and_compact_layouts(window, cx).await;
                 inline_links_follow_row_order(window, cx).await;
                 home_chips_and_narrow_error(window, cx).await;
+                search_song_rows(window, cx).await;
                 guide_chrome(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
