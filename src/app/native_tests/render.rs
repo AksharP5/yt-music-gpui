@@ -603,10 +603,21 @@ pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
         String::from_utf8_lossy(&output.stderr)
     );
     let image = image::open(&path).unwrap().to_rgba8();
+    let viewport = window.viewport_size();
+    let scale = window.scale_factor();
+    assert_eq!(
+        image.dimensions(),
+        (
+            (f32::from(viewport.width) * scale).round() as u32,
+            (f32::from(viewport.height) * scale).round() as u32
+        ),
+        "Capture must contain the app window at its actual dimensions"
+    );
     // Comparison loops use the pixels immediately. Keep representative states,
     // rather than dozens of nearly identical PNGs in a quota-limited runtime.
-    if (name.starts_with("Lyrics-") || name.starts_with("Related-"))
-        && (name.contains("-tab-") || name.contains("-focus-"))
+    if (name.starts_with("Lyrics-") || name.starts_with("Related-") || name.starts_with("artist-"))
+        && (name.contains("-tab-") || name.contains("-focus-") || name.contains("-tick-"))
+        && !(name.starts_with("artist-") && name.ends_with("-focus-0"))
     {
         std::fs::remove_file(path).unwrap();
     }
@@ -651,6 +662,253 @@ fn assert_page_retained(baseline: &image::RgbaImage, image: &image::RgbaImage) {
     );
 }
 
+async fn scrolled_artist_survives_tab(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::{ListRow, Route};
+    use crate::catalog::{BrowseLink, Collection, Item, PageHeader, Shelf, ShelfLayout};
+    use sha1::{Digest, Sha1};
+
+    // Seed the real artwork loader's private disk cache, keeping the pixel test
+    // offline while exercising decoded textures as well as text and SVG glyphs.
+    let cache = std::path::PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
+        .join("yt-music-gpui/artwork");
+    std::fs::create_dir_all(&cache).unwrap();
+    let urls = (0..6)
+        .map(|index| {
+            let url = format!("https://i.ytimg.com/vi/native-tab-{index}/cover.png");
+            let image = image::RgbaImage::from_fn(96, 96, |x, y| {
+                image::Rgba([80 + index * 25, (x * 2) as u8, (y * 2) as u8, 255])
+            });
+            image
+                .save_with_format(
+                    cache.join(format!("{:x}", Sha1::digest(url.as_bytes()))),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            url
+        })
+        .collect::<Vec<_>>();
+    let covers = urls.clone();
+    let albums_row = window
+        .update(cx, |music, window, cx| {
+            music.player_open = false;
+            music.route = Route::Browse(BrowseLink::new("UCnative-artist", "Synthetic artist"));
+            music.page = crate::app::sync::tests::page(5, false);
+            music.page.title = "Synthetic artist".into();
+            music.page.header = Some(PageHeader {
+                collection: Default::default(),
+                thumbnail: Some(covers[0].clone()),
+                artist: None,
+                artist_thumbnail: None,
+                owner: String::new(),
+                subtitle: "Artist".into(),
+                stats: String::new(),
+                shuffle: None,
+                mix: None,
+                subscribed: None,
+                subscription_label: String::new(),
+                subscriber_count: String::new(),
+            });
+            for title in ["Albums", "Singles & EPs", "Videos"] {
+                music.page.shelves.push(Shelf {
+                    title: title.into(),
+                    layout: ShelfLayout::Cards,
+                    more: None,
+                    items: covers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, url)| {
+                            Item::Collection(Collection {
+                                id: format!("MPREnative-{index}"),
+                                title: format!("Album {}", index + 1),
+                                subtitle: "2026".into(),
+                                thumbnail: Some(url.clone()),
+                                details: Default::default(),
+                            })
+                        })
+                        .collect(),
+                });
+            }
+            music.error = None;
+            music.notice = None;
+            music.rebuild_rows();
+            music.detail_list = crate::app::DetailList::new();
+            music.detail_list.reset_rows(music.list_rows.len());
+            music.shelf_scroll.clear();
+            window.resize(size(px(1916.), px(1050.)));
+            window.focus(&music.focus, cx);
+            cx.notify();
+            music
+                .list_rows
+                .iter()
+                .position(|row| matches!(row, ListRow::Shelf(1)))
+                .unwrap()
+                + 1
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, _, cx| {
+            music.detail_list.state.scroll_to(gpui::ListOffset {
+                item_ix: albums_row,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    for attempt in 0..100 {
+        let loaded = window
+            .update(cx, |music, _, _| {
+                urls.iter().all(|url| music.artwork.get(url).is_some())
+                    && music.artwork.get_hero(&urls[0]).is_some()
+            })
+            .unwrap();
+        if loaded {
+            break;
+        }
+        assert!(
+            attempt < 99,
+            "Synthetic covers must finish loading before pixel comparisons"
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    wait_for_presented_frame(window, cx).await;
+    for paused in [false, true] {
+        window
+            .update(cx, |music, window, cx| {
+                music.playback = Playback::Loaded {
+                    paused,
+                    buffering: false,
+                };
+                window.focus(&music.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let baseline = window
+            .update(cx, |music, window, _| {
+                assert_eq!(
+                    music.detail_list.state.logical_scroll_top().item_ix,
+                    albums_row
+                );
+                capture(window, &format!("artist-{paused}-before"))
+            })
+            .unwrap();
+        if !paused {
+            let before = window
+                .update(cx, |music, _, cx| {
+                    (
+                        music.content_view.read(cx).renders,
+                        music.player_bar.read(cx).renders,
+                        music.renders,
+                    )
+                })
+                .unwrap();
+            for seconds in 20..25 {
+                window
+                    .update(cx, |music, _, cx| {
+                        music.player_event(
+                            PlayerEvent::Position {
+                                track_id: 42,
+                                seconds: f64::from(seconds),
+                            },
+                            cx,
+                        )
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+            }
+            window
+                .update(cx, |music, _, cx| {
+                    assert_eq!(music.content_view.read(cx).renders, before.0);
+                    assert!(music.player_bar.read(cx).renders >= before.1 + 5);
+                    println!(
+                        "BROWSE_POSITION_RENDERS body=0 bar={} root={}",
+                        music.player_bar.read(cx).renders - before.1,
+                        music.renders - before.2
+                    );
+                })
+                .unwrap();
+        }
+        for step in 0..24 {
+            let before = cx
+                .update_window(window.into(), |_, window, cx| window.focused(cx))
+                .unwrap();
+            key(window, cx, "tab").await;
+            let focused = window
+                .update(cx, |_, window, cx| {
+                    assert_ne!(
+                        window.focused(cx),
+                        before,
+                        "Tab must advance on a scrolled artist page"
+                    );
+                    capture(window, &format!("artist-{paused}-focus-{step}"))
+                })
+                .unwrap();
+            assert_page_retained(&baseline, &focused);
+            for (region, x0, y0, x1, y1) in [
+                ("header", 0, 0, baseline.width(), 64),
+                ("sidebar", 0, 64, 240, 400),
+            ] {
+                let bright = |image: &image::RgbaImage| {
+                    (y0..y1)
+                        .flat_map(|y| (x0..x1).map(move |x| image.get_pixel(x, y)))
+                        .filter(|pixel| pixel.0[..3].iter().any(|channel| *channel >= 100))
+                        .count()
+                };
+                let before = bright(&baseline);
+                let after = bright(&focused);
+                let area = f64::from((x1 - x0) * (y1 - y0));
+                println!(
+                    "ARTIST_TAB paused={paused} step={step} {region}_bright before={:.6} after={:.6}",
+                    before as f64 / area,
+                    after as f64 / area
+                );
+                assert!(
+                    before > 100 && after as f64 >= before as f64 * 0.98,
+                    "Tab erased {region}"
+                );
+            }
+            if !paused {
+                window
+                    .update(cx, |music, _, cx| {
+                        music.player_event(
+                            PlayerEvent::Position {
+                                track_id: 42,
+                                seconds: f64::from(30 + step),
+                            },
+                            cx,
+                        )
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                window
+                    .update(cx, |_, window, _| {
+                        assert_page_retained(
+                            &baseline,
+                            &capture(window, &format!("artist-{paused}-tick-{step}")),
+                        );
+                    })
+                    .unwrap();
+            }
+        }
+    }
+    window
+        .update(cx, |music, window, cx| {
+            music.playback = Playback::Loaded {
+                paused: false,
+                buffering: false,
+            };
+            window.resize(size(px(850.), px(560.)));
+            window.focus(&music.focus, cx);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+}
+
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn position_samples_only_render_the_player_bar() -> Result<()> {
@@ -670,7 +928,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                            point(px(40.), px(40.)),
+                            point(px(2.), px(2.)),
                             size(px(850.), px(560.)),
                         ))),
                         titlebar: Some(TitlebarOptions {
@@ -945,6 +1203,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                         assert_page_retained(&baseline, &image);
                     }
                 }
+                scrolled_artist_survives_tab(window, cx).await;
                 window
                     .update(cx, |music, _, cx| {
                         music.player_open = false;
@@ -1035,7 +1294,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
             .detach();
             cx.spawn(async move |cx| {
                 cx.background_executor()
-                    .timer(Duration::from_secs(90))
+                    .timer(Duration::from_secs(150))
                     .await;
                 cx.update(|cx| cx.quit());
             })
