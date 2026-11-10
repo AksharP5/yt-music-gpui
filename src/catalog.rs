@@ -541,6 +541,7 @@ pub struct Continuation {
     visitor: Option<HeaderValue>,
     session: Option<Arc<Session>>,
     show: Option<(String, String)>,
+    album: Option<AlbumMetadata>,
 }
 
 impl Continuation {
@@ -550,6 +551,7 @@ impl Continuation {
             visitor: None,
             session: None,
             show: None,
+            album: None,
         }
     }
 
@@ -721,6 +723,9 @@ impl Catalog {
                     .transpose()?,
             };
         }
+        if let Some(album) = previous.and_then(|continuation| continuation.album.as_ref()) {
+            album.apply(&mut page);
+        }
         if let Some((id, title)) = previous.and_then(|continuation| continuation.show.as_ref()) {
             associate_show(&mut page, id, title);
         }
@@ -848,6 +853,48 @@ pub(crate) fn thumbnail(value: &Value) -> Option<String> {
         .min_by_key(|t| t["width"].as_u64().unwrap_or(0).abs_diff(360))?["url"]
         .as_str()
         .map(str::to_owned)
+}
+
+fn banner_thumbnail(value: &Value) -> Option<String> {
+    let url = find(value, "thumbnails")?
+        .as_array()?
+        .iter()
+        .filter(|entry| {
+            entry["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("https://"))
+        })
+        .max_by_key(|entry| entry["width"].as_u64().unwrap_or(0))?["url"]
+        .as_str()?;
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !parsed.host_str().is_some_and(|host| {
+        host.ends_with(".googleusercontent.com") || host.ends_with(".ggpht.com")
+    }) {
+        return Some(url.to_owned());
+    }
+    let Some((base, parameters)) = url.rsplit_once('=') else {
+        return Some(url.to_owned());
+    };
+    if parsed.query().is_some() {
+        return Some(url.to_owned());
+    }
+    let parameters = parameters
+        .split('-')
+        .map(|part| match part.as_bytes().split_first() {
+            Some((b'w', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+                "w1920"
+            }
+            Some((b'h', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+                "h1080"
+            }
+            Some((b's', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+                "s1920"
+            }
+            _ => part,
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    Some(format!("{base}={parameters}"))
 }
 
 pub(crate) fn duration(s: &str) -> Option<u64> {
@@ -1614,10 +1661,14 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     if shelves.is_empty() && find(data, "contents").is_none() {
         bail!("YouTube Music returned no music. Try again or open a different collection.");
     }
-    Ok(Page {
+    let mut page = Page {
         title,
         header: header.map(|header| PageHeader {
-            thumbnail: thumbnail(&header["thumbnail"]),
+            thumbnail: if artist_header.is_some() {
+                banner_thumbnail(&header["thumbnail"])
+            } else {
+                thumbnail(&header["thumbnail"])
+            },
             artist: {
                 let artist = text(&header["straplineTextOne"]);
                 (!artist.is_empty()).then(|| {
@@ -1691,7 +1742,68 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
             .map(str::to_owned),
         chips: Vec::new(),
         countries: Vec::new(),
-    })
+    };
+    if let Some(album) = header.and_then(|header| {
+        let kind = text(&header["subtitle"]);
+        matches!(kind.split(" • ").next(), Some("Album" | "Single" | "EP")).then(|| {
+            let artist = page
+                .header
+                .as_ref()
+                .and_then(|header| header.artist.as_ref());
+            AlbumMetadata {
+                title: page.title.clone(),
+                artist: artist.map(|artist| match artist {
+                    HeaderArtist::Link(link) => link.title.clone(),
+                    HeaderArtist::Text(text) => text.clone(),
+                }),
+                artist_id: artist.and_then(|artist| match artist {
+                    HeaderArtist::Link(link) => Some(link.id.clone()),
+                    HeaderArtist::Text(_) => None,
+                }),
+                thumbnail: page
+                    .header
+                    .as_ref()
+                    .and_then(|header| header.thumbnail.clone()),
+            }
+        })
+    }) {
+        album.apply(&mut page);
+    }
+    Ok(page)
+}
+
+#[derive(Clone)]
+struct AlbumMetadata {
+    title: String,
+    artist: Option<String>,
+    artist_id: Option<String>,
+    thumbnail: Option<String>,
+}
+
+impl AlbumMetadata {
+    fn apply(&self, page: &mut Page) {
+        for item in page.shelves.iter_mut().flat_map(|shelf| &mut shelf.items) {
+            let Item::Track(track) = item else { continue };
+            if track.details.episode.is_some() {
+                continue;
+            }
+            if track.details.artist_id.is_none() {
+                if let Some(artist) = &self.artist {
+                    track.artist.clone_from(artist);
+                }
+                track.details.artist_id.clone_from(&self.artist_id);
+            }
+            if track.album.is_none() {
+                track.album = Some(self.title.clone());
+            }
+            if track.thumbnail.is_none() {
+                track.thumbnail.clone_from(&self.thumbnail);
+            }
+        }
+        if let Some(continuation) = &mut page.continuation {
+            continuation.album = Some(self.clone());
+        }
+    }
 }
 
 fn home_choices(data: &Value) -> Result<Vec<BrowseChoice>> {
@@ -1936,6 +2048,69 @@ mod tests {
             Some("https://i.ytimg.com/song")
         );
         assert!(page.header.is_none());
+    }
+
+    #[test]
+    fn album_rows_inherit_artist_and_cover_before_reaching_the_queue() {
+        let response = json!({
+            "contents":{"twoColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{"contents":[
+                {"musicResponsiveHeaderRenderer":{
+                    "title":{"runs":[{"text":"A LA SALA"}]},
+                    "subtitle":{"runs":[{"text":"Album"},{"text":" • "},{"text":"2024"}]},
+                    "straplineTextOne":{"runs":[{"text":"Khruangbin","navigationEndpoint":{"browseEndpoint":{"browseId":"UCu_artist"}}}]},
+                    "thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{"url":"https://lh3.googleusercontent.com/album=w544-h544-l90-rj","width":544,"height":544}]}}}
+                }},
+                {"musicPlaylistShelfRenderer":{"contents":[{"musicResponsiveListItemRenderer":{
+                    "playlistItemData":{"videoId":"csILUDfmtqM"},
+                    "flexColumns":[
+                        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Hold Me Up (Thank You)","navigationEndpoint":{"watchEndpoint":{"videoId":"csILUDfmtqM"}}}]}}},
+                        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"171K plays"}]}}}
+                    ],
+                    "fixedColumns":[{"musicResponsiveListItemFixedColumnRenderer":{"text":{"simpleText":"3:52"}}}]
+                }}],"continuations":[{"nextContinuationData":{"continuation":"album-tail"}}]}}
+            ]}}}}]}}
+        });
+        let page = parse_page(&response, "Album").unwrap();
+        let track = &page.tracks()[0];
+        assert_eq!(track.artist, "Khruangbin");
+        assert_eq!(track.details.artist_id.as_deref(), Some("UCu_artist"));
+        assert_eq!(track.details.plays.as_deref(), Some("171K plays"));
+        assert_eq!(track.album.as_deref(), Some("A LA SALA"));
+        assert_eq!(track.duration, Some(232));
+        assert_eq!(
+            track.thumbnail.as_deref(),
+            Some("https://lh3.googleusercontent.com/album=w544-h544-l90-rj")
+        );
+        let catalog = Catalog::new().unwrap();
+        let mut tail = parse_page(&json!({"contents":[{"musicPlaylistShelfRenderer":{"contents":[{
+            "musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"abcdefghijk"},"title":{"simpleText":"Tail song"}}
+        }]}}]}), "More music").unwrap();
+        tail = catalog
+            .bind_page(tail, &json!({}), page.continuation.as_ref())
+            .unwrap();
+        assert_eq!(tail.tracks()[0].artist, "Khruangbin");
+        assert_eq!(tail.tracks()[0].thumbnail, track.thumbnail);
+    }
+
+    #[test]
+    fn artist_banners_request_large_pixels_without_upscaling_song_thumbnails() {
+        let value = json!({"thumbnails":[
+            {"url":"https://lh3.googleusercontent.com/banner=w360-h180-l90-rj", "width":360},
+            {"url":"https://lh3.googleusercontent.com/banner=w960-h540-l90-rj", "width":960}
+        ]});
+        assert_eq!(
+            thumbnail(&value).as_deref(),
+            Some("https://lh3.googleusercontent.com/banner=w360-h180-l90-rj")
+        );
+        assert_eq!(
+            banner_thumbnail(&value).as_deref(),
+            Some("https://lh3.googleusercontent.com/banner=w1920-h1080-l90-rj")
+        );
+        let page = parse_page(&json!({"header":{"musicImmersiveHeaderRenderer":{"title":{"simpleText":"Artist"},"thumbnail":value}},"contents":[]}), "Artist").unwrap();
+        assert_eq!(
+            page.header.unwrap().thumbnail.as_deref(),
+            Some("https://lh3.googleusercontent.com/banner=w1920-h1080-l90-rj")
+        );
     }
 
     #[test]
