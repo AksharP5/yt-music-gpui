@@ -1100,6 +1100,7 @@ async fn scrolled_artist_survives_tab(
             }
         }
     }
+    artist_revisit_shows_hero(window, cx).await;
     window
         .update(cx, |music, window, cx| {
             music.playback = Playback::Loaded {
@@ -1112,6 +1113,137 @@ async fn scrolled_artist_survives_tab(
         })
         .unwrap();
     wait_for_presented_frame(window, cx).await;
+}
+
+async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::{CatalogRequests, CatalogResult, Query, Route};
+    use crate::catalog::{Item, ShelfLayout};
+
+    let (artist, page) = window
+        .update(cx, |music, window, cx| {
+            music.catalog_requests = CatalogRequests::new();
+            music.account = None;
+            music.library.saved.clear();
+            music
+                .detail_list
+                .state
+                .scroll_to(gpui::ListOffset::default());
+            window.focus(&music.focus, cx);
+            cx.notify();
+            let Route::Browse(artist) = music.route.clone() else {
+                unreachable!()
+            };
+            (artist, music.page.clone())
+        })
+        .unwrap();
+    wait_for_quiescence(window, cx).await;
+    let baseline = window
+        .update(cx, |_, window, _| {
+            capture(window, "artist-first-visit-hero")
+        })
+        .unwrap();
+    // This patch of the decoded photo is clear of the header controls and artist text.
+    let hero = image::imageops::crop_imm(&baseline, 1000, 90, 500, 120).to_image();
+    let colorful = hero
+        .pixels()
+        .filter(|pixel| {
+            let [r, g, b, _] = pixel.0;
+            r.max(g).max(b) - r.min(g).min(b) > 20
+        })
+        .count();
+    assert!(
+        colorful > 30_000,
+        "First visit must contain the seeded hero photo: {colorful}"
+    );
+    window
+        .update(cx, |music, _, cx| {
+            music.navigate(Route::Home, cx);
+            let job = music.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(job.query, Query::Home));
+            let mut home = crate::app::sync::tests::page(0, false);
+            home.shelves[0].layout = ShelfLayout::Cards;
+            home.shelves[0].items.push(Item::Navigation(artist.clone()));
+            music.catalog_result(
+                CatalogResult {
+                    id: job.id,
+                    account_revision: job.account_revision,
+                    append: false,
+                    revalidate: false,
+                    result: Ok(home),
+                    session_rejected: false,
+                    target: CatalogTarget::Page,
+                },
+                cx,
+            );
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    // Four header controls and six expanded sidebar controls precede the artist link.
+    for _ in 0..11 {
+        key(window, cx, "tab").await;
+    }
+    window
+        .update(cx, |_, window, _| {
+            capture(window, "artist-revisit-link-focused");
+        })
+        .unwrap();
+    key(window, cx, "enter").await;
+    window
+        .update(cx, |music, _, cx| {
+            assert!(
+                music.route == Route::Browse(artist.clone()),
+                "Enter must reopen the artist through the Home link"
+            );
+            let job = music.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(&job.query, Query::Browse(link) if link == &artist));
+            assert!(
+                music.artwork.is_idle(),
+                "Revisit must use decoded artwork without a late image completion"
+            );
+            assert!(
+                music
+                    .artwork
+                    .get_hero(page.header.as_ref().unwrap().thumbnail.as_ref().unwrap())
+                    .is_some()
+            );
+            music.catalog_result(
+                CatalogResult {
+                    id: job.id,
+                    account_revision: job.account_revision,
+                    append: false,
+                    revalidate: false,
+                    result: Ok(page),
+                    session_rejected: false,
+                    target: CatalogTarget::Page,
+                },
+                cx,
+            );
+        })
+        .unwrap();
+    // No scroll, input, resize, sleep or manual notify after the response. The
+    // heading measurement must itself arrange the first redraw with cached art.
+    wait_for_presented_frame(window, cx).await;
+    let revisit = window
+        .update(cx, |_, window, _| {
+            capture(window, "artist-revisit-first-frames")
+        })
+        .unwrap();
+    let revisit = image::imageops::crop_imm(&revisit, 1000, 90, 500, 120).to_image();
+    let missing = hero
+        .pixels()
+        .zip(revisit.pixels())
+        .filter(|(before, after)| {
+            before.0[..3]
+                .iter()
+                .zip(&after.0[..3])
+                .any(|(a, b)| a.abs_diff(*b) > 6)
+        })
+        .count();
+    println!("ARTIST_REVISIT_HERO changed_pixels={missing}/60000 colorful_baseline={colorful}");
+    assert!(
+        missing < 600,
+        "Cached hero photo must be present in the first presented frames after reopening through a link: {missing}/60000 changed pixels"
+    );
 }
 
 async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut AsyncApp) {
