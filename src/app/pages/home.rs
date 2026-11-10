@@ -19,16 +19,11 @@ impl Music {
         };
         if !self.page.chips.is_empty() {
             content = content.child(
-                div()
-                    .id("home-filters")
+                chip_row("home-filters")
                     .mx(px(layout.inset))
                     .mt(px(above))
                     .mb(px(below))
                     .flex_shrink_0()
-                    .flex()
-                    .gap(px(12.))
-                    .overflow_x_scroll()
-                    .restrict_scroll_to_axis()
                     .children(
                         self.page
                             .chips

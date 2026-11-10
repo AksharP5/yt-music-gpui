@@ -458,16 +458,11 @@ impl Music {
                 ..search.clone()
             };
             content = content.child(
-                div()
-                    .id("search-filters")
+                chip_row("search-filters")
                     .mx(px(inset))
                     .mt(px(6.))
                     .mb(px(6.))
                     .flex_shrink_0()
-                    .flex()
-                    .gap(px(12.))
-                    .overflow_x_scroll()
-                    .restrict_scroll_to_axis()
                     .when(search.filter != SearchFilter::All, |chips| {
                         chips.child(
                             search_chip("search-filter-clear", None, false, self.theme).on_click(
