@@ -94,16 +94,20 @@ impl RenderOnce for ChipRow {
             }
             (focus.scroll.clone(), chips)
         });
-        let mut row = div()
+        let row = div()
             .id(self.id)
             .flex()
             .gap(px(12.))
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
             .track_scroll(&scroll)
+            // The ring extends 4px outside a chip. Keep its room outside layout flow.
+            .py(px(4.))
+            .my(px(-4.))
             .children(chips);
-        row.style().refine(&self.style);
-        row
+        let mut container = div().min_w_0().child(row);
+        container.style().refine(&self.style);
+        container
     }
 }
 
