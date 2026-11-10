@@ -202,14 +202,12 @@ impl Music {
                         .child(self.byline(explicit, byline, text_size)),
                 )
                 .child(
-                    button(("quick-menu", id), "more", self.theme)
-                        .opacity(0.)
-                        .group_hover("music-row", |style| style.opacity(1.))
-                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            cx.stop_propagation();
-                            view.open_item_menu(id, window, cx);
-                        })),
+                    self.menu_button(("quick-menu", id), cx, move |view, window, cx| {
+                        view.open_item_menu(id, window, cx);
+                    })
+                    .opacity(0.)
+                    .group_hover("music-row", |style| style.opacity(1.))
+                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
@@ -322,18 +320,16 @@ impl Music {
             .when(artist, |card| card.items_center())
             .child(art.when(!artist, |art| {
                 art.child(
-                    button(("card-menu", id), "more", self.theme)
-                        .absolute()
-                        .right(px(4.))
-                        .top(px(8.))
-                        .size(px(36.))
-                        .opacity(0.)
-                        .group_hover("music-card", |style| style.opacity(1.))
-                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            cx.stop_propagation();
-                            view.open_item_menu(id, window, cx);
-                        })),
+                    self.menu_button(("card-menu", id), cx, move |view, window, cx| {
+                        view.open_item_menu(id, window, cx);
+                    })
+                    .absolute()
+                    .right(px(4.))
+                    .top(px(8.))
+                    .size(px(36.))
+                    .opacity(0.)
+                    .group_hover("music-card", |style| style.opacity(1.))
+                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
                 )
             }))
             .child(
@@ -606,14 +602,12 @@ impl Music {
         };
         let Some(track) = track.cloned() else {
             row = row.child(
-                button(("collection-menu", index), "more", self.theme)
-                    .opacity(0.)
-                    .group_hover("music-row", |style| style.opacity(1.))
-                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        cx.stop_propagation();
-                        view.open_item_menu(index, window, cx);
-                    })),
+                self.menu_button(("collection-menu", index), cx, move |view, window, cx| {
+                    view.open_item_menu(index, window, cx);
+                })
+                .opacity(0.)
+                .group_hover("music-row", |style| style.opacity(1.))
+                .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
             );
             return div().w_full().px(px(inset)).child(row).into_any_element();
         };
@@ -692,14 +686,12 @@ impl Music {
                 )
             })
             .child(
-                button(("track-menu", index), "more", self.theme)
-                    .opacity(0.)
-                    .group_hover("music-row", |d| d.opacity(1.))
-                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        cx.stop_propagation();
-                        view.open_track_menu(menu_track.clone(), Some(index), window, cx);
-                    })),
+                self.menu_button(("track-menu", index), cx, move |view, window, cx| {
+                    view.open_track_menu(menu_track.clone(), Some(index), window, cx);
+                })
+                .opacity(0.)
+                .group_hover("music-row", |d| d.opacity(1.))
+                .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
             );
         row = row.child(
             controls

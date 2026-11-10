@@ -132,14 +132,12 @@ impl Music {
                             .child(self.byline(explicit, byline, 14.)),
                     )
                     .child(
-                        button(("featured-menu", id), "more", self.theme)
-                            .opacity(0.)
-                            .group_hover("featured-row", |style| style.opacity(1.))
-                            .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                cx.stop_propagation();
-                                view.open_item_menu(id, window, cx);
-                            })),
+                        self.menu_button(("featured-menu", id), cx, move |view, window, cx| {
+                            view.open_item_menu(id, window, cx);
+                        })
+                        .opacity(0.)
+                        .group_hover("featured-row", |style| style.opacity(1.))
+                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
                     )
                     .on_mouse_down(
                         MouseButton::Right,

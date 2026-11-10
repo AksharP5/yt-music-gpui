@@ -136,14 +136,9 @@ impl Music {
             );
         }
         actions = actions.child(
-            button("artist-menu", "more", self.theme).on_click(cx.listener(
-                move |view, event, window, cx| {
-                    view.open_collection_menu(artist.clone(), window, cx);
-                    if let ClickEvent::Keyboard(event) = event {
-                        view.overlay_anchor = Some(event.bounds.bottom_left());
-                    }
-                },
-            )),
+            self.menu_button("artist-menu", cx, move |view, window, cx| {
+                view.open_collection_menu(artist.clone(), window, cx);
+            }),
         );
         let open = *expanded.read(cx);
         div()

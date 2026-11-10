@@ -198,14 +198,10 @@ impl Music {
         }
         if let Some(collection) = collection {
             actions = actions.child(
-                button("collection-header-menu", "more", self.theme)
-                    .bg(self.theme.panel)
-                    .on_click(cx.listener(move |view, event, window, cx| {
-                        view.open_collection_menu(collection.clone(), window, cx);
-                        if let ClickEvent::Keyboard(event) = event {
-                            view.overlay_anchor = Some(event.bounds.bottom_left());
-                        }
-                    })),
+                self.menu_button("collection-header-menu", cx, move |view, window, cx| {
+                    view.open_collection_menu(collection.clone(), window, cx);
+                })
+                .bg(self.theme.panel),
             );
         }
         if let [Item::Track(track)] = self.rows.as_slice()
