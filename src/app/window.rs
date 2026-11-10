@@ -60,6 +60,7 @@ impl Music {
         let background = self.page_background(compact, width, height);
         let header = (!fullscreen).then(|| self.header(inset, compact, width, cx));
         let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
+        let divider = (!fullscreen).then(|| self.header_divider()).flatten();
         let content = if player_page {
             let body = height - player_bar_height(width) - if fullscreen { 0. } else { 64. };
             self.player_page(width, sidebar_width, body, window, cx)
@@ -81,6 +82,7 @@ impl Music {
                     .children(sidebar)
                     .child(content),
             )
+            .children(divider)
             .into_any_element()
     }
 }

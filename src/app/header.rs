@@ -50,18 +50,32 @@ impl Music {
         } else {
             100.
         };
+        let scrolled = self.page_scrolled();
+        // Unscrolled, Home tints the header beside the guide, which keeps its
+        // own background and border up to the top of the window.
+        let home_band = self.route.is_home() && !self.player_open && !scrolled;
         div()
             .h(px(64.))
             .w_full()
             .flex_shrink_0()
+            .relative()
             .flex()
             .items_center()
-            .when(!self.immersive_header(), |d| {
-                d.bg(if self.route.is_home() && !self.player_open {
-                    rgb(0x14252c).into()
-                } else {
-                    self.theme.bg
-                })
+            .when(home_band, |d| {
+                d.bg(rgb(0x14252c)).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(px(if compact { 72. } else { 240. }))
+                        .bg(self.theme.bg)
+                        .border_r_1()
+                        .border_color(self.theme.border),
+                )
+            })
+            .when(!home_band && (scrolled || !self.immersive_header()), |d| {
+                d.bg(self.theme.bg)
             })
             .child(
                 div()
@@ -210,5 +224,30 @@ impl Music {
                     }),
             )
             .into_any_element()
+    }
+
+    /// Whether the page has scrolled away from its top, where the web turns
+    /// the header solid and draws a divider under it.
+    pub(in crate::app) fn page_scrolled(&self) -> bool {
+        if self.player_open {
+            return false;
+        }
+        let top = self.detail_list.state.logical_scroll_top();
+        top.item_ix > 0
+            || top.offset_in_item > px(0.)
+            || self.list_scroll.0.borrow().base_handle.offset().y < px(0.)
+    }
+
+    /// The 1px rule under a scrolled header, drawn over the page below it.
+    pub(in crate::app) fn header_divider(&self) -> Option<Div> {
+        self.page_scrolled().then(|| {
+            div()
+                .absolute()
+                .top(px(64.))
+                .left_0()
+                .right_0()
+                .h(px(1.))
+                .bg(self.theme.border)
+        })
     }
 }

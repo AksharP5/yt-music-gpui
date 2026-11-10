@@ -18,6 +18,10 @@ pub(in crate::app) enum ListRow {
     More(usize),
 }
 
+/// Space above stacked album and playlist columns: the old back-button row
+/// plus the web's 40px top padding.
+const STACKED_TOP: f32 = 64.;
+
 pub(in crate::app) struct DetailList {
     pub(in crate::app) state: ListState,
     pub(in crate::app) inline_header: bool,
@@ -287,8 +291,31 @@ impl Music {
         let stacked = collection && !artist && available >= 980.;
         // Library pages open on their chips, without a back button or heading.
         let library = !collection && matches!(self.route, Route::Saved | Route::Library(_));
-        let mut content = div().flex_1().min_w_0().min_h_0().flex().flex_col();
-        if !home && !artist && !search && !library {
+        let mut content = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .relative()
+            .flex()
+            .flex_col();
+        // Stacked album and playlist rows scroll up to the header, so their
+        // back button floats over the top of the art column instead.
+        if stacked && !self.back.is_empty() {
+            content = content.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(inset))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .child(
+                        button("back", "back", self.theme)
+                            .on_click(cx.listener(|view, _, _, cx| view.go_back(cx))),
+                    ),
+            );
+        }
+        if !home && !artist && !search && !stacked && !library {
             content = content.child(
                 div()
                     .h(px(if collection { 24. } else { 48. }))
@@ -368,8 +395,15 @@ impl Music {
                 )
                 .into_any_element();
         }
-        let heading = (collection && stacked)
-            .then(|| self.page_heading(true, if available < 1200. { 240. } else { 264. }, cx));
+        // The web's album and playlist columns by window tier: art column,
+        // a 40px gutter, then the track list, centered 8px right of center.
+        let (header_width, list_width, cover): (f32, f32, f32) = match layout.tier {
+            Tier::Huge => (333., 921., 264.),
+            Tier::Large => (261., 779., 245.),
+            _ => (280., 546., 240.),
+        };
+        let list_width = list_width.min(available - header_width - 56.);
+        let heading = (collection && stacked).then(|| self.page_heading(true, cover, cx));
         if self.rows.is_empty()
             && !collection
             && let Some(empty) = self.library_empty()
@@ -409,7 +443,8 @@ impl Music {
                 div()
                     .flex_1()
                     .px(px(24.))
-                    .py(px(32.))
+                    .pt(px(STACKED_TOP + 32.))
+                    .pb(px(32.))
                     .text_color(self.theme.muted)
                     .child("No songs here yet.")
                     .into_any_element()
@@ -424,6 +459,16 @@ impl Music {
                                 view.artist_heading(inset, window, cx)
                             } else {
                                 view.list_row(index - 1, inset, window, cx)
+                            };
+                        }
+                        // Stacked rows scroll up to the header, so the space
+                        // above them scrolls with the first row.
+                        if stacked {
+                            let row = view.list_row(index, 0., window, cx);
+                            return if index == 0 {
+                                div().pt(px(STACKED_TOP)).child(row).into_any_element()
+                            } else {
+                                row
                             };
                         }
                         if inline && index == 0 {
@@ -447,12 +492,7 @@ impl Music {
                                 ))
                                 .into_any_element();
                         }
-                        view.list_row(
-                            index - usize::from(inline),
-                            if stacked { 0. } else { inset },
-                            window,
-                            cx,
-                        )
+                        view.list_row(index - usize::from(inline), inset, window, cx)
                     }),
                 )
                 .flex_1()
@@ -552,27 +592,22 @@ impl Music {
                         .flex_1()
                         .min_h_0()
                         .w_full()
-                        .max_w(px(1492.))
-                        .mx_auto()
-                        // Measured on the web at 1280: art column at 335, list
-                        // 40px later, durations ending 79px from the edge.
-                        .when(available < 1200., |d| {
-                            d.pl(px(inset - 11.)).pr(px(inset - 27.))
-                        })
-                        .when(available >= 1200., |d| d.px(px(inset)))
-                        .pt(px(40.))
+                        .pl(px(((available - header_width - 40. - list_width) / 2.
+                            + 8.)
+                            .max(0.)))
                         .flex()
-                        .gap(px(if available < 1200. { 40. } else { 72. }))
+                        .gap(px(40.))
                         .child(
                             div()
                                 .id("collection-header")
-                                .w(px(if available < 1200. { 280. } else { 330. }))
+                                .w(px(header_width))
                                 .h_full()
                                 .flex_shrink_0()
+                                .pt(px(STACKED_TOP))
                                 .overflow_y_scroll()
                                 .children(heading),
                         )
-                        .child(list),
+                        .child(div().w(px(list_width)).h_full().flex().child(list)),
                 )
             } else {
                 content

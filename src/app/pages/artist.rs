@@ -218,15 +218,19 @@ impl Music {
         let left = if compact { 72. } else { 240. };
         let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
         if let Some(url) = self.wash_url() {
-            let image = self.artwork.get_wash(&url)?;
             // The web blurs the art over the top 49vh and fades it out by 50vh.
+            let wash = height * 0.5;
+            if scrolled <= -wash {
+                return None;
+            }
+            let image = self.artwork.get_wash(&url)?;
             return Some(
                 div()
                     .absolute()
                     .left(px(left))
                     .right_0()
-                    .top_0()
-                    .h(px(height * 0.5))
+                    .top(px(scrolled))
+                    .h(px(wash))
                     .overflow_hidden()
                     .child(
                         img(image)
