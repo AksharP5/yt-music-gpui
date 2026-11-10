@@ -44,7 +44,7 @@ class YtMusicAccountIE(YoutubeIE):
     @functools.cached_property
     def _account(self):
         if __version__ != "2026.08.19":
-            raise DownloadError("Account playback requires the reviewed yt-dlp version")
+            raise DownloadError("Account playback requires yt-dlp 2026.08.19; the installed version has not been reviewed")
         paths = self._configuration_arg("context", ie_key="ytmusicaccount", casesense=True)
         try:
             if len(paths) != 1 or not re.fullmatch(r"/proc/[0-9]+/fd/[0-9]+", paths[0]):

@@ -243,6 +243,8 @@ pub enum PlayerEvent {
         track_id: Option<u64>,
         message: String,
     },
+    #[allow(dead_code)] // Consumed by the app integration after its module split.
+    Notice(String),
     VideoChanged,
     VideoError {
         message: String,
@@ -1008,6 +1010,36 @@ fn replace_playback_credentials(
     Ok(())
 }
 
+const REVIEWED_YTDLP: &str = "2026.08.19";
+
+fn account_playback_supported(ytdlp: &Path) -> bool {
+    std::process::Command::new(ytdlp)
+        .args(["--ignore-config", "--no-plugin-dirs", "--version"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == REVIEWED_YTDLP
+        })
+}
+
+fn account_credentials(
+    source: Option<PlaybackCredentials>,
+    supported: bool,
+    warned: &mut bool,
+    events: &async_channel::Sender<PlayerEvent>,
+) -> Option<PlaybackCredentials> {
+    if supported || source.is_none() {
+        return source;
+    }
+    if !*warned {
+        *warned = true;
+        let _ = events.send_blocking(PlayerEvent::Notice(format!(
+            "Signed-in playback requires yt-dlp {REVIEWED_YTDLP}. Playing public streams as a guest with the installed version. Account-only songs may be unavailable."
+        )));
+    }
+    None
+}
+
 fn run(
     options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
@@ -1026,6 +1058,8 @@ fn run(
         .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/yt-dlp")))
         .find(|path| path.is_file())
         .context("Could not find yt-dlp. Install it, then restart the app.")?;
+    let account_supported = account_playback_supported(&ytdlp);
+    let mut account_warned = false;
     let mut credentials = None;
     // Destroy the core before dropping the RAM credentials or private runtime.
     let core = MpvCore::new(&options, &ytdlp, &socket_path)?;
@@ -1050,7 +1084,12 @@ fn run(
         &mut socket,
         &mut pending,
         &mut credentials,
-        options.credentials,
+        account_credentials(
+            options.credentials,
+            account_supported,
+            &mut account_warned,
+            events,
+        ),
         &plugin_dir,
         &mut state,
         events,
@@ -1106,6 +1145,8 @@ fn run(
                 Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Credentials { next, reply }) => {
+                    let next =
+                        account_credentials(next, account_supported, &mut account_warned, events);
                     state.invalidate_seeks();
                     state.desired = None;
                     state.loaded = false;
@@ -1666,6 +1707,39 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mismatched_extractor_uses_guest_streams_and_notifies_only_once() {
+        let (events, received) = async_channel::unbounded();
+        let mut warned = false;
+        for _ in 0..2 {
+            assert!(
+                account_credentials(
+                    Some(synthetic_credentials("INVENTED")),
+                    false,
+                    &mut warned,
+                    &events
+                )
+                .is_none()
+            );
+        }
+        let PlayerEvent::Notice(message) = received.try_recv().unwrap() else {
+            panic!("missing fallback notice")
+        };
+        assert!(message.contains("2026.08.19"));
+        assert!(message.contains("guest"));
+        assert!(!message.contains("update yt-dlp"));
+        assert!(received.is_empty());
+        assert!(
+            account_credentials(
+                Some(synthetic_credentials("INVENTED")),
+                true,
+                &mut warned,
+                &events
+            )
+            .is_some()
+        );
+    }
 
     #[test]
     fn command_wakeups_coalesce_without_losing_commands_or_socket_readiness() {
