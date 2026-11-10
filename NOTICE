@@ -23,6 +23,12 @@ Source: https://github.com/google/material-design-icons
   Adapted: menu, person, thumb-up and thumb-up-filled (Material "thumb_up"),
   and thumb-down (thumb-up rotated).
 
+Icons in assets/icons from Google Material Icons, Copyright Google LLC,
+licensed under Apache License 2.0 (LICENSE-APACHE).
+Source: https://github.com/google/material-design-icons
+  Unmodified: home-filled ("home"), home-outlined (outlined "home"),
+  explore-filled ("explore") and explore-outlined (outlined "explore").
+
 Icons in assets/icons adapted from Feather, Copyright 2013-2023 Cole Bemis,
 licensed under the MIT License (LICENSE-FEATHER).
 Source: https://github.com/feathericons/feather

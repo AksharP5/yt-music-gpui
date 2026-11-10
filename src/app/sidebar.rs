@@ -6,7 +6,7 @@ impl Music {
     pub(in crate::app) fn nav(
         &self,
         id: &'static str,
-        glyph: &'static str,
+        glyphs: (&'static str, &'static str),
         label: &'static str,
         route: Route,
         compact: bool,
@@ -20,18 +20,23 @@ impl Music {
             .keyboard_control(self.theme)
             .h(px(if compact { 68. } else { 48. }))
             .flex_shrink_0()
-            .px(px(if compact { 4. } else { 16. }))
+            .px(px(if compact { 4. } else { 15. }))
             .flex()
             .items_center()
             .when(compact, |d| d.flex_col().justify_center())
-            .gap(px(if compact { 6. } else { 24. }))
+            .gap(px(if compact { 6. } else { 20. }))
             .rounded(px(8.))
             .text_size(px(if compact { 10. } else { 16. }))
             .text_color(self.theme.text)
             .when(active, |d| d.bg(self.theme.selection))
             .hover(|d| d.bg(gpui::white().opacity(0.1)))
             .cursor_pointer()
-            .child(icon(glyph, 24., self.theme.text))
+            .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+            .child(icon(
+                if active { glyphs.1 } else { glyphs.0 },
+                24.,
+                self.theme.text,
+            ))
             .child(label)
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
@@ -52,16 +57,30 @@ impl Music {
             .border_r_1()
             .border_color(self.theme.border)
             .bg(self.theme.bg)
-            .child(self.nav("home-nav", "home", "Home", Route::Home, compact, cx))
+            .child(self.nav(
+                "home-nav",
+                ("home-outlined", "home-filled"),
+                "Home",
+                Route::Home,
+                compact,
+                cx,
+            ))
             .child(self.nav(
                 "explore-nav",
-                "explore",
+                ("explore-outlined", "explore-filled"),
                 "Explore",
                 Route::Explore,
                 compact,
                 cx,
             ))
-            .child(self.nav("saved-nav", "library", "Library", Route::Saved, compact, cx));
+            .child(self.nav(
+                "saved-nav",
+                ("bookmark", "bookmark-filled"),
+                "Library",
+                Route::Saved,
+                compact,
+                cx,
+            ));
         if compact {
             return sidebar.into_any_element();
         }

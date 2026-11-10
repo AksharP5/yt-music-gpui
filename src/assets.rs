@@ -38,6 +38,18 @@ impl AssetSource for Assets {
             "shuffle" => Some(Cow::Borrowed(include_bytes!("../assets/icons/shuffle.svg"))),
             "repeat" => Some(Cow::Borrowed(include_bytes!("../assets/icons/repeat.svg"))),
             "music" => Some(Cow::Borrowed(include_bytes!("../assets/icons/music.svg"))),
+            "home-filled" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/home-filled.svg"
+            ))),
+            "explore-filled" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/explore-filled.svg"
+            ))),
+            "home-outlined" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/home-outlined.svg"
+            ))),
+            "explore-outlined" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/explore-outlined.svg"
+            ))),
             "settings" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/settings.svg"
             ))),
