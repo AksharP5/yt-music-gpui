@@ -1258,38 +1258,36 @@ mod tests {
     #[ignore = "reads public issued playback destinations without playback or an account"]
     fn live_public_issued_click_queues() {
         let catalog = Catalog::new().unwrap();
-        let home = catalog.home().unwrap();
-        let explore = catalog.explore().unwrap();
-        let search = catalog
+        let playlist = catalog
+            .browse(&BrowseLink::new("VLPL979721712CED57BB", "Public songs"))
+            .unwrap();
+        let songs = catalog
             .search_filtered(
                 "Khruangbin",
                 crate::search::SearchFilter::Songs,
                 crate::search::SearchScope::Catalog,
             )
             .unwrap();
-        let video = explore
-            .shelves
-            .iter()
-            .find(|shelf| shelf.layout == crate::catalog::ShelfLayout::Videos)
-            .and_then(|shelf| {
-                shelf.items.iter().find_map(|item| match item {
-                    crate::catalog::Item::Track(track) if track.details.watch.is_some() => {
-                        Some(track.clone())
-                    }
-                    _ => None,
-                })
-            })
-            .expect("Explore must expose an issued video destination");
-        let mut examples = vec![("Explore video", video)];
-        for (name, page) in [("Home", home), ("Explore", explore), ("Search", search)] {
-            examples.push((
-                name,
-                page.tracks()
-                    .into_iter()
-                    .find(|track| track.details.watch.is_some())
-                    .expect("Public song row must retain its issued destination"),
-            ));
-        }
+        let videos = catalog
+            .search_filtered(
+                "Rick Astley Never Gonna Give You Up",
+                crate::search::SearchFilter::Videos,
+                crate::search::SearchScope::Catalog,
+            )
+            .unwrap();
+        let examples = [
+            ("Playlist song", playlist),
+            ("Search song", songs),
+            ("Search video", videos),
+        ]
+        .map(|(name, page)| {
+            let seed = page
+                .tracks()
+                .into_iter()
+                .find(|track| track.details.watch.is_some())
+                .expect("Public song or video row must retain its issued destination");
+            (name, seed)
+        });
         for (name, seed) in examples {
             let watch = catalog.watch(&seed, WatchMode::Issued).unwrap();
             assert_eq!(
