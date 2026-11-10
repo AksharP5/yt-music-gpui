@@ -790,6 +790,7 @@ pub(in crate::app) fn adopt_watch_queue(
         .current_index
         .ok_or("YouTube Music did not include the requested song in its playback queue")?;
     queue.replace(watch.queue.clone(), index);
+    queue.playing_from = watch.source.clone();
     Ok(true)
 }
 

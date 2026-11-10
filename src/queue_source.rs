@@ -196,6 +196,7 @@ impl Worker {
         session: Option<Arc<Session>>,
     ) {
         queue.replace(page.tracks(), selected);
+        queue.playing_from = Some(page.title.clone()).filter(|title| !title.is_empty());
         self.set_source(
             queue,
             page.continuation
@@ -1130,7 +1131,9 @@ mod tests {
         queue.shuffle_upcoming();
         let loaded = queue.tracks.clone();
         let saved = serde_json::to_value(&queue).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 3);
+        let mut keys = saved.as_object().unwrap().keys().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["incomplete", "index", "playing_from", "tracks"]);
         let mut restored: Queue = serde_json::from_value(saved).unwrap();
         assert!(restored.incomplete);
         assert!(restored.source_id.is_none());

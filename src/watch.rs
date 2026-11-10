@@ -14,6 +14,8 @@ pub struct Watch {
     pub current: Option<Track>,
     pub current_index: Option<usize>,
     pub queue: Vec<Track>,
+    /// What the queue plays from, such as an album or "Song Mix", shown as "Playing from".
+    pub source: Option<String>,
     pub lyrics: Option<String>,
     pub related: Option<String>,
     pub alternatives: Option<Box<MediaPair>>,
@@ -289,6 +291,15 @@ fn parse_watch(
         }
         current.duration = current.duration.or(seed.duration);
     }
+    let source = tabs
+        .iter()
+        .find_map(|tab| {
+            tab.pointer(
+                "/tabRenderer/content/musicQueueRenderer/header/musicQueueHeaderRenderer/subtitle",
+            )
+        })
+        .map(text)
+        .filter(|source| !source.trim().is_empty());
     let mut lyrics = None;
     let mut related = None;
     for tab in tabs {
@@ -317,6 +328,7 @@ fn parse_watch(
         current: current_index.map(|index| queue[index].clone()),
         current_index,
         queue,
+        source,
         lyrics,
         related,
         alternatives,
@@ -695,9 +707,13 @@ mod tests {
                         "browseEndpointContextMusicConfig":{"pageType":"MUSIC_PAGE_TYPE_TRACK_RELATED"}
                     }
                 }}}},
-                {"tabRenderer":{"content":{"musicQueueRenderer":{"content":{
-                    "playlistPanelRenderer":{"contents":rows}
-                }}}}},
+                {"tabRenderer":{"content":{"musicQueueRenderer":{
+                    "header":{"musicQueueHeaderRenderer":{
+                        "title":{"runs":[{"text":"Playing from"}]},
+                        "subtitle":{"runs":[{"text":"The album"}]}
+                    }},
+                    "content":{"playlistPanelRenderer":{"contents":rows}}
+                }}}},
                 {"tabRenderer":{"endpoint":{"browseEndpoint":{
                     "browseId":"MPLYlyrics","browseEndpointContextSupportedConfigs":{
                         "browseEndpointContextMusicConfig":{"pageType":"MUSIC_PAGE_TYPE_TRACK_LYRICS"}
@@ -1030,6 +1046,7 @@ mod tests {
             Some("UCartist")
         );
         assert_eq!(watch.lyrics.as_deref(), Some("MPLYlyrics"));
+        assert_eq!(watch.source.as_deref(), Some("The album"));
         assert_eq!(watch.related.as_deref(), Some("MPTRrelated"));
     }
 

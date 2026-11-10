@@ -79,6 +79,7 @@ fn issued_queue_adoption_preserves_manual_edits_and_the_selected_occurrence() {
         current: Some(seed.clone()),
         current_index: Some(1),
         queue: vec![next.clone(), seed.clone(), next.clone()],
+        source: None,
         lyrics: None,
         related: None,
         alternatives: None,

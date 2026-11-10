@@ -354,7 +354,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 assert!(job.session.is_some_and(|session| Arc::ptr_eq(&session, &original)));
                 assert!(view.queue_waiting.is_some() && !view.playback.is_paused());
                 assert!(view.error.is_none() && commands.is_empty());
-                let watch = Watch { current: Some(track("invalid-first")), current_index: Some(0), queue: vec![track("invalid-first"), track("invalid-second")], lyrics: None, related: None, alternatives: None, continuation: None };
+                let watch = Watch { current: Some(track("invalid-first")), current_index: Some(0), queue: vec![track("invalid-first"), track("invalid-second")], source: None, lyrics: None, related: None, alternatives: None, continuation: None };
                 view.playback_result(PlaybackResult::Watch { id: job.id, account_revision: job.account_revision, update: QueueUpdate::Adopt, result: Ok(Box::new(watch)), session_rejected: false }, cx);
                 assert_eq!(view.library.queue.index, Some(1));
                 assert_eq!(view.library.queue.current().unwrap().id, "invalid-second");

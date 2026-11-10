@@ -101,6 +101,9 @@ pub struct Queue {
     pub index: Option<usize>,
     /// More explicit tracks exist. Restored partial queues must not enter autoplay.
     pub incomplete: bool,
+    /// The album, playlist or mix this queue came from, shown as "Playing from".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playing_from: Option<String>,
     #[serde(skip)]
     pub(crate) source_id: Option<Arc<()>>,
 }
@@ -113,6 +116,7 @@ impl Queue {
         self.index = (selected < tracks.len()).then_some(selected);
         self.tracks = tracks;
         self.incomplete = false;
+        self.playing_from = None;
         self.source_id = None;
     }
     pub fn select(&mut self, index: usize) -> bool {
