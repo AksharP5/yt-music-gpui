@@ -20,6 +20,7 @@ pub struct Watch {
     pub related: Option<String>,
     pub alternatives: Option<Box<MediaPair>>,
     pub continuation: Option<WatchContinuation>,
+    pub issued_target: Option<crate::catalog::WatchTarget>,
 }
 
 #[derive(Clone)]
@@ -80,6 +81,13 @@ pub enum WatchMode {
 }
 
 impl Catalog {
+    pub(crate) fn watch_target(&self, target: &crate::catalog::WatchTarget) -> Result<Watch> {
+        let mut request = target.body();
+        request["enablePersistentPlaylistPanel"] = json!(true);
+        request["isAudioOnly"] = json!(true);
+        let response = self.request("next", request.clone())?;
+        parse_playlist_watch(&response, request, self.session.clone())
+    }
     pub fn watch_playlist(&self, target: &PlaylistTarget) -> Result<Watch> {
         let mut request = target.request();
         request["enablePersistentPlaylistPanel"] = json!(true);
@@ -312,6 +320,10 @@ fn parse_watch(
         }
     }
     Ok(Watch {
+        issued_target: (mode == WatchMode::Issued)
+            .then(|| crate::catalog::WatchTarget::try_from(request.clone()).ok())
+            .flatten()
+            .filter(crate::catalog::WatchTarget::restorable),
         current: current_index.map(|index| queue[index].clone()),
         current_index,
         queue,

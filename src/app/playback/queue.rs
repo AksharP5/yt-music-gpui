@@ -402,6 +402,9 @@ impl Music {
                 filter: search.filter,
                 scope: search.scope,
             },
+            Route::Browse(link) if link.id.starts_with("VL") || link.id.starts_with("MPREb") => {
+                PageRequest::Collection(link.id.clone())
+            }
             _ => PageRequest::Browse,
         };
         let session = self.account.as_ref().map(|account| account.session.clone());
@@ -429,6 +432,7 @@ impl Music {
             return;
         }
         let session = self.account.as_ref().map(|account| &account.session);
+        self.queue_source.restore(&mut self.library.queue, session);
         if let Err(error) = self.queue_source.load(session, false) {
             self.error = Some(error);
             self.notify_playback(cx);
@@ -670,6 +674,7 @@ impl Music {
             if self.library.queue.incomplete {
                 self.autoplay_waiting = None;
                 let session = self.account.as_ref().map(|account| &account.session);
+                self.queue_source.restore(&mut self.library.queue, session);
                 match self.queue_source.load(session, !intent.natural) {
                     Ok(true) => {
                         self.queue_waiting = Some(intent);

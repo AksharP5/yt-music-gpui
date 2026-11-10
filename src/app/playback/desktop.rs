@@ -31,7 +31,7 @@ impl Music {
                         }
                 )
             )
-            || (queue.incomplete && self.queue_source.can_continue())
+            || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
             || (!queue.incomplete
                 && self.library.repeat != Repeat::Off
                 && !queue.tracks.is_empty())

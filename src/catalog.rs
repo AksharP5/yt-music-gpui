@@ -71,7 +71,8 @@ impl Track {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Value", into = "Value")]
 pub struct WatchTarget {
     video_id: Option<String>,
     playlist_id: Option<String>,
@@ -81,6 +82,11 @@ pub struct WatchTarget {
 }
 
 impl WatchTarget {
+    pub(crate) fn restorable(&self) -> bool {
+        self.playlist_id
+            .as_ref()
+            .is_some_and(|id| id.starts_with("PL") || id.starts_with("OLAK5uy"))
+    }
     pub fn is_single_video(&self) -> bool {
         self.playlist_id.is_none() && self.params.is_none() && self.index.is_none()
     }
@@ -173,7 +179,7 @@ impl WatchTarget {
         Ok(self.body())
     }
 
-    fn body(&self) -> Value {
+    pub(crate) fn body(&self) -> Value {
         let mut body = json!({});
         if let Some(id) = &self.video_id {
             body["videoId"] = json!(id);
@@ -192,6 +198,20 @@ impl WatchTarget {
                 json!({"watchEndpointMusicConfig":{"musicVideoType":kind}});
         }
         body
+    }
+}
+
+impl TryFrom<Value> for WatchTarget {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self> {
+        Self::from_endpoint(&value).context("Invalid saved playback destination")
+    }
+}
+
+impl From<WatchTarget> for Value {
+    fn from(target: WatchTarget) -> Self {
+        target.body()
     }
 }
 

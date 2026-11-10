@@ -106,6 +106,8 @@ pub struct Queue {
     pub playing_from: Option<String>,
     /// Keep continuation pages mixed into the remaining queue after Shuffle.
     pub(crate) shuffled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<crate::queue_source::SavedSource>,
     #[serde(skip)]
     pub(crate) source_id: Option<Arc<()>>,
 }
@@ -121,6 +123,7 @@ impl Queue {
         self.playing_from = None;
         self.shuffled = false;
         self.source_id = None;
+        self.source = None;
     }
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tracks.len() {

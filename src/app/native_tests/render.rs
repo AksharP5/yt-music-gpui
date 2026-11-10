@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+pub(super) async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     let (sender, received) = async_channel::bounded(1);
     cx.update_window(window.into(), |_, window, _| {
         // GPUI invokes next-frame callbacks before drawing. The second callback

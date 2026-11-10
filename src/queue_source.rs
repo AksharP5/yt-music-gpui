@@ -1,11 +1,12 @@
 use crate::{
     auth::{self, Session},
-    catalog::{Catalog, Continuation, Item, Page, Track},
+    catalog::{BrowseLink, Catalog, Continuation, Item, Page, Track, WatchTarget},
     library::Queue,
     search::{SearchFilter, SearchScope},
     watch::{Watch, WatchContinuation},
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     sync::{
@@ -18,6 +19,7 @@ use std::{
 #[derive(Clone)]
 pub enum PageRequest {
     Browse,
+    Collection(String),
     Search {
         query: String,
         filter: SearchFilter,
@@ -25,8 +27,59 @@ pub enum PageRequest {
     },
 }
 
+/// Only public request fields and the consumed source order, never continuation
+/// tokens, visitor data or credentials. Queue edits do not change this prefix.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SavedSource {
+    target: SavedTarget,
+    loaded: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum SavedTarget {
+    Browse(String),
+    Watch(WatchTarget),
+}
+
+impl SavedTarget {
+    fn load(&self, catalog: &Catalog) -> Result<QueuePage> {
+        match self {
+            Self::Browse(id) => {
+                ensure!(
+                    id.starts_with("VLPL")
+                        || id.starts_with("VLOLAK5uy")
+                        || id.starts_with("MPREb"),
+                    "This saved queue has no reloadable collection"
+                );
+                let page = catalog.browse(&BrowseLink::new(id, "Saved queue"))?;
+                Ok(QueuePage {
+                    tracks: page.tracks(),
+                    continuation: page
+                        .continuation
+                        .map(|continuation| SourceContinuation::Page {
+                            page: PageRequest::Browse,
+                            continuation,
+                        }),
+                })
+            }
+            Self::Watch(target) => {
+                ensure!(
+                    target.restorable(),
+                    "This saved queue has no reloadable playlist"
+                );
+                let watch = catalog.watch_target(target)?;
+                Ok(QueuePage {
+                    tracks: watch.queue,
+                    continuation: watch.continuation.map(SourceContinuation::Watch),
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 enum SourceContinuation {
+    Restore(SavedSource),
     Page {
         page: PageRequest,
         continuation: Continuation,
@@ -37,6 +90,7 @@ enum SourceContinuation {
 impl SourceContinuation {
     fn token(&self) -> &str {
         match self {
+            Self::Restore(_) => "",
             Self::Page { continuation, .. } => continuation.token(),
             Self::Watch(continuation) => continuation.token(),
         }
@@ -44,9 +98,88 @@ impl SourceContinuation {
 
     fn renew_session(&mut self, expected: &Arc<Session>, next: &Arc<Session>) -> Result<()> {
         match self {
+            Self::Restore(_) => expected.require_same_account(next),
             Self::Page { continuation, .. } => continuation.renew_session(expected, next),
             Self::Watch(continuation) => continuation.renew_session(expected, next),
         }
+    }
+}
+
+fn load_page(catalog: &Catalog, continuation: &SourceContinuation) -> Result<QueuePage> {
+    match continuation {
+        SourceContinuation::Restore(saved) => {
+            let first = saved.target.load(catalog)?;
+            resume_prefix(saved, first, |next| load_page(catalog, next))
+        }
+        SourceContinuation::Page { page, continuation } => {
+            let response = match page {
+                PageRequest::Browse | PageRequest::Collection(_) => catalog.more(continuation),
+                PageRequest::Search {
+                    query,
+                    filter,
+                    scope,
+                } => catalog.search_more(query, *filter, *scope, continuation),
+            }?;
+            Ok(QueuePage {
+                tracks: response
+                    .shelves
+                    .into_iter()
+                    .flat_map(|shelf| shelf.items)
+                    .filter_map(|item| match item {
+                        Item::Track(track) => Some(track),
+                        _ => None,
+                    })
+                    .collect(),
+                continuation: response
+                    .continuation
+                    .map(|continuation| SourceContinuation::Page {
+                        page: page.clone(),
+                        continuation,
+                    }),
+            })
+        }
+        SourceContinuation::Watch(continuation) => {
+            let response = catalog.watch_more(continuation)?;
+            Ok(QueuePage {
+                tracks: response.queue,
+                continuation: response.continuation.map(SourceContinuation::Watch),
+            })
+        }
+    }
+}
+
+fn resume_prefix(
+    saved: &SavedSource,
+    mut page: QueuePage,
+    mut more: impl FnMut(&SourceContinuation) -> Result<QueuePage>,
+) -> Result<QueuePage> {
+    let mut consumed = 0;
+    let mut seen = HashSet::new();
+    loop {
+        let skip = page.tracks.len().min(saved.loaded.len() - consumed);
+        ensure!(
+            page.tracks
+                .iter()
+                .take(skip)
+                .map(|track| &track.id)
+                .eq(&saved.loaded[consumed..consumed + skip]),
+            "The playlist or account changed since this queue was saved. Open the playlist again to continue."
+        );
+        consumed += skip;
+        if consumed == saved.loaded.len() {
+            page.tracks.drain(..skip);
+            return Ok(page);
+        }
+        let next = page.continuation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "The saved playlist is now shorter. Open the playlist again to continue."
+            )
+        })?;
+        ensure!(
+            seen.insert(next.token().to_owned()),
+            "YouTube Music repeated a saved queue page. Open the playlist again to continue."
+        );
+        page = more(next)?;
     }
 }
 
@@ -103,42 +236,7 @@ impl Worker {
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error:#}"))?
                 .for_session(request.session.clone());
-            match &request.continuation {
-                SourceContinuation::Page { page, continuation } => {
-                    let response = match page {
-                        PageRequest::Browse => catalog.more(continuation),
-                        PageRequest::Search {
-                            query,
-                            filter,
-                            scope,
-                        } => catalog.search_more(query, *filter, *scope, continuation),
-                    }?;
-                    Ok(QueuePage {
-                        tracks: response
-                            .shelves
-                            .into_iter()
-                            .flat_map(|shelf| shelf.items)
-                            .filter_map(|item| match item {
-                                Item::Track(track) => Some(track),
-                                _ => None,
-                            })
-                            .collect(),
-                        continuation: response.continuation.map(|continuation| {
-                            SourceContinuation::Page {
-                                page: page.clone(),
-                                continuation,
-                            }
-                        }),
-                    })
-                }
-                SourceContinuation::Watch(continuation) => {
-                    let response = catalog.watch_more(continuation)?;
-                    Ok(QueuePage {
-                        tracks: response.queue,
-                        continuation: response.continuation.map(SourceContinuation::Watch),
-                    })
-                }
-            }
+            load_page(&catalog, &request.continuation)
         })
     }
 
@@ -197,6 +295,12 @@ impl Worker {
     ) {
         queue.replace(page.tracks(), selected);
         queue.playing_from = Some(page.title.clone()).filter(|title| !title.is_empty());
+        if let PageRequest::Collection(id) = &request {
+            queue.source = Some(SavedSource {
+                target: SavedTarget::Browse(id.clone()),
+                loaded: queue.tracks.iter().map(|track| track.id.clone()).collect(),
+            });
+        }
         self.set_source(
             queue,
             page.continuation
@@ -216,6 +320,10 @@ impl Worker {
         watch: &Watch,
         session: Option<Arc<Session>>,
     ) {
+        queue.source = watch.issued_target.clone().map(|target| SavedSource {
+            target: SavedTarget::Watch(target),
+            loaded: watch.queue.iter().map(|track| track.id.clone()).collect(),
+        });
         self.set_source(
             queue,
             watch
@@ -224,6 +332,21 @@ impl Worker {
                 .map(|continuation| SourceContinuation::Watch(continuation.clone())),
             session,
         );
+    }
+
+    /// Reacquire under the current session only when playback needs more tracks.
+    /// Prefix verification protects queues if the collection or account changed.
+    pub fn restore(&mut self, queue: &mut Queue, session: Option<&Arc<Session>>) {
+        if self.source.is_none()
+            && queue.incomplete
+            && let Some(saved) = queue.source.clone()
+        {
+            self.set_source(
+                queue,
+                Some(SourceContinuation::Restore(saved)),
+                session.cloned(),
+            );
+        }
     }
 
     fn set_source(
@@ -236,6 +359,7 @@ impl Worker {
         queue.source_id = None;
         queue.incomplete = continuation.is_some();
         let Some(continuation) = continuation else {
+            queue.source = None;
             return;
         };
         let id = Arc::new(());
@@ -325,8 +449,16 @@ impl Worker {
             source.state = State::Failed(error.clone());
             return Err(error);
         }
+        if let Some(saved) = &mut queue.source {
+            saved
+                .loaded
+                .extend(page.tracks.iter().map(|track| track.id.clone()));
+        }
         queue.append_source(page.tracks);
         queue.incomplete = page.continuation.is_some();
+        if !queue.incomplete {
+            queue.source = None;
+        }
         match page.continuation {
             Some(continuation) => {
                 source.continuation = continuation;
@@ -349,6 +481,7 @@ impl Worker {
         queue: &mut Queue,
         session: Option<&Arc<Session>>,
     ) -> Result<(), String> {
+        self.restore(queue, session);
         queue.shuffle_upcoming();
         self.load(session, true)?;
         Ok(())
@@ -1204,5 +1337,159 @@ mod tests {
         all.sort_unstable();
         assert_eq!(all, ["a", "a", "b", "c", "play-next", "tail"]);
         assert_eq!(queue.current().unwrap().id, "a");
+    }
+
+    #[test]
+    fn restart_verifies_source_occurrences_without_replacing_edited_or_shuffled_tracks() {
+        for issued in [false, true] {
+            for shuffled in [false, true] {
+                for signed_in in [false, true] {
+                    let original: Vec<String> = (0..177)
+                        .map(|i| format!("{:011}", if i == 7 || i == 80 { 0 } else { i % 173 }))
+                        .collect();
+                    let initial: Vec<&str> = original[..100].iter().map(String::as_str).collect();
+                    let (mut worker, _) = Worker::spawn(|_| unreachable!());
+                    let mut queue = Queue::default();
+                    let old_session = signed_in.then(session);
+                    if issued {
+                        let watch = watch(&initial, Some("secret-old-token"), old_session.clone());
+                        queue.replace(watch.queue.clone(), 7);
+                        worker.attach_watch(&mut queue, &watch, old_session);
+                    } else {
+                        worker.replace_queue(
+                            &mut queue,
+                            &page(&initial, Some("secret-old-token")),
+                            7,
+                            PageRequest::Collection("VLPLsynthetic".into()),
+                            old_session,
+                        );
+                    }
+                    queue.tracks.insert(8, track("manual-next"));
+                    queue.remove(15);
+                    queue.move_track(35, 9);
+                    if shuffled {
+                        queue.shuffle_upcoming();
+                    }
+                    let before = queue.tracks.clone();
+                    let selected = queue.current().unwrap().clone();
+                    let serialized = serde_json::to_string(&queue).unwrap();
+                    for secret in [
+                        "secret-old-token",
+                        "cookie",
+                        "visitor",
+                        "authuser",
+                        "data_sync_id",
+                        "synthetic-user",
+                    ] {
+                        assert!(
+                            !serialized.contains(secret),
+                            "Saved queue contains {secret}"
+                        );
+                    }
+                    drop(worker);
+                    let mut queue: Queue = serde_json::from_str(&serialized).unwrap();
+                    let renewed = signed_in.then(|| account("synthetic-user||", None));
+                    let current = renewed.clone();
+                    let source_tracks = original.clone();
+                    let (mut worker, events) = Worker::spawn(move |request| {
+                        assert!(same_session(request.session.as_ref(), current.as_ref()));
+                        if let SourceContinuation::Restore(saved) = &request.continuation {
+                            assert_eq!(saved.loaded, source_tracks[..100]);
+                            // A fresh session may use different page boundaries.
+                            let first: Vec<&str> =
+                                source_tracks[..60].iter().map(String::as_str).collect();
+                            let rest: Vec<&str> =
+                                source_tracks[60..].iter().map(String::as_str).collect();
+                            return resume_prefix(
+                                saved,
+                                next_page(&first, Some("fresh-token")),
+                                |_| Ok(next_page(&rest, None)),
+                            );
+                        }
+                        panic!("Restoration must reacquire the source, not replay an old token");
+                    });
+                    assert!(!worker.can_continue());
+                    assert!(events.try_recv().is_err());
+                    worker.restore(&mut queue, renewed.as_ref());
+                    worker.load(renewed.as_ref(), false).unwrap();
+                    worker
+                        .apply(
+                            events.recv_blocking().unwrap(),
+                            &mut queue,
+                            renewed.as_ref(),
+                        )
+                        .unwrap();
+                    assert_eq!(queue.index, Some(7));
+                    assert_eq!(queue.current(), Some(&selected));
+                    assert_eq!(queue.shuffled, shuffled);
+                    assert!(!queue.incomplete);
+                    if !shuffled {
+                        assert_eq!(&queue.tracks[..100], &before);
+                        queue.select(99);
+                        assert!(queue.advance(Repeat::Off, false));
+                        assert_eq!(queue.current().unwrap().id, original[100]);
+                    }
+                    let mut expected: Vec<_> = before
+                        .iter()
+                        .map(|track| track.id.as_str())
+                        .chain(original[100..].iter().map(String::as_str))
+                        .collect();
+                    let mut actual = ids(&queue);
+                    expected.sort_unstable();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changed_collection_or_account_keeps_the_cached_queue_and_blocks_autoplay() {
+        for changed in [true, false] {
+            let saved = SavedSource {
+                target: SavedTarget::Browse("VLPLsynthetic".into()),
+                loaded: vec!["a".into(), "a".into(), "b".into()],
+            };
+            let mut queue = Queue::default();
+            queue.replace(vec![track("a"), track("manual"), track("b")], 2);
+            queue.incomplete = true;
+            queue.source = Some(saved);
+            let current = account("different-account||", None);
+            let expected = current.clone();
+            let (mut worker, events) = Worker::spawn(move |request| {
+                assert!(same_session(request.session.as_ref(), Some(&expected)));
+                let SourceContinuation::Restore(saved) = &request.continuation else {
+                    panic!()
+                };
+                resume_prefix(
+                    saved,
+                    next_page(
+                        if changed {
+                            &["a", "different", "b"]
+                        } else {
+                            &["a"]
+                        },
+                        None,
+                    ),
+                    |_| unreachable!(),
+                )
+            });
+            worker.restore(&mut queue, Some(&current));
+            worker.load(Some(&current), false).unwrap();
+            assert!(
+                worker
+                    .apply(events.recv_blocking().unwrap(), &mut queue, Some(&current))
+                    .is_err()
+            );
+            assert_eq!(ids(&queue), ["a", "manual", "b"]);
+            assert_eq!(queue.index, Some(2));
+            assert!(queue.incomplete);
+            assert!(!queue.advance_with_autoplay(
+                Repeat::All,
+                false,
+                true,
+                &mut VecDeque::from([track("radio")])
+            ));
+        }
     }
 }
