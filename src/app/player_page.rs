@@ -317,7 +317,10 @@ impl Music {
             inner - side - spacing.gap
         };
         let main_height = if stacked {
-            (width * 0.5625).min(height * 0.5)
+            // Leave room for the tabs, queue header, Autoplay and one complete row.
+            (width * 0.5625)
+                .min(height * 0.5)
+                .min((height - spacing.vertical - 256.).max(TOGGLE_HEIGHT))
         } else {
             height - spacing.vertical * 2.
         };
