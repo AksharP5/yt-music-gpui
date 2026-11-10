@@ -1360,8 +1360,7 @@ fn run(
                     }
                     preparation.take();
                     prepared = None;
-                    state.upcoming = None;
-                    state.entries.retain(|_, id| Some(*id) == state.current);
+                    state.discard_upcoming();
                     write_command(&mut socket, json!(["playlist-clear"]), None)?;
                     if let Some(target) = target {
                         preparation =
@@ -1557,8 +1556,7 @@ fn run(
             state.current != Some(target.track_id) && SystemTime::now() >= stream.expires
         }) {
             let (target, _) = prepared.take().unwrap();
-            state.upcoming = None;
-            state.entries.retain(|_, id| Some(*id) == state.current);
+            state.discard_upcoming();
             write_command(&mut socket, json!(["playlist-clear"]), None)?;
             preparation = StreamPreparation::start(target, &ytdlp, credentials.as_ref()).ok();
         }
@@ -1685,6 +1683,14 @@ impl PlaybackState {
             "mpv returned an oversized response."
         );
         Ok(())
+    }
+
+    fn discard_upcoming(&mut self) {
+        self.upcoming = None;
+        // Next can adopt an entry before mpv delivers start-file. Preparing the
+        // following song must preserve that entry's event identity as well.
+        self.entries
+            .retain(|_, id| Some(*id) == self.current || Some(*id) == self.desired);
     }
 
     fn invalidate_seeks(&mut self) {
@@ -2192,6 +2198,48 @@ mod tests {
     }
 
     #[test]
+    fn preparing_another_song_during_adoption_keeps_start_and_position_events() {
+        let (events, received) = async_channel::unbounded();
+        // Next has adopted entry 11, but mpv has not delivered its start-file yet.
+        let mut state = PlaybackState {
+            desired: Some(2),
+            current: Some(1),
+            entries: HashMap::from([(10, 1), (11, 2), (12, 3)]),
+            ..Default::default()
+        };
+        // The app's next render immediately prepares the following queue entry.
+        state.discard_upcoming();
+        state.message(
+            json!({"event":"end-file","playlist_entry_id":10,"reason":"stop"}),
+            &events,
+        );
+        state.message(
+            json!({"event":"start-file","playlist_entry_id":11}),
+            &events,
+        );
+        state.message(json!({"event":"file-loaded"}), &events);
+        state.message(
+            json!({"event":"property-change","name":"time-pos","id":1,"data":0.25}),
+            &events,
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Started { track_id: 2, .. })
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Position {
+                track_id: 2,
+                seconds: 0.25
+            })
+        ));
+        assert!(
+            !state.entries.contains_key(&12),
+            "cancelled preparations must still be discarded"
+        );
+    }
+
+    #[test]
     fn natural_prefetched_transition_reports_the_old_end_and_new_start_in_order() {
         let (events, received) = async_channel::unbounded();
         let mut state = PlaybackState {
@@ -2343,6 +2391,10 @@ mod tests {
         let id = player
             .play("csILUDfmtqM", "Prepared", PlayOptions::default())
             .unwrap();
+        // Music prepares the following entry on its first render, before Started.
+        player
+            .prepare_next(Some("dQw4w9WgXcQ"), PlayOptions::default())
+            .unwrap();
         let warm = wait_for_audio(&player, id, start);
         println!(
             "cold_next_ms={:.1} prepared_next_ms={:.1}",
@@ -2354,7 +2406,8 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(55);
         loop {
-            if matches!(event(&player, deadline), PlayerEvent::Prepared { .. }) {
+            if matches!(event(&player, deadline), PlayerEvent::Prepared { video_id } if video_id == "csILUDfmtqM")
+            {
                 break;
             }
         }
