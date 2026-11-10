@@ -937,6 +937,10 @@ impl Music {
                 cx,
                 move |view, window, cx| {
                     view.close_overlay(window, cx);
+                    if selected.id.starts_with("UC") && view.account.is_none() {
+                        view.connect_account(window, cx);
+                        return;
+                    }
                     view.save_collection(selected.clone(), cx);
                 },
             ));
