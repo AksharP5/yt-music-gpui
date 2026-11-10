@@ -223,11 +223,30 @@ impl Music {
                         window.focus(&view.focus, cx);
                     }
                 }
+                SearchBoxEvent::Open(item) => {
+                    window.focus(&view.focus, cx);
+                    match item.as_ref().clone() {
+                        Item::Track(track) => view.play_track(track, cx),
+                        Item::Collection(collection) => view.navigate(
+                            Route::Browse(BrowseLink::new(collection.id, collection.title)),
+                            cx,
+                        ),
+                        Item::Navigation(link) => view.navigate(Route::Browse(link), cx),
+                    }
+                }
                 SearchBoxEvent::Blur => window.focus(&view.focus, cx),
             });
         let activation = cx.observe_window_activation(window, Self::window_activated);
         let focus_lost = cx.on_focus_lost(window, Self::restore_keyboard_focus);
         let music = cx.entity();
+        let weak = music.downgrade();
+        search.update(cx, |search, _| {
+            search.set_artwork(Box::new(move |url, cx| {
+                weak.update(cx, |music, _| music.artwork.get(url))
+                    .ok()
+                    .flatten()
+            }))
+        });
         let content_view = cx.new(|cx| MusicContent::new(music.clone(), cx));
         let player_bar = cx.new(|_| PlayerBar::new(music.downgrade()));
         let mut view = Self {

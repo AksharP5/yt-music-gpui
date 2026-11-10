@@ -1,6 +1,7 @@
-use crate::catalog::{Catalog, Continuation, Page, parse_page};
+use crate::catalog::{Catalog, Continuation, Item, Page, parse_item, parse_page};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchFilter {
@@ -179,7 +180,7 @@ impl Catalog {
         )
     }
 
-    pub fn suggestions(&self, query: &str) -> Result<Vec<String>> {
+    pub fn suggestions(&self, query: &str) -> Result<Vec<Suggestion>> {
         let response = self.request(
             "music/get_search_suggestions",
             json!({"input": query.trim()}),
@@ -291,7 +292,21 @@ fn parse_search_page(
     Ok(page)
 }
 
-fn parse_suggestions(response: &Value) -> Result<Vec<String>> {
+/// One row of the search box dropdown, in the service's order.
+#[derive(Clone, Debug)]
+pub enum Suggestion {
+    /// A query to search for, shown with the service's bold ranges.
+    Query {
+        query: String,
+        label: String,
+        bold: Vec<Range<usize>>,
+        history: bool,
+    },
+    /// An artist, album, song or video to open directly.
+    Item(Box<Item>),
+}
+
+fn parse_suggestions(response: &Value) -> Result<Vec<Suggestion>> {
     let mut suggestions = Vec::new();
     for section in response["contents"].as_array().into_iter().flatten() {
         for item in section
@@ -300,16 +315,49 @@ fn parse_suggestions(response: &Value) -> Result<Vec<String>> {
             .into_iter()
             .flatten()
         {
-            let renderer = item
+            let (renderer, history) = match item
                 .get("historySuggestionRenderer")
-                .or_else(|| item.get("searchSuggestionRenderer"));
-            let Some(renderer) = renderer else { continue };
+                .map(|renderer| (renderer, true))
+                .or_else(|| {
+                    item.get("searchSuggestionRenderer")
+                        .map(|renderer| (renderer, false))
+                }) {
+                Some(found) => found,
+                None => {
+                    suggestions
+                        .extend(parse_item(item).map(|item| Suggestion::Item(Box::new(item))));
+                    continue;
+                }
+            };
             let query = renderer
                 .pointer("/navigationEndpoint/searchEndpoint/query")
                 .and_then(Value::as_str)
                 .filter(|query| !query.trim().is_empty())
                 .context("YouTube Music returned an unreadable search suggestion")?;
-            suggestions.push(query.to_owned());
+            let mut label = String::new();
+            let mut bold = Vec::new();
+            for run in renderer
+                .pointer("/suggestion/runs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let text = run["text"].as_str().unwrap_or_default();
+                if run["bold"] == true {
+                    bold.push(label.len()..label.len() + text.len());
+                }
+                label.push_str(text);
+            }
+            if label.trim().is_empty() {
+                label = query.to_owned();
+                bold.clear();
+            }
+            suggestions.push(Suggestion::Query {
+                query: query.to_owned(),
+                label,
+                bold,
+                history,
+            });
         }
     }
     Ok(suggestions)
@@ -537,19 +585,60 @@ mod tests {
 
     #[test]
     fn suggestions_use_canonical_queries_and_keep_server_order() {
-        let response = json!({"contents":[{"searchSuggestionsSectionRenderer":{"contents":[
-            {"historySuggestionRenderer":{
-                "navigationEndpoint":{"searchEndpoint":{"query":"A previous search"}},
-                "suggestion":{"runs":[{"text":"Different display formatting"}]},
-                "serviceEndpoint":{"feedbackEndpoint":{"feedbackToken":"not-a-query"}}
-            }},
-            {"searchSuggestionRenderer":{"navigationEndpoint":{"searchEndpoint":{"query":"A suggested search"}}}},
-            {"musicResponsiveListItemRenderer":{"title":{"simpleText":"A direct song result"}}}
-        ]}}]});
-        assert_eq!(
-            parse_suggestions(&response).unwrap(),
-            ["A previous search", "A suggested search"]
-        );
+        let response = json!({"contents":[
+            {"searchSuggestionsSectionRenderer":{"contents":[
+                {"historySuggestionRenderer":{
+                    "navigationEndpoint":{"searchEndpoint":{"query":"a previous search"}},
+                    "suggestion":{"runs":[{"text":"a ","bold":true},{"text":"previous search"}]},
+                    "serviceEndpoint":{"feedbackEndpoint":{"feedbackToken":"not-a-query"}}
+                }},
+                {"searchSuggestionRenderer":{"navigationEndpoint":{"searchEndpoint":{"query":"A suggested search"}}}}
+            ]}},
+            {"searchSuggestionsSectionRenderer":{"contents":[
+                {"musicResponsiveListItemRenderer":{
+                    "flexColumns":[
+                        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"An artist"}]}}},
+                        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"1M monthly audience"}]}}}
+                    ],
+                    "navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}
+                }},
+                {"musicResponsiveListItemRenderer":{
+                    "flexColumns":[
+                        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"A song"}]}}},
+                        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+                            {"text":"Song"},{"text":" • "},
+                            {"text":"An artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}
+                        ]}}}
+                    ],
+                    "playlistItemData":{"videoId":"abcdefghijk"}
+                }}
+            ]}}
+        ]});
+        let suggestions = parse_suggestions(&response).unwrap();
+        let Suggestion::Query {
+            query,
+            label,
+            bold,
+            history: true,
+        } = &suggestions[0]
+        else {
+            panic!("expected a history query first");
+        };
+        assert_eq!(query, "a previous search");
+        assert_eq!(&label[bold[0].clone()], "a ");
+        assert!(matches!(
+            &suggestions[1],
+            Suggestion::Query { query, label, history: false, .. }
+                if query == "A suggested search" && label == query
+        ));
+        assert!(matches!(
+            &suggestions[2],
+            Suggestion::Item(item) if matches!(item.as_ref(), Item::Collection(artist) if artist.id == "UCartist")
+        ));
+        assert!(matches!(
+            &suggestions[3],
+            Suggestion::Item(item) if matches!(item.as_ref(), Item::Track(song) if song.id == "abcdefghijk" && song.artist == "An artist")
+        ));
         assert!(
             parse_suggestions(&json!({"contents":[]}))
                 .unwrap()

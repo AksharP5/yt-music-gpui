@@ -122,26 +122,7 @@ impl Music {
                     .flex()
                     .items_center()
                     .gap(px(24.))
-                    .child(
-                        div()
-                            .id("search-box")
-                            .w(px(480.))
-                            .min_w_0()
-                            .h(px(42.))
-                            .px(px(12.))
-                            .rounded(px(8.))
-                            .bg(self.theme.raised)
-                            .border_1()
-                            .border_color(rgb(0x484848))
-                            .flex()
-                            .items_center()
-                            .gap(px(16.))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                window.focus(&view.search.focus_handle(cx), cx)
-                            }))
-                            .child(icon("search", 20., gpui::white().opacity(0.5)))
-                            .child(div().flex_1().min_w_0().child(self.search.clone())),
-                    )
+                    .child(self.search.clone())
                     .child(div().flex_1())
                     .when_some(avatar, |header, avatar| {
                         header.child(

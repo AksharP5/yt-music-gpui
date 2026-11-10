@@ -1175,7 +1175,7 @@ fn associate_show(page: &mut Page, show_id: &str, title: &str) {
     }
 }
 
-fn parse_item(value: &Value) -> Option<Item> {
+pub(crate) fn parse_item(value: &Value) -> Option<Item> {
     if let Some(button) = value.get("musicNavigationButtonRenderer") {
         let endpoint = button.pointer("/clickCommand/browseEndpoint")?;
         let mut link = BrowseLink::from_endpoint(endpoint, text(&button["buttonText"]))?;
