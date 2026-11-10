@@ -190,7 +190,7 @@ impl Music {
     pub(in crate::app) fn grouped_rows(&self) -> bool {
         self.page.header.is_some()
             || self.history_groups()
-            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
+            || matches!(self.route, Route::Search(_))
     }
 
     pub(in crate::app) fn list_row(
@@ -291,7 +291,11 @@ impl Music {
         if !home {
             content = self.home_filters(content, layout, cx);
         }
-        content = self.search_filters(content, inset, cx);
+        // With results, the search chips scroll away as the list's first row.
+        content = self.search_scopes(content, inset, cx);
+        if self.rows.is_empty() {
+            content = self.search_filters(content, inset, cx);
+        }
         content = self.library_filters(content, inset, cx);
         if !matches!(self.overlay, Some(Overlay::SignIn))
             && let Some(error) = &self.error
@@ -369,6 +373,7 @@ impl Music {
             content = self.home_content(content, cx);
         } else {
             let grid = !collection
+                && !search
                 && self
                     .rows
                     .iter()
@@ -428,11 +433,17 @@ impl Music {
                 .min_h_0()
                 .into_any_element()
             } else if grouped {
-                self.detail_list.set_inline_header(false);
+                // Search results carry their chips as the first row.
+                self.detail_list.set_inline_header(search);
                 list(
                     self.detail_list.state.clone(),
                     cx.processor(move |view, index, window, cx| {
-                        view.list_row(index, inset, window, cx)
+                        if search && index == 0 {
+                            return view
+                                .search_filters(div().w_full().flex().flex_col(), inset, cx)
+                                .into_any_element();
+                        }
+                        view.list_row(index - usize::from(search), inset, window, cx)
                     }),
                 )
                 .flex_1()

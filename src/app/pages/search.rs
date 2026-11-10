@@ -8,6 +8,7 @@ fn result_action(
     glyph: &'static str,
     label: &'static str,
     filled: bool,
+    width: f32,
     theme: Theme,
 ) -> Stateful<Div> {
     let ink: Hsla = if filled {
@@ -18,9 +19,8 @@ fn result_action(
     div()
         .id(id)
         .keyboard_control(theme)
+        .w(px(width))
         .h(px(36.))
-        .pl(px(12.))
-        .pr(px(16.))
         .flex_shrink_0()
         .rounded_full()
         .flex()
@@ -38,6 +38,7 @@ fn result_action(
         })
         .when(!filled, |action| {
             action
+                .border_1()
                 .border_color(gpui::white().opacity(0.2))
                 .hover(|style| style.bg(gpui::white().opacity(0.1)))
         })
@@ -61,7 +62,7 @@ impl Music {
             matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
         let art = self.art(
             item.thumbnail(),
-            96.,
+            100.,
             if artist {
                 ArtworkShape::Circle
             } else {
@@ -149,98 +150,156 @@ impl Music {
                     .on_click(cx.listener(move |view, _, _, cx| view.play_item(id, cx))),
             );
         }
-        let mut actions = div().mt(px(12.)).flex().items_center().gap(px(16.));
+        // The web sizes these buttons per card: albums and playlists 137px,
+        // artists 125px and songs 119px.
+        let mut actions = div().flex().items_center().gap(px(16.));
         match &item {
-            Item::Collection(collection) if artist => {
-                for (id, glyph, label, filled, target) in [
-                    (
-                        "featured-shuffle",
-                        "shuffle",
-                        "Shuffle",
-                        true,
-                        collection.details.shuffle.clone(),
-                    ),
-                    (
-                        "featured-mix",
-                        "mix",
-                        "Mix",
-                        false,
-                        collection.details.mix.clone(),
-                    ),
-                ] {
+            Item::Collection(collection) => {
+                let play = if artist {
+                    None
+                } else {
+                    Some((
+                        "featured-play",
+                        "play",
+                        "Play",
+                        collection.details.play.clone(),
+                    ))
+                };
+                let shuffle = Some((
+                    "featured-shuffle",
+                    "shuffle",
+                    "Shuffle",
+                    collection.details.shuffle.clone(),
+                ));
+                let mix =
+                    artist.then(|| ("featured-mix", "mix", "Mix", collection.details.mix.clone()));
+                // Playlists lead with Shuffle on the web; albums with Play.
+                let order = if collection.id.starts_with("VL") {
+                    [shuffle, play, mix]
+                } else {
+                    [play, shuffle, mix]
+                };
+                let width = if artist { 125. } else { 137. };
+                for (position, (id, glyph, label, target)) in
+                    order.into_iter().flatten().enumerate()
+                {
                     let Some(target) = target else { continue };
                     actions = actions.child(
-                        result_action(id, glyph, label, filled, self.theme).on_click(cx.listener(
-                            move |view, _, _, cx| {
-                                cx.stop_propagation();
-                                view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
-                            },
-                        )),
-                    );
-                }
-            }
-            Item::Collection(collection) => {
-                let saved = self.is_saved(collection);
-                let selected = collection.clone();
-                actions = actions
-                    .child(
-                        result_action("featured-play", "play", "Play", true, self.theme).on_click(
+                        result_action(id, glyph, label, position == 0, width, self.theme).on_click(
                             cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&view.focus, cx);
-                                match view.rows.get(index) {
-                                    Some(Item::Collection(collection)) => {
-                                        if let Some(target) = collection.details.play.clone() {
-                                            view.start_queue(PlaybackQuery::Playlist(target), cx);
-                                        } else {
-                                            view.play_item(index, cx);
-                                        }
-                                    }
-                                    _ => view.play_item(index, cx),
-                                }
+                                view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
                             }),
                         ),
-                    )
-                    .child(
-                        result_action(
-                            "featured-save",
-                            if saved { "bookmark-filled" } else { "bookmark" },
-                            if saved { "Saved" } else { "Save" },
-                            false,
-                            self.theme,
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            cx.stop_propagation();
-                            view.save_collection(selected.clone(), cx);
-                        })),
                     );
+                }
             }
             Item::Track(track) => {
                 let track = track.clone();
                 actions = actions
                     .child(
-                        result_action("featured-play", "play", "Play", true, self.theme).on_click(
-                            cx.listener(move |view, _, window, cx| {
+                        result_action("featured-play", "play", "Play", true, 119., self.theme)
+                            .on_click(cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&view.focus, cx);
                                 view.play_item(index, cx);
-                            }),
-                        ),
+                            })),
                     )
                     .child(
-                        result_action("featured-save", "playlist-add", "Save", false, self.theme)
-                            .on_click(cx.listener(move |view, _, window, cx| {
+                        result_action(
+                            "featured-save",
+                            "playlist-add",
+                            "Save",
+                            false,
+                            119.,
+                            self.theme,
+                        )
+                        .on_click(cx.listener(
+                            move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 if view.account.is_none() {
                                     view.connect_account(window, cx);
                                     return;
                                 }
                                 view.playlist_picker(vec![track.clone()], cx);
-                            })),
+                            },
+                        )),
                     );
             }
             Item::Navigation(_) => {}
         }
+        let text = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(24.))
+                    .line_height(relative(1.2))
+                    .font_weight(FontWeight::BOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(14.))
+                    .line_height(relative(1.2))
+                    .text_color(self.theme.muted)
+                    .child(subtitle),
+            );
+        let details = details_chevron(("featured-details", shelf), self.theme).on_click(
+            cx.listener(move |view, _, _, cx| {
+                cx.stop_propagation();
+                view.play_item(index, cx);
+            }),
+        );
+        // Albums and playlists without related songs use the web's single
+        // 132px row: art, text, then the actions and a details chevron.
+        let compact = matches!(&item, Item::Collection(_)) && !artist && related.is_empty();
+        let card = div()
+            .id(("featured-result", shelf))
+            .keyboard_control(self.theme)
+            .relative()
+            .flex_1()
+            .min_w(px(280.))
+            .pl(px(16.))
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .cursor_pointer()
+            .child(art)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_item_menu(index, window, cx);
+                }),
+            )
+            .on_click(cx.listener(move |view, _, _, cx| view.play_item(index, cx)));
+        let card = if compact {
+            card.h(px(132.))
+                .pr(px(8.))
+                .child(text)
+                .child(actions)
+                .child(details)
+        } else {
+            let corner = if matches!(&item, Item::Track(_)) {
+                self.menu_button(("featured-menu", index), cx, move |view, window, cx| {
+                    view.open_item_menu(index, window, cx);
+                })
+                .into_any_element()
+            } else {
+                details.into_any_element()
+            };
+            card.h(px(232.))
+                .pr(px(16.))
+                .child(text.child(actions.mt(px(12.))))
+                .child(div().absolute().top(px(4.)).right(px(8.)).child(corner))
+        };
         let panel = div()
             .w_full()
             .rounded(px(8.))
@@ -252,53 +311,7 @@ impl Music {
             ))
             .flex()
             .flex_wrap()
-            .child(
-                div()
-                    .id(("featured-result", shelf))
-                    .keyboard_control(self.theme)
-                    .flex_1()
-                    .min_w(px(280.))
-                    .h(px(232.))
-                    .px(px(16.))
-                    .flex()
-                    .items_center()
-                    .gap(px(20.))
-                    .cursor_pointer()
-                    .child(art)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(24.))
-                                    .line_height(relative(1.2))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(14.))
-                                    .line_height(relative(1.2))
-                                    .text_color(self.theme.muted)
-                                    .child(subtitle),
-                            )
-                            .child(actions),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |view, _, window, cx| {
-                            cx.stop_propagation();
-                            view.open_item_menu(index, window, cx);
-                        }),
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| view.play_item(index, cx))),
-            )
+            .child(card)
             .when(!related.is_empty(), |body| {
                 body.child(div().flex_1().min_w(px(280.)).py(px(8.)).children(related))
             });
@@ -311,16 +324,35 @@ impl Music {
     }
 }
 
+/// The 24px chevron the web puts on a top result to open its page.
+fn details_chevron(id: impl Into<ElementId>, theme: Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .keyboard_control(theme)
+        .size(px(24.))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(gpui::white().opacity(0.1)))
+        .child(icon("forward", 20., rgb(0xf1f1f1).into()))
+}
+
 impl Music {
-    pub(in crate::app) fn search_filters(
+    /// The signed-in YT Music and Library tabs, which stay pinned on the web.
+    pub(in crate::app) fn search_scopes(
         &mut self,
         mut content: Div,
         inset: f32,
         cx: &mut Context<Self>,
     ) -> Div {
-        if let Route::Search(search) = &self.route {
-            if self.account.is_some() {
-                content = content.child(
+        if let Route::Search(search) = &self.route
+            && self.account.is_some()
+        {
+            content =
+                content.child(
                     div()
                         .id("search-scopes")
                         .mx(px(inset))
@@ -357,7 +389,18 @@ impl Music {
                             },
                         )),
                 );
-            }
+        }
+        content
+    }
+
+    /// The category chips, which scroll with the results on the web.
+    pub(in crate::app) fn search_filters(
+        &mut self,
+        mut content: Div,
+        inset: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        if let Route::Search(search) = &self.route {
             let filters = if self.page.search_filters.is_empty() {
                 search.scope.supported_filters()
             } else {
@@ -399,7 +442,7 @@ impl Music {
                         };
                         search_chip(
                             ("search-filter", index),
-                            Some(filter.label()),
+                            Some(filter.label().into()),
                             selected,
                             self.theme,
                         )
@@ -413,10 +456,10 @@ impl Music {
     }
 }
 
-/// The web's 32px search category chip; with no label it is the clear chip.
-fn search_chip(
+/// The web's 32px search and library chip; with no label it is the clear chip.
+pub(in crate::app) fn search_chip(
     id: impl Into<ElementId>,
-    label: Option<&'static str>,
+    label: Option<SharedString>,
     selected: bool,
     theme: Theme,
 ) -> Stateful<Div> {
@@ -431,13 +474,15 @@ fn search_chip(
         .items_center()
         .text_size(px(14.))
         .cursor_pointer()
-        .when(selected, |chip| chip.bg(theme.text).text_color(theme.bg))
-        .when(!selected, |chip| {
+        .when(selected || label.is_none(), |chip| {
+            chip.bg(theme.text).text_color(theme.bg)
+        })
+        .when(!selected && label.is_some(), |chip| {
             chip.bg(gpui::white().opacity(0.1))
                 .hover(|style| style.bg(gpui::white().opacity(0.2)))
         })
         .map(|chip| match label {
             Some(label) => chip.child(label),
-            None => chip.child(icon("close", 20., theme.text)),
+            None => chip.child(icon("close", 20., theme.bg)),
         })
 }
