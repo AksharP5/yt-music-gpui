@@ -328,7 +328,10 @@ impl Music {
             let carousel = sectioned
                 && matches!(
                     shelf.layout,
-                    ShelfLayout::Cards | ShelfLayout::Videos | ShelfLayout::Episodes
+                    ShelfLayout::Cards
+                        | ShelfLayout::SmallCards
+                        | ShelfLayout::Videos
+                        | ShelfLayout::Episodes
                 );
             if featured {
                 self.list_rows.push(ListRow::Featured(index));

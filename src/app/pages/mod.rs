@@ -155,8 +155,24 @@ impl PageLayout {
         match layout {
             ShelfLayout::Songs | ShelfLayout::Episodes => self.song_width(),
             ShelfLayout::Videos => self.card_width() * 16. / 9.,
-            ShelfLayout::Cards | ShelfLayout::Featured => self.card_width(),
+            ShelfLayout::Cards | ShelfLayout::SmallCards | ShelfLayout::Featured => {
+                self.card_width()
+            }
         }
+    }
+
+    /// Art, track column and cover widths shared by collection headers and shelves.
+    fn collection_columns(self) -> (f32, f32, f32) {
+        let (header, tracks, cover): (f32, f32, f32) = match self.tier {
+            Tier::Huge => (333., 921., 264.),
+            Tier::Large => (261., 779., 245.),
+            _ => (280., 546., 240.),
+        };
+        (
+            header,
+            tracks.min(self.column + 2. * self.inset - header - 56.),
+            cover,
+        )
     }
 
     /// The web narrows search results to a centered column.
@@ -395,14 +411,7 @@ impl Music {
                 )
                 .into_any_element();
         }
-        // The web's album and playlist columns by window tier: art column,
-        // a 40px gutter, then the track list, centered 8px right of center.
-        let (header_width, list_width, cover): (f32, f32, f32) = match layout.tier {
-            Tier::Huge => (333., 921., 264.),
-            Tier::Large => (261., 779., 245.),
-            _ => (280., 546., 240.),
-        };
-        let list_width = list_width.min(available - header_width - 56.);
+        let (header_width, list_width, cover) = layout.collection_columns();
         let heading =
             (collection && stacked).then(|| self.page_heading(true, cover, layout.text_size(), cx));
         if self.rows.is_empty()

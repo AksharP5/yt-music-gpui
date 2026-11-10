@@ -263,6 +263,13 @@ impl Music {
                 }))
                 .into_any_element();
         }
+        let subtitle_lines = if layout == ShelfLayout::Cards
+            && matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"))
+        {
+            1
+        } else {
+            2
+        };
         let subtitle = item.subtitle().to_owned();
         let explicit = match &item {
             Item::Track(track) => track.details.explicit,
@@ -409,12 +416,14 @@ impl Music {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .line_clamp(2)
+                                .line_clamp(subtitle_lines)
                                 .text_ellipsis()
                                 .child(subtitle),
                         )
                 } else {
-                    line.line_clamp(2).text_ellipsis().child(subtitle)
+                    line.line_clamp(subtitle_lines)
+                        .text_ellipsis()
+                        .child(subtitle)
                 }
             })
             .on_mouse_down(

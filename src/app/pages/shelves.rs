@@ -48,11 +48,17 @@ impl Music {
             .iter()
             .all(|item| matches!(item, Item::Navigation(_)));
         let page = self.page_layout(window);
-        let available = page.column;
         let album = matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"));
-        // Album pages list their carousels beside the art at a fixed card size.
-        let (width, gap) = if album && layout == ShelfLayout::Cards {
+        let available = if album && page.column + 2. * page.inset >= 980. {
+            page.collection_columns().1
+        } else {
+            page.column
+        };
+        let (width, gap) = if album && layout == ShelfLayout::SmallCards {
             (160., if page.tier >= Tier::Large { 24. } else { 16. })
+        } else if album && layout == ShelfLayout::Cards {
+            let cards = if page.tier >= Tier::Large { 5. } else { 4. };
+            ((available - (cards - 1.) * 24.) / cards, 24.)
         } else {
             (page.shelf_width(layout), page.card_gap())
         };
@@ -63,7 +69,10 @@ impl Music {
                 ShelfLayout::Songs => 4. * 48. + 3. * 16.,
                 ShelfLayout::Episodes => 3. * EPISODE_ROW + 2. * 16.,
                 ShelfLayout::Videos => width * 9. / 16. + page.card_text_height(),
-                ShelfLayout::Cards | ShelfLayout::Featured => width + page.card_text_height(),
+                ShelfLayout::Cards if album => width + 19. + 3. * page.text_size() * 1.2,
+                ShelfLayout::Cards | ShelfLayout::SmallCards | ShelfLayout::Featured => {
+                    width + page.card_text_height()
+                }
             }
         };
         let rows = match layout {
@@ -76,6 +85,7 @@ impl Music {
         let scroll = self.shelf_scroll.entry(index).or_default().clone();
         let range = visible_cards(count, (-scroll.offset().x).into(), available, width + gap);
         let stride = width + gap;
+        let overflows = count as f32 * stride - gap > available + 1.;
         // The web scales shelf titles with the window on Home, Explore and
         // album pages; artist titles stay small and playlists stop at 28px.
         let heading_size = match &self.route {
@@ -196,44 +206,49 @@ impl Music {
                                         view.navigate(Route::Browse(link.clone()), cx)
                                     }))
                             }))
-                            .child(
-                                button(("shelf-previous", index), "back", self.theme)
-                                    .size(px(36.))
-                                    .tab_stop(scroll.offset().x < px(-1.))
-                                    .border_1()
-                                    .border_color(self.theme.border)
-                                    .opacity(if scroll.offset().x < px(-1.) {
-                                        1.
-                                    } else {
-                                        0.35
-                                    })
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        let offset = previous.offset();
-                                        previous.set_offset(point(
-                                            (offset.x + px(stride * 3.)).min(px(0.)),
-                                            offset.y,
-                                        ));
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                button(("shelf-next", index), "forward", self.theme)
-                                    .size(px(36.))
-                                    .tab_stop(
-                                        -f32::from(scroll.offset().x) + available + 1.
-                                            < count as f32 * stride - gap,
-                                    )
-                                    .border_1()
-                                    .border_color(self.theme.border)
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        let offset = next.offset();
-                                        next.set_offset(point(
-                                            (offset.x - px(stride * 3.)).max(-next.max_offset().x),
-                                            offset.y,
-                                        ));
-                                        cx.notify();
-                                    })),
-                            ),
+                            .when(overflows, |controls| {
+                                controls.child(
+                                    button(("shelf-previous", index), "back", self.theme)
+                                        .size(px(36.))
+                                        .tab_stop(scroll.offset().x < px(-1.))
+                                        .border_1()
+                                        .border_color(self.theme.border)
+                                        .opacity(if scroll.offset().x < px(-1.) {
+                                            1.
+                                        } else {
+                                            0.35
+                                        })
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            let offset = previous.offset();
+                                            previous.set_offset(point(
+                                                (offset.x + px(stride * 3.)).min(px(0.)),
+                                                offset.y,
+                                            ));
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .when(overflows, |controls| {
+                                controls.child(
+                                    button(("shelf-next", index), "forward", self.theme)
+                                        .size(px(36.))
+                                        .tab_stop(
+                                            -f32::from(scroll.offset().x) + available + 1.
+                                                < count as f32 * stride - gap,
+                                        )
+                                        .border_1()
+                                        .border_color(self.theme.border)
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            let offset = next.offset();
+                                            next.set_offset(point(
+                                                (offset.x - px(stride * 3.))
+                                                    .max(-next.max_offset().x),
+                                                offset.y,
+                                            ));
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     ),
             )
             .child(contents)

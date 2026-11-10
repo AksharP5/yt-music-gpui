@@ -90,7 +90,7 @@ impl Music {
             }
             heading = heading.child(
                 div()
-                    .w_full()
+                    .w(relative(if stacked { 1.04 } else { 1. }))
                     .text_size(px(if stacked { 28. } else { 32. }))
                     .line_height(relative(1.2))
                     .font_weight(FontWeight::BOLD)

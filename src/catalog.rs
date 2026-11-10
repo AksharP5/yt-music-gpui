@@ -536,6 +536,8 @@ pub struct Shelf {
 pub enum ShelfLayout {
     #[default]
     Cards,
+    /// The service's small-card hint, fixed at 160px on album pages.
+    SmallCards,
     Videos,
     Songs,
     Featured,
@@ -1677,6 +1679,12 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                             items,
                             layout: if key == "musicCardShelfRenderer" {
                                 ShelfLayout::Featured
+                            } else if shelf["itemSize"] == "COLLECTION_STYLE_ITEM_SIZE_SMALL"
+                                && contents
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|items| shelf_layout(items) == ShelfLayout::Cards)
+                            {
+                                ShelfLayout::SmallCards
                             } else {
                                 contents
                                     .and_then(Value::as_array)
@@ -2535,6 +2543,23 @@ mod tests {
             assert_eq!(page.shelves.len(), 1);
             assert_eq!(page.shelves[0].layout, layout);
             assert_eq!(page.shelves[0].items.len(), 1);
+        }
+        for (hint, layout) in [
+            ("COLLECTION_STYLE_ITEM_SIZE_MEDIUM", ShelfLayout::Cards),
+            ("COLLECTION_STYLE_ITEM_SIZE_SMALL", ShelfLayout::SmallCards),
+        ] {
+            let page = parse_page(
+                &json!({"contents":[{"musicCarouselShelfRenderer":{
+                    "contents":[{"musicTwoRowItemRenderer":{
+                        "title":{"simpleText":"Alternate album"},
+                        "navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalternate"}}
+                    }}],
+                    "itemSize":hint
+                }}]}),
+                "Album",
+            )
+            .unwrap();
+            assert_eq!(page.shelves[0].layout, layout);
         }
         let list = parse_page(
             &json!({"contents":[{"musicShelfRenderer":{"contents":[songs]}}]}),
