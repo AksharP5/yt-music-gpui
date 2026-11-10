@@ -280,7 +280,24 @@ impl Store {
 
 enum SaveRequest {
     Snapshot(Box<Library>),
-    Preferences(Preferences),
+    Update(LibraryUpdate),
+}
+
+#[derive(Default)]
+struct LibraryUpdate {
+    preferences: Option<Preferences>,
+    positions: Option<crate::listening::ResumePositions>,
+}
+
+impl LibraryUpdate {
+    fn apply(self, library: &mut Library) {
+        if let Some(preferences) = self.preferences {
+            preferences.apply(library);
+        }
+        if let Some(positions) = self.positions {
+            library.positions = positions;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -338,7 +355,7 @@ impl LibraryWriter {
                 while let Ok(request) = receiver.recv_blocking() {
                     match request {
                         SaveRequest::Snapshot(library) => current = Some(*library),
-                        SaveRequest::Preferences(preferences) => {
+                        SaveRequest::Update(update) => {
                             if current.is_none() {
                                 let restored = match fs::read(&store.path) {
                                     Ok(bytes) => serde_json::from_slice::<Library>(&bytes)
@@ -359,7 +376,7 @@ impl LibraryWriter {
                                 }
                             }
                             let library = current.as_mut().unwrap();
-                            preferences.apply(library);
+                            update.apply(library);
                         }
                     }
                     if let Err(error) = store.save(current.as_ref().unwrap()) {
@@ -387,15 +404,31 @@ impl LibraryWriter {
     }
 
     /// Save settings without cloning queue or library collections on the UI thread.
-    #[allow(dead_code)] // The app integration can use this independently of full snapshots.
     pub fn save_preferences(&self, library: &Library) {
-        let preferences = Preferences::from(library);
+        self.update(LibraryUpdate {
+            preferences: Some(Preferences::from(library)),
+            ..Default::default()
+        });
+    }
+
+    pub fn save_positions(&self, positions: &crate::listening::ResumePositions) {
+        self.update(LibraryUpdate {
+            positions: Some(positions.clone()),
+            ..Default::default()
+        });
+    }
+
+    fn update(&self, update: LibraryUpdate) {
         let request = match self.pending.try_recv() {
             Ok(SaveRequest::Snapshot(mut snapshot)) => {
-                preferences.apply(&mut snapshot);
+                update.apply(&mut snapshot);
                 SaveRequest::Snapshot(snapshot)
             }
-            _ => SaveRequest::Preferences(preferences),
+            Ok(SaveRequest::Update(pending)) => SaveRequest::Update(LibraryUpdate {
+                preferences: update.preferences.or(pending.preferences),
+                positions: update.positions.or(pending.positions),
+            }),
+            Err(_) => SaveRequest::Update(update),
         };
         let _ = self.requests.try_send(request);
     }
@@ -493,6 +526,40 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_and_preferences_preserve_each_other_and_pending_queue_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.json");
+        let mut library = Library::new();
+        let mut episode = track("episode");
+        episode.details.episode = Some(Box::default());
+        episode.duration = Some(3600);
+        library.queue.replace(vec![episode.clone()], 0);
+        Store { path: path.clone() }.save(&library).unwrap();
+
+        for snapshot in [false, true] {
+            let (writer, errors) = LibraryWriter::new(Store { path: path.clone() });
+            if snapshot {
+                library.queue.tracks.push(track("queued"));
+                writer.save(&library);
+            }
+            for seconds in 100..200 {
+                library
+                    .positions
+                    .set("guest", &episode, f64::from(seconds), 3600., false);
+                writer.save_positions(&library.positions);
+                library.volume = f64::from(seconds % 100);
+                writer.save_preferences(&library);
+            }
+            drop(writer);
+            assert!(errors.is_empty());
+            let saved: Library = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved.positions.get("guest", &episode), 199.);
+            assert_eq!(saved.volume, 99.);
+            assert_eq!(saved.queue.tracks, library.queue.tracks);
+        }
+    }
+
+    #[test]
     #[ignore = "measures caller-thread save cost with a 10,000-song queue"]
     fn large_queue_preference_save_latency() {
         let directory = tempfile::tempdir().unwrap();
@@ -515,10 +582,20 @@ mod tests {
             writer.save_preferences(&library);
         }
         let preferences = start.elapsed().as_secs_f64() * 1000. / 20.;
+        let mut episode = track("episode");
+        episode.details.episode = Some(Box::default());
+        let start = std::time::Instant::now();
+        for seconds in 100..120 {
+            library
+                .positions
+                .set("guest", &episode, f64::from(seconds), 3600., false);
+            writer.save_positions(&library.positions);
+        }
+        let checkpoint = start.elapsed().as_secs_f64() * 1000. / 20.;
         drop(writer);
         assert!(errors.is_empty());
         println!(
-            "queue_tracks=10000 snapshot_save_ms={full:.4} preference_save_ms={preferences:.4}"
+            "queue_tracks=10000 snapshot_save_ms={full:.4} preference_save_ms={preferences:.4} checkpoint_save_ms={checkpoint:.4}"
         );
     }
 

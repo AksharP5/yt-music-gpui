@@ -123,8 +123,8 @@ impl Music {
             completed,
         );
         active.checkpoint = Instant::now();
-        if saved {
-            self.save();
+        if saved && let Some(store) = &self.store {
+            store.save_positions(&self.library.positions);
         }
     }
 
