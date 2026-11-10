@@ -1391,12 +1391,16 @@ fn run(
                     state.desired = Some(track_id);
                     state.paused = options.paused;
                     state.pause_target = Some(options.paused);
+                    // Adoption must refresh seekability even if file-loaded preceded Play.
+                    state.pause_after_load = true;
                     state.upcoming = None;
                     if prefetched {
                         if state.current != Some(track_id) {
                             state.loaded = false;
                             state.pause_after_load = true;
-                            write_command(&mut socket, json!(["playlist-next", "force"]), None)?;
+                            // mpv may have reached this last prepared entry before
+                            // its start-file event reaches us. Weak leaves it playing.
+                            write_command(&mut socket, json!(["playlist-next", "weak"]), None)?;
                         } else if state.loaded {
                             // EOF may have transitioned before the UI consumed Ended.
                             let _ = events.send_blocking(PlayerEvent::Started {
@@ -2453,6 +2457,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut ended = None;
         let mut next_id = None;
+        let mut started = false;
+        let mut seekable = false;
+        let mut positioned = false;
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -2466,16 +2473,31 @@ mod tests {
                             .play("csILUDfmtqM", "Natural", PlayOptions::default())
                             .unwrap(),
                     );
+                    player
+                        .prepare_next(Some("dQw4w9WgXcQ"), PlayOptions::default())
+                        .unwrap();
                 }
                 PlayerEvent::Started { track_id, .. } if Some(track_id) == next_id => {
                     println!(
                         "natural_eof_to_started_ms={:.3}",
                         ended.unwrap().elapsed().as_secs_f64() * 1000.
                     );
-                    break;
+                    started = true;
+                }
+                PlayerEvent::Seekable {
+                    track_id,
+                    seekable: true,
+                } if Some(track_id) == next_id => seekable = true,
+                PlayerEvent::Position { track_id, seconds }
+                    if Some(track_id) == next_id && seconds > 0. =>
+                {
+                    positioned = true
                 }
                 PlayerEvent::Error { track_id, message } => panic!("track {track_id:?}: {message}"),
                 _ => {}
+            }
+            if started && seekable && positioned {
+                break;
             }
         }
     }
