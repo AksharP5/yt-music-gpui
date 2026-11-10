@@ -20,6 +20,93 @@ pub(in crate::app) trait KeyboardControl:
 
 impl<T: StatefulInteractiveElement + Styled> KeyboardControl for T {}
 
+#[derive(Default)]
+struct ChipRowFocus {
+    scroll: ScrollHandle,
+    controls: Vec<FocusHandle>,
+    focused: Option<usize>,
+}
+
+/// Horizontal filters reveal each chip when it receives keyboard focus.
+#[derive(IntoElement)]
+pub(in crate::app) struct ChipRow {
+    id: ElementId,
+    style: StyleRefinement,
+    chips: Vec<Stateful<Div>>,
+}
+
+pub(in crate::app) fn chip_row(id: impl Into<ElementId>) -> ChipRow {
+    ChipRow {
+        id: id.into(),
+        style: StyleRefinement::default(),
+        chips: Vec::new(),
+    }
+}
+
+impl Styled for ChipRow {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl ChipRow {
+    pub(in crate::app) fn child(mut self, chip: Stateful<Div>) -> Self {
+        self.chips.push(chip);
+        self
+    }
+
+    pub(in crate::app) fn children(
+        mut self,
+        chips: impl IntoIterator<Item = Stateful<Div>>,
+    ) -> Self {
+        self.chips.extend(chips);
+        self
+    }
+}
+
+impl RenderOnce for ChipRow {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = window.use_keyed_state(self.id.clone(), cx, |_, _| ChipRowFocus::default());
+        let (scroll, chips) = focus.update(cx, |focus, cx| {
+            focus.controls.truncate(self.chips.len());
+            let chips = self
+                .chips
+                .into_iter()
+                .enumerate()
+                .map(|(index, chip)| {
+                    if focus.controls.len() <= index {
+                        focus
+                            .controls
+                            .push(cx.focus_handle().tab_index(0).tab_stop(true));
+                    }
+                    chip.track_focus(&focus.controls[index])
+                })
+                .collect::<Vec<_>>();
+            let focused = focus
+                .controls
+                .iter()
+                .position(|handle| handle.is_focused(window));
+            if focused != focus.focused {
+                if let Some(index) = focused {
+                    focus.scroll.scroll_to_item(index);
+                }
+                focus.focused = focused;
+            }
+            (focus.scroll.clone(), chips)
+        });
+        let mut row = div()
+            .id(self.id)
+            .flex()
+            .gap(px(12.))
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&scroll)
+            .children(chips);
+        row.style().refine(&self.style);
+        row
+    }
+}
+
 /// Keep handles for rendered controls and the next keyboard target. Tab creates its handle before
 /// scrolling it into the virtualized tree, without constructing offscreen rows.
 #[derive(Default)]

@@ -13,14 +13,9 @@ impl Music {
         let Some(filters) = self.page.library.clone() else {
             return content;
         };
-        let chips = div()
-            .id("library-chips")
+        let chips = chip_row("library-chips")
             .flex_1()
             .min_w_0()
-            .flex()
-            .gap(px(12.))
-            .overflow_x_scroll()
-            .restrict_scroll_to_axis()
             .when_some(filters.clear, |chips, landing| {
                 chips.child(
                     search_chip("library-clear", None, false, self.theme).on_click(cx.listener(
