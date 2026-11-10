@@ -26,7 +26,7 @@ pub enum SearchBoxEvent {
 pub type ArtworkLookup = Box<dyn Fn(&str, &mut App) -> Option<Arc<RenderImage>>>;
 
 /// The web's search box: 480px wide, with the dropdown joined beneath it.
-const WIDTH: f32 = 480.;
+pub(crate) const WIDTH: f32 = 480.;
 const HEIGHT: f32 = 42.;
 
 struct SuggestionRequest {
@@ -423,16 +423,12 @@ impl Render for SearchBox {
             .w(px(WIDTH))
             .min_w_0()
             .h(px(HEIGHT))
-            .pl(px(12.))
+            .pl(px(16.))
             .pr(px(4.))
             .rounded(px(8.))
             .when(open, |view| view.rounded_b_none())
             // Focused, the web darkens the box rather than underlining the text.
-            .bg(if focused {
-                rgb(0x030303).into()
-            } else {
-                theme.raised
-            })
+            .bg(if focused { rgb(0x030303).into() } else { edge })
             .border_1()
             .border_color(if focused { edge } else { rgb(0x484848).into() })
             .flex()

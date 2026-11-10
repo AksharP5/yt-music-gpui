@@ -51,6 +51,22 @@ impl Music {
             100.
         };
         let scrolled = self.page_scrolled();
+        let guide_width = if compact { 72. } else { 240. };
+        let brand_width = if compact && width < 1150. {
+            148.
+        } else {
+            guide_width
+        };
+        let search_left = if matches!(self.route, Route::Search(_)) {
+            let layout = pages::PageLayout::new(width, width - guide_width);
+            // The web centers this column in the space before its 12px scrollbar.
+            guide_width + (width - guide_width - 12. - layout.search_width()) / 2. + 1.
+        } else if compact && width < 1150. {
+            // Below the wide breakpoint, center between the brand and account controls.
+            brand_width + ((width - brand_width - 194. - crate::search_box::WIDTH) / 2.).max(0.)
+        } else {
+            guide_width + inset
+        };
         // Only an expanded, unscrolled guide has its own header background.
         let home_band = self.route.is_home() && !self.player_open && !scrolled;
         div()
@@ -79,7 +95,7 @@ impl Music {
             })
             .child(
                 div()
-                    .w(px(if compact { 148. } else { 240. }))
+                    .w(px(brand_width))
                     .flex_shrink_0()
                     .px(px(16.))
                     .flex()
@@ -122,22 +138,12 @@ impl Music {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .pl(px(if compact {
-                        0.
-                    } else {
-                        inset
-                            + if matches!(self.route, Route::Search(_)) {
-                                ((width - 240. - 1060.) / 2.).max(0.)
-                            } else {
-                                0.
-                            }
-                    }))
+                    .pl(px((search_left - brand_width).max(0.)))
                     .pr(px(account_inset))
                     .flex()
                     .items_center()
                     .gap(px(24.))
-                    .child(self.search.clone())
-                    .child(div().flex_1())
+                    .child(div().flex_1().min_w_0().flex().child(self.search.clone()))
                     // Signed in, the web keeps History here rather than in the library.
                     .when(
                         avatar.is_some() && !matches!(self.route, Route::Search(_)),
