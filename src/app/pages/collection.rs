@@ -1,6 +1,7 @@
 //! Shared album/playlist headers, metadata, and collection actions.
 
 use super::super::*;
+use super::PageLayout;
 
 impl Music {
     pub(in crate::app) fn page_collection(&self) -> Option<Collection> {
@@ -27,9 +28,10 @@ impl Music {
         &mut self,
         stacked: bool,
         edge: f32,
-        text_size: f32,
+        layout: PageLayout,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let text_size = layout.text_size();
         let header = self.page.header.clone();
         let title = self.page.title.clone();
         let has_tracks = self.rows.iter().any(|item| matches!(item, Item::Track(_)));
@@ -91,7 +93,11 @@ impl Music {
             heading = heading.child(
                 div()
                     .w(relative(if stacked { 1.04 } else { 1. }))
-                    .text_size(px(if stacked { 28. } else { 32. }))
+                    .text_size(px(if stacked {
+                        layout.heading_size().min(28.)
+                    } else {
+                        32.
+                    }))
                     .line_height(relative(1.2))
                     .font_weight(FontWeight::BOLD)
                     .child(title),
