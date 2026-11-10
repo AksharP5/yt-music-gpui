@@ -301,6 +301,15 @@ pub struct TrackDetails {
     pub year: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode: Option<Box<EpisodeContext>>,
+    /// The secondary line exactly as the service lays it out, such as
+    /// "Song • Daft Punk • 28M plays" in search results.
+    #[serde(skip)]
+    pub byline: Option<String>,
+    #[serde(skip)]
+    pub explicit: bool,
+    /// Video and episode frames are 16:9 and must not be cropped square.
+    #[serde(skip)]
+    pub wide_thumbnail: bool,
 }
 
 impl TrackDetails {
@@ -332,6 +341,8 @@ pub struct CollectionDetails {
     pub saved: Option<bool>,
     #[serde(skip)]
     pub editable: bool,
+    #[serde(skip)]
+    pub explicit: bool,
 }
 
 pub(crate) struct ArtistSubscription {
@@ -386,6 +397,8 @@ pub struct BrowseLink {
     pub id: String,
     pub params: Option<String>,
     pub chart_country: Option<String>,
+    /// The colored stripe on a mood or genre button, as 0xRRGGBB.
+    pub accent: Option<u32>,
 }
 
 impl BrowseLink {
@@ -395,6 +408,7 @@ impl BrowseLink {
             id: id.into(),
             params: None,
             chart_country: None,
+            accent: None,
         }
     }
 
@@ -439,6 +453,7 @@ impl BrowseLink {
                 None => None,
             },
             chart_country: None,
+            accent: None,
         };
         link.validate().ok()?;
         Some(link)
@@ -1159,7 +1174,11 @@ fn associate_show(page: &mut Page, show_id: &str, title: &str) {
 fn parse_item(value: &Value) -> Option<Item> {
     if let Some(button) = value.get("musicNavigationButtonRenderer") {
         let endpoint = button.pointer("/clickCommand/browseEndpoint")?;
-        let link = BrowseLink::from_endpoint(endpoint, text(&button["buttonText"]))?;
+        let mut link = BrowseLink::from_endpoint(endpoint, text(&button["buttonText"]))?;
+        link.accent = button
+            .pointer("/solid/leftStripeColor")
+            .and_then(Value::as_u64)
+            .map(|argb| (argb & 0xff_ffff) as u32);
         return Some(Item::Navigation(link));
     }
     let row = value
@@ -1279,6 +1298,19 @@ fn parse_item(value: &Value) -> Option<Item> {
             });
         let mut details = track_details(row, &runs, id);
         details.episode = episode;
+        let byline = if columns.len() > 1 {
+            columns[1..]
+                .iter()
+                .map(|column| text(column))
+                .filter(|column| !column.is_empty())
+                .collect::<Vec<_>>()
+                .join(" • ")
+        } else {
+            text(&row["subtitle"])
+        };
+        details.byline = Some(byline).filter(|byline| !byline.is_empty());
+        details.explicit = explicit(row);
+        details.wide_thumbnail = wide_thumbnail(row);
         return Some(Item::Track(Track {
             id: id.to_owned(),
             title,
@@ -1301,6 +1333,28 @@ fn parse_item(value: &Value) -> Option<Item> {
         thumbnail: thumbnail(row),
         details: collection_details(row, id),
     }))
+}
+
+fn explicit(row: &Value) -> bool {
+    ["badges", "subtitleBadges"]
+        .into_iter()
+        .filter_map(|key| row[key].as_array())
+        .flatten()
+        .any(|badge| {
+            badge.pointer("/musicInlineBadgeRenderer/icon/iconType")
+                == Some(&json!("MUSIC_EXPLICIT_BADGE"))
+        })
+}
+
+fn wide_thumbnail(row: &Value) -> bool {
+    find(row, "thumbnails")
+        .and_then(Value::as_array)
+        .and_then(|thumbnails| thumbnails.last())
+        .is_some_and(|thumbnail| {
+            let width = thumbnail["width"].as_u64().unwrap_or(0);
+            let height = thumbnail["height"].as_u64().unwrap_or(0);
+            height > 0 && width * 10 > height * 13
+        })
 }
 
 fn item_rating(row: &Value) -> Option<Rating> {
@@ -1368,6 +1422,7 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
         mix: collection_action(row, "MIX"),
         playlist_id: playlist_id.map(str::to_owned),
         saved: subscribed.or_else(|| item_rating(row).map(|rating| rating == Rating::Like)),
+        explicit: explicit(row),
         editable: browse_id.strip_prefix("VL").filter(|id| !id.is_empty()).is_some_and(|id| {
             row.pointer("/menu/menuRenderer/items")
                 .and_then(Value::as_array)
@@ -2408,6 +2463,44 @@ mod tests {
     }
 
     #[test]
+    fn rows_keep_the_services_byline_explicit_badge_and_frame_shape() {
+        let row = json!({"musicResponsiveListItemRenderer":{
+            "thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[
+                {"url":"https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg","width":400,"height":225}
+            ]}}},
+            "badges":[{"musicInlineBadgeRenderer":{"icon":{"iconType":"MUSIC_EXPLICIT_BADGE"}}}],
+            "flexColumns":[
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"A song","navigationEndpoint":{"watchEndpoint":{"videoId":"abcdefghijk"}}}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+                    {"text":"Song"},{"text":" • "},
+                    {"text":"Artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}
+                ]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"28M plays"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{}}}
+            ]
+        }});
+        let Some(Item::Track(track)) = parse_item(&row) else {
+            panic!("expected a song");
+        };
+        assert_eq!(
+            track.details.byline.as_deref(),
+            Some("Song • Artist • 28M plays")
+        );
+        assert!(track.details.explicit);
+        assert!(track.details.wide_thumbnail);
+        let restored: Track =
+            serde_json::from_value(serde_json::to_value(&track).unwrap()).unwrap();
+        assert!(restored.details.byline.is_none() && !restored.details.explicit);
+
+        let mut mood = navigation("Chill", "ggMPOg1uX1JOQWZFeDByc2Jm");
+        mood["musicNavigationButtonRenderer"]["solid"] = json!({"leftStripeColor": 4288988671u64});
+        let Some(Item::Navigation(link)) = parse_item(&mood) else {
+            panic!("expected a mood link");
+        };
+        assert_eq!(link.accent, Some(0xa4c5ff));
+    }
+
+    #[test]
     fn collection_header_keeps_save_state_and_distinct_issued_actions() {
         for saved in [false, true] {
             let page = parse_page(&json!({
@@ -3020,6 +3113,8 @@ mod tests {
             "Episode summary"
         );
         track.details.clear_account_state();
+        // Bylines are display-only and rebuilt from the next response.
+        track.details.byline = None;
         assert_eq!(track, restored);
     }
 
