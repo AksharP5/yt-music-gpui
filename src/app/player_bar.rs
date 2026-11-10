@@ -69,7 +69,7 @@ impl Music {
             Err(error) => self.error = Some(error),
         }
         self.save();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn player_bar(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
@@ -365,7 +365,7 @@ impl Music {
                                     |view, _, cx| {
                                         view.library.repeat = view.library.repeat.next();
                                         view.save_preferences();
-                                        cx.notify();
+                                        view.notify_playback(cx);
                                     },
                                 )
                                 .when(repeat == Repeat::One, |d| {

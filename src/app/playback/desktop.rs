@@ -120,7 +120,6 @@ impl Music {
             }
             mpris::Event::Error(error) => self.error = Some(error),
         }
-        self.publish_desktop();
-        cx.notify();
+        self.notify_playback(cx);
     }
 }

@@ -34,7 +34,7 @@ impl Music {
                 self.next_session_refresh = None;
                 self.refresh_session(false, cx);
             }
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
 
@@ -98,7 +98,7 @@ impl Music {
                 "The playback details connection stopped. Restart the app to reconnect.".into(),
             );
         }
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn discard_pending_playback(&mut self) {
@@ -213,7 +213,7 @@ impl Music {
                         Some(AccountOperation::Refreshing { .. })
                     ) {
                         self.watch_pending = None;
-                        cx.notify();
+                        self.notify_playback(cx);
                         return;
                     }
                 }
@@ -241,7 +241,7 @@ impl Music {
                                     }
                                     self.notice = None;
                                     self.error = Some(error);
-                                    cx.notify();
+                                    self.notify_playback(cx);
                                     return;
                                 }
                             };
@@ -368,7 +368,7 @@ impl Music {
                         Some(AccountOperation::Refreshing { .. })
                     ) {
                         self.radio_loading = false;
-                        cx.notify();
+                        self.notify_playback(cx);
                         return;
                     }
                 }
@@ -388,7 +388,7 @@ impl Music {
                 }
             }
         }
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn replace_page_queue(&mut self, selected: usize, cx: &mut Context<Self>) {
@@ -431,7 +431,7 @@ impl Music {
         let session = self.account.as_ref().map(|account| &account.session);
         if let Err(error) = self.queue_source.load(session, false) {
             self.error = Some(error);
-            cx.notify();
+            self.notify_playback(cx);
         }
     }
 
@@ -468,7 +468,7 @@ impl Music {
                         Some(AccountOperation::Refreshing { .. })
                     ) {
                         self.notice = Some("Reconnecting account…".into());
-                        cx.notify();
+                        self.notify_playback(cx);
                         return;
                     }
                 }
@@ -479,7 +479,7 @@ impl Music {
                 self.error = Some(error);
             }
         }
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn play_recommendation(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -502,7 +502,7 @@ impl Music {
         self.library.queue = Default::default();
         self.media_pair = None;
         self.save();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn toggle_autoplay(&mut self, cx: &mut Context<Self>) {
@@ -516,7 +516,7 @@ impl Music {
             self.reset_radio();
         }
         self.save_preferences();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn play_item(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -605,7 +605,7 @@ impl Music {
                 self.next_session_refresh = None;
                 self.refresh_session(false, cx);
             }
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
         let playback = self
@@ -664,7 +664,7 @@ impl Music {
                     };
                 }
                 self.notice = Some("Loading more queued songs".into());
-                cx.notify();
+                self.notify_playback(cx);
                 return;
             }
             if self.library.queue.incomplete {
@@ -687,7 +687,7 @@ impl Music {
                     }
                     Err(error) => self.error = Some(error),
                 }
-                cx.notify();
+                self.notify_playback(cx);
                 return;
             }
             if autoplay {
@@ -695,7 +695,7 @@ impl Music {
                 self.extend_autoplay(cx);
                 self.resume_autoplay(cx);
             }
-            cx.notify();
+            self.notify_playback(cx);
         }
     }
 
@@ -754,7 +754,7 @@ impl Music {
         }
         self.prefetch_queue(cx);
         self.save();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn remove_queue_track(&mut self, index: usize, cx: &mut Context<Self>) {

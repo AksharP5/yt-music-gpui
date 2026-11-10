@@ -124,7 +124,7 @@ impl Music {
                                     Some(format!("Could not refresh the current song: {error}"))
                             }
                         }
-                        cx.notify();
+                        view.notify_playback(cx);
                     })
                     .is_err()
                 {
@@ -323,6 +323,7 @@ impl Music {
             drag_position: None,
             _subscriptions: vec![subscription, activation],
         };
+        view.notify_playback(cx);
         window.focus(&view.focus, cx);
         if startup != Startup::Restore || !auth::ACCOUNT_LOGIN_ENABLED {
             view.request(Query::Home, cx);

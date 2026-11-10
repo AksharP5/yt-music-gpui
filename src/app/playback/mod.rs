@@ -182,7 +182,7 @@ impl Music {
             resume.position = seconds.max(0.);
             resume.advance = None;
             self.position = resume.position;
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
         let Some(track_id) = self.active_id else {
@@ -209,7 +209,7 @@ impl Music {
                 Err(error) => self.error = Some(error.to_string()),
             }
         }
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn play_current(&mut self, cx: &mut Context<Self>) {
@@ -259,7 +259,7 @@ impl Music {
                 self.next_session_refresh = None;
                 self.refresh_session(false, cx);
             }
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
         self.queue_waiting = None;
@@ -294,7 +294,7 @@ impl Music {
             self.playback = Playback::Stopped;
             self.error =
                 Some("The audio player is unavailable. Restart the app to try again.".into());
-            cx.notify();
+            self.notify_playback(cx);
             return;
         };
         match player.play(
@@ -344,7 +344,7 @@ impl Music {
         self.extend_autoplay(cx);
         self.prefetch_queue(cx);
         self.save();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn play_chapter(
@@ -373,9 +373,14 @@ impl Music {
         self.play_current_at(seconds as f64, false, WatchMode::Details, cx);
     }
 
-    /// Lets the player resolve the natural successor ahead of time. Cheap to call on
-    /// every render: the player ignores an unchanged candidate.
-    pub(in crate::app) fn prepare_upcoming(&mut self) {
+    /// Keep player preparation and desktop controls current even when no frame is drawn.
+    pub(in crate::app) fn notify_playback(&mut self, cx: &mut Context<Self>) {
+        self.prepare_upcoming();
+        self.publish_desktop();
+        cx.notify();
+    }
+
+    fn prepare_upcoming(&mut self) {
         let queue = &self.library.queue;
         let next = (self.active_id.is_some() && self.playback != Playback::Stopped)
             .then(|| {
@@ -429,7 +434,7 @@ impl Music {
             }
         }
         self.save_preferences();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn set_video_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -455,7 +460,7 @@ impl Music {
         let pending_track = matches!(pending, Some(PlaybackIntent::Track(_)));
         if deferred_source {
             self.save();
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
         let alternative = self
@@ -488,7 +493,7 @@ impl Music {
             self.error = Some(error.to_string());
         }
         self.save();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn set_video_quality(
@@ -509,7 +514,7 @@ impl Music {
             }
         }
         self.save_preferences();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn toggle_video_fullscreen(
@@ -522,7 +527,7 @@ impl Music {
         }
         self.video_fullscreen = !window.is_fullscreen();
         window.toggle_fullscreen();
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn reload_stream(&mut self) -> anyhow::Result<()> {
@@ -602,7 +607,7 @@ impl Music {
                 self.next_session_refresh = None;
                 self.refresh_session(false, cx);
             }
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
 
@@ -616,12 +621,12 @@ impl Music {
                 paused: intent.playback.is_paused(),
                 retried: false,
             };
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
         if self.waiting_for_watch() {
             self.playback = self.playback.toggled();
-            cx.notify();
+            self.notify_playback(cx);
             return;
         }
         if self.active_id.is_some() && self.playback != Playback::Stopped {
@@ -634,7 +639,7 @@ impl Music {
                     Err(error) => self.error = Some(error.to_string()),
                 }
             }
-            cx.notify();
+            self.notify_playback(cx);
         } else {
             if self.library.queue.index.is_none() {
                 self.library.queue.select(0);
@@ -668,7 +673,7 @@ impl Music {
         self.discard_pending_playback();
         self.now_playing = None;
         self.video_click = None;
-        cx.notify();
+        self.notify_playback(cx);
     }
 
     pub(in crate::app) fn player_event(&mut self, event: PlayerEvent, cx: &mut Context<Self>) {
@@ -713,7 +718,7 @@ impl Music {
                 if track_id.is_some() && self.playback.retry() {
                     match self.reload_stream() {
                         Ok(()) => {
-                            cx.notify();
+                            self.notify_playback(cx);
                             return;
                         }
                         Err(error) => message = format!("{message} Retry failed: {error}"),
@@ -822,8 +827,7 @@ impl Music {
             _ => changed = false,
         }
         if changed {
-            self.publish_desktop();
-            cx.notify();
+            self.notify_playback(cx);
         }
         if let Some((track_id, seconds)) = seeked
             && let Some(service) = &self.mpris
@@ -839,7 +843,7 @@ impl Music {
         }
         self.library.volume = volume;
         self.player_command(|player| player.set_volume(volume));
-        cx.notify();
+        self.notify_playback(cx);
         true
     }
 }
