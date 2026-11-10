@@ -2204,11 +2204,13 @@ mod tests {
             std::process::id(),
             credentials.cookies.as_raw_fd()
         );
-        assert_ne!(file_identity(&copy), file_identity(&original));
+        let copied = file_identity(&copy);
+        assert_ne!(copied, file_identity(&original));
         assert!(fs::read_to_string(&copy).unwrap().contains("INVENTED"));
         drop(job);
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
-        assert!(!Path::new(&copy).exists());
+        // Parallel tests can reuse the closed descriptor number for an unrelated file.
+        assert_ne!(file_identity(&copy), copied);
         assert!(Path::new(&original).exists());
     }
 

@@ -982,7 +982,16 @@ mod tests {
         let owner = lock_file(&path).unwrap();
         assert!(lock_file(&path).is_err());
         drop(owner);
-        assert!(lock_file(&path).is_ok());
+        // Tests that spawn processes can fork while `owner` is open; the child keeps the
+        // lock's file description until it execs, so release can lag by a moment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while lock_file(&path).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released lock stayed held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let link = directory.path().join("linked.lock");
         std::os::unix::fs::symlink(&path, &link).unwrap();
