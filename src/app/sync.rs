@@ -400,7 +400,7 @@ pub(super) mod tests {
     use crate::{
         account::Mutation,
         app::Route,
-        catalog::{BrowseLink, Item, Page, Rating, Shelf, ShelfLayout, Track},
+        catalog::{BrowseLink, Collection, Item, Page, Rating, Shelf, ShelfLayout, Track},
     };
     use serde_json::json;
     use std::time::{Duration, Instant};
@@ -420,6 +420,41 @@ pub(super) mod tests {
         assert!(!needs_refresh(Some(now - Duration::from_secs(179)), now));
         assert!(needs_refresh(Some(now - Duration::from_secs(180)), now));
         assert!(needs_refresh(None, now));
+    }
+
+    #[test]
+    fn confirmed_collection_save_updates_header_without_changing_subscriptions() {
+        let mut page = crate::catalog::parse_page(
+            &json!({"header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"Album"},
+                "buttons":[{"toggleButtonRenderer":{
+                    "defaultIcon":{"iconType":"BOOKMARK_BORDER"},"isToggled":false
+                }}]
+            }},"contents":[]}),
+            "Album",
+        )
+        .unwrap();
+        let collection = Collection {
+            id: "MPREalbum".into(),
+            title: "Album".into(),
+            subtitle: String::new(),
+            thumbnail: None,
+            details: Default::default(),
+        };
+        let route = Route::Browse(BrowseLink::new(&collection.id, &collection.title));
+        for save in [true, false] {
+            patch_page(
+                &mut page,
+                &route,
+                &Mutation::CollectionLibrary {
+                    collection: collection.clone(),
+                    save,
+                },
+            );
+            let header = page.header.as_ref().unwrap();
+            assert_eq!(header.collection.saved, Some(save));
+            assert_eq!(header.subscribed, None);
+        }
     }
 
     #[test]
