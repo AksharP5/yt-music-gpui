@@ -14,9 +14,12 @@ This is an independent client using YouTube Music's unofficial API. Account supp
 
 ## Build and install
 
-Requires Rust, a C compiler and pkg-config. On Arch, runtime dependencies are `libxcb`, `libxkbcommon`, `libxkbcommon-x11`, `vulkan-driver`, `mpv`, `yt-dlp`, `libglvnd`, `wayland`, `libx11` and `libxext`.
+Requires Rust, a C compiler and pkg-config. On Arch:
 
 ```sh
+sudo pacman -S --needed git rust base-devel mpv yt-dlp libglvnd wayland libx11 libxext libxcb libxkbcommon libxkbcommon-x11 fontconfig freetype2 vulkan-driver
+git clone https://github.com/AksharP5/yt-music-gpui
+cd yt-music-gpui
 bin/build
 bin/install
 ```
