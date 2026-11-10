@@ -718,6 +718,7 @@ impl Music {
         let theme = self.theme;
         let arrow = move |id: (&'static str, usize), name: &'static str, enabled: bool| {
             button(id, name, theme)
+                .tab_stop(enabled)
                 .size(px(36.))
                 .border_1()
                 .border_color(gpui::white().opacity(0.2))
@@ -771,7 +772,8 @@ impl Music {
                                 arrow(
                                     ("related-next", index),
                                     "forward",
-                                    scroll.offset().x > -scroll.max_offset().x + px(1.),
+                                    -f32::from(scroll.offset().x) + side + 1.
+                                        < count as f32 * stride - gap,
                                 )
                                 .on_click(cx.listener(
                                     move |_, _, _, cx| {

@@ -99,6 +99,8 @@ pub struct Music {
     track_state: track_state::Worker,
     track_state_id: Option<u64>,
     focus: FocusHandle,
+    sidebar_focus: VirtualListFocus,
+    queue_focus: VirtualListFocus,
     search: Entity<SearchBox>,
     route: Route,
     page: Page,

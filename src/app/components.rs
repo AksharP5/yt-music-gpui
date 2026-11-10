@@ -15,6 +15,118 @@ pub(in crate::app) trait KeyboardControl:
 
 impl<T: StatefulInteractiveElement + Styled> KeyboardControl for T {}
 
+/// Keep handles for rendered controls and the next keyboard target. Tab creates its handle before
+/// scrolling it into the virtualized tree, without constructing offscreen rows.
+#[derive(Default)]
+pub(in crate::app) struct VirtualListFocus {
+    handles: HashMap<usize, FocusHandle>,
+}
+
+impl VirtualListFocus {
+    pub(in crate::app) fn handle(&mut self, index: usize, cx: &App) -> FocusHandle {
+        self.handles
+            .entry(index)
+            .or_insert_with(|| cx.focus_handle().tab_index(0).tab_stop(true))
+            .clone()
+    }
+
+    pub(in crate::app) fn retain(
+        &mut self,
+        rows: std::ops::Range<usize>,
+        window: &Window,
+        row_for: impl Fn(usize) -> usize,
+    ) {
+        // UniformList also requests row zero in its measurement pass. Only prune
+        // against a viewport range, keeping a newly focused offscreen target.
+        if rows == (0..1) {
+            return;
+        }
+        self.handles
+            .retain(|index, handle| rows.contains(&row_for(*index)) || handle.is_focused(window));
+    }
+
+    pub(in crate::app) fn focused(&self, window: &Window) -> Option<usize> {
+        self.handles
+            .iter()
+            .find_map(|(index, handle)| handle.is_focused(window).then_some(*index))
+    }
+
+    fn advance(&mut self, reverse: bool, count: usize, window: &mut Window, cx: &mut App) -> bool {
+        let Some(current) = self.focused(window) else {
+            return false;
+        };
+        if current >= count {
+            return false;
+        }
+        let next = if reverse {
+            current.checked_sub(1)
+        } else {
+            current.checked_add(1).filter(|next| *next < count)
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        window.focus(&self.handle(next, cx), cx);
+        true
+    }
+}
+
+impl Music {
+    pub(super) fn move_keyboard_focus(
+        &mut self,
+        reverse: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sidebar_count = if self.account.is_some() {
+            self.sidebar_playlists.len()
+        } else {
+            self.library.saved.len()
+        };
+        let queue_count = (self.library.queue.tracks.len() + self.autoplay_tracks.len()) * 2;
+        let advanced = self
+            .sidebar_focus
+            .advance(reverse, sidebar_count, window, cx)
+            || self.queue_focus.advance(reverse, queue_count, window, cx);
+        if !advanced {
+            if reverse {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+        }
+        if let Some(mut index) = self
+            .sidebar_focus
+            .focused(window)
+            .filter(|index| *index < sidebar_count)
+        {
+            if !advanced {
+                index = if reverse { sidebar_count - 1 } else { 0 };
+                window.focus(&self.sidebar_focus.handle(index, cx), cx);
+            }
+            self.sidebar_scroll
+                .scroll_to_item(index, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+        if let Some(mut index) = self
+            .queue_focus
+            .focused(window)
+            .filter(|index| *index < queue_count)
+        {
+            if !advanced {
+                index = if reverse { queue_count - 1 } else { 0 };
+                window.focus(&self.queue_focus.handle(index, cx), cx);
+            }
+            let row = index / 2;
+            let row = row + usize::from(row >= self.library.queue.tracks.len());
+            self.player_page
+                .queue_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::app) enum ArtworkShape {
     Square,

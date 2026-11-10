@@ -183,6 +183,7 @@ impl Music {
                             .child(
                                 button(("shelf-previous", index), "back", self.theme)
                                     .size(px(36.))
+                                    .tab_stop(scroll.offset().x < px(-1.))
                                     .border_1()
                                     .border_color(self.theme.border)
                                     .opacity(if scroll.offset().x < px(-1.) {
@@ -202,6 +203,10 @@ impl Music {
                             .child(
                                 button(("shelf-next", index), "forward", self.theme)
                                     .size(px(36.))
+                                    .tab_stop(
+                                        -f32::from(scroll.offset().x) + available + 1.
+                                            < count as f32 * stride - gap,
+                                    )
                                     .border_1()
                                     .border_color(self.theme.border)
                                     .on_click(cx.listener(move |_, _, _, cx| {

@@ -91,11 +91,7 @@ impl Music {
             return;
         }
         if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
-            if modifiers.shift {
-                window.focus_prev(cx);
-            } else {
-                window.focus_next(cx);
-            }
+            self.move_keyboard_focus(modifiers.shift, window, cx);
             cx.stop_propagation();
             return;
         }

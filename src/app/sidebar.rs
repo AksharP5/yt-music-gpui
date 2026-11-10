@@ -199,7 +199,7 @@ impl Music {
             uniform_list(
                 "sidebar-playlists",
                 playlists.len(),
-                cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
+                cx.processor(|view, range: std::ops::Range<usize>, window, cx| {
                     if view.account.is_some()
                         && range.end.saturating_add(5) >= view.sidebar_playlists.len()
                         && !view.catalog_requests.is_loading(CatalogTarget::Sidebar)
@@ -208,6 +208,8 @@ impl Music {
                     {
                         view.request(Query::SidebarMore(token), cx);
                     }
+                    view.sidebar_focus
+                        .retain(range.clone(), window, |index| index);
                     let playlists = if view.account.is_some() {
                         &view.sidebar_playlists
                     } else {
@@ -220,6 +222,7 @@ impl Music {
                             div()
                                 .id(("sidebar-playlist", index))
                                 .keyboard_control(view.theme)
+                                .track_focus(&view.sidebar_focus.handle(index, cx))
                                 .h(px(56.))
                                 .px(px(16.))
                                 .rounded(px(8.))

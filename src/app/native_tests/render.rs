@@ -2,8 +2,8 @@ use crate::app::{CatalogTarget, Music, Playback, Startup, player_page::PlayerTab
 use crate::player::PlayerEvent;
 use anyhow::{Result, ensure};
 use gpui::{
-    AppContext, AsyncApp, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
-    point, px, size,
+    AppContext, AsyncApp, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, point, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::AtomicBool;
@@ -27,7 +27,297 @@ async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp
     received.recv().await.unwrap();
 }
 
-fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
+async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+    })
+    .unwrap();
+    wait_for_presented_frame(window, cx).await;
+}
+
+fn assert_row_visible(scroll: &gpui::UniformListScrollHandle, row: usize, count: usize) {
+    let state = scroll.0.borrow();
+    let size = state.last_item_size.unwrap();
+    let height = size.contents.height / count as f32;
+    let top = -state.base_handle.offset().y;
+    assert!(
+        height * row as f32 >= top - px(1.),
+        "Focused row {row} is clipped above"
+    );
+    assert!(
+        height * (row + 1) as f32 <= top + size.item.height + px(1.),
+        "Focused row {row} is clipped below"
+    );
+}
+
+async fn keyboard_survives_replacement_and_scrolls_lists(
+    window: WindowHandle<Music>,
+    cx: &mut AsyncApp,
+) {
+    use crate::app::{CatalogResult, Route, sync::tests::page};
+    use crate::catalog::ShelfLayout;
+    window
+        .update(cx, |music, window, cx| {
+            music.player_open = false;
+            music.route = Route::Home;
+            music.page = page(1, false);
+            music.page.shelves[0].layout = ShelfLayout::Cards;
+            music.page.shelves[0].title = "Removed Home shelf".into();
+            music.rebuild_rows();
+            music
+                .detail_list
+                .state
+                .scroll_to(gpui::ListOffset::default());
+            music.shelf_scroll.clear();
+            music.error = None;
+            music.notice = None;
+            music.player = Some(
+                crate::player::Player::new(crate::player::PlayerOptions {
+                    volume: 0.,
+                    audio_output: Some("null".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            window.focus(&music.focus, cx);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    // At this narrow width: four header tab stops, three primary navigation
+    // controls, then the card. Both carousel arrows are disabled for one card.
+    for _ in 0..8 {
+        key(window, cx, "tab").await;
+    }
+    window
+        .update(cx, |music, window, _| {
+            assert!(!music.focus.is_focused(window));
+            capture(window, "focused-home-card");
+        })
+        .unwrap();
+    key(window, cx, "ctrl-r").await;
+    window
+        .update(cx, |music, _, cx| {
+            let job = std::iter::from_fn(|| music.catalog_requests.pending.try_recv().ok())
+                .find(|job| job.query.target() == CatalogTarget::Page)
+                .unwrap();
+            music.catalog_result(
+                CatalogResult {
+                    id: job.id,
+                    account_revision: job.account_revision,
+                    append: false,
+                    revalidate: true,
+                    result: Ok(page(0, false)),
+                    session_rejected: false,
+                    target: CatalogTarget::Page,
+                },
+                cx,
+            );
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, window, _| {
+            assert!(
+                music.focus.is_focused(window),
+                "Removing a focused card must restore root shortcuts"
+            );
+        })
+        .unwrap();
+    key(window, cx, "space").await;
+    window
+        .update(cx, |music, _, _| {
+            assert!(
+                music.playback.is_paused(),
+                "Space must pause after the focused card disappears"
+            )
+        })
+        .unwrap();
+    key(window, cx, "tab").await;
+    window
+        .update(cx, |music, window, _| {
+            assert!(
+                !music.focus.is_focused(window),
+                "Tab must still traverse after replacement"
+            )
+        })
+        .unwrap();
+    key(window, cx, "/").await;
+    window
+        .update(cx, |music, window, cx| {
+            assert!(
+                music.search.focus_handle(cx).is_focused(window),
+                "Search must survive replacement"
+            );
+            window.focus(&music.focus, cx);
+            window.resize(size(px(1280.), px(700.)));
+            music.library.queue.replace(page(30, false).tracks(), 0);
+            music.autoplay_tracks = page(3, false).tracks().into();
+            music.player_open = true;
+            music.select_player_tab(PlayerTab::UpNext, cx);
+            music
+                .player_page
+                .queue_scroll
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    // Enter by Tab, then pass through every row and menu, including the unrendered
+    // queue tail and the autoplay separator. Shift Tab takes the same path back.
+    for _ in 0..30 {
+        if window
+            .update(cx, |music, window, _| {
+                music.queue_focus.focused(window) == Some(0)
+            })
+            .unwrap()
+        {
+            break;
+        }
+        key(window, cx, "tab").await;
+    }
+    for slot in 0..66 {
+        window
+            .update(cx, |music, window, _| {
+                assert_eq!(music.queue_focus.focused(window), Some(slot));
+                let row = slot / 2;
+                assert_row_visible(
+                    &music.player_page.queue_scroll,
+                    row + usize::from(row >= 30),
+                    34,
+                );
+            })
+            .unwrap();
+        if slot < 65 {
+            key(window, cx, "tab").await;
+        }
+    }
+    window
+        .update(cx, |_, window, _| {
+            capture(window, "queue-keyboard-tail");
+        })
+        .unwrap();
+    key(window, cx, "tab").await;
+    window
+        .update(cx, |music, window, _| {
+            assert_eq!(
+                music.queue_focus.focused(window),
+                None,
+                "The final queue menu exits to the player bar"
+            )
+        })
+        .unwrap();
+    window
+        .update(cx, |music, _, cx| {
+            music
+                .player_page
+                .queue_scroll
+                .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    key(window, cx, "shift-tab").await;
+    for slot in (0..66).rev() {
+        window
+            .update(cx, |music, window, _| {
+                assert_eq!(music.queue_focus.focused(window), Some(slot));
+                let row = slot / 2;
+                assert_row_visible(
+                    &music.player_page.queue_scroll,
+                    row + usize::from(row >= 30),
+                    34,
+                );
+            })
+            .unwrap();
+        if slot > 0 {
+            key(window, cx, "shift-tab").await;
+        }
+    }
+    // Scrolling a focused virtual row away must recover the same root shortcuts.
+    window
+        .update(cx, |music, _, cx| {
+            music
+                .player_page
+                .queue_scroll
+                .scroll_to_item_strict(29, gpui::ScrollStrategy::Top);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window.update(cx, |music, window, cx| {
+        assert!(music.focus.is_focused(window), "Virtualizing the focused row must restore root focus");
+        music.player_open = false;
+        music.library.saved = (0..30).map(|index| serde_json::from_value(serde_json::json!({
+            "id": format!("VLsynthetic-{index}"), "title": format!("Playlist {index}"), "subtitle": "Synthetic playlist"
+        })).unwrap()).collect();
+        window.resize(size(px(1280.), px(700.)));
+        window.focus(&music.focus, cx);
+        cx.notify();
+    }).unwrap();
+    wait_for_presented_frame(window, cx).await;
+    for _ in 0..30 {
+        if window
+            .update(cx, |music, window, _| {
+                music.sidebar_focus.focused(window) == Some(0)
+            })
+            .unwrap()
+        {
+            break;
+        }
+        key(window, cx, "tab").await;
+    }
+    for index in 0..30 {
+        window
+            .update(cx, |music, window, _| {
+                assert_eq!(music.sidebar_focus.focused(window), Some(index));
+                assert_row_visible(&music.sidebar_scroll, index, 30);
+            })
+            .unwrap();
+        if index < 29 {
+            key(window, cx, "tab").await;
+        }
+    }
+    window
+        .update(cx, |_, window, _| {
+            capture(window, "sidebar-keyboard-tail");
+        })
+        .unwrap();
+    key(window, cx, "tab").await;
+    window
+        .update(cx, |music, window, cx| {
+            assert_eq!(music.sidebar_focus.focused(window), None);
+            music
+                .sidebar_scroll
+                .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    key(window, cx, "shift-tab").await;
+    window
+        .update(cx, |music, window, _| {
+            assert_eq!(
+                music.sidebar_focus.focused(window),
+                Some(29),
+                "Shift Tab enters the final item even when it is not rendered"
+            );
+            assert_row_visible(&music.sidebar_scroll, 29, 30);
+        })
+        .unwrap();
+    for index in (0..29).rev() {
+        key(window, cx, "shift-tab").await;
+        window
+            .update(cx, |music, window, _| {
+                assert_eq!(music.sidebar_focus.focused(window), Some(index));
+                assert_row_visible(&music.sidebar_scroll, index, 30);
+            })
+            .unwrap();
+    }
+    println!("KEYBOARD_RECOVERY card=passed virtual_row=passed queue_slots=66 sidebar_rows=30");
+}
+
+pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let id = match HasWindowHandle::window_handle(window).unwrap().as_raw() {
         RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
         RawWindowHandle::Xlib(handle) => handle.window,
@@ -112,6 +402,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                             title: Some("Music render isolation test".into()),
                             ..Default::default()
                         }),
+                        kind: WindowKind::PopUp,
                         focus: false,
                         ..Default::default()
                     },
@@ -454,6 +745,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                         capture(window, "carousel-scrolled");
                     })
                     .unwrap();
+                keyboard_survives_replacement_and_scrolls_lists(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })

@@ -124,6 +124,11 @@ impl Music {
                                 } else {
                                     14.
                                 };
+                                let queued = view.library.queue.tracks.len();
+                                view.queue_focus.retain(range.clone(), window, |index| {
+                                    let row = index / 2;
+                                    row + usize::from(row >= queued)
+                                });
                                 range
                                     .map(|row| match view.up_next_row(row) {
                                         UpNextRow::Queued(row) => view.queue_row(row, text, cx),
@@ -261,9 +266,16 @@ impl Music {
                     }),
                 )
         });
-        let menu = self.row_menu(("queue-menu", index), cx, move |view, window, cx| {
-            view.open_queue_menu(index, window, cx);
-        });
+        let row_focus = self.queue_focus.handle(row * 2, cx);
+        let menu_focus = self.queue_focus.handle(row * 2 + 1, cx);
+        let menu = self.row_menu(
+            ("queue-menu", index),
+            menu_focus,
+            cx,
+            move |view, window, cx| {
+                view.open_queue_menu(index, window, cx);
+            },
+        );
         self.track_row(
             ("queue-row", index),
             &track,
@@ -273,6 +285,7 @@ impl Music {
             handle,
             menu,
         )
+        .track_focus(&row_focus)
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |view, _, window, cx| {
@@ -315,10 +328,16 @@ impl Music {
         let Some(track) = self.autoplay_tracks.get(index).cloned() else {
             return div().h(px(ROW_HEIGHT)).into_any_element();
         };
+        let row = self.library.queue.tracks.len() + index;
+        let row_focus = self.queue_focus.handle(row * 2, cx);
+        let menu_focus = self.queue_focus.handle(row * 2 + 1, cx);
         let menu_track = track.clone();
-        let menu = self.row_menu(("autoplay-menu", index), cx, move |view, window, cx| {
-            view.open_track_menu(menu_track.clone(), None, window, cx)
-        });
+        let menu = self.row_menu(
+            ("autoplay-menu", index),
+            menu_focus,
+            cx,
+            move |view, window, cx| view.open_track_menu(menu_track.clone(), None, window, cx),
+        );
         let context_track = track.clone();
         self.track_row(
             ("autoplay-row", index),
@@ -329,6 +348,7 @@ impl Music {
             None,
             menu,
         )
+        .track_focus(&row_focus)
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |view, _, window, cx| {
@@ -469,11 +489,13 @@ impl Music {
     fn row_menu(
         &self,
         id: (&'static str, usize),
+        focus: FocusHandle,
         cx: &mut Context<Self>,
         open: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let theme = self.theme;
         self.menu_button(id, cx, open)
+            .track_focus(&focus)
             .size(px(36.))
             .opacity(0.)
             .group_hover("up-next-row", |menu| menu.opacity(1.))

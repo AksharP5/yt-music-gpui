@@ -226,6 +226,7 @@ impl Music {
                 SearchBoxEvent::Blur => window.focus(&view.focus, cx),
             });
         let activation = cx.observe_window_activation(window, Self::window_activated);
+        let focus_lost = cx.on_focus_lost(window, Self::restore_keyboard_focus);
         let music = cx.entity();
         let content_view = cx.new(|cx| MusicContent::new(music.clone(), cx));
         let player_bar = cx.new(|_| PlayerBar::new(music.downgrade()));
@@ -248,6 +249,8 @@ impl Music {
             track_state,
             track_state_id: None,
             focus: cx.focus_handle(),
+            sidebar_focus: VirtualListFocus::default(),
+            queue_focus: VirtualListFocus::default(),
             search,
             route: Route::Home,
             page: Page {
@@ -324,7 +327,7 @@ impl Music {
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
             drag_position: None,
-            _subscriptions: vec![subscription, activation],
+            _subscriptions: vec![subscription, activation, focus_lost],
         };
         view.notify_playback(cx);
         window.focus(&view.focus, cx);

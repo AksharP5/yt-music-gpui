@@ -36,6 +36,17 @@ impl Render for MusicContent {
 }
 
 impl Music {
+    pub(super) fn restore_keyboard_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = if self.settings_menu.is_some() {
+            &self.settings_focus
+        } else if self.overlay.is_some() {
+            &self.overlay_focus
+        } else {
+            &self.focus
+        };
+        window.focus(focus, cx);
+    }
+
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let player_page = self.player_open && self.library.queue.current().is_some();
         let fullscreen = player_page && self.library.video && window.is_fullscreen();
