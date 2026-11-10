@@ -138,6 +138,7 @@ fn issued_queue_adoption_preserves_manual_edits_and_the_selected_occurrence() {
         source: None,
         lyrics: None,
         related: None,
+        comments: None,
         alternatives: None,
         continuation: None,
     };

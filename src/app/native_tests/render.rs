@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+pub(in crate::app) async fn wait_for_presented_frame(
+    window: WindowHandle<Music>,
+    cx: &mut AsyncApp,
+) {
     let (sender, received) = async_channel::bounded(1);
     cx.update_window(window.into(), |_, window, _| {
         // GPUI invokes next-frame callbacks before drawing. The second callback
@@ -864,7 +867,7 @@ fn prepare_x11_capture(id: u64) -> (u32, u32) {
     }
 }
 
-pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
+pub(in crate::app) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let id = match HasWindowHandle::window_handle(window).unwrap().as_raw() {
         RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
         RawWindowHandle::Xlib(handle) => handle.window,
@@ -1733,6 +1736,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 source: None,
                 lyrics: None,
                 related: None,
+                comments: None,
                 alternatives: None,
                 continuation: None,
                 source_target: None,
@@ -2123,9 +2127,14 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     after_wheel, before_wheel,
                     "A wheel tick outside a scroller must not redraw playback"
                 );
-                for tab in [PlayerTab::Lyrics, PlayerTab::Related] {
+                for tab in [PlayerTab::Lyrics, PlayerTab::Comments, PlayerTab::Related] {
                     window
-                        .update(cx, |music, _, cx| music.select_player_tab(tab, cx))
+                        .update(cx, |music, _, cx| {
+                            if tab == PlayerTab::Comments {
+                                music.seed_comments_for_render();
+                            }
+                            music.select_player_tab(tab, cx);
+                        })
                         .unwrap();
                     wait_for_presented_frame(window, cx).await;
                     let baseline = window

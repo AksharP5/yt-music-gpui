@@ -1,23 +1,27 @@
-//! The player page: artwork or video beside the Up next, Lyrics and Related tabs.
+//! The player page: artwork or video beside the Up next, Lyrics, Comments and Related tabs.
 
 use super::*;
 use pages::shelves::visible_cards;
 use queue_panel::Reorder;
 
+mod comments;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum PlayerTab {
     UpNext,
     Lyrics,
+    Comments,
     Related,
 }
 
 impl PlayerTab {
-    const ALL: [Self; 3] = [Self::UpNext, Self::Lyrics, Self::Related];
+    const ALL: [Self; 4] = [Self::UpNext, Self::Lyrics, Self::Comments, Self::Related];
 
     fn label(self) -> &'static str {
         match self {
             Self::UpNext => "UP NEXT",
             Self::Lyrics => "LYRICS",
+            Self::Comments => "COMMENTS",
             Self::Related => "RELATED",
         }
     }
@@ -38,6 +42,7 @@ pub(in crate::app) struct PlayerPage {
     latest_request: u64,
     lyrics: Option<Details>,
     related: Option<Details>,
+    comments: comments::State,
     related_list: ListState,
     related_scroll: Vec<ScrollHandle>,
     /// Focus handles for each shelf's items, so keyboard focus can scroll its carousel.
@@ -81,6 +86,7 @@ impl PlayerPage {
             latest_request: 0,
             lyrics: None,
             related: None,
+            comments: comments::State::new(),
             related_list: ListState::new(0, ListAlignment::Top, px(400.)),
             related_scroll: Vec::new(),
             related_focus: Vec::new(),
@@ -120,9 +126,10 @@ impl PlayerPage {
         Some(event.session_rejected)
     }
 
-    /// Drop Lyrics and Related loaded or loading for an account that is no longer current.
+    /// Drop Lyrics, Comments and Related loaded or loading for an account that is no longer current.
     pub(in crate::app) fn reset_account(&mut self) {
         self.worker.cancel();
+        self.comments = comments::State::new();
         self.lyrics = None;
         self.related = None;
         self.related_scroll.clear();
@@ -132,7 +139,7 @@ impl PlayerPage {
 
     fn details(&mut self, tab: PlayerTab) -> Option<&mut Option<Details>> {
         match tab {
-            PlayerTab::UpNext => None,
+            PlayerTab::UpNext | PlayerTab::Comments => None,
             PlayerTab::Lyrics => Some(&mut self.lyrics),
             PlayerTab::Related => Some(&mut self.related),
         }
@@ -171,6 +178,10 @@ const TOGGLE_HEIGHT: f32 = 56.;
 impl Music {
     pub(in crate::app) fn select_player_tab(&mut self, tab: PlayerTab, cx: &mut Context<Self>) {
         if self.player_page.tab != tab {
+            if self.player_page.tab == PlayerTab::Comments && self.player_page.comments.cancel() {
+                self.player_page.worker.cancel();
+            }
+            self.player_page.comments.close_menu();
             self.player_page.tab = tab;
             cx.notify();
         }
@@ -210,7 +221,7 @@ impl Music {
     fn tab_source(&self, tab: PlayerTab) -> Option<String> {
         let watch = self.current_watch()?;
         match tab {
-            PlayerTab::UpNext => None,
+            PlayerTab::UpNext | PlayerTab::Comments => None,
             PlayerTab::Lyrics => watch.lyrics.clone(),
             PlayerTab::Related => watch.related.clone(),
         }
@@ -219,6 +230,10 @@ impl Music {
     /// Request the visible tab's details when the song changes or a request was superseded.
     fn load_visible_tab(&mut self) {
         let tab = self.player_page.tab;
+        if tab == PlayerTab::Comments {
+            self.load_comments();
+            return;
+        }
         let Some(id) = self.tab_source(tab) else {
             return;
         };
@@ -235,7 +250,7 @@ impl Music {
         let query = match tab {
             PlayerTab::Lyrics => TextQuery::Lyrics(id.clone()),
             PlayerTab::Related => TextQuery::Related(id.clone()),
-            PlayerTab::UpNext => return,
+            PlayerTab::UpNext | PlayerTab::Comments => return,
         };
         let details = match self.player_page.worker.load(query, session.clone()) {
             Ok(request) => {
@@ -260,6 +275,10 @@ impl Music {
     }
 
     fn player_details_loaded(&mut self, event: song_text::Event, cx: &mut Context<Self>) {
+        if self.player_page.comments.pending_id() == Some(event.id) {
+            self.comments_loaded(event, cx);
+            return;
+        }
         let session = self.account.as_ref().map(|account| &account.session);
         let related =
             (self.player_page.related.as_ref()).is_some_and(|slot| slot.request == event.id);
@@ -385,6 +404,7 @@ impl Music {
         let body = match self.player_page.tab {
             PlayerTab::UpNext => self.up_next(cx),
             PlayerTab::Lyrics => self.lyrics_tab(),
+            PlayerTab::Comments => self.comments_tab(cx),
             PlayerTab::Related => self.related_tab(width, side, cx),
         };
         let side_panel = div()
@@ -510,6 +530,7 @@ impl Music {
         let watch = self.current_watch();
         let available = |tab: PlayerTab| match tab {
             PlayerTab::UpNext => true,
+            PlayerTab::Comments => watch.is_some_and(|watch| watch.comments.is_some()),
             PlayerTab::Lyrics => watch.is_some_and(|watch| watch.lyrics.is_some()),
             PlayerTab::Related => watch.is_some_and(|watch| watch.related.is_some()),
         };

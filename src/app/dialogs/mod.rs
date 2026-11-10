@@ -297,6 +297,7 @@ impl Music {
             TextQuery::Lyrics(_) => "Lyrics",
             TextQuery::Credits(_) => "Credits",
             TextQuery::Related(_) => "Related",
+            TextQuery::Comments(_) => "Comments",
         };
         let title = format!("{label} · {title}");
         let session = self.account.as_ref().map(|account| account.session.clone());
@@ -947,7 +948,7 @@ impl Music {
                 Some(Ok(SongText::Lyrics(lyrics))) => {
                     body = body.child(div().text_size(px(17.)).child(lyrics.text.clone()))
                 }
-                Some(Ok(SongText::Related(_))) => {}
+                Some(Ok(SongText::Related(_) | SongText::Comments(_))) => {}
                 Some(Ok(SongText::Credits(credits))) => {
                     for section in credits {
                         body = body.child(

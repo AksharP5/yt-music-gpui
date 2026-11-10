@@ -1,0 +1,184 @@
+{
+  "onResponseReceivedEndpoints": [
+    {
+      "reloadContinuationItemsCommand": {
+        "targetId": "video-id",
+        "continuationItems": [
+          {
+            "commentsHeaderRenderer": {
+              "countText": {
+                "runs": [
+                  {
+                    "text": "1,234"
+                  },
+                  {
+                    "text": " Comments"
+                  }
+                ]
+              },
+              "sortMenu": {
+                "sortFilterSubMenuRenderer": {
+                  "subMenuItems": [
+                    {
+                      "title": "Top",
+                      "selected": true,
+                      "continuation": {
+                        "reloadContinuationData": {
+                          "continuation": "top-sort"
+                        }
+                      }
+                    },
+                    {
+                      "title": "Newest",
+                      "selected": false,
+                      "continuation": {
+                        "reloadContinuationData": {
+                          "continuation": "new-sort"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "reloadContinuationItemsCommand": {
+        "targetId": "comments-section",
+        "continuationItems": [
+          {
+            "commentThreadRenderer": {
+              "commentViewModel": {
+                "commentViewModel": {
+                  "commentKey": "top-comment-key",
+                  "commentId": "top-comment",
+                  "pinnedText": "Pinned by @artist"
+                }
+              },
+              "replies": {
+                "commentRepliesRenderer": {
+                  "viewReplies": {
+                    "buttonRenderer": {
+                      "text": {
+                        "runs": [
+                          {
+                            "text": "2 replies"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "subThreads": [
+                    {
+                      "continuationItemRenderer": {
+                        "trigger": "CONTINUATION_TRIGGER_ON_ITEM_SHOWN",
+                        "continuationEndpoint": {
+                          "continuationCommand": {
+                            "token": "replies-page"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "commentThreadRenderer": {
+              "commentViewModel": {
+                "commentViewModel": {
+                  "commentKey": "second-comment-key",
+                  "commentId": "second-comment"
+                }
+              }
+            }
+          },
+          {
+            "continuationItemRenderer": {
+              "trigger": "CONTINUATION_TRIGGER_ON_ITEM_SHOWN",
+              "continuationEndpoint": {
+                "continuationCommand": {
+                  "token": "comments-page-2"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "frameworkUpdates": {
+    "entityBatchUpdate": {
+      "mutations": [
+        {
+          "entityKey": "top-comment-key",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "commentEntityPayload": {
+              "key": "top-comment-key",
+              "properties": {
+                "commentId": "top-comment",
+                "content": {
+                  "content": "A song for everyone.\nThanks for listening! Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. Recorded live with friends. "
+                },
+                "publishedTime": "2 days ago (edited)",
+                "toolbarStateKey": "top-comment-state"
+              },
+              "author": {
+                "displayName": "@artist",
+                "avatarThumbnailUrl": "https://yt3.googleusercontent.com/synthetic=s88-c-k-c0x00ffffff-no-rj",
+                "isCreator": true,
+                "isVerified": true
+              },
+              "toolbar": {
+                "likeCountNotliked": "1.2K",
+                "likeCountLiked": "1.2K",
+                "replyCount": "2"
+              }
+            }
+          }
+        },
+        {
+          "entityKey": "second-comment-key",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "commentEntityPayload": {
+              "key": "second-comment-key",
+              "properties": {
+                "commentId": "second-comment",
+                "content": {
+                  "content": "Still listening in 2026."
+                },
+                "publishedTime": "2 days ago (edited)",
+                "toolbarStateKey": "second-comment-state"
+              },
+              "author": {
+                "displayName": "@listener",
+                "avatarThumbnailUrl": "https://yt3.googleusercontent.com/synthetic=s88-c-k-c0x00ffffff-no-rj",
+                "isCreator": false,
+                "isVerified": false
+              },
+              "toolbar": {
+                "likeCountNotliked": "1.2K",
+                "likeCountLiked": "1.2K",
+                "replyCount": "2"
+              }
+            }
+          }
+        },
+        {
+          "entityKey": "top-comment-state",
+          "payload": {
+            "engagementToolbarStateEntityPayload": {
+              "likeState": "TOOLBAR_LIKE_STATE_LIKED"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
