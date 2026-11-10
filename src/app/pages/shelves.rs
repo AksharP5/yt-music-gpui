@@ -19,7 +19,7 @@ impl Music {
             .gap(px(8.))
             .text_size(px(15.))
             .cursor_pointer()
-            .hover(|d| d.text_color(self.theme.accent))
+            .hover(|d| d.text_color(self.theme.accent).bg(self.theme.raised))
             .child(div().flex_1().child(link.title.clone()))
             .child(icon("forward", 17., self.theme.muted))
             .on_click(cx.listener(move |view, _, window, cx| {

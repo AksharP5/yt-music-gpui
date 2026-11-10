@@ -44,10 +44,7 @@ impl Music {
                                     selected,
                                     self.theme,
                                 )
-                                .when(!selected, |chip| {
-                                    chip.bg(gpui::white().opacity(0.1))
-                                        .hover(|style| style.bg(gpui::white().opacity(0.2)))
-                                })
+                                .when(!selected, |chip| chip.bg(gpui::white().opacity(0.1)))
                                 .on_click(cx.listener(
                                     move |view, _, _, cx| {
                                         view.navigate(Route::Browse(target.clone()), cx)

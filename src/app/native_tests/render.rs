@@ -974,6 +974,62 @@ async fn scrolled_artist_survives_tab(window: WindowHandle<Music>, cx: &mut Asyn
     wait_for_presented_frame(window, cx).await;
 }
 
+async fn home_chips_and_browse_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    let chip = |label, selected, params| {
+        serde_json::json!({"chipCloudChipRenderer": {
+            "text":{"simpleText":label}, "isSelected":selected,
+            "navigationEndpoint":{"browseEndpoint":{"browseId":"FEmusic_home","params":params}},
+            "onDeselectedCommand":{"browseEndpoint":{"browseId":"FEmusic_home","params":"all-filter"}}
+        }})
+    };
+    let response = serde_json::json!({"contents":{"singleColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{
+        "sectionListRenderer":{"contents":[],"header":{"chipCloudRenderer":{"chips":[
+            chip("Relax", true, "relax-filter"), chip("Focus", false, "focus-filter")
+        ]}}}
+    }}}]}}});
+    window
+        .update(cx, |music, window, cx| {
+            window.resize(size(px(956.), px(1050.)));
+            music.player_open = false;
+            music.playback = Playback::Stopped;
+            music.route = crate::app::Route::Home;
+            music.catalog_requests.cancel(CatalogTarget::Page);
+            music.page = crate::catalog::parse_home(&response, "Home").unwrap();
+            assert_eq!(music.page.chips.len(), 3);
+            music.page.shelves = crate::app::sync::tests::page(1, false).shelves;
+            music.rebuild_rows();
+            music
+                .detail_list
+                .state
+                .scroll_to(gpui::ListOffset::default());
+            music.notice = None;
+            music.error = None;
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, window, cx| {
+            capture(window, "home-chips-956");
+            // This browse row used to add a second hover style to navigation().
+            music.route = crate::app::Route::Browse(crate::catalog::BrowseLink::new(
+                "FEmusic_moods_and_genres",
+                "Moods",
+            ));
+            music.page = crate::app::sync::tests::page(0, false);
+            music.page.shelves[0]
+                .items
+                .push(crate::catalog::Item::Navigation(
+                    crate::catalog::BrowseLink::new("FEmusic_home", "Home"),
+                ));
+            music.rebuild_rows();
+            cx.notify();
+            println!("DEBUG_HOME_CHIPS rendered=true browse_rows=true");
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+}
+
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn position_samples_only_render_the_player_bar() -> Result<()> {
@@ -1354,6 +1410,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 keyboard_survives_replacement_and_scrolls_lists(window, cx).await;
                 library_sort_and_compact_layouts(window, cx).await;
                 inline_links_follow_row_order(window, cx).await;
+                home_chips_and_browse_rows(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })

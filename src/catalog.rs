@@ -750,16 +750,18 @@ impl Catalog {
 
     pub fn browse(&self, link: &BrowseLink) -> Result<Page> {
         let data = self.request("browse", link.body()?)?;
-        let mut page = parse_page(&data, &link.title)?;
+        let mut page = if link.id == "FEmusic_home" {
+            parse_home(&data, &link.title)?
+        } else {
+            parse_page(&data, &link.title)?
+        };
         if matches!(link.id.as_str(), "FEmusic_home" | "FEmusic_explore") {
             page.continuation = data
                 .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer")
                 .and_then(owned_continuation);
         }
-        match link.id.as_str() {
-            "FEmusic_home" => page.chips = home_choices(&data)?,
-            "FEmusic_charts" => page.countries = chart_choices(&data, link)?,
-            _ => {}
+        if link.id == "FEmusic_charts" {
+            page.countries = chart_choices(&data, link)?;
         }
         apply_episode_page(&mut page, &data, &link.id)?;
         self.bind_page(page, &data, None)
@@ -2131,6 +2133,12 @@ fn library_filters(data: &Value) -> Option<LibraryFilters> {
         )
     });
     Some(filters)
+}
+
+pub(crate) fn parse_home(data: &Value, title: &str) -> Result<Page> {
+    let mut page = parse_page(data, title)?;
+    page.chips = home_choices(data)?;
+    Ok(page)
 }
 
 fn home_choices(data: &Value) -> Result<Vec<BrowseChoice>> {

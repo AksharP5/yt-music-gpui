@@ -455,7 +455,6 @@ impl Music {
                 .w_full()
                 .h(px(64.))
                 .px(px(inset))
-                .hover(|d| d.bg(self.theme.raised))
                 .into_any_element();
         }
         let page = self.page_layout(window);
