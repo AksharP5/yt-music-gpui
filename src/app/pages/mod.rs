@@ -278,7 +278,7 @@ impl Music {
         &mut self,
         index: usize,
         inset: f32,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.prefetch_page(index, self.list_rows.len(), 8, cx);
