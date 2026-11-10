@@ -249,7 +249,7 @@ impl Music {
                     })
                     .opacity(0.)
                     .group_hover("music-row", |style| style.opacity(1.))
-                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
+                    .keyboard_focus_style(self.theme, |style| style.opacity(1.)),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
@@ -378,7 +378,7 @@ impl Music {
                     .size(px(36.))
                     .opacity(0.)
                     .group_hover("music-card", |style| style.opacity(1.))
-                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
+                    .keyboard_focus_style(self.theme, |style| style.opacity(1.)),
                 )
             }))
             .child(
@@ -687,7 +687,7 @@ impl Music {
                 })
                 .opacity(0.)
                 .group_hover("music-row", |style| style.opacity(1.))
-                .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
+                .keyboard_focus_style(self.theme, |style| style.opacity(1.)),
             );
             return wrap_row(row).into_any_element();
         };

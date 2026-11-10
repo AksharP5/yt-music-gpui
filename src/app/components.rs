@@ -6,15 +6,28 @@ pub(in crate::app) trait KeyboardControl:
     StatefulInteractiveElement + Styled + Sized
 {
     fn keyboard_control(self, theme: Theme) -> Self {
-        self.tab_index(0)
-            .border_1()
-            .border_color(gpui::transparent_black())
-            .focus_visible(move |style| {
-                style.border_color(theme.text).shadow(vec![
-                    BoxShadow::new(px(0.), px(0.), theme.text).spread_radius(px(4.)),
-                    BoxShadow::new(px(0.), px(0.), theme.bg).spread_radius(px(2.)),
-                ])
-            })
+        self.tab_index(0).keyboard_focus_style(theme, |style| style)
+    }
+
+    fn keyboard_focus_style(
+        self,
+        theme: Theme,
+        update: impl FnOnce(StyleRefinement) -> StyleRefinement,
+    ) -> Self {
+        self.focus_visible(move |style| {
+            // Shadows leave inline text and control sizes unchanged. The inset
+            // edge remains visible when an ancestor clips the outer ring.
+            update(style).shadow(vec![
+                BoxShadow::new(px(0.), px(0.), theme.text)
+                    .spread_radius(px(1.))
+                    .inset(),
+                BoxShadow::new(px(0.), px(0.), theme.bg)
+                    .spread_radius(px(2.))
+                    .inset(),
+                BoxShadow::new(px(0.), px(0.), theme.text).spread_radius(px(4.)),
+                BoxShadow::new(px(0.), px(0.), theme.bg).spread_radius(px(2.)),
+            ])
+        })
     }
 }
 
