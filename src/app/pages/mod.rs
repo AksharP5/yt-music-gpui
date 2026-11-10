@@ -369,7 +369,7 @@ impl Music {
                     cx.processor(move |view, index: usize, window, cx| {
                         if artist {
                             return if index == 0 {
-                                view.artist_heading(inset, cx)
+                                view.artist_heading(inset, window, cx)
                             } else {
                                 view.list_row(index - 1, inset, window, cx)
                             };
@@ -491,10 +491,15 @@ impl Music {
                         .w_full()
                         .max_w(px(1492.))
                         .mx_auto()
-                        .px(px(inset + 6.))
+                        // Measured on the web at 1280: art column at 335, list
+                        // 40px later, durations ending 79px from the edge.
+                        .when(available < 1200., |d| {
+                            d.pl(px(inset - 11.)).pr(px(inset - 27.))
+                        })
+                        .when(available >= 1200., |d| d.px(px(inset)))
                         .pt(px(40.))
                         .flex()
-                        .gap(px(if available < 1200. { 56. } else { 72. }))
+                        .gap(px(if available < 1200. { 40. } else { 72. }))
                         .child(
                             div()
                                 .id("collection-header")

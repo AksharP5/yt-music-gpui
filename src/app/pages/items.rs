@@ -521,11 +521,7 @@ impl Music {
                 16.
             }))
             .rounded(px(4.))
-            .when(style == RowStyle::ArtistTable, |row| {
-                row.rounded_none()
-                    .border_b_1()
-                    .border_color(gpui::white().opacity(0.1))
-            })
+            .when(style == RowStyle::ArtistTable, |row| row.rounded_none())
             .when(active, |d| d.bg(self.theme.selection))
             .hover(|d| d.bg(self.theme.raised))
             .cursor_pointer()
@@ -706,6 +702,9 @@ impl Music {
             .px(px(inset))
             .when(style.gap() > 0., |d| d.pb(px(style.gap())))
             .child(row)
+            .when(artist_table, |d| {
+                d.child(div().h(px(1.)).bg(gpui::white().opacity(0.1)))
+            })
             .into_any_element()
     }
 }
@@ -730,7 +729,7 @@ impl RowStyle {
         match self {
             Self::Search => 80.,
             Self::Album | Self::Playlist => 68.,
-            Self::ArtistTable => 49.,
+            Self::ArtistTable => 48.,
             Self::List => 64.,
         }
     }

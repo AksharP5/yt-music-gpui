@@ -30,7 +30,8 @@ Source: https://github.com/google/material-design-icons
   explore-filled ("explore") and explore-outlined (outlined "explore").
   Also unmodified: explicit, new-releases (outlined "new_releases"),
   trending-up ("trending_up") and mood (outlined "mood").
-  From Material Symbols, unmodified: podcasts ("podcasts").
+  From Material Symbols, unmodified: podcasts ("podcasts") and mix
+  ("sensors").
 
 Icons in assets/icons adapted from Feather, Copyright 2013-2023 Cole Bemis,
 licensed under the MIT License (LICENSE-FEATHER).

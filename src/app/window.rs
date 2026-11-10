@@ -46,7 +46,7 @@ impl Music {
         let sidebar_width = if compact { 72. } else { 240. };
         let available = width - sidebar_width;
         let inset = if available >= 1000. { 100. } else { 32. };
-        let artist_background = self.artist_background(compact);
+        let background = self.page_background(compact, height);
         let header = (!fullscreen).then(|| self.header(inset, compact, width, cx));
         let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
         let content = if player_page {
@@ -60,7 +60,7 @@ impl Music {
             .relative()
             .flex()
             .flex_col()
-            .children(artist_background)
+            .children(background)
             .children(header)
             .child(
                 div()

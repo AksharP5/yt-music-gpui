@@ -42,32 +42,56 @@ impl Music {
             .gap(px(8.))
             .when(stacked, |d| d.items_center().text_center());
         if let Some(header) = header {
-            creator = header.artist.map(|artist| match artist {
-                HeaderArtist::Link(link) => div()
-                    .id("collection-artist")
-                    .keyboard_control(self.theme)
+            let avatar = header.artist_thumbnail.as_deref().and_then(|url| {
+                self.artwork.get(url).map(|image| {
+                    img(image)
+                        .size(px(16.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .object_fit(ObjectFit::Cover)
+                })
+            });
+            creator = header.artist.map(|artist| {
+                let strapline = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .text_size(px(14.))
-                    .cursor_pointer()
-                    .child(link.title.clone())
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.navigate(Route::Browse(link.clone()), cx)
-                    }))
-                    .into_any_element(),
-                HeaderArtist::Text(text) => div().text_size(px(14.)).child(text).into_any_element(),
+                    .line_height(relative(1.2))
+                    .children(avatar);
+                match artist {
+                    HeaderArtist::Link(link) => strapline
+                        .id("collection-artist")
+                        .keyboard_control(self.theme)
+                        .cursor_pointer()
+                        .child(link.title.clone())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.navigate(Route::Browse(link.clone()), cx)
+                        }))
+                        .into_any_element(),
+                    HeaderArtist::Text(text) => strapline.child(text).into_any_element(),
+                }
             });
             if let Some(url) = header.thumbnail {
-                cover = Some(
-                    div()
+                cover = Some(match self.artwork.get(&url) {
+                    Some(image) => img(image)
+                        .size(px(edge))
+                        .flex_shrink_0()
                         .rounded(px(12.))
-                        .overflow_hidden()
-                        .child(self.art(Some(&url), edge, ArtworkShape::Square))
+                        .object_fit(ObjectFit::Cover)
                         .into_any_element(),
-                );
+                    None => div()
+                        .size(px(edge))
+                        .rounded(px(12.))
+                        .bg(self.theme.raised)
+                        .into_any_element(),
+                });
             }
             heading = heading.child(
                 div()
                     .w_full()
                     .text_size(px(if stacked { 28. } else { 32. }))
+                    .line_height(relative(1.2))
                     .font_weight(FontWeight::BOLD)
                     .child(title),
             );
@@ -78,7 +102,7 @@ impl Music {
                         .flex_col()
                         .when(stacked, |d| d.items_center())
                         .text_size(px(14.))
-                        .line_height(px(20.))
+                        .line_height(relative(1.2))
                         .text_color(self.theme.muted)
                         .when(!header.subtitle.is_empty(), |d| d.child(header.subtitle))
                         .when(!header.stats.is_empty(), |d| d.child(header.stats)),
@@ -101,10 +125,9 @@ impl Music {
                     .w_full()
                     .text_size(px(14.))
                     .text_color(self.theme.muted)
-                    .line_height(px(20.))
+                    .line_height(relative(1.2))
                     .line_clamp(2)
                     .text_ellipsis()
-                    .max_h(px(40.))
                     .overflow_hidden()
                     .cursor_pointer()
                     .child(self.page.description.clone())
@@ -122,8 +145,8 @@ impl Music {
             .flex()
             .items_center()
             .flex_wrap()
-            .gap(px(12.))
-            .when(stacked, |d| d.justify_center());
+            .gap(px(if stacked { 32. } else { 12. }))
+            .when(stacked, |d| d.mt(px(8.)).justify_center());
         if let Some(collection) = collection.as_ref() {
             let selected = collection.clone();
             let saved = self.is_saved(collection);
@@ -263,7 +286,7 @@ impl Music {
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(20.))
+                .gap(px(16.))
                 .child(
                     div()
                         .flex()

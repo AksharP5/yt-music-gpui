@@ -549,6 +549,7 @@ pub struct PageHeader {
     pub collection: CollectionDetails,
     pub thumbnail: Option<String>,
     pub artist: Option<HeaderArtist>,
+    pub artist_thumbnail: Option<String>,
     pub subtitle: String,
     pub stats: String,
     pub shuffle: Option<Arc<PlaylistTarget>>,
@@ -1808,6 +1809,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
                         .map_or(HeaderArtist::Text(artist), HeaderArtist::Link)
                 })
             },
+            artist_thumbnail: thumbnail(&header["straplineThumbnail"]),
             stats: text(&header["secondSubtitle"]),
             subtitle: ["subtitle", "monthlyListenerCount"]
                 .into_iter()

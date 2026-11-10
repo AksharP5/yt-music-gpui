@@ -56,7 +56,7 @@ impl Music {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .when(!self.route.is_artist() || self.player_open, |d| {
+            .when(!self.immersive_header(), |d| {
                 d.bg(if self.route.is_home() && !self.player_open {
                     rgb(0x14252c).into()
                 } else {

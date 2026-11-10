@@ -21,6 +21,8 @@ const WORKERS: usize = 3;
 enum Resolution {
     Thumbnail,
     Hero,
+    /// A small, heavily blurred copy that GPUI stretches into a page wash.
+    Wash,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -112,6 +114,12 @@ impl Artwork {
 
     pub fn get_hero(&mut self, url: &str) -> Option<Arc<RenderImage>> {
         self.get_resolution(url, Resolution::Hero)
+    }
+
+    /// The blurred wash behind album and playlist headers, made once at decode
+    /// time so drawing it costs one stretched texture per frame.
+    pub fn get_wash(&mut self, url: &str) -> Option<Arc<RenderImage>> {
+        self.get_resolution(url, Resolution::Wash)
     }
 
     fn get_resolution(&mut self, url: &str, resolution: Resolution) -> Option<Arc<RenderImage>> {
@@ -349,8 +357,13 @@ fn decode(bytes: Vec<u8>, resolution: Resolution) -> anyhow::Result<RenderImage>
     let (width, height) = match resolution {
         Resolution::Thumbnail => (320, 320),
         Resolution::Hero => (1600, 900),
+        Resolution::Wash => (64, 64),
     };
     let mut pixels = reader.decode()?.thumbnail(width, height).into_rgba8();
+    if resolution == Resolution::Wash {
+        // About the web's 80px blur once the wash is stretched across the page.
+        pixels = image::imageops::blur(&pixels, 4.);
+    }
     for pixel in pixels.pixels_mut() {
         pixel.0.swap(0, 2);
     }
