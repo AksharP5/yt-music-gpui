@@ -184,6 +184,7 @@ impl Music {
                     if view.account.is_some()
                         && range.end.saturating_add(5) >= view.sidebar_playlists.len()
                         && !view.catalog_requests.is_loading(CatalogTarget::Sidebar)
+                        && view.sidebar_error.is_none()
                         && let Some(token) = view.sync.sidebar_continuation.clone()
                     {
                         view.request(Query::SidebarMore(token), cx);

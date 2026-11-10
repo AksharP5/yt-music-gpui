@@ -41,16 +41,16 @@ Once connected, the browser can stay closed. The app restores your saved account
 
 Your profile menu shows the connected name and handle. Use **Switch account** to connect another account. Closing the sign-in dialog cancels an unfinished connection.
 
-Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
+Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload the current page from YouTube Music, including its order and removals. The app replaces loaded rows and reloads continuations to find the visible song again, up to the previous loaded depth.
 
-Podcast episodes and videos with resume information keep a local listening position across restarts. Connected accounts also read the progress supplied by YouTube Music and report playback and listening intervals. Focus refreshes wait three minutes and preserve loaded rows. Likes and dislikes update immediately and revert if saving fails. Playlist edits wait for confirmation.
+Podcast episodes and videos with resume information keep a local listening position across restarts. Connected accounts also read the progress supplied by YouTube Music and report playback and listening intervals. Focus refreshes wait three minutes. They replace the first page in the server's order and preserve loaded deeper pages, removing occurrences that moved into the first page. History refreshes after a playback report do the same. A response without a continuation replaces the entire list. Likes and dislikes update immediately and revert if saving fails. Playlist edits wait for confirmation.
 
 ## Controls
 
 | Key | Action |
 | --- | --- |
 | / or Ctrl K | Search |
-| Ctrl R | Refresh |
+| Ctrl R | Reload the current page |
 | Alt Left | Go back |
 | Space | Play or pause |
 | Ctrl Right / Ctrl Left | Next / previous song |

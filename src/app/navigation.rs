@@ -148,6 +148,8 @@ pub(in crate::app) struct NavigationState {
     pub(in crate::app) route: Route,
     pub(in crate::app) page: Option<Page>,
     pub(in crate::app) fetched_at: Option<Instant>,
+    pub(in crate::app) coverage: sync::PageCoverage,
+    pub(in crate::app) page_error: Option<String>,
     pub(in crate::app) list_scroll: UniformListScrollHandle,
     pub(in crate::app) detail_list: DetailList,
     pub(in crate::app) shelf_scroll: HashMap<usize, ScrollHandle>,
@@ -158,6 +160,11 @@ impl Music {
         let target = query.target();
         if target == CatalogTarget::Page {
             self.sync.page_changes.clear();
+            self.sync.page_reload = None;
+            if self.error == self.sync.page_error {
+                self.error = None;
+            }
+            self.sync.page_error = None;
         }
         let session = self
             .account
@@ -172,10 +179,11 @@ impl Music {
             }
         } else if target == CatalogTarget::Sidebar {
             self.sidebar_error = result.err();
-        } else if target == CatalogTarget::Page
-            && let Err(error) = result
-        {
-            self.error = Some(error);
+        } else if target == CatalogTarget::Page {
+            self.sync.page_error = result.err();
+            if let Some(error) = &self.sync.page_error {
+                self.error = Some(error.clone());
+            }
         }
         cx.notify();
     }
@@ -185,14 +193,16 @@ impl Music {
         self.artwork.cancel_pending();
         self.player_open = false;
         if self.route != route {
-            let cached = ((!self.rows.is_empty()
-                || !self.catalog_requests.is_loading(CatalogTarget::Page))
-                && self.error.is_none())
+            let cached = (!self.rows.is_empty()
+                || (!self.catalog_requests.is_loading(CatalogTarget::Page)
+                    && self.sync.page_error.is_none()))
             .then(|| self.page.clone());
             self.back.push(NavigationState {
                 route: self.route.clone(),
                 page: cached,
                 fetched_at: self.sync.page_fetched_at,
+                coverage: self.sync.page_coverage,
+                page_error: self.sync.page_error.take(),
                 list_scroll: std::mem::replace(
                     &mut self.list_scroll,
                     UniformListScrollHandle::new(),
@@ -207,6 +217,9 @@ impl Music {
         self.list_id = self.list_id.wrapping_add(1);
         self.route = route.clone();
         self.sync.page_fetched_at = None;
+        self.sync.page_reload = None;
+        self.sync.page_coverage = sync::PageCoverage::default();
+        self.sync.page_error = None;
         self.error = None;
         self.notice = None;
         self.page.shelves.clear();
@@ -373,7 +386,9 @@ impl Music {
             }
             self.page = page;
             self.sync.page_fetched_at = state.fetched_at;
-            self.error = None;
+            self.sync.page_coverage = state.coverage;
+            self.sync.page_error = state.page_error;
+            self.error = self.sync.page_error.clone();
             self.notice = None;
             self.rebuild_rows();
             if self.account.is_some() {
@@ -512,10 +527,24 @@ impl Music {
                     }
                 }
                 self.sync.page_fetched_at = Some(Instant::now());
+                self.sync.page_error = None;
                 if result.revalidate {
-                    sync::merge_page(&mut self.page, page);
+                    let anchor = self.page_anchor();
+                    if self.sync.page_reload.is_some() {
+                        self.sync.page_coverage = sync::PageCoverage {
+                            first_page_shelves: page.shelves.len(),
+                            continued: false,
+                        };
+                        self.page = page;
+                    } else {
+                        sync::merge_page(&mut self.page, page, &mut self.sync.page_coverage);
+                    }
                     self.rebuild_rows();
+                    if self.sync.page_reload.is_none() {
+                        self.restore_page_anchor(&anchor);
+                    }
                 } else if result.append {
+                    self.sync.page_coverage.continued = true;
                     let first_shelf = self.page.shelves.len();
                     let previous_rows = self.list_rows.len();
                     self.page.continuation = page.continuation;
@@ -528,14 +557,25 @@ impl Music {
                             .append_rows(self.list_rows.len() - previous_rows);
                     }
                 } else {
+                    self.sync.page_coverage = sync::PageCoverage {
+                        first_page_shelves: page.shelves.len(),
+                        continued: false,
+                    };
                     self.page = page;
                     if matches!(self.overlay, Some(Overlay::Track { .. })) {
                         self.overlay = None;
                     }
                     self.rebuild_rows();
                 }
+                if self.sync.page_reload.is_some() {
+                    self.rebuild_rows();
+                    self.continue_page_reload(cx);
+                }
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.sync.page_error = Some(error.clone());
+                self.error = Some(error);
+            }
         }
         self.overlay_ratings();
         cx.notify();

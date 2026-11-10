@@ -112,11 +112,7 @@ impl Music {
             return;
         }
         if control && key == "r" {
-            if self.account.is_some() {
-                self.refresh_remote(cx);
-            } else {
-                self.navigate(self.route.clone(), cx);
-            }
+            self.reload_current_page(cx);
             return;
         }
         if modifiers.alt

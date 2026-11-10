@@ -179,6 +179,7 @@ impl Music {
                         button("dismiss-error", "close", self.theme).on_click(cx.listener(
                             |view, _, _, cx| {
                                 view.error = None;
+                                view.sync.page_error = None;
                                 cx.notify();
                             },
                         )),
@@ -429,7 +430,7 @@ impl Music {
     ) {
         if visible_end.saturating_add(ahead) < count
             || self.catalog_requests.is_loading(CatalogTarget::Page)
-            || self.error.is_some()
+            || self.sync.page_error.is_some()
         {
             return;
         }

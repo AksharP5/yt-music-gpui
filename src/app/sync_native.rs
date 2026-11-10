@@ -1,5 +1,5 @@
 //! Synthetic account UI checks. Never reads a saved account or sends network writes.
-use super::tests::page;
+use super::tests::{page, response};
 use crate::{
     account::{self, Connection, Effect, Mutation},
     app::{CatalogRequests, CatalogResult, CatalogTarget, Music, Overlay, Query, Route, Startup},
@@ -10,8 +10,8 @@ use crate::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    AppContext, Bounds, ListOffset, ScrollStrategy, TitlebarOptions, WindowBounds, WindowKind,
-    WindowOptions, point, px, size,
+    AppContext, Bounds, KeyDownEvent, Keystroke, ListOffset, Modifiers, ScrollStrategy,
+    TitlebarOptions, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
 use serde_json::json;
 use std::{
@@ -40,7 +40,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
         crate::input::init(cx);
         let (sender, commands) = async_channel::bounded(64);
         let window = cx.open_window(WindowOptions {
-            window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(40.),px(40.)),size(px(1050.),px(700.))))),
+            window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(40.),px(40.)),size(px(1280.),px(700.))))),
             kind:WindowKind::PopUp,
             titlebar:Some(TitlebarOptions { title:Some("Music sync validation".into()), ..Default::default() }),
             focus:true, ..Default::default()
@@ -68,6 +68,11 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             view.account = Some(Connection { session, account:Account { name:"Synthetic account".into(),handle:String::new(),thumbnail:None } });
             view.route = Route::Browse(BrowseLink::new("VLsynthetic","Sync validation playlist"));
             view.page = page(500,true);
+            let tail = view.page.shelves[0].items.split_off(50);
+            let mut shelf = view.page.shelves[0].clone();
+            shelf.items = tail;
+            view.page.shelves.push(shelf);
+            view.sync.page_coverage = super::PageCoverage { first_page_shelves: 1, continued: true };
             view.page.title = "Sync validation playlist".into();
             view.rebuild_rows();
             view
@@ -162,6 +167,123 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             cx.background_executor().timer(Duration::from_millis(600)).await;
             println!("SYNC_SCREENSHOT already-added");
             window.update(cx,|view,_,cx| {
+                view.overlay = None;
+                view.library.queue = Default::default();
+                view.navigate(Route::Liked,cx);
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect::<Vec<_>>().into_iter().find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:false,revalidate:false,result:Ok(response(&[("Songs",(0..50).collect())],Some("page-2"),true)),session_rejected:false,target:CatalogTarget::Page },cx);
+                view.error = Some("Synthetic playback failure".into());
+                view.prefetch_page(50,50,12,cx);
+                let job = view.catalog_requests.pending.try_recv().expect("A playback failure must not block page continuation");
+                assert!(matches!(job.query,Query::More { .. }));
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:true,revalidate:false,result:Ok(response(&[("Songs",(50..500).collect())],Some("page-11"),true)),session_rejected:false,target:CatalogTarget::Page },cx);
+                view.prefetch_page(500,500,12,cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:true,revalidate:false,result:Err("Synthetic page failure".into()),session_rejected:false,target:CatalogTarget::Page },cx);
+                view.error = Some("Another playback failure".into());
+                view.prefetch_page(500,500,12,cx);
+                assert!(view.catalog_requests.pending.try_recv().is_err(),"Page errors block automatic retry even if playback replaces the banner");
+                view.list_scroll.scroll_to_item_strict(450,ScrollStrategy::Top);
+                cx.notify();
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            window.update(cx,|view,window,cx| {
+                window.focus(&view.focus,cx);
+                let track = view.page.tracks()[450].clone();
+                view.overlay = Some(Overlay::Track { track,index:Some(450),queue_index:None });
+                // The keyboard ignores refresh while a menu is open; the reload
+                // method also supports keeping an already-open menu anchored.
+                view.reload_current_page(cx);
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect::<Vec<_>>().into_iter().find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                let mut first = vec![900];
+                first.extend((0..49).rev());
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:false,revalidate:true,result:Ok(response(&[("Songs",first)],Some("fresh-page-2"),true)),session_rejected:false,target:CatalogTarget::Page },cx);
+                assert_eq!(view.rows.len(),50,"Ctrl R replaces stale loaded pages");
+                assert!(view.sync.page_error.is_none(),"Reload retries the page error");
+                let job = view.catalog_requests.pending.try_recv().expect("Reload follows the fresh continuation to find the visible occurrence");
+                assert!(matches!(job.query,Query::More { ref token,.. } if token.token()=="fresh-page-2"));
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:true,revalidate:false,result:Ok(response(&[("Songs",(50..500).rev().collect())],Some("fresh-tail"),true)),session_rejected:false,target:CatalogTarget::Page },cx);
+                assert_eq!(view.rows[0].id(),format!("{:011}",900));
+                assert!(matches!(view.overlay,Some(Overlay::Track { index:Some(99),.. })),"Menu follows the occurrence after the server reorder");
+                assert!(view.sync.page_reload.is_none());
+                view.overlay = None;
+                let scroll = view.list_scroll.0.borrow();
+                let height = scroll.last_item_size.unwrap().contents.height / 500.;
+                assert_eq!(scroll.base_handle.offset().y,-height*99.,"Scroll follows occurrence 450 into row 99");
+                drop(scroll);
+                let event = KeyDownEvent { keystroke:Keystroke { key:"r".into(),modifiers:Modifiers { control:true,..Default::default() },..Default::default() },is_held:false,prefer_character_input:false };
+                view.key_down(&event,window,cx);
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect::<Vec<_>>().into_iter().find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                let mut fresh = response(&[("Songs",(50..500).rev().collect())],None,true);
+                fresh.shelves[0].items.insert(0,view.rows[0].clone());
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:false,revalidate:true,result:Ok(fresh),session_rejected:false,target:CatalogTarget::Page },cx);
+                assert_eq!(view.rows.len(),451);
+                assert_eq!(view.rows[50].id(),format!("{:011}",450));
+                assert!(view.page.continuation.is_none());
+                cx.notify();
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            println!("SYNC_SCREENSHOT reload-order-anchor");
+            cx.background_executor().timer(Duration::from_millis(800)).await;
+            window.update(cx,|view,_,cx| {
+                view.route = Route::Browse(BrowseLink::new("VLsynthetic","Collection anchor"));
+                view.page = response(&[("Songs",(0..500).collect())],Some("tail"),true);
+                view.page.header = crate::catalog::parse_page(&json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Collection anchor"}}},"contents":[]}),"Collection anchor").unwrap().header;
+                view.page.title = "Collection anchor".into();
+                view.sync.page_coverage = super::PageCoverage { first_page_shelves:1,continued:false };
+                view.rebuild_rows();
+                view.detail_list.state.scroll_to(ListOffset { item_ix:401,offset_in_item:px(8.) });
+                let track = view.page.tracks()[400].clone();
+                view.overlay = Some(Overlay::Track { track,index:Some(400),queue_index:None });
+                cx.notify();
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            let expected_collection_top = window.update(cx,|view,_,cx| {
+                let before = view.detail_list.state.logical_scroll_top();
+                assert_eq!(before.item_ix,401);
+                let mut fresh = response(&[("Songs",(0..500).rev().collect())],None,true);
+                fresh.header = view.page.header.clone();
+                fresh.title = "Collection anchor".into();
+                view.revalidate_page(cx);
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect::<Vec<_>>().into_iter().find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:false,revalidate:true,result:Ok(fresh),session_rejected:false,target:CatalogTarget::Page },cx);
+                let after = view.detail_list.state.logical_scroll_top();
+                assert_eq!(after.item_ix,100,"Collection scroll follows occurrence 400 into row 99, after its heading");
+                assert_eq!(after.offset_in_item,before.offset_in_item);
+                assert!(matches!(view.overlay,Some(Overlay::Track { index:Some(99),.. })));
+                (after.item_ix,after.offset_in_item)
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            window.update(cx,|view,_,_| {
+                let top = view.detail_list.state.logical_scroll_top();
+                assert_eq!((top.item_ix,top.offset_in_item),expected_collection_top,"The rendered collection must preserve the anchor");
+            }).unwrap();
+            println!("SYNC_SCREENSHOT collection-order-anchor");
+            cx.background_executor().timer(Duration::from_millis(800)).await;
+            window.update(cx,|view,_,cx| {
+                view.overlay = None;
+                view.request(Query::SidebarPlaylists,cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                let mut choices = page(0,true);
+                choices.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLretry","title":"Retry playlist","subtitle":"Playlist"})).unwrap()));
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:false,revalidate:false,result:Ok(choices),session_rejected:false,target:CatalogTarget::Sidebar },cx);
+                let token = view.sync.sidebar_continuation.clone().unwrap();
+                view.request(Query::SidebarMore(token),cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:true,revalidate:false,result:Err("Synthetic sidebar failure".into()),session_rejected:false,target:CatalogTarget::Sidebar },cx);
+                view.error = None;
+                cx.notify();
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            println!("SYNC_SCREENSHOT sidebar-error-stopped");
+            cx.background_executor().timer(Duration::from_millis(800)).await;
+            window.update(cx,|view,_,cx| {
+                assert!(view.catalog_requests.pending.try_recv().is_err(),"Rendering near the sidebar end must not retry a failed continuation");
+                assert_eq!(view.sidebar_error.as_deref(),Some("Synthetic sidebar failure"));
+                view.request(Query::SidebarPlaylists,cx);
+                let job = view.catalog_requests.pending.try_recv().expect("Explicit sidebar Retry remains available");
+                view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,append:false,revalidate:false,result:Ok(page(0,false)),session_rejected:false,target:CatalogTarget::Sidebar },cx);
+                assert!(view.sidebar_error.is_none());
                 view.route = Route::Home;
                 view.overlay = None;
                 view.player_open = false;
@@ -183,17 +305,21 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 let before = view.detail_list.state.logical_scroll_top();
                 let before = (before.item_ix,before.offset_in_item);
                 assert!(before.0 >= 3,"The Home fixture must be scrolled before refresh");
-                let fresh = view.page.clone();
+                let visible_title = view.page.shelves[before.0-1].title.clone();
+                let mut fresh = view.page.clone();
+                fresh.shelves.reverse();
                 view.request(Query::Revalidate(Box::new(Query::Home)),cx);
-                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect::<Vec<_>>().into_iter().find(|job| job.query.target()==CatalogTarget::Page).unwrap();
                 view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,append:false,revalidate:true,result:Ok(fresh),session_rejected:false,target:CatalogTarget::Page },cx);
                 let after = view.detail_list.state.logical_scroll_top();
-                assert_eq!((after.item_ix,after.offset_in_item),before,"Refreshing Home must keep the visible shelf");
+                assert_eq!(view.page.shelves[after.item_ix-1].title,visible_title,"Home follows the visible shelf after the server reorders it");
+                assert_eq!(after.offset_in_item,before.1);
+                let expected = (after.item_ix,after.offset_in_item);
                 let track = view.page.tracks()[0].clone();
                 view.patch_confirmed(&Mutation::RateSong { track,rating:Rating::Like },cx);
                 let after = view.detail_list.state.logical_scroll_top();
-                assert_eq!((after.item_ix,after.offset_in_item),before,"A save acknowledgement must keep the visible shelf");
-                before
+                assert_eq!((after.item_ix,after.offset_in_item),expected,"A save acknowledgement must keep the visible shelf");
+                expected
             }).unwrap();
             cx.background_executor().timer(Duration::from_millis(300)).await;
             window.update(cx,|view,_,_| {

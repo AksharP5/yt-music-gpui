@@ -9,6 +9,15 @@ pub(in crate::app) struct SyncState {
     pub rating_overrides: HashSet<String>,
     pub page_changes: Vec<PageChange>,
     pub optimistic_ratings: HashMap<String, Option<Rating>>,
+    pub page_coverage: PageCoverage,
+    pub page_error: Option<String>,
+    pub page_reload: Option<PageReload>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(in crate::app) struct PageCoverage {
+    pub first_page_shelves: usize,
+    pub continued: bool,
 }
 
 pub(super) enum PageChange {
@@ -39,68 +48,53 @@ fn item_key(item: &Item) -> (&str, Option<&str>, u8) {
     }
 }
 
-/// A first page cannot prove that an unseen row was removed. Keep loaded order,
-/// occurrences and the continuation already reached; refresh metadata in place.
-pub(super) fn merge_page(loaded: &mut Page, fresh: Page) {
-    loaded.title = fresh.title;
-    loaded.header = fresh.header;
-    loaded.description = fresh.description;
-    loaded.privacy = fresh.privacy;
-    loaded.editable = fresh.editable;
-    loaded.chips = fresh.chips;
-    loaded.countries = fresh.countries;
-    if loaded.shelves.is_empty() {
-        loaded.shelves = fresh.shelves;
-        loaded.continuation = fresh.continuation;
-        return;
-    }
-    let complete_list = fresh.continuation.is_none() && loaded.header.is_some();
-    if complete_list {
+type ItemKey = (String, Option<String>, u8);
+
+fn owned_item_key(item: &Item) -> ItemKey {
+    let (id, occurrence, kind) = item_key(item);
+    (id.to_owned(), occurrence.map(str::to_owned), kind)
+}
+
+enum RowAnchor {
+    Item(ItemKey),
+    Shelf(String, ShelfLayout),
+}
+
+pub(super) struct PageAnchor {
+    detail: Option<(RowAnchor, ListOffset)>,
+    uniform: Option<(ItemKey, Pixels, Pixels)>,
+    shelves: Vec<(String, ShelfLayout, ScrollHandle)>,
+}
+
+pub(super) struct PageReload {
+    anchor: PageAnchor,
+    rows: usize,
+}
+
+/// Replace the first response's shelves, preserving only separately loaded pages.
+pub(super) fn merge_page(loaded: &mut Page, mut fresh: Page, coverage: &mut PageCoverage) {
+    let first_page_shelves = fresh.shelves.len();
+    if fresh.continuation.is_some() && coverage.continued {
         let keys: HashSet<_> = fresh
             .shelves
             .iter()
             .flat_map(|shelf| &shelf.items)
-            .map(|item| {
-                let (id, occurrence, kind) = item_key(item);
-                (id.to_owned(), occurrence.map(str::to_owned), kind)
-            })
+            .map(item_key)
             .collect();
-        for shelf in &mut loaded.shelves {
-            shelf.items.retain(|item| {
-                let (id, occurrence, kind) = item_key(item);
-                keys.contains(&(id.to_owned(), occurrence.map(str::to_owned), kind))
-            });
+        let mut tail = loaded.shelves.split_off(coverage.first_page_shelves);
+        for shelf in &mut tail {
+            // Playlist occurrence IDs distinguish repeated songs. History has no
+            // occurrence IDs, so a replay moves the song out of its old day bucket.
+            shelf.items.retain(|item| !keys.contains(&item_key(item)));
         }
-        loaded.continuation = None;
+        tail.retain(|shelf| !shelf.items.is_empty());
+        fresh.shelves.extend(tail);
+        fresh.continuation = loaded.continuation.take();
+    } else {
+        coverage.continued = false;
     }
-    for shelf in fresh.shelves {
-        // Continuations can split one playlist over several same-named shelves.
-        let matching: Vec<_> = loaded
-            .shelves
-            .iter()
-            .enumerate()
-            .filter(|(_, old)| old.title == shelf.title && old.layout == shelf.layout)
-            .map(|(index, _)| index)
-            .collect();
-        let Some(&first) = matching.first() else {
-            loaded.shelves.push(shelf);
-            continue;
-        };
-        for item in shelf.items {
-            let existing = matching.iter().find_map(|&index| {
-                loaded.shelves[index]
-                    .items
-                    .iter()
-                    .position(|old| item_key(old) == item_key(&item))
-                    .map(|row| (index, row))
-            });
-            if let Some((index, row)) = existing {
-                loaded.shelves[index].items[row] = item;
-            } else {
-                loaded.shelves[first].items.push(item);
-            }
-        }
-    }
+    coverage.first_page_shelves = first_page_shelves;
+    *loaded = fresh;
 }
 
 pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
@@ -281,6 +275,182 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) {
 }
 
 impl Music {
+    pub(super) fn page_anchor(&self) -> PageAnchor {
+        let home = self.route.is_home() || matches!(self.route, Route::Explore);
+        let detailed = home
+            || self.page.header.is_some()
+            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
+        let top = self.detail_list.state.logical_scroll_top();
+        let detail = if home {
+            top.item_ix
+                .checked_sub(1)
+                .and_then(|index| self.page.shelves.get(index))
+                .map(|shelf| RowAnchor::Shelf(shelf.title.clone(), shelf.layout))
+        } else if detailed {
+            top.item_ix
+                .checked_sub(usize::from(self.detail_list.inline_header))
+                .and_then(|index| self.list_rows.get(index))
+                .map(|row| match *row {
+                    ListRow::Item(index) => RowAnchor::Item(owned_item_key(&self.rows[index])),
+                    ListRow::Featured(index)
+                    | ListRow::Shelf(index)
+                    | ListRow::Heading(index)
+                    | ListRow::More(index) => {
+                        let shelf = &self.page.shelves[index];
+                        RowAnchor::Shelf(shelf.title.clone(), shelf.layout)
+                    }
+                })
+        } else {
+            None
+        }
+        .map(|anchor| (anchor, top));
+        let scroll = self.list_scroll.0.borrow();
+        let uniform = scroll.last_item_size.and_then(|size| {
+            // Collection grids use one scroll item per grid row, not per item.
+            if detailed
+                || self
+                    .rows
+                    .iter()
+                    .all(|item| matches!(item, Item::Collection(_)))
+                || self.rows.is_empty()
+                || size.contents.height <= px(0.)
+            {
+                return None;
+            }
+            let height = size.contents.height / self.rows.len() as f32;
+            let offset = -scroll.base_handle.offset().y;
+            let index = (f32::from(offset) / f32::from(height)).floor().max(0.) as usize;
+            self.rows
+                .get(index)
+                .map(|item| (owned_item_key(item), offset - height * index as f32, height))
+        });
+        let shelves = self
+            .shelf_scroll
+            .iter()
+            .filter_map(|(index, scroll)| {
+                let shelf = self.page.shelves.get(*index)?;
+                Some((shelf.title.clone(), shelf.layout, scroll.clone()))
+            })
+            .collect();
+        PageAnchor {
+            detail,
+            uniform,
+            shelves,
+        }
+    }
+
+    pub(super) fn restore_page_anchor(&mut self, anchor: &PageAnchor) -> bool {
+        self.shelf_scroll = anchor
+            .shelves
+            .iter()
+            .filter_map(|(title, layout, scroll)| {
+                self.page
+                    .shelves
+                    .iter()
+                    .position(|shelf| shelf.title == *title && shelf.layout == *layout)
+                    .map(|index| (index, scroll.clone()))
+            })
+            .collect();
+        let mut found = true;
+        if let Some((key, offset_in_item, height)) = &anchor.uniform {
+            found = false;
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|item| item_key(item) == (key.0.as_str(), key.1.as_deref(), key.2))
+            {
+                let scroll = self.list_scroll.0.borrow();
+                let mut offset = scroll.base_handle.offset();
+                offset.y = -(*height * index as f32 + *offset_in_item);
+                scroll.base_handle.set_offset(offset);
+                found = true;
+            }
+        }
+        let Some((anchor, old_top)) = &anchor.detail else {
+            return found;
+        };
+        let mut top = *old_top;
+        let home = self.route.is_home() || matches!(self.route, Route::Explore);
+        let index = if home {
+            self.detail_list.state.reset(self.page.shelves.len() + 1);
+            self.page.shelves.iter().position(|shelf| matches!(&anchor, RowAnchor::Shelf(title, layout) if shelf.title == *title && shelf.layout == *layout)).map(|index| index + 1)
+        } else {
+            self.list_rows
+                .iter()
+                .position(|row| match (anchor, row) {
+                    (RowAnchor::Item(key), ListRow::Item(index)) => {
+                        item_key(&self.rows[*index]) == (key.0.as_str(), key.1.as_deref(), key.2)
+                    }
+                    (
+                        RowAnchor::Shelf(title, layout),
+                        ListRow::Featured(index)
+                        | ListRow::Shelf(index)
+                        | ListRow::Heading(index)
+                        | ListRow::More(index),
+                    ) => {
+                        let shelf = &self.page.shelves[*index];
+                        shelf.title == *title && shelf.layout == *layout
+                    }
+                    _ => false,
+                })
+                .map(|index| index + usize::from(self.detail_list.inline_header))
+        };
+        if let Some(index) = index {
+            top.item_ix = index;
+        }
+        top.item_ix = top
+            .item_ix
+            .min(self.detail_list.state.item_count().saturating_sub(1));
+        self.detail_list.state.scroll_to(top);
+        index.is_some()
+    }
+
+    pub(in crate::app) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
+        if self.account.is_none()
+            && matches!(self.route, Route::Liked | Route::Saved | Route::Recent)
+        {
+            let anchor = self.page_anchor();
+            self.refresh_local();
+            self.restore_page_anchor(&anchor);
+            cx.notify();
+            return;
+        }
+        if self.account.is_some() {
+            self.refresh_remote(cx);
+        } else {
+            self.revalidate_page(cx);
+        }
+        self.sync.page_reload = Some(PageReload {
+            anchor: self.page_anchor(),
+            rows: self.rows.len(),
+        });
+    }
+
+    pub(super) fn continue_page_reload(&mut self, cx: &mut Context<Self>) {
+        let Some(reload) = self.sync.page_reload.take() else {
+            return;
+        };
+        let found = self.restore_page_anchor(&reload.anchor);
+        // Reload enough continuations to find the old visible occurrence. If it
+        // was removed, stop at the previous depth rather than reading the whole list.
+        if !found
+            && self.rows.len() < reload.rows
+            && let Some(token) = self.page.continuation.clone()
+        {
+            self.request(
+                Query::More {
+                    token,
+                    search: match &self.route {
+                        Route::Search(search) => Some(search.clone()),
+                        _ => None,
+                    },
+                },
+                cx,
+            );
+            self.sync.page_reload = Some(reload);
+        }
+    }
+
     pub(super) fn overlay_ratings(&mut self) {
         for track in self.library.queue.tracks.iter_mut().chain(
             self.page
@@ -396,11 +566,11 @@ impl Music {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{merge_page, needs_refresh, patch_page};
+    use super::{PageCoverage, merge_page, needs_refresh, patch_page};
     use crate::{
         account::Mutation,
         app::Route,
-        catalog::{BrowseLink, Collection, Item, Page, Rating, Shelf, ShelfLayout, Track},
+        catalog::{BrowseLink, Collection, Item, Page, Shelf, ShelfLayout, Track},
     };
     use serde_json::json;
     use std::time::{Duration, Instant};
@@ -457,44 +627,190 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn refreshing_five_hundred_rows_preserves_tail_occurrences_and_continuation() {
-        let mut loaded = page(500, true);
-        let mut fresh = page(50, true);
-        if let Item::Track(track) = &mut fresh.shelves[0].items[0] {
-            track.details.rating = Some(Rating::Like);
-        }
-        fresh.shelves[0].items.reverse();
-        merge_page(&mut loaded, fresh);
-        assert_eq!(loaded.tracks().len(), 500);
-        assert_eq!(loaded.tracks()[0].details.rating, Some(Rating::Like));
-        assert_eq!(
-            loaded.tracks()[499].details.set_video_id.as_deref(),
-            Some("occurrence-499")
-        );
-        assert!(loaded.continuation.is_some());
+    pub(super) fn response(
+        shelves: &[(&str, Vec<usize>)],
+        token: Option<&str>,
+        occurrences: bool,
+    ) -> Page {
+        let contents: Vec<_> = shelves.iter().map(|(title, rows)| json!({
+            "musicShelfRenderer": {
+                "title": {"runs": [{"text": title}]},
+                "contents": rows.iter().map(|index| json!({
+                    "musicResponsiveListItemRenderer": {
+                        "playlistItemData": {
+                            "videoId": format!("{index:011}"),
+                            "setVideoId": occurrences.then(|| format!("occurrence-{index}"))
+                        },
+                        "flexColumns": [
+                            {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": format!("Song {}", index+1)}]}}},
+                            {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Synthetic artist"}]}}}
+                        ]
+                    }
+                })).collect::<Vec<_>>()
+            }
+        })).collect();
+        crate::catalog::parse_page(&json!({
+            "continuationContents": {"sectionListContinuation": {
+                "contents": contents,
+                "continuations": token.map(|token| vec![json!({"nextContinuationData": {"continuation": token}})]).unwrap_or_default()
+            }}
+        }), "Synthetic library").unwrap()
+    }
+
+    fn ids(page: &Page) -> Vec<String> {
+        page.shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .map(|item| item.id().to_owned())
+            .collect()
     }
 
     #[test]
-    fn home_refresh_keeps_shelves_and_cards_under_the_cursor() {
-        let mut loaded = page(5, false);
-        loaded.shelves[0].layout = ShelfLayout::Cards;
-        let mut fresh = loaded.clone();
-        fresh.shelves[0].items.reverse();
-        let before: Vec<_> = loaded.shelves[0]
-            .items
-            .iter()
-            .map(|item| item.id().to_owned())
-            .collect();
-        merge_page(&mut loaded, fresh);
-        assert_eq!(
-            loaded.shelves[0]
-                .items
-                .iter()
-                .map(|item| item.id().to_owned())
-                .collect::<Vec<_>>(),
-            before
+    fn first_page_refresh_adopts_order_removals_and_new_likes_preserving_450_deeper_rows() {
+        let mut loaded = response(&[("Songs", (0..50).collect())], Some("page-2"), true);
+        for start in (50..500).step_by(50) {
+            loaded.shelves.extend(
+                response(
+                    &[("Songs", (start..start + 50).collect())],
+                    Some("page-11"),
+                    true,
+                )
+                .shelves,
+            );
+        }
+        loaded.continuation = response(&[], Some("page-11"), true).continuation;
+        let mut coverage = PageCoverage {
+            first_page_shelves: 1,
+            continued: true,
+        };
+        // The old last row is removed, a new like arrives first, and all other
+        // first-page songs are reversed. None of the loaded tail is covered.
+        let mut fresh_rows = vec![900];
+        fresh_rows.extend((0..49).rev());
+        let fresh = response(&[("Songs", fresh_rows)], Some("fresh-page-2"), true);
+        let expected_prefix = ids(&fresh);
+        let expected_tail = ids(&response(&[("Songs", (50..500).collect())], None, true));
+        merge_page(&mut loaded, fresh, &mut coverage);
+        let actual = ids(&loaded);
+        assert_eq!(&actual[..50], expected_prefix);
+        assert_eq!(&actual[50..], expected_tail);
+        assert!(!actual.contains(&format!("{:011}", 49)));
+        assert_eq!(loaded.continuation.as_ref().unwrap().token(), "page-11");
+
+        // A shorter first response still replaces the entire previous span.
+        merge_page(
+            &mut loaded,
+            response(&[("Songs", vec![900, 48])], Some("next"), true),
+            &mut coverage,
         );
+        assert_eq!(loaded.tracks().len(), 452);
+        assert_eq!(&ids(&loaded)[2..], expected_tail);
+    }
+
+    #[test]
+    fn refreshed_occurrences_are_removed_from_deeper_pages_without_removing_repeated_songs() {
+        let mut loaded = response(
+            &[("Songs", vec![0, 1]), ("Songs", vec![2, 3, 4])],
+            Some("tail"),
+            true,
+        );
+        let Item::Track(repeated) = &mut loaded.shelves[1].items[2] else {
+            panic!("track fixture")
+        };
+        repeated.id = format!("{:011}", 3);
+        let mut coverage = PageCoverage {
+            first_page_shelves: 1,
+            continued: true,
+        };
+        merge_page(
+            &mut loaded,
+            response(&[("Songs", vec![3, 1])], Some("next"), true),
+            &mut coverage,
+        );
+        assert_eq!(ids(&loaded), [3, 1, 2, 3].map(|id| format!("{id:011}")));
+        assert_eq!(
+            loaded.tracks()[3].details.set_video_id.as_deref(),
+            Some("occurrence-4")
+        );
+    }
+
+    #[test]
+    fn history_replay_moves_into_today_and_drops_its_old_day_bucket_occurrence() {
+        let mut loaded = response(
+            &[
+                ("Today", vec![0, 1]),
+                ("Yesterday", vec![2, 3]),
+                ("Last week", vec![4, 5]),
+            ],
+            Some("older"),
+            false,
+        );
+        let mut coverage = PageCoverage {
+            first_page_shelves: 1,
+            continued: true,
+        };
+        merge_page(
+            &mut loaded,
+            response(
+                &[("Today", vec![2, 0, 1]), ("Yesterday", vec![3])],
+                Some("next"),
+                false,
+            ),
+            &mut coverage,
+        );
+        assert_eq!(
+            loaded
+                .shelves
+                .iter()
+                .map(|shelf| shelf.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Today", "Yesterday", "Last week"]
+        );
+        assert_eq!(
+            ids(&loaded),
+            [2, 0, 1, 3, 4, 5].map(|id| format!("{id:011}"))
+        );
+        assert_eq!(loaded.continuation.as_ref().unwrap().token(), "older");
+        assert_eq!(coverage.first_page_shelves, 2);
+    }
+
+    #[test]
+    fn complete_responses_are_authoritative_without_a_collection_header() {
+        let mut loaded = response(
+            &[("Today", vec![0, 1]), ("Yesterday", vec![2, 3])],
+            Some("next"),
+            false,
+        );
+        let mut coverage = PageCoverage {
+            first_page_shelves: 1,
+            continued: true,
+        };
+        merge_page(
+            &mut loaded,
+            response(&[("Today", vec![3, 0])], None, false),
+            &mut coverage,
+        );
+        assert_eq!(ids(&loaded), [3, 0].map(|id| format!("{id:011}")));
+        assert!(loaded.continuation.is_none());
+        assert!(!coverage.continued);
+        merge_page(&mut loaded, response(&[], None, false), &mut coverage);
+        assert!(loaded.shelves.is_empty());
+    }
+
+    #[test]
+    fn a_first_page_without_loaded_continuations_adopts_the_new_continuation() {
+        let mut loaded = response(&[("Songs", vec![0, 1])], Some("stale"), true);
+        let mut coverage = PageCoverage {
+            first_page_shelves: 1,
+            continued: false,
+        };
+        merge_page(
+            &mut loaded,
+            response(&[("Songs", vec![1, 2])], Some("fresh"), true),
+            &mut coverage,
+        );
+        assert_eq!(ids(&loaded), [1, 2].map(|id| format!("{id:011}")));
+        assert_eq!(loaded.continuation.as_ref().unwrap().token(), "fresh");
     }
 
     #[test]
