@@ -13,10 +13,13 @@ use std::{collections::HashSet, process::Command};
 #[ignore = "requires isolated desktop/D-Bus, network and a yt-dlp version-mismatch wrapper; set YT_MUSIC_NATIVE_TESTS=1"]
 fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> Result<()> {
     super::isolate()?;
-    let version = Command::new("yt-dlp").arg("--version").output()?;
+    let version = Command::new("yt-dlp")
+        .args(["--ignore-config", "--no-plugin-dirs", "--version"])
+        .output()?;
     ensure!(
         version.status.success() && String::from_utf8_lossy(&version.stdout).trim() != "2026.08.19",
-        "Use the synthetic version-mismatch wrapper"
+        "Use a synthetic version-mismatch wrapper that also handles --version after other flags; got {:?}",
+        String::from_utf8_lossy(&version.stdout).trim()
     );
 
     let (completed, result) = async_channel::bounded::<Result<()>>(1);

@@ -44,11 +44,13 @@ for test in $(bin/test app::native_tests:: -- --ignored --list | sed -n 's/: tes
   mkdir -p "$runtime/data/yt-music-gpui" "$runtime/cache" "$runtime/bin"
   cat > "$runtime/bin/yt-dlp" <<EOF
 #!/bin/sh
-if [ "\$1" = --version ]; then
-  echo native-test-mismatch
-else
-  exec "$real_ytdlp" "\$@"
-fi
+for arg in "\$@"; do
+  if [ "\$arg" = --version ]; then
+    echo native-test-mismatch
+    exit 0
+  fi
+done
+exec "$real_ytdlp" "\$@"
 EOF
   chmod 700 "$runtime/bin/yt-dlp"
   env -u WAYLAND_DISPLAY \
@@ -61,6 +63,8 @@ EOF
   echo "Native test files: $runtime"
 done
 ```
+
+The wrapper handles `--version` after other flags because the player queries `yt-dlp --ignore-config --no-plugin-dirs --version` before enabling account playback. All other invocations use the real extractor.
 
 No test signs in to a real Google account. Do not add one that does.
 
