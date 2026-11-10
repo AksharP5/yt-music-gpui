@@ -60,3 +60,15 @@ by its MIT license (LICENSE).
 assets/icons/check.svg and expand-more.svg are unmodified Google Material Icons
 ("check" and "expand_more"), Copyright Google LLC, Apache License 2.0.
 Source: https://github.com/google/material-design-icons/tree/master/src/navigation
+
+Icons in assets/icons from Google Material Symbols (Rounded), Copyright Google
+LLC, licensed under Apache License 2.0 (LICENSE-APACHE), with their viewBox
+scaled to the glyph sizes music.youtube.com draws.
+Source: https://github.com/google/material-design-icons
+  home-outlined and home-filled ("home"), explore-outlined and explore-filled
+  ("explore"), bookmark and bookmark-filled ("bookmark"), previous
+  ("skip_previous"), next ("skip_next"), play ("play_arrow"), pause ("pause"),
+  thumb-up and thumb-up-filled ("thumb_up"), and thumb-down and
+  thumb-down-filled ("thumb_down"). new-releases combines the "new_releases"
+  badge outline with a scaled "music_note".
+  These entries replace any earlier source listed above for the same files.

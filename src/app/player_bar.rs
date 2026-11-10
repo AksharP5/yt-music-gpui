@@ -90,8 +90,24 @@ impl Music {
         // Sized to its content and centered, so the rating buttons follow the title as on the web.
         let mut details = div().min_w_0().max_w(px(660.)).flex().items_center();
         if let Some(track) = current {
-            let thumbnail = self.current_thumbnail();
-            let art = self.art(thumbnail.as_deref(), 40., ArtworkShape::Square);
+            // The web rounds the bar's art by only 2px.
+            let art = match self
+                .current_thumbnail()
+                .and_then(|url| self.artwork.get(&url))
+            {
+                Some(image) => img(image)
+                    .size(px(40.))
+                    .flex_shrink_0()
+                    .rounded(px(2.))
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element(),
+                None => div()
+                    .size(px(40.))
+                    .flex_shrink_0()
+                    .rounded(px(2.))
+                    .bg(theme.raised)
+                    .into_any_element(),
+            };
             let liked = self.is_liked(&track);
             let disliked = self
                 .ratings
@@ -263,7 +279,7 @@ impl Music {
                                     .hover(|d| d.bg(theme.raised))
                                     .child(icon(
                                         if playing { "pause" } else { "play" },
-                                        36.,
+                                        40.,
                                         theme.text,
                                     ))
                                     .on_click(cx.listener(|view, _, _, cx| {
