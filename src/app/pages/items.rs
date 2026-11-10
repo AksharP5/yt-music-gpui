@@ -30,17 +30,13 @@ impl Music {
             .items_center()
             .justify_center();
         let art = match image {
-            Some(image) if wide => div()
-                .w(px(edge))
-                .h(px(edge * 9. / 16.))
-                .rounded(px(radius))
-                .overflow_hidden()
-                .child(img(image).size_full().object_fit(ObjectFit::Cover)),
-            Some(image) => div()
-                .size(px(edge))
-                .rounded(px(radius))
-                .overflow_hidden()
-                .child(img(image).size_full().object_fit(ObjectFit::Cover)),
+            Some(image) => div().child(
+                img(image)
+                    .w(px(edge))
+                    .h(px(if wide { edge * 9. / 16. } else { edge }))
+                    .rounded(px(radius))
+                    .object_fit(ObjectFit::Cover),
+            ),
             None => div()
                 .size(px(edge))
                 .rounded(px(radius))
@@ -112,7 +108,14 @@ impl Music {
             .flex()
             .items_center()
             .cursor_pointer()
-            .child(div().w(px(6.)).h_full().flex_shrink_0().bg(accent))
+            .child(
+                div()
+                    .w(px(6.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .rounded_l(px(7.))
+                    .bg(accent),
+            )
             .child(
                 div()
                     .flex_1()
@@ -246,8 +249,15 @@ impl Music {
             .when(artist, |d| d.rounded_full())
             .overflow_hidden()
             .bg(self.theme.raised);
+        // GPUI clips children to rectangles, so the image carries its own corners.
+        let radius = if artist { width / 2. } else { 8. };
         art = if let Some(image) = image {
-            art.child(img(image).size_full().object_fit(ObjectFit::Cover))
+            art.child(
+                img(image)
+                    .size_full()
+                    .rounded(px(radius))
+                    .object_fit(ObjectFit::Cover),
+            )
         } else {
             art.flex()
                 .items_center()
@@ -261,6 +271,7 @@ impl Music {
                     .group_hover("music-card", |style| style.visible())
                     .absolute()
                     .inset_0()
+                    .rounded(px(radius))
                     .bg(linear_gradient(
                         180.,
                         linear_color_stop(rgba(0x00000080), 0.),
