@@ -1089,17 +1089,17 @@ fn account_playback_supported(ytdlp: &Path) -> bool {
 fn account_credentials(
     source: Option<PlaybackCredentials>,
     supported: bool,
-    warned: &mut bool,
-    events: &async_channel::Sender<PlayerEvent>,
+    warned: bool,
+    notice: &mut Option<String>,
 ) -> Option<PlaybackCredentials> {
     if supported || source.is_none() {
+        *notice = None;
         return source;
     }
-    if !*warned {
-        *warned = true;
-        let _ = events.send_blocking(PlayerEvent::Notice(format!(
+    if !warned {
+        *notice = Some(format!(
             "Signed-in playback requires yt-dlp {REVIEWED_YTDLP}. Playing public streams as a guest with the installed version. Account-only songs may be unavailable."
-        )));
+        ));
     }
     None
 }
@@ -1287,6 +1287,7 @@ fn run(
         .context("Could not find yt-dlp. Install it, then restart the app.")?;
     let account_supported = account_playback_supported(&ytdlp);
     let mut account_warned = false;
+    let mut account_notice = None;
     let mut credentials = None;
     // Destroy the core before dropping the RAM credentials or private runtime.
     let core = MpvCore::new(&options, &ytdlp, &socket_path)?;
@@ -1317,8 +1318,8 @@ fn run(
         account_credentials(
             options.credentials,
             account_supported,
-            &mut account_warned,
-            events,
+            account_warned,
+            &mut account_notice,
         ),
         &plugin_dir,
         &mut state,
@@ -1428,8 +1429,12 @@ fn run(
                     preparation.take();
                     prepared = None;
                     state.upcoming = None;
-                    let next =
-                        account_credentials(next, account_supported, &mut account_warned, events);
+                    let next = account_credentials(
+                        next,
+                        account_supported,
+                        account_warned,
+                        &mut account_notice,
+                    );
                     state.invalidate_seeks();
                     state.desired = None;
                     state.loaded = false;
@@ -1585,6 +1590,15 @@ fn run(
         state.write_seek(&mut socket)?;
         if pending.contains(&b'\n') || wait_for_player_input(&socket, wake)? {
             state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
+        }
+        if state.loaded
+            && state.current == state.desired
+            && let Some(message) = account_notice.take()
+        {
+            // Activation and stream replacement clear transient UI notices.
+            // Deliver this after Started, once guest playback is actually ready.
+            account_warned = true;
+            let _ = events.send_blocking(PlayerEvent::Notice(message));
         }
         let _ = &credentials;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
@@ -2074,34 +2088,56 @@ mod tests {
 
     #[test]
     fn mismatched_extractor_uses_guest_streams_and_notifies_only_once() {
-        let (events, received) = async_channel::unbounded();
-        let mut warned = false;
+        let mut notice = None;
         for _ in 0..2 {
             assert!(
                 account_credentials(
                     Some(synthetic_credentials("INVENTED")),
                     false,
-                    &mut warned,
-                    &events
+                    false,
+                    &mut notice
                 )
                 .is_none()
             );
         }
-        let PlayerEvent::Notice(message) = received.try_recv().unwrap() else {
-            panic!("missing fallback notice")
-        };
+        let message = notice
+            .take()
+            .expect("fallback notice must wait for playback");
         assert!(message.contains("2026.08.19"));
         assert!(message.contains("guest"));
         assert!(!message.contains("update yt-dlp"));
-        assert!(received.is_empty());
+        assert!(
+            account_credentials(
+                Some(synthetic_credentials("INVENTED")),
+                false,
+                true,
+                &mut notice
+            )
+            .is_none()
+        );
+        assert!(
+            notice.is_none(),
+            "a displayed fallback notice must not repeat"
+        );
         assert!(
             account_credentials(
                 Some(synthetic_credentials("INVENTED")),
                 true,
-                &mut warned,
-                &events
+                false,
+                &mut notice
             )
             .is_some()
+        );
+        account_credentials(
+            Some(synthetic_credentials("INVENTED")),
+            false,
+            false,
+            &mut notice,
+        );
+        account_credentials(None, false, false, &mut notice);
+        assert!(
+            notice.is_none(),
+            "sign-out must cancel an undisplayed account notice"
         );
     }
 
