@@ -145,6 +145,17 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 assert!(std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).any(|job| job.query.target()==CatalogTarget::Sidebar),"Deleting a playlist reloads sidebar membership");
                 view.go_back(cx);
                 assert_eq!(view.rows.len(),500);
+                view.navigate(Route::Browse(BrowseLink::new("VLtarget","Target playlist")),cx);
+                view.page = page(0,false);
+                view.library.queue = Default::default();
+                view.patch_added("target",&[(track.id.clone(),"new-occurrence".into())],cx);
+                assert_eq!(view.rows.len(),1,"An addition can resolve metadata from the page left behind");
+                assert_eq!(view.page.tracks()[0].details.set_video_id.as_deref(),Some("new-occurrence"));
+                let id = view.catalog_requests.generations[CatalogTarget::Page as usize].load(Ordering::Relaxed);
+                view.catalog_result(CatalogResult { id,account_revision:view.account_revision,append:false,revalidate:false,result:Ok(page(0,false)),session_rejected:false,target:CatalogTarget::Page },cx);
+                assert_eq!(view.rows.len(),1,"An older page reply must preserve the acknowledged addition");
+                view.go_back(cx);
+                assert_eq!(view.rows.len(),500);
                 cx.notify();
             }).unwrap();
             result.store(true,Ordering::Release);

@@ -7,8 +7,22 @@ pub(in crate::app) struct SyncState {
     pub page_fetched_at: Option<Instant>,
     pub sidebar_continuation: Option<Continuation>,
     pub rating_overrides: HashSet<String>,
-    pub page_changes: Vec<Mutation>,
+    pub page_changes: Vec<PageChange>,
     pub optimistic_ratings: HashMap<String, Option<Rating>>,
+}
+
+pub(super) enum PageChange {
+    Confirmed(Box<Mutation>),
+    PlaylistAdded { id: String, tracks: Vec<Track> },
+}
+
+impl PageChange {
+    pub(super) fn apply(self, page: &mut Page, route: &Route) {
+        match self {
+            Self::Confirmed(mutation) => patch_page(page, route, &mutation),
+            Self::PlaylistAdded { id, tracks } => append_added(page, route, &id, &tracks),
+        }
+    }
 }
 
 pub(super) const FOCUS_REFRESH_AGE: Duration = Duration::from_secs(180);
@@ -238,6 +252,32 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     }
 }
 
+fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) {
+    if !matches!(route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
+        || page.continuation.is_some()
+    {
+        return;
+    }
+    if page.shelves.is_empty() {
+        page.shelves.push(Shelf {
+            title: String::new(),
+            layout: ShelfLayout::Songs,
+            more: None,
+            items: Vec::new(),
+        });
+    }
+    for track in sources {
+        if !page.shelves.iter().flat_map(|shelf| &shelf.items).any(|item| matches!(item, Item::Track(current) if current.details.set_video_id == track.details.set_video_id))
+        {
+            page.shelves
+                .last_mut()
+                .unwrap()
+                .items
+                .push(Item::Track(track.clone()));
+        }
+    }
+}
+
 impl Music {
     pub(super) fn overlay_ratings(&mut self) {
         for track in self.library.queue.tracks.iter_mut().chain(
@@ -275,43 +315,35 @@ impl Music {
                         Item::Track(track) => Some(track),
                         _ => None,
                     }))
+                    .chain(
+                        self.back
+                            .iter()
+                            .filter_map(|state| state.page.as_ref())
+                            .flat_map(|page| &page.shelves)
+                            .flat_map(|shelf| &shelf.items)
+                            .filter_map(|item| match item {
+                                Item::Track(track) => Some(track),
+                                _ => None,
+                            }),
+                    )
                     .find(|track| &track.id == video)?;
                 let mut track = source.clone();
                 track.details.set_video_id = Some(occurrence.clone());
                 Some(track)
             })
             .collect();
+        if self.catalog_requests.is_loading(CatalogTarget::Page) {
+            self.sync.page_changes.push(PageChange::PlaylistAdded {
+                id: id.into(),
+                tracks: sources.clone(),
+            });
+        }
         for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
             self.back
                 .iter_mut()
                 .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
         ) {
-            if !matches!(route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
-                || page.continuation.is_some()
-            {
-                continue;
-            }
-            if page.shelves.is_empty() {
-                page.shelves.push(Shelf {
-                    title: String::new(),
-                    layout: ShelfLayout::Songs,
-                    more: None,
-                    items: Vec::new(),
-                });
-            }
-            for track in &sources {
-                if !page
-                    .tracks()
-                    .iter()
-                    .any(|current| current.details.set_video_id == track.details.set_video_id)
-                {
-                    page.shelves
-                        .last_mut()
-                        .unwrap()
-                        .items
-                        .push(Item::Track(track.clone()));
-                }
-            }
+            append_added(page, route, id, &sources);
         }
         self.rebuild_rows();
         cx.notify();
@@ -333,7 +365,9 @@ impl Music {
 
     pub(super) fn patch_confirmed(&mut self, mutation: &Mutation, cx: &mut Context<Self>) {
         if self.catalog_requests.is_loading(CatalogTarget::Page) {
-            self.sync.page_changes.push(mutation.clone());
+            self.sync
+                .page_changes
+                .push(PageChange::Confirmed(Box::new(mutation.clone())));
         }
         patch_page(&mut self.page, &self.route, mutation);
         for state in &mut self.back {

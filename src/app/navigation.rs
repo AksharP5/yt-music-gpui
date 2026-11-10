@@ -463,8 +463,8 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
-                for mutation in self.sync.page_changes.drain(..) {
-                    sync::patch_page(&mut page, &self.route, &mutation);
+                for change in self.sync.page_changes.drain(..) {
+                    change.apply(&mut page, &self.route);
                 }
                 if result.account_revision != self.account_revision {
                     for track in page
