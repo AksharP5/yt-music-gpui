@@ -1,13 +1,19 @@
 use gpui::RenderImage;
+use sha1::{Digest, Sha1};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::Read,
-    sync::Arc,
+    fs::{self, File},
+    io::{Read, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-const CACHE_ENTRIES: usize = 96;
+const CACHE_ENTRIES: usize = 512;
+const DISK_BYTES: u64 = 256 * 1024 * 1024;
+const DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024;
+const DISK_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CACHE_BYTES: usize = 40 * 1024 * 1024;
 const WORKERS: usize = 3;
 
@@ -49,7 +55,9 @@ impl Artwork {
     pub fn new() -> (Self, async_channel::Receiver<LoadedArtwork>) {
         let (requests, receiver) = async_channel::bounded::<ArtworkRequest>(64);
         let (results, loaded) = async_channel::bounded(WORKERS);
+        let disk = Arc::new(OnceLock::new());
         for n in 0..WORKERS {
+            let disk = disk.clone();
             let receiver = receiver.clone();
             let results = results.clone();
             thread::Builder::new()
@@ -64,7 +72,16 @@ impl Artwork {
                         let image = client
                             .as_ref()
                             .ok()
-                            .and_then(|client| load(client, &request).ok())
+                            .and_then(|client| {
+                                load(
+                                    client,
+                                    &request,
+                                    disk.get_or_init(|| {
+                                        Mutex::new(DiskCache::new(cache_directory()))
+                                    }),
+                                )
+                                .ok()
+                            })
                             .map(Arc::new);
                         if results
                             .send_blocking(LoadedArtwork { request, image })
@@ -163,6 +180,7 @@ impl Artwork {
 fn load(
     client: &reqwest::blocking::Client,
     request: &ArtworkRequest,
+    disk: &Mutex<DiskCache>,
 ) -> anyhow::Result<RenderImage> {
     let parsed = reqwest::Url::parse(&request.url)?;
     anyhow::ensure!(
@@ -172,14 +190,153 @@ fn load(
                 || h.ends_with(".ggpht.com")),
         "Unsupported artwork host"
     );
+    let key = format!("{:x}", Sha1::digest(request.url.as_bytes()));
+    let cached = disk.lock().unwrap().read(&key);
+    if let Some(bytes) = cached {
+        if let Ok(image) = decode(bytes, request.resolution) {
+            return Ok(image);
+        }
+        disk.lock().unwrap().remove(&key);
+    }
     let mut bytes = Vec::new();
     client
         .get(parsed)
         .send()?
         .error_for_status()?
-        .take(4 * 1024 * 1024)
+        .take(DOWNLOAD_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    decode(bytes, request.resolution)
+    anyhow::ensure!(
+        bytes.len() as u64 <= DOWNLOAD_BYTES,
+        "Artwork response is too large"
+    );
+    let image = decode(bytes.clone(), request.resolution)?;
+    disk.lock().unwrap().write(&key, &bytes);
+    Ok(image)
+}
+
+fn cache_directory() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .map(|base| base.join("yt-music-gpui/artwork"))
+}
+
+struct DiskEntry {
+    bytes: u64,
+    used: SystemTime,
+}
+
+struct DiskCache {
+    directory: Option<PathBuf>,
+    entries: HashMap<String, DiskEntry>,
+    bytes: u64,
+}
+
+impl DiskCache {
+    fn new(directory: Option<PathBuf>) -> Self {
+        let mut cache = Self {
+            directory,
+            entries: HashMap::new(),
+            bytes: 0,
+        };
+        if let Some(directory) = &cache.directory
+            && fs::create_dir_all(directory).is_ok()
+            && let Ok(entries) = fs::read_dir(directory)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.len() != 40 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                let used = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                cache.bytes += metadata.len();
+                cache.entries.insert(
+                    name,
+                    DiskEntry {
+                        bytes: metadata.len(),
+                        used,
+                    },
+                );
+            }
+        }
+        cache.evict(DISK_BYTES);
+        cache
+    }
+
+    fn read(&mut self, key: &str) -> Option<Vec<u8>> {
+        let entry = self.entries.get_mut(key)?;
+        if entry.bytes > DOWNLOAD_BYTES || entry.used.elapsed().unwrap_or_default() > DISK_MAX_AGE {
+            self.remove(key);
+            return None;
+        }
+        let file = File::open(self.directory.as_ref()?.join(key)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(DOWNLOAD_BYTES + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > DOWNLOAD_BYTES {
+            return None;
+        }
+        entry.used = SystemTime::now();
+        // Persist LRU recency across launches without rewriting encoded image bytes.
+        let _ = File::open(self.directory.as_ref()?.join(key))
+            .and_then(|file| file.set_modified(entry.used));
+        Some(bytes)
+    }
+
+    fn write(&mut self, key: &str, bytes: &[u8]) {
+        if let Some(directory) = &self.directory {
+            let result = (|| -> std::io::Result<()> {
+                let mut file = tempfile::NamedTempFile::new_in(directory)?;
+                file.write_all(bytes)?;
+                file.persist(directory.join(key))
+                    .map_err(|error| error.error)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                return;
+            }
+            if let Some(previous) = self.entries.insert(
+                key.to_owned(),
+                DiskEntry {
+                    bytes: bytes.len() as u64,
+                    used: SystemTime::now(),
+                },
+            ) {
+                self.bytes -= previous.bytes;
+            }
+            self.bytes += bytes.len() as u64;
+            self.evict(DISK_BYTES);
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes -= entry.bytes;
+            if let Some(directory) = &self.directory {
+                let _ = fs::remove_file(directory.join(key));
+            }
+        }
+    }
+
+    fn evict(&mut self, budget: u64) {
+        let mut oldest = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.used))
+            .collect::<Vec<_>>();
+        oldest.sort_unstable_by_key(|(_, used)| *used);
+        for (key, used) in oldest {
+            if self.bytes <= budget && used.elapsed().unwrap_or_default() <= DISK_MAX_AGE {
+                break;
+            }
+            self.remove(&key);
+        }
+    }
 }
 
 fn decode(bytes: Vec<u8>, resolution: Resolution) -> anyhow::Result<RenderImage> {
@@ -230,6 +387,65 @@ mod tests {
         Arc::new(RenderImage::new(vec![image::Frame::new(
             image::RgbaImage::new(width, height),
         )]))
+    }
+
+    #[test]
+    fn disk_cache_survives_restart_evicts_oldest_and_recovers_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let mut disk = DiskCache::new(Some(directory.path().to_owned()));
+        disk.write(&a, b"first");
+        disk.write(&b, b"second");
+        drop(disk);
+        let mut disk = DiskCache::new(Some(directory.path().to_owned()));
+        assert_eq!(disk.read(&a).unwrap(), b"first");
+        disk.evict(6);
+        assert!(disk.read(&a).is_some());
+        assert!(disk.read(&b).is_none());
+        assert!(disk.bytes <= 6);
+        disk.entries.get_mut(&a).unwrap().used =
+            SystemTime::now() - DISK_MAX_AGE - Duration::from_secs(1);
+        assert!(disk.read(&a).is_none());
+        assert!(!directory.path().join(a).exists());
+    }
+
+    #[test]
+    #[ignore = "downloads three public thumbnails; warm restart has networking disabled"]
+    fn live_artwork_warm_restart_avoids_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let online = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let disk = Mutex::new(DiskCache::new(Some(directory.path().to_owned())));
+        let requests = ["default.jpg", "mqdefault.jpg", "hqdefault.jpg"].map(|name| {
+            request(
+                &format!("https://i.ytimg.com/vi/csILUDfmtqM/{name}"),
+                Resolution::Thumbnail,
+            )
+        });
+        for request in &requests {
+            load(&online, request, &disk).unwrap();
+        }
+        assert_eq!(disk.lock().unwrap().entries.len(), 3);
+        drop(disk);
+        let offline = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let disk = Mutex::new(DiskCache::new(Some(directory.path().to_owned())));
+        for request in &requests {
+            load(&offline, request, &disk).unwrap();
+        }
+        println!("cold_artwork_downloads=3 warm_restart_artwork_downloads=0");
+        // A corrupt entry must be discarded, allowing a subsequent online retry.
+        let key = format!("{:x}", Sha1::digest(requests[0].url.as_bytes()));
+        fs::write(directory.path().join(&key), b"broken image").unwrap();
+        assert!(load(&offline, &requests[0], &disk).is_err());
+        load(&online, &requests[0], &disk).unwrap();
     }
 
     #[test]
@@ -352,7 +568,7 @@ mod tests {
             request: request("loaded", Resolution::Thumbnail),
             image: Some(image.clone()),
         });
-        for index in 0..95 {
+        for index in 0..CACHE_ENTRIES - 1 {
             assert!(
                 artwork
                     .insert(LoadedArtwork {
