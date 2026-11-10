@@ -1391,7 +1391,7 @@ fn run(
                     state.desired = Some(track_id);
                     state.paused = options.paused;
                     state.pause_target = Some(options.paused);
-                    // Adoption must refresh seekability even if file-loaded preceded Play.
+                    // Adoption must refresh metadata even if file-loaded preceded Play.
                     state.pause_after_load = true;
                     state.upcoming = None;
                     if prefetched {
@@ -1687,6 +1687,11 @@ impl PlaybackState {
                             json!(["get_property", "seekable"]),
                             Some(json!(format!("loaded-seekable:{track_id}"))),
                         )?;
+                        write_command(
+                            socket,
+                            json!(["get_property", "duration"]),
+                            Some(json!(format!("loaded-duration:{track_id}"))),
+                        )?;
                     }
                     if let Some(paused) = self.pause_target {
                         self.pause_revision += 1;
@@ -1827,6 +1832,21 @@ impl PlaybackState {
                     track_id,
                     seekable: self.seekable,
                 });
+            }
+            return;
+        }
+        if let Some(track_id) = value["request_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("loaded-duration:"))
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            if self.loaded
+                && self.current == Some(track_id)
+                && self.desired == Some(track_id)
+                && value["error"] == "success"
+                && let Some(seconds) = value["data"].as_f64().filter(|seconds| seconds.is_finite())
+            {
+                let _ = events.send_blocking(PlayerEvent::Duration { track_id, seconds });
             }
             return;
         }
@@ -4282,6 +4302,58 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 seekable: true
             })
         ));
+    }
+
+    #[test]
+    fn adopting_a_loaded_stream_refreshes_duration_and_seekability() {
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        mpv.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        // mpv finished loading before the UI adopted this occurrence. Its first
+        // duration/seekability notifications belonged to the old UI track.
+        let mut state = PlaybackState {
+            current: Some(2),
+            desired: Some(2),
+            loaded: true,
+            pause_after_load: true,
+            ..Default::default()
+        };
+        let mut pending = b"{\"event\":\"playback-restart\"}\n".to_vec();
+        state
+            .read_messages(&mut socket, &mut pending, &mut [0; 1024], &events)
+            .unwrap();
+        for (property, data) in [("seekable", json!(true)), ("duration", json!(281.521))] {
+            let command = socket_message(&mut mpv);
+            assert_eq!(command["command"], json!(["get_property", property]));
+            state.message(
+                json!({"request_id":command["request_id"],"error":"success","data":data}),
+                &events,
+            );
+        }
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Seekable {
+                track_id: 2,
+                seekable: true
+            })
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Duration {
+                track_id: 2,
+                seconds: 281.521
+            })
+        ));
+        state.desired = Some(3);
+        state.message(
+            json!({"request_id":"loaded-duration:2","error":"success","data":281.521}),
+            &events,
+        );
+        assert!(
+            received.is_empty(),
+            "late duration must not overwrite a replacement track"
+        );
     }
 
     #[test]
