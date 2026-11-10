@@ -46,6 +46,8 @@ impl Music {
             .child(
                 div()
                     .pt(px(16.))
+                    .pb(px(16.))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(16.))
@@ -75,6 +77,7 @@ impl Music {
                             .id("save-queue")
                             .keyboard_control(theme)
                             .h(px(32.))
+                            .w(px(90.))
                             .pl(px(12.))
                             .pr(px(8.))
                             .flex_shrink_0()
@@ -101,11 +104,11 @@ impl Music {
                             })),
                     ),
             )
+            .child(self.autoplay_switch(cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .ml(px(-24.))
                     .relative()
                     .child(
                         canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
@@ -152,7 +155,6 @@ impl Music {
                         .size_full(),
                     ),
             )
-            .child(self.autoplay_switch(cx))
             .into_any_element()
     }
 
@@ -171,8 +173,11 @@ impl Music {
         div()
             .id("autoplay-toggle")
             .keyboard_control(self.theme)
-            .h(px(40.))
+            .border_0()
+            .min_h(px(50.))
             .flex_shrink_0()
+            .mb(px(12.))
+            .py(px(4.))
             .px(px(8.))
             .flex()
             .items_center()
@@ -188,8 +193,16 @@ impl Music {
                     .child(
                         div()
                             .text_size(px(14.))
+                            .line_height(px(20.))
                             .font_weight(FontWeight::MEDIUM)
                             .child("Autoplay"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(self.theme.muted)
+                            .child("Add similar content to the end of the queue"),
                     ),
             )
             .child(
@@ -231,19 +244,20 @@ impl Music {
                 .and_then(|watch| watch.current.as_ref()?.duration);
         }
         let playing = active && self.playback != Playback::Stopped && !self.playback.is_paused();
-        // Overlay the handle in the gutter so hover never shifts the song or thumbnail.
+        // The hover handle overlays the thumbnail instead of reserving a gutter.
         let show_handle = dragged || self.player_page.hovered_row == Some(index);
         let handle = show_handle.then(|| {
             div()
                 .id(("queue-handle", index))
                 .absolute()
-                .left_0()
-                .size(px(24.))
+                .left(px(8.))
+                .size(px(32.))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
                 .justify_center()
                 .cursor_grab()
+                .bg(self.theme.bg)
                 .child(icon("drag-handle", 24., rgb(0xf1f1f1).into()))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -386,11 +400,12 @@ impl Music {
         div()
             .id(id)
             .keyboard_control(self.theme)
+            .border_0()
             .group("up-next-row")
             .relative()
             .w_full()
             .h(px(ROW_HEIGHT))
-            .pl(px(32.))
+            .pl(px(8.))
             .pr(px(8.))
             .flex()
             .items_center()
@@ -408,7 +423,6 @@ impl Music {
                     .h(px(1.))
                     .bg(gpui::white().opacity(0.1)),
             )
-            .children(handle)
             .child(
                 div()
                     .relative()
@@ -458,8 +472,8 @@ impl Music {
             )
             .child(
                 div()
-                    .ml(px(8.))
-                    .w(px(56.))
+                    .ml(px(16.))
+                    .w(px(35.))
                     .h(px(36.))
                     .flex_shrink_0()
                     .relative()
@@ -476,6 +490,7 @@ impl Music {
                     )
                     .child(div().absolute().top_0().right_0().child(menu)),
             )
+            .children(handle)
     }
 
     /// The hover menu button that replaces the duration, as on the web. Keyboard focus

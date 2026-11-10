@@ -38,7 +38,7 @@ The five native window tests live in `src/app/native_tests/`. They share `YT_MUS
 
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
-At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline.
+At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline. At 956 and 1280 pixels, it captures search header and player chrome, including the Autoplay header and hover handles. It opens the compact player controls with a pointer and dismisses them with Escape.
 
 Render-count measurements wait for idle artwork and playback/catalog requests, then presented frames with stable counters. A window-bounds notification invalidates the measurement interval and starts it again; any redraw during an interval with stable bounds still fails the assertion.
 

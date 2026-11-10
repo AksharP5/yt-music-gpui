@@ -274,7 +274,7 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
             assert_eq!(
                 music.queue_focus.focused(window),
                 None,
-                "The final queue menu exits to the autoplay control"
+                "The final queue menu exits to the player bar"
             )
         })
         .unwrap();
@@ -574,11 +574,13 @@ async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut 
             })
             .unwrap();
         key(window, cx, "shift-tab").await;
+        key(window, cx, "shift-tab").await;
         window
             .update(cx, |_, window, _| {
                 capture(window, &format!("queue-save-focused-{width}"));
             })
             .unwrap();
+        key(window, cx, "tab").await;
         key(window, cx, "tab").await;
         for slot in 0..66 {
             window
@@ -607,6 +609,22 @@ async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut 
                 assert_eq!(music.queue_focus.focused(window), None)
             })
             .unwrap();
+        window
+            .update(cx, |music, _, cx| {
+                music
+                    .player_page
+                    .queue_scroll
+                    .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |music, window, cx| {
+                music.queue_focus.focus(0, window, cx)
+            })
+            .unwrap();
+        key(window, cx, "shift-tab").await;
         key(window, cx, "space").await;
         window
             .update(cx, |music, _, cx| {
@@ -1546,6 +1564,192 @@ async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     );
 }
 
+async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::{Route, Search};
+    use crate::search::{SearchFilter, SearchScope};
+    window
+        .update(cx, |music, window, cx| {
+            music.account = None;
+            music.catalog_requests = crate::app::CatalogRequests::new();
+            music.player = None;
+            music.now_playing = None;
+            music.autoplay_tracks.clear();
+            music.duration = 337.8;
+            music.position = 3.;
+            music.playback = Playback::Loaded {
+                paused: true,
+                buffering: false,
+            };
+            music.error = None;
+            music.notice = None;
+            music.route = Route::Home;
+            let mut track: crate::catalog::Track = serde_json::from_value(serde_json::json!({
+                "id": "khnokW3Mw24",
+                "title": "Instant Crush (feat. Julian Casablancas)",
+                "artist": "Daft Punk & Julian Casablancas",
+                "album": "Random Access Memories",
+                "duration": 338
+            }))
+            .unwrap();
+            track.details.year = Some("2013".into());
+            music.library.queue.replace(vec![track.clone(); 12], 0);
+            music.library.queue.playing_from = Some("Daft Punk".into());
+            music.now_playing = Some(crate::watch::Watch {
+                current: Some(track),
+                current_index: Some(0),
+                queue: Vec::new(),
+                source: None,
+                lyrics: None,
+                related: None,
+                alternatives: None,
+                continuation: None,
+                source_target: None,
+            });
+            music.select_player_tab(PlayerTab::UpNext, cx);
+            music
+                .player_page
+                .queue_scroll
+                .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+            window.focus(&music.focus, cx);
+            cx.notify();
+        })
+        .unwrap();
+    for width in [1280., 956.] {
+        window
+            .update(cx, |music, window, cx| {
+                window.resize(size(px(width), px(800.)));
+                music.sidebar_collapsed = Some(width < 1150.);
+                music.player_open = true;
+                music.player_page.hovered_row = None;
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |music, window, cx| {
+                capture(window, &format!("chrome-queue-{width}"));
+                let bounds = music.player_page.queue_bounds.get();
+                let (left, top) = if width == 1280. {
+                    (890., 277.)
+                } else {
+                    (593., 269.)
+                };
+                assert_eq!(
+                    bounds.origin,
+                    point(px(left), px(top)),
+                    "Queue must align with the web's tabs and Autoplay header"
+                );
+                println!("PLAYER_CHROME width={width} queue={bounds:?}");
+                music.player_page.hovered_row = Some(0);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("chrome-queue-hover-{width}"));
+            })
+            .unwrap();
+        if width == 956. {
+            // Open the compact controls with a real pointer event, then dismiss with Escape.
+            cx.update_window(window.into(), |_, window, cx| {
+                let position = point(px(878.), px(764.));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            window
+                .update(cx, |music, window, cx| {
+                    assert!(music.player_bar.read(cx).controls_expanded);
+                    capture(window, "chrome-controls-expanded-956");
+                })
+                .unwrap();
+            key(window, cx, "escape").await;
+            window
+                .update(cx, |music, _, cx| {
+                    assert!(!music.player_bar.read(cx).controls_expanded)
+                })
+                .unwrap();
+        }
+    }
+    for (width, compact, search) in [
+        (1280., true, false),
+        (956., true, false),
+        (1280., false, true),
+    ] {
+        window
+            .update(cx, |music, window, cx| {
+                window.resize(size(px(width), px(800.)));
+                music.player_open = false;
+                music.sidebar_collapsed = Some(compact);
+                music
+                    .detail_list
+                    .state
+                    .scroll_to(gpui::ListOffset::default());
+                music
+                    .list_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(0.), px(0.)));
+                music.route = if search {
+                    Route::Search(Search {
+                        query: "daft punk".into(),
+                        filter: SearchFilter::All,
+                        scope: SearchScope::Catalog,
+                    })
+                } else {
+                    Route::Home
+                };
+                window.focus(&music.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                let image = capture(window, &format!("chrome-header-{width}-{search}"));
+                let left = if search {
+                    325
+                } else if width == 1280. {
+                    172
+                } else {
+                    215
+                };
+                assert_ne!(
+                    image.get_pixel(left, 32),
+                    image.get_pixel(left - 1, 32),
+                    "Search must start at the web's horizontal position"
+                );
+                assert_ne!(image.get_pixel(left, 32), image.get_pixel(left + 1, 32));
+                assert_ne!(
+                    image.get_pixel(left + 479, 32),
+                    image.get_pixel(left + 480, 32),
+                    "Search must retain its 480px width"
+                );
+            })
+            .unwrap();
+    }
+}
+
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn position_samples_only_render_the_player_bar() -> Result<()> {
@@ -1947,6 +2151,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 home_chips_and_narrow_error(window, cx).await;
                 search_song_rows(window, cx).await;
                 guide_chrome(window, cx).await;
+                player_chrome(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })
