@@ -304,9 +304,8 @@ impl Music {
                     .clone()
                     .expect("shelf navigation row");
                 div()
-                    .h(px(72.))
+                    .h(px(64.))
                     .px(px(inset))
-                    .pt(px(8.))
                     .flex()
                     .items_start()
                     .child(
