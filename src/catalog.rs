@@ -3836,12 +3836,42 @@ mod tests {
                 .iter()
                 .any(|track| track.details.plays.is_some())
         );
+        let banner = artist.header.as_ref().unwrap().thumbnail.as_ref().unwrap();
+        let bytes = reqwest::blocking::get(banner)
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert!(
+            width >= 1600,
+            "artist banners need full-width source pixels"
+        );
+        println!("artist_banner_pixels={width}x{height}");
         let album = catalog
             .browse(&BrowseLink::new(
                 "MPREb_K8qWMWVqXGi",
                 "Random Access Memories",
             ))
             .unwrap();
+        let tracks = album.tracks();
+        assert!(!tracks.is_empty());
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.thumbnail.is_some() && !track.artist.contains(" plays"))
+        );
+        println!(
+            "album_tracks={} first_artist={} cover_present={}",
+            tracks.len(),
+            tracks[0].artist,
+            tracks[0].thumbnail.is_some()
+        );
         let header = album.header.unwrap();
         assert!(
             matches!(header.artist, Some(HeaderArtist::Link(artist)) if artist.id == "UCRr1xG_2WIDs18a6cIiCxeA")
