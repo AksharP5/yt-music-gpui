@@ -15,6 +15,7 @@ mod playlist_form;
 mod queue_source;
 mod search;
 mod search_box;
+mod shutdown;
 mod song_text;
 mod theme;
 mod track_state;
@@ -23,35 +24,12 @@ mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
-static TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn terminate(_: libc::c_int) {
-    TERMINATE.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
 fn shutdown_on_signal(cx: &mut App) {
-    // Signal handlers only set a flag. Quit on GPUI's thread so player and video
-    // destructors can stop extraction and remove the private playback directory.
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = terminate as *const () as usize;
-        unsafe { libc::sigemptyset(&mut action.sa_mask) };
-        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
-            eprintln!(
-                "Could not install shutdown handler: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-    cx.spawn(async |cx| {
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(100))
-                .await;
-            if TERMINATE.load(std::sync::atomic::Ordering::Relaxed) {
-                cx.update(|cx| cx.quit());
-                break;
-            }
+    let signal = shutdown::listen().expect("install shutdown signal handlers");
+    cx.spawn(async move |cx| {
+        if signal.recv().await.is_ok() {
+            // Quit on GPUI's thread so player and video destructors can clean up.
+            cx.update(|cx| cx.quit());
         }
     })
     .detach();
