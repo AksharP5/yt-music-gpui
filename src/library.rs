@@ -198,19 +198,26 @@ impl Queue {
     }
 
     pub(crate) fn append_source(&mut self, tracks: Vec<Track>) {
+        let first_new = self.tracks.len();
         self.tracks.extend(tracks);
         if self.shuffled {
-            self.shuffle_remaining();
+            self.shuffle_from(first_new);
         }
     }
 
     fn shuffle_remaining(&mut self) {
+        self.shuffle_from(self.index.map_or(0, |i| i + 1));
+    }
+
+    fn shuffle_from(&mut self, first: usize) {
         let start = self.index.map_or(0, |i| i + 1);
         let mut seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        for i in (start + 1..self.tracks.len()).rev() {
+        // Forward Fisher-Yates also inserts new pages into an already shuffled
+        // suffix in O(page size), without revisiting the entire loaded queue.
+        for i in first.max(start + 1)..self.tracks.len() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
