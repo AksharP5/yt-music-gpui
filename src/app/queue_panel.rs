@@ -493,7 +493,7 @@ impl Music {
             .size(px(36.))
             .opacity(0.)
             .group_hover("up-next-row", |menu| menu.opacity(1.))
-            .focus_visible(move |menu| menu.opacity(1.).bg(theme.raised).border_color(theme.text))
+            .keyboard_focus_style(theme, move |menu| menu.opacity(1.).bg(theme.raised))
             .into_any_element()
     }
 

@@ -149,7 +149,7 @@ impl Music {
                         .right(px(-18.))
                         .opacity(0.)
                         .group_hover("featured-row", |style| style.opacity(1.))
-                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
+                        .keyboard_focus_style(self.theme, |style| style.opacity(1.)),
                     )
                     .on_mouse_down(
                         MouseButton::Right,
