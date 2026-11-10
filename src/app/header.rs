@@ -95,23 +95,23 @@ impl Music {
                         div()
                             .id("brand-home")
                             .keyboard_control(self.theme)
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
+                            // The focus shadow supplies the ring without a 1px layout inset.
+                            .border_0()
+                            .flex_shrink_0()
                             .cursor_pointer()
                             .child(
-                                div()
-                                    .size(px(24.))
-                                    .rounded_full()
-                                    .bg(self.theme.accent)
-                                    .child(icon("brand", 24., self.theme.text)),
-                            )
-                            .child(
-                                svg()
-                                    .path("wordmark")
-                                    .w(px(43.4))
-                                    .h(px(24.))
-                                    .text_color(self.theme.text),
+                                img(|window: &mut Window, cx: &mut App| {
+                                    let scale = window.scale_factor();
+                                    window.use_asset::<crate::assets::HeaderLogo>(
+                                        &size(
+                                            DevicePixels((71. * scale).round() as i32),
+                                            DevicePixels((24. * scale).round() as i32),
+                                        ),
+                                        cx,
+                                    )
+                                })
+                                .w(px(71.))
+                                .h(px(24.)),
                             )
                             .on_click(cx.listener(|view, _, _, cx| view.navigate(Route::Home, cx))),
                     ),

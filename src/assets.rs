@@ -1,5 +1,8 @@
-use gpui::{AssetSource, SharedString};
-use std::borrow::Cow;
+use gpui::{
+    App, Asset, AssetSource, DevicePixels, ImageCacheError, RenderImage, SharedString, Size,
+    SvgSize,
+};
+use std::{borrow::Cow, sync::Arc};
 pub struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
@@ -166,5 +169,26 @@ impl AssetSource for Assets {
     }
     fn list(&self, _: &str) -> anyhow::Result<Vec<SharedString>> {
         Ok(Vec::new())
+    }
+}
+
+/// Rasterize at device resolution to avoid resampling the logo's thin glyphs.
+pub struct HeaderLogo;
+
+impl Asset for HeaderLogo {
+    type Source = Size<DevicePixels>;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(
+        size: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let renderer = cx.svg_renderer();
+        async move {
+            let svg = renderer.parse_svg(include_bytes!("../assets/icons/logo.svg"))?;
+            renderer
+                .render_parsed(&svg, SvgSize::ExactSize(size))
+                .map_err(Into::into)
+        }
     }
 }
