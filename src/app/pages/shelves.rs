@@ -1,6 +1,7 @@
 //! Virtualized shelves, carousel navigation, and discovery links.
 
 use super::super::*;
+use super::PageLayout;
 
 impl Music {
     pub(in crate::app) fn navigation(
@@ -54,14 +55,16 @@ impl Music {
         } else {
             match layout {
                 ShelfLayout::Songs => 4. * 48. + 3. * 16.,
+                ShelfLayout::Episodes => 3. * EPISODE_ROW + 2. * 16.,
                 ShelfLayout::Videos => width * 9. / 16. + page.card_text_height(),
                 ShelfLayout::Cards | ShelfLayout::Featured => width + page.card_text_height(),
             }
         };
-        let rows = if navigation || layout == ShelfLayout::Songs {
-            4
-        } else {
-            1
+        let rows = match layout {
+            _ if navigation => 4,
+            ShelfLayout::Songs => 4,
+            ShelfLayout::Episodes => 3,
+            _ => 1,
         };
         let count = shelf.items.len().div_ceil(rows);
         let scroll = self.shelf_scroll.entry(index).or_default().clone();
@@ -83,24 +86,17 @@ impl Music {
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
-                    .gap(px(if navigation || layout == ShelfLayout::Songs {
-                        16.
-                    } else {
-                        0.
-                    }))
+                    .gap(px(if rows > 1 { 16. } else { 0. }))
                     .children(
                         items
                             .into_iter()
                             .enumerate()
                             .map(|(row, item)| {
-                                self.card(
-                                    item,
-                                    start + column * rows + row,
-                                    width,
-                                    layout,
-                                    page,
-                                    cx,
-                                )
+                                let id = start + column * rows + row;
+                                if layout == ShelfLayout::Episodes {
+                                    return self.episode_row(item, id, width, page, cx);
+                                }
+                                self.card(item, id, width, layout, page, cx)
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -221,6 +217,120 @@ impl Music {
                     ),
             )
             .child(contents)
+            .into_any_element()
+    }
+}
+
+/// Explore's episode rows: a 120x68 frame beside three lines of text.
+const EPISODE_ROW: f32 = 120.;
+
+impl Music {
+    fn episode_row(
+        &mut self,
+        item: Item,
+        id: usize,
+        width: f32,
+        page: PageLayout,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Item::Track(track) = item else {
+            return self.card(item, id, width, ShelfLayout::Cards, page, cx);
+        };
+        let stats = [
+            track.details.byline.clone().unwrap_or_default(),
+            track
+                .details
+                .episode
+                .as_ref()
+                .map(|episode| episode.duration_text.clone())
+                .unwrap_or_default(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" • ");
+        let image = track
+            .thumbnail
+            .as_deref()
+            .and_then(|url| self.artwork.get(url));
+        let frame = div()
+            .relative()
+            .w(px(120.))
+            .h(px(68.))
+            .flex_shrink_0()
+            .rounded(px(4.))
+            .overflow_hidden()
+            .bg(self.theme.raised)
+            .when_some(image, |frame, image| {
+                frame.child(
+                    img(image)
+                        .size_full()
+                        .rounded(px(4.))
+                        .object_fit(ObjectFit::Cover),
+                )
+            })
+            .child(
+                div()
+                    .invisible()
+                    .group_hover("episode-row", |style| style.visible())
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(4.))
+                    .bg(gpui::black().opacity(0.8))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("play", 24., self.theme.text)),
+            );
+        div()
+            .id(("episode-row", id))
+            .keyboard_control(self.theme)
+            .group("episode-row")
+            .w(px(width))
+            .h(px(EPISODE_ROW))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|row| row.bg(self.theme.raised))
+            .child(frame)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .text_size(px(14.))
+                    .line_height(px(16.8))
+                    .child(div().truncate().text_color(self.theme.muted).child(stats))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .line_clamp(2)
+                            .text_ellipsis()
+                            .child(track.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(self.theme.muted)
+                            .child(track.artist.clone()),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_item_menu(id, window, cx);
+                }),
+            )
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&view.focus, cx);
+                view.play_item(id, cx);
+            }))
             .into_any_element()
     }
 }

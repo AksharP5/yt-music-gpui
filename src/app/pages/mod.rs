@@ -149,7 +149,7 @@ impl PageLayout {
     /// Width of one carousel column for a shelf layout.
     pub(in crate::app) fn shelf_width(self, layout: ShelfLayout) -> f32 {
         match layout {
-            ShelfLayout::Songs => self.song_width(),
+            ShelfLayout::Songs | ShelfLayout::Episodes => self.song_width(),
             ShelfLayout::Videos => self.card_width() * 16. / 9.,
             ShelfLayout::Cards | ShelfLayout::Featured => self.card_width(),
         }

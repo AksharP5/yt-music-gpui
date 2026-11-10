@@ -536,6 +536,8 @@ pub enum ShelfLayout {
     Videos,
     Songs,
     Featured,
+    /// Podcast episodes: 16:9 rows stacked three to a column.
+    Episodes,
 }
 
 #[derive(Clone, Debug)]
@@ -1683,6 +1685,12 @@ fn shelf_layout(items: &[Value]) -> ShelfLayout {
     }
     if items
         .iter()
+        .any(|item| item.get("musicMultiRowListItemRenderer").is_some())
+    {
+        return ShelfLayout::Episodes;
+    }
+    if items
+        .iter()
         .any(|item| item.get("musicResponsiveListItemRenderer").is_some())
     {
         return ShelfLayout::Songs;
@@ -2366,6 +2374,7 @@ mod tests {
             (cards, ShelfLayout::Cards),
             (videos, ShelfLayout::Videos),
             (songs.clone(), ShelfLayout::Songs),
+            (episode_row(), ShelfLayout::Episodes),
         ] {
             let page = parse_page(&json!({"contents":[{"musicCarouselShelfRenderer":{
                 "header":{"musicCarouselShelfBasicHeaderRenderer":{"title":{"simpleText":"Shelf"}}},

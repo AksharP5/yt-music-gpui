@@ -303,8 +303,11 @@ impl Music {
                 continue;
             }
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
-            let carousel =
-                sectioned && matches!(shelf.layout, ShelfLayout::Cards | ShelfLayout::Videos);
+            let carousel = sectioned
+                && matches!(
+                    shelf.layout,
+                    ShelfLayout::Cards | ShelfLayout::Videos | ShelfLayout::Episodes
+                );
             if featured {
                 self.list_rows.push(ListRow::Featured(index));
             } else if carousel {
