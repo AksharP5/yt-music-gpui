@@ -182,7 +182,6 @@ impl Music {
                 .gap(px(16.))
                 .rounded(px(4.))
                 .cursor_pointer()
-                .hover(|d| d.bg(self.theme.raised))
                 .child(art)
                 .child(
                     div()
@@ -454,7 +453,7 @@ impl Music {
                 .justify_center()
                 .text_size(px(text_size))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(self.theme.text)
+                .text_color(rgb(0xaaaaaa))
                 .when(active, |d| d.child(icon("volume", 20., self.theme.text)))
                 .when(!active, |d| {
                     d.child(
@@ -510,6 +509,11 @@ impl Music {
                 .byline
                 .clone()
                 .unwrap_or_else(|| joined(&[Some(&track.artist), plays.as_deref()])),
+            (RowStyle::Playlist, Some(track)) => joined(&[
+                Some(&track.artist),
+                plays.as_deref(),
+                track.album.as_deref(),
+            ]),
             (_, Some(track)) => joined(&[Some(&track.artist), plays.as_deref()]),
             _ => item.subtitle().to_owned(),
         };
@@ -533,7 +537,6 @@ impl Music {
             .rounded(px(4.))
             .when(style == RowStyle::ArtistTable, |row| row.rounded_none())
             .when(active, |d| d.bg(self.theme.selection))
-            .hover(|d| d.bg(self.theme.raised))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Right,
@@ -548,37 +551,37 @@ impl Music {
             }))
             .child(art);
         row = if style == RowStyle::ArtistTable {
-            let column = |text: Option<String>, flex: f32| {
+            // The web gives the title two fifths of the columns and each other
+            // column a fifth less its 16px gap, leaving 150px for the controls.
+            let columns = (page.column - 214.).max(0.);
+            let column = |text: Option<String>| {
                 div()
-                    .flex_grow(flex)
-                    .flex_basis(px(0.))
-                    .min_w_0()
+                    .w(px((columns / 5. - 16.).max(0.)))
+                    .flex_shrink_0()
                     .truncate()
                     .text_color(self.theme.muted)
                     .child(text.unwrap_or_default())
             };
             row.child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w(px(columns))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(16.))
                     .text_size(px(text_size))
                     .child(
                         div()
-                            .flex_grow(2.)
-                            .flex_basis(px(0.))
-                            .min_w_0()
+                            .w(px(columns * 0.4))
+                            .flex_shrink_0()
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
                             .child(title),
                     )
-                    .child(column(track.map(|track| track.artist.clone()), 1.))
-                    .child(column(plays, 1.))
-                    .child(column(track.and_then(|track| track.album.clone()), 1.)),
+                    .child(column(track.map(|track| track.artist.clone())))
+                    .child(column(plays))
+                    .child(column(track.and_then(|track| track.album.clone()))),
             )
-            .child(div().w(px(120.)).flex_shrink_0())
         } else {
             row.child(
                 div()
@@ -596,7 +599,13 @@ impl Music {
                             .child(title),
                     )
                     .when(!subtitle.is_empty() || explicit, |d| {
-                        d.child(self.byline(explicit, subtitle, text_size))
+                        // Album bylines stay 14px when the web enlarges titles.
+                        let size = if style == RowStyle::Album {
+                            14.
+                        } else {
+                            text_size
+                        };
+                        d.child(self.byline(explicit, subtitle, size))
                     }),
             )
         };
@@ -623,19 +632,26 @@ impl Music {
                     .map(|episode| episode.duration_text.clone())
                     .unwrap_or_default()
             });
+            // Like, dislike and menu replace the duration on hover. GPUI hover
+            // styles cannot move layout, so the row keeps their room clear.
             row = row.child(
                 div()
+                    .w(px(104.))
                     .flex_shrink_0()
+                    .flex()
+                    .justify_end()
                     .text_size(px(text_size))
                     .text_color(self.theme.muted)
+                    .group_hover("music-row", |style| style.invisible())
                     .child(duration),
             );
         }
         let artist_table = style == RowStyle::ArtistTable;
+        // Three 36px buttons, 2px apart, fill the 104px zone plus the row's padding.
         let controls = div()
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(2.))
             .pr(px(8.))
             .child(
                 button(
@@ -643,6 +659,7 @@ impl Music {
                     if liked { "thumb-up-filled" } else { "thumb-up" },
                     self.theme,
                 )
+                .size(px(36.))
                 .when(!liked, |d| {
                     d.opacity(0.)
                         .group_hover("music-row", |d| d.opacity(1.))
@@ -656,6 +673,7 @@ impl Music {
             .when(!artist_table, |d| {
                 d.child(
                     button(("dislike", index), "thumb-down", self.theme)
+                        .size(px(36.))
                         .opacity(0.)
                         .group_hover("music-row", |d| d.opacity(1.))
                         .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
@@ -689,20 +707,12 @@ impl Music {
                 self.menu_button(("track-menu", index), cx, move |view, window, cx| {
                     view.open_track_menu(menu_track.clone(), Some(index), window, cx);
                 })
+                .size(px(36.))
                 .opacity(0.)
                 .group_hover("music-row", |d| d.opacity(1.))
                 .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
             );
-        row = row.child(
-            controls
-                .absolute()
-                .right_0()
-                .top_0()
-                .h_full()
-                .when(!artist_table, |controls| {
-                    controls.group_hover("music-row", |style| style.bg(self.theme.raised))
-                }),
-        );
+        row = row.child(controls.absolute().right_0().top_0().h_full());
         div()
             .w_full()
             .px(px(inset))
