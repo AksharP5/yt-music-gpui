@@ -575,7 +575,7 @@ pub(super) mod tests {
     use serde_json::json;
     use std::time::{Duration, Instant};
 
-    pub(super) fn page(count: usize, continuation: bool) -> Page {
+    pub(in crate::app) fn page(count: usize, continuation: bool) -> Page {
         let mut page = crate::catalog::parse_page(&json!({"contents":[],"nextContinuationData":if continuation { json!({"continuation":"next"}) } else { serde_json::Value::Null }}), "Playlist").unwrap();
         page.shelves.push(Shelf { title: "Songs".into(), layout: ShelfLayout::Songs, more: None, items:(0..count).map(|index| {
             let mut track: Track = serde_json::from_value(json!({"id":format!("{index:011}"),"title":format!("Song {}",index+1),"artist":"Synthetic artist"})).unwrap();
@@ -627,7 +627,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(super) fn response(
+    pub(in crate::app) fn response(
         shelves: &[(&str, Vec<usize>)],
         token: Option<&str>,
         occurrences: bool,
@@ -852,7 +852,3 @@ pub(super) mod tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "sync_native.rs"]
-mod native;

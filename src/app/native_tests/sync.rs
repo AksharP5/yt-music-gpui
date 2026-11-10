@@ -1,5 +1,5 @@
 //! Synthetic account UI checks. Never reads a saved account or sends network writes.
-use super::tests::{page, response};
+use crate::app::sync::tests::{page, response};
 use crate::{
     account::{self, Connection, Effect, Mutation},
     app::{CatalogRequests, CatalogResult, CatalogTarget, Music, Overlay, Query, Route, Startup},
@@ -8,7 +8,7 @@ use crate::{
     catalog::{Account, BrowseLink, Rating},
     track_state,
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Result, ensure};
 use gpui::{
     AppContext, Bounds, KeyDownEvent, Keystroke, ListOffset, Modifiers, ScrollStrategy,
     TitlebarOptions, WindowBounds, WindowKind, WindowOptions, point, px, size,
@@ -16,7 +16,6 @@ use gpui::{
 use serde_json::json;
 use std::{
     borrow::Cow,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,18 +24,13 @@ use std::{
 };
 
 #[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; set YT_MUSIC_NATIVE_SYNC_TEST=1; synthetic account only"]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; set YT_MUSIC_NATIVE_TESTS=1; synthetic account only"]
 fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
-    ensure!(std::env::var("YT_MUSIC_NATIVE_SYNC_TEST").as_deref() == Ok("1"));
-    let runtime =
-        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("Set private runtime")?);
-    let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").context("Set isolated data")?);
-    ensure!(data.starts_with(&runtime) && data != runtime);
-    crate::video::initialize()?;
+    super::isolate()?;
     let passed = Arc::new(AtomicBool::new(false));
     let result = passed.clone();
     gpui_platform::application().with_assets(Assets).run(move |cx| {
-        cx.text_system().add_fonts(vec![Cow::Borrowed(include_bytes!("../../assets/fonts/Roboto.ttf").as_slice())]).unwrap();
+        cx.text_system().add_fonts(vec![Cow::Borrowed(include_bytes!("../../../assets/fonts/Roboto.ttf").as_slice())]).unwrap();
         crate::input::init(cx);
         let (sender, commands) = async_channel::bounded(64);
         let window = cx.open_window(WindowOptions {
@@ -72,7 +66,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             let mut shelf = view.page.shelves[0].clone();
             shelf.items = tail;
             view.page.shelves.push(shelf);
-            view.sync.page_coverage = super::PageCoverage { first_page_shelves: 1, continued: true };
+            view.sync.page_coverage = crate::app::sync::PageCoverage { first_page_shelves: 1, continued: true };
             view.page.title = "Sync validation playlist".into();
             view.rebuild_rows();
             view
@@ -230,7 +224,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 view.page = response(&[("Songs",(0..500).collect())],Some("tail"),true);
                 view.page.header = crate::catalog::parse_page(&json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Collection anchor"}}},"contents":[]}),"Collection anchor").unwrap().header;
                 view.page.title = "Collection anchor".into();
-                view.sync.page_coverage = super::PageCoverage { first_page_shelves:1,continued:false };
+                view.sync.page_coverage = crate::app::sync::PageCoverage { first_page_shelves:1,continued:false };
                 view.rebuild_rows();
                 view.detail_list.state.scroll_to(ListOffset { item_ix:401,offset_in_item:px(8.) });
                 let track = view.page.tracks()[400].clone();

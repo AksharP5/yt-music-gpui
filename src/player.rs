@@ -242,7 +242,6 @@ pub enum PlayerEvent {
         track_id: Option<u64>,
         message: String,
     },
-    #[allow(dead_code)] // Consumed by the app integration after its module split.
     Notice(String),
     #[cfg(test)]
     Prepared {
@@ -421,7 +420,6 @@ impl Player {
     /// Resolve only the next candidate. Replacing/clearing it cancels old work.
     /// Pass the natural successor, respecting repeat/autoplay. Call after queue edits
     /// and quality changes. mpv can transition to it at EOF without reopening its stream.
-    #[allow(dead_code)] // Wired by the app integration after its module split.
     pub fn prepare_next(&self, video_id: Option<&str>, options: PlayOptions) -> Result<()> {
         if let Some(id) = video_id {
             ensure!(
@@ -455,6 +453,15 @@ impl Player {
             track_id: self.next_id.fetch_add(1, Ordering::Relaxed),
         });
         self.send(PlayerCommand::Prepare(next.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_preparation(&self) -> Option<String> {
+        self.next
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|next| next.key.url.clone())
     }
 
     fn play_url(&self, url: String, title: &str, options: PlayOptions) -> Result<u64> {
@@ -2451,7 +2458,7 @@ mod tests {
         let id = player
             .play("csILUDfmtqM", "Prepared", PlayOptions::default())
             .unwrap();
-        // Music prepares the following entry on its first render, before Started.
+        // Music prepares the following entry when the current selection changes.
         player
             .prepare_next(Some("dQw4w9WgXcQ"), PlayOptions::default())
             .unwrap();

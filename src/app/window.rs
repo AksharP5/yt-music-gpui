@@ -80,6 +80,10 @@ fn player_bar_height(width: f32) -> f32 {
 
 impl Render for Music {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         if self.video_fullscreen && !(self.player_open && self.library.video) {
             if window.is_fullscreen() {
                 window.toggle_fullscreen();

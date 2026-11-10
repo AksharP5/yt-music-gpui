@@ -7,33 +7,18 @@ use crate::{
 use anyhow::{Context as _, Result, ensure};
 use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 use std::time::{Duration, Instant};
-use std::{collections::HashSet, path::PathBuf, process::Command};
+use std::{collections::HashSet, process::Command};
 
 #[test]
-#[ignore = "requires isolated desktop/D-Bus, network and a yt-dlp version-mismatch wrapper; set YT_MUSIC_NATIVE_PLAYBACK_TEST=1"]
+#[ignore = "requires isolated desktop/D-Bus, network and a yt-dlp version-mismatch wrapper; set YT_MUSIC_NATIVE_TESTS=1"]
 fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> Result<()> {
-    ensure!(std::env::var("YT_MUSIC_NATIVE_PLAYBACK_TEST").as_deref() == Ok("1"));
-    let runtime =
-        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("Set private runtime")?);
-    let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").context("Set private data")?);
-    ensure!(runtime.starts_with("/tmp") && data.starts_with(&runtime) && data != runtime);
-    let cache = PathBuf::from(std::env::var_os("XDG_CACHE_HOME").context("Set private cache")?);
-    ensure!(cache.starts_with(&runtime) && cache != runtime);
-    ensure!(
-        std::env::var("DBUS_SESSION_BUS_ADDRESS")?.contains("/tmp/"),
-        "Use a private session bus"
-    );
+    super::isolate()?;
     let version = Command::new("yt-dlp").arg("--version").output()?;
     ensure!(
         version.status.success() && String::from_utf8_lossy(&version.stdout).trim() != "2026.08.19",
         "Use the synthetic version-mismatch wrapper"
     );
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    ensure!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } == 0);
-    crate::video::initialize()?;
+
     let (completed, result) = async_channel::bounded::<Result<()>>(1);
     gpui_platform::application().with_assets(crate::assets::Assets).run(move |cx| {
         cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/Roboto.ttf").as_slice())]).unwrap();

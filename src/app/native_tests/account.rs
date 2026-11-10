@@ -1,4 +1,4 @@
-use super::{
+use crate::app::{
     AccountOperation, BrowserConnection, CatalogRequests, CatalogTarget, Drag, Music, Overlay,
     Playback, PlaybackQuery, PlaybackResult, QueueUpdate, Route, Startup,
 };
@@ -14,14 +14,13 @@ use crate::{
     track_state,
     watch::{MediaPair, Watch, WatchMode},
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Result, ensure};
 use gpui::{
     AppContext, Bounds, Context, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
     point, px, size,
 };
 use serde_json::json;
 use std::borrow::Cow;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -125,33 +124,14 @@ fn renew(
 }
 
 #[test]
-#[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_ACCOUNT_TEST=1"]
+#[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result<()> {
-    ensure!(
-        std::env::var("YT_MUSIC_NATIVE_ACCOUNT_TEST").as_deref() == Ok("1"),
-        "This native test requires explicit isolated execution"
-    );
-    let runtime =
-        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("Set private XDG_RUNTIME_DIR")?);
-    let data =
-        PathBuf::from(std::env::var_os("XDG_DATA_HOME").context("Set private XDG_DATA_HOME")?);
-    ensure!(
-        runtime.is_absolute() && data.starts_with(&runtime) && data != runtime,
-        "XDG_DATA_HOME must be under the private runtime"
-    );
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    ensure!(
-        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } == 0,
-        "Could not disable core dumps"
-    );
-    crate::video::initialize()?;
+    super::isolate()?;
+    let data = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
     let passed = Arc::new(AtomicBool::new(false));
     let result = passed.clone();
     gpui_platform::application().with_assets(Assets).run(move |cx| {
-        cx.text_system().add_fonts(vec![Cow::Borrowed(include_bytes!("../assets/fonts/Roboto.ttf").as_slice())]).unwrap();
+        cx.text_system().add_fonts(vec![Cow::Borrowed(include_bytes!("../../../assets/fonts/Roboto.ttf").as_slice())]).unwrap();
         input::init(cx);
         let bounds = Bounds::new(point(px(40.), px(40.)), size(px(850.), px(560.)));
         let (sender, commands) = async_channel::bounded(64);

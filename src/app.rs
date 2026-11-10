@@ -82,6 +82,8 @@ pub enum Startup {
 }
 
 pub struct Music {
+    #[cfg(test)]
+    renders: usize,
     content_view: Entity<MusicContent>,
     player_bar: Entity<PlayerBar>,
     theme: Theme,
@@ -172,8 +174,4 @@ pub struct Music {
 mod tests;
 
 #[cfg(test)]
-#[path = "native_account_tests.rs"]
-mod native_account_tests;
-
-#[cfg(test)]
-mod render_tests;
+mod native_tests;

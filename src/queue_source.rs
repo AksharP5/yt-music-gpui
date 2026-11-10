@@ -344,7 +344,6 @@ impl Worker {
     }
 
     /// Shuffle the entire source, including pages that have not arrived yet.
-    #[allow(dead_code)] // The app's Shuffle action can call this after its module split.
     pub fn shuffle(
         &mut self,
         queue: &mut Queue,

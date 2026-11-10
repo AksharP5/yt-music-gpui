@@ -847,6 +847,3 @@ impl Music {
         true
     }
 }
-
-#[cfg(test)]
-mod native_tests;
