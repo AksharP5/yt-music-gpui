@@ -296,6 +296,9 @@ pub struct TrackDetails {
     pub artist_id: Option<String>,
     pub album_id: Option<String>,
     pub credits_id: Option<String>,
+    /// The release year from the byline, shown after the album in the player bar.
+    #[serde(skip)]
+    pub year: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode: Option<Box<EpisodeContext>>,
 }
@@ -1428,6 +1431,12 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> Tra
             .map(str::to_owned),
         artist_id: browse_id("UC"),
         album_id: browse_id("MPRE"),
+        year: runs
+            .iter()
+            .filter(|run| run.get("navigationEndpoint").is_none())
+            .filter_map(|run| run["text"].as_str())
+            .find(|text| text.len() == 4 && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .map(str::to_owned),
         ..Default::default()
     };
     for item in row

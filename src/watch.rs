@@ -703,7 +703,9 @@ mod tests {
                 {"text":" & "},
                 {"text":"Second artist","navigationEndpoint":{"browseEndpoint":{"browseId":"UCother"}}},
                 {"text":" • "},
-                {"text":"The album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}}
+                {"text":"The album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}},
+                {"text":" • "},
+                {"text":"2013"}
             ]},
             "lengthText":{"simpleText":"3:27"},
             "thumbnail":{"thumbnails":[{"url":"https://example.com/cover.jpg","width":320}]},
@@ -1004,6 +1006,7 @@ mod tests {
         assert_eq!(current.title, "Selected occurrence");
         assert_eq!(current.artist, "First artist, Second artist");
         assert_eq!(current.album.as_deref(), Some("The album"));
+        assert_eq!(current.details.year.as_deref(), Some("2013"));
         assert_eq!(current.duration, Some(207));
         assert_eq!(current.details.rating, Some(Rating::Like));
         assert_eq!(current.details.in_library, Some(true));
