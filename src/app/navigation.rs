@@ -266,7 +266,9 @@ impl Music {
         if let Some(Overlay::Track { track, index, .. }) = &mut self.overlay {
             *index = self.rows.iter().position(|item| matches!(item, Item::Track(current) if current.id == track.id && current.details.set_video_id == track.details.set_video_id));
         }
-        if self.page.header.is_some()
+        if self.route.is_home() || matches!(self.route, Route::Explore) {
+            self.detail_list.state.remeasure();
+        } else if self.page.header.is_some()
             || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
         {
             self.detail_list.reset_rows(self.list_rows.len());

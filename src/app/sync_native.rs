@@ -10,8 +10,8 @@ use crate::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    AppContext, Bounds, ScrollStrategy, TitlebarOptions, WindowBounds, WindowKind, WindowOptions,
-    point, px, size,
+    AppContext, Bounds, ListOffset, ScrollStrategy, TitlebarOptions, WindowBounds, WindowKind,
+    WindowOptions, point, px, size,
 };
 use serde_json::json;
 use std::{
@@ -95,6 +95,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 assert!(matches!(view.overlay,Some(Overlay::Track { index:Some(450),.. })));
                 assert_eq!(view.list_scroll.0.borrow().base_handle.offset(),scroll);
                 view.overlay = None;
+                assert!(view.error.is_none(),"Synthetic fixture error: {:?}",view.error);
                 view.navigate(Route::Explore,cx);
                 let start = Instant::now();
                 view.go_back(cx);
@@ -158,10 +159,49 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 assert_eq!(view.rows.len(),500);
                 cx.notify();
             }).unwrap();
-            result.store(true,Ordering::Release);
             cx.background_executor().timer(Duration::from_millis(600)).await;
             println!("SYNC_SCREENSHOT already-added");
-            cx.background_executor().timer(Duration::from_secs(5)).await;
+            window.update(cx,|view,_,cx| {
+                view.route = Route::Home;
+                view.overlay = None;
+                view.player_open = false;
+                view.library.queue = Default::default();
+                view.page = page(4,false);
+                let shelf = view.page.shelves[0].clone();
+                view.page.shelves = (0..8).map(|index| {
+                    let mut shelf = shelf.clone();
+                    shelf.title = format!("Home shelf {index}");
+                    shelf
+                }).collect();
+                view.rebuild_rows();
+                view.detail_list.state.reset(9);
+                view.detail_list.state.scroll_to(ListOffset { item_ix:4,offset_in_item:px(0.) });
+                cx.notify();
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            let expected = window.update(cx,|view,_,cx| {
+                let before = view.detail_list.state.logical_scroll_top();
+                let before = (before.item_ix,before.offset_in_item);
+                assert!(before.0 >= 3,"The Home fixture must be scrolled before refresh");
+                let fresh = view.page.clone();
+                view.request(Query::Revalidate(Box::new(Query::Home)),cx);
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,append:false,revalidate:true,result:Ok(fresh),session_rejected:false,target:CatalogTarget::Page },cx);
+                let after = view.detail_list.state.logical_scroll_top();
+                assert_eq!((after.item_ix,after.offset_in_item),before,"Refreshing Home must keep the visible shelf");
+                let track = view.page.tracks()[0].clone();
+                view.patch_confirmed(&Mutation::RateSong { track,rating:Rating::Like },cx);
+                let after = view.detail_list.state.logical_scroll_top();
+                assert_eq!((after.item_ix,after.offset_in_item),before,"A save acknowledgement must keep the visible shelf");
+                before
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            window.update(cx,|view,_,_| {
+                let after = view.detail_list.state.logical_scroll_top();
+                assert_eq!((after.item_ix,after.offset_in_item),expected,"The next frame must preserve Home's scroll position");
+            }).unwrap();
+            result.store(true,Ordering::Release);
+            println!("SYNC_SCREENSHOT home-scroll-preserved");
             cx.update(|cx| cx.quit());
         }).detach();
         cx.spawn(async move |cx| {
