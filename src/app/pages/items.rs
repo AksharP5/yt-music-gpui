@@ -65,25 +65,63 @@ impl Music {
     }
 
     /// The explicit badge and secondary line shared by rows and cards.
-    pub(in crate::app) fn byline(
-        &self,
-        explicit: bool,
-        text: impl Into<SharedString>,
-        size: f32,
-    ) -> Div {
+    pub(in crate::app) fn byline(&self, explicit: bool, text: impl IntoElement, size: f32) -> Div {
         let line = div()
             .min_w_0()
             .text_size(px(size))
             .line_height(relative(1.2))
             .text_color(self.theme.muted);
         if !explicit {
-            return line.truncate().child(text.into());
+            return line.truncate().child(text);
         }
         line.flex()
             .items_center()
             .gap(px(4.))
             .child(icon("explicit", 16., self.theme.muted).flex_shrink_0())
-            .child(div().flex_1().min_w_0().truncate().child(text.into()))
+            .child(div().flex_1().min_w_0().truncate().child(text))
+    }
+
+    /// Text whose artist, album and show names open their pages, underlined
+    /// on hover like the web's links. Clicking elsewhere on the text still
+    /// reaches the row.
+    pub(in crate::app) fn linked_text<'a>(
+        &self,
+        text: String,
+        links: impl IntoIterator<Item = &'a BrowseLink>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let spans = link_spans(&text, links);
+        if spans.iter().all(|(_, link)| link.is_none()) {
+            return text.into_any_element();
+        }
+        let last = spans.len() - 1;
+        div()
+            .flex()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .children(spans.into_iter().enumerate().map(|(index, (span, link))| {
+                let span = div().child(span);
+                // Only the last span shrinks, so the line ends in an ellipsis.
+                let span = if index == last {
+                    span.min_w_0().truncate()
+                } else {
+                    span.flex_shrink_0()
+                };
+                let Some(link) = link else {
+                    return span.into_any_element();
+                };
+                span.id(SharedString::from(format!("text-link-{}-{index}", link.id)))
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&view.focus, cx);
+                        view.navigate(Route::Browse(link.clone()), cx);
+                    }))
+                    .into_any_element()
+            }))
+            .into_any_element()
     }
 
     fn mood_button(
@@ -153,15 +191,19 @@ impl Music {
         if layout == ShelfLayout::Songs {
             let (byline, explicit, wide) = match &item {
                 Item::Track(track) => (
-                    track
-                        .details
-                        .byline
-                        .clone()
-                        .unwrap_or_else(|| track.artist.clone()),
+                    self.linked_text(
+                        track
+                            .details
+                            .byline
+                            .clone()
+                            .unwrap_or_else(|| track.artist.clone()),
+                        &track.details.links,
+                        cx,
+                    ),
                     track.details.explicit,
                     track.details.wide_thumbnail,
                 ),
-                _ => (item.subtitle().to_owned(), false, false),
+                _ => (item.subtitle().to_owned().into_any_element(), false, false),
             };
             let art = self.row_thumbnail(
                 item.thumbnail(),
@@ -554,14 +596,28 @@ impl Music {
             // The web gives the title two fifths of the columns and each other
             // column a fifth less its 16px gap, leaving 150px for the controls.
             let columns = (page.column - 214.).max(0.);
-            let column = |text: Option<String>| {
+            let column = |text: AnyElement| {
                 div()
                     .w(px((columns / 5. - 16.).max(0.)))
                     .flex_shrink_0()
                     .truncate()
                     .text_color(self.theme.muted)
-                    .child(text.unwrap_or_default())
+                    .child(text)
             };
+            let links = track.map_or(&[][..], |track| track.details.links.as_slice());
+            let is_album = |link: &&BrowseLink| link.id.starts_with("MPRE");
+            let artist = self.linked_text(
+                track.map(|track| track.artist.clone()).unwrap_or_default(),
+                links.iter().filter(|link| !is_album(link)),
+                cx,
+            );
+            let album = self.linked_text(
+                track
+                    .and_then(|track| track.album.clone())
+                    .unwrap_or_default(),
+                links.iter().filter(is_album),
+                cx,
+            );
             row.child(
                 div()
                     .w(px(columns))
@@ -578,9 +634,9 @@ impl Music {
                             .font_weight(FontWeight::MEDIUM)
                             .child(title),
                     )
-                    .child(column(track.map(|track| track.artist.clone())))
-                    .child(column(plays))
-                    .child(column(track.and_then(|track| track.album.clone()))),
+                    .child(column(artist))
+                    .child(column(plays.unwrap_or_default().into_any_element()))
+                    .child(column(album)),
             )
         } else {
             row.child(
@@ -605,7 +661,8 @@ impl Music {
                         } else {
                             text_size
                         };
-                        d.child(self.byline(explicit, subtitle, size))
+                        let links = track.map_or(&[][..], |track| track.details.links.as_slice());
+                        d.child(self.byline(explicit, self.linked_text(subtitle, links, cx), size))
                     }),
             )
         };
@@ -771,5 +828,63 @@ impl RowStyle {
             Self::ArtistTable => 32.,
             _ => 48.,
         }
+    }
+}
+
+/// Splits text into plain spans and the names that `links` open. Links come in
+/// the text's order, so each is looked for after the previous match; one the
+/// text does not contain is skipped.
+fn link_spans<'a>(
+    text: &str,
+    links: impl IntoIterator<Item = &'a BrowseLink>,
+) -> Vec<(String, Option<BrowseLink>)> {
+    let mut spans = Vec::new();
+    let mut rest = 0;
+    for link in links {
+        if link.title.is_empty() {
+            continue;
+        }
+        let Some(start) = text[rest..].find(&link.title).map(|start| rest + start) else {
+            continue;
+        };
+        if start > rest {
+            spans.push((text[rest..start].to_owned(), None));
+        }
+        rest = start + link.title.len();
+        spans.push((link.title.clone(), Some(link.clone())));
+    }
+    if rest < text.len() || spans.is_empty() {
+        spans.push((text[rest..].to_owned(), None));
+    }
+    spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_spans;
+    use crate::catalog::BrowseLink;
+
+    #[test]
+    fn byline_links_follow_the_text_order_and_skip_missing_names() {
+        let links = [
+            BrowseLink::new("UCweezer", "Weezer"),
+            BrowseLink::new("UCother", "Not in this line"),
+            BrowseLink::new("MPREweezer", "Weezer"),
+        ];
+        let spans = link_spans("Song • Weezer • Weezer • 1994", &links);
+        let shape: Vec<_> = spans
+            .iter()
+            .map(|(text, link)| (text.as_str(), link.as_ref().map(|link| link.id.as_str())))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("Song • ", None),
+                ("Weezer", Some("UCweezer")),
+                (" • ", None),
+                ("Weezer", Some("MPREweezer")),
+                (" • 1994", None),
+            ]
+        );
     }
 }

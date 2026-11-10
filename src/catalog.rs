@@ -305,6 +305,9 @@ pub struct TrackDetails {
     /// "Song • Daft Punk • 28M plays" in search results.
     #[serde(skip)]
     pub byline: Option<String>,
+    /// Artist, album and show links in service byline order.
+    #[serde(skip)]
+    pub links: Vec<BrowseLink>,
     #[serde(skip)]
     pub explicit: bool,
     /// Video and episode frames are 16:9 and must not be cropped square.
@@ -1538,6 +1541,18 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> Tra
             .map(str::to_owned),
         artist_id: browse_id("UC"),
         album_id: browse_id("MPRE"),
+        links: runs
+            .iter()
+            .filter_map(|run| {
+                BrowseLink::from_endpoint(
+                    run.pointer("/navigationEndpoint/browseEndpoint")?,
+                    run["text"].as_str()?.to_owned(),
+                )
+            })
+            .filter(|link| {
+                link.id.starts_with("UC") || link.id.starts_with("MPRE") || valid_show_id(&link.id)
+            })
+            .collect(),
         year: runs
             .iter()
             .filter(|run| run.get("navigationEndpoint").is_none())

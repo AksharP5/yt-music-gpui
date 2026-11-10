@@ -479,22 +479,24 @@ fn parse_track(row: &Value, current_id: &str) -> Option<Track> {
         .into_iter()
         .flatten()
         .collect();
-    let artists: Vec<_> = runs
-        .iter()
-        .filter(|run| {
-            run.pointer("/navigationEndpoint/browseEndpoint/browseId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id.starts_with("UC"))
-        })
-        .filter_map(|run| run["text"].as_str())
-        .collect();
-    let artist = if artists.is_empty() {
-        runs.first()
+    let is_artist = |run: &&Value| {
+        run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("UC"))
+    };
+    let artist = match (
+        runs.iter().position(is_artist),
+        runs.iter().rposition(is_artist),
+    ) {
+        (Some(first), Some(last)) => runs[first..=last]
+            .iter()
+            .filter_map(|run| run["text"].as_str())
+            .collect(),
+        _ => runs
+            .first()
             .and_then(|run| run["text"].as_str())
             .unwrap_or("YouTube Music")
-            .to_owned()
-    } else {
-        artists.join(", ")
+            .to_owned(),
     };
     let album = runs.iter().find_map(|run| {
         run.pointer("/navigationEndpoint/browseEndpoint/browseId")
@@ -1004,7 +1006,7 @@ mod tests {
         assert_eq!(watch.current_index, Some(2));
         let current = watch.current.unwrap();
         assert_eq!(current.title, "Selected occurrence");
-        assert_eq!(current.artist, "First artist, Second artist");
+        assert_eq!(current.artist, "First artist & Second artist");
         assert_eq!(current.album.as_deref(), Some("The album"));
         assert_eq!(current.details.year.as_deref(), Some("2013"));
         assert_eq!(current.duration, Some(207));
