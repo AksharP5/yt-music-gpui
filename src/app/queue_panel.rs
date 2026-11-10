@@ -181,7 +181,6 @@ impl Music {
         };
         let active = self.library.queue.index == Some(index);
         let playing = active && self.playback != Playback::Stopped && !self.playback.is_paused();
-        let menu_track = track.clone();
         // Showing the handle shifts the row, as on the web. GPUI evaluates `display` in both
         // prepaint and paint, so it follows stored hover state rather than `group_hover`.
         let show_handle = dragged || self.player_page.hovered_row == Some(index);
@@ -210,10 +209,7 @@ impl Music {
                 )
         });
         let menu = self.row_menu(("queue-menu", index), cx, move |view, window, cx| {
-            view.open_track_menu(menu_track.clone(), None, window, cx);
-            if let Some(Overlay::Track { queue_index, .. }) = &mut view.overlay {
-                *queue_index = Some(index);
-            }
+            view.open_queue_menu(index, window, cx);
         });
         self.track_row(
             ("queue-row", index),
@@ -222,6 +218,13 @@ impl Music {
             dragged,
             handle,
             menu,
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |view, _, window, cx| {
+                cx.stop_propagation();
+                view.open_queue_menu(index, window, cx);
+            }),
         )
         .on_hover(cx.listener(move |view, hovered: &bool, _, cx| {
             let hovered_row = &mut view.player_page.hovered_row;
@@ -242,6 +245,16 @@ impl Music {
             }
         }))
         .into_any_element()
+    }
+
+    fn open_queue_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(track) = self.library.queue.tracks.get(index).cloned() else {
+            return;
+        };
+        self.open_track_menu(track, None, window, cx);
+        if let Some(Overlay::Track { queue_index, .. }) = &mut self.overlay {
+            *queue_index = Some(index);
+        }
     }
 
     fn autoplay_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
