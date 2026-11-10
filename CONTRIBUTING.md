@@ -35,6 +35,8 @@ bin/test -- --ignored --exact player::tests::embedded_extractor_binds_the_select
 - **Keyring and browser tests** (`live_keyring_removal_is_idempotent`, `live_default_browser_profile_resolves_omarchy_launcher`) use your desktop session. They create only a synthetic keyring entry and read only browser profile metadata.
 - **The native account test** opens a window and refuses to run unless `YT_MUSIC_NATIVE_ACCOUNT_TEST=1` is set, with a private `XDG_RUNTIME_DIR` and an `XDG_DATA_HOME` inside it, as described below.
 
+The native sync test, `app::sync::native::native_sync_preserves_loaded_pages_and_rolls_back_ratings`, uses a synthetic account and intercepted account commands. Run it in the same isolated environment with `YT_MUSIC_NATIVE_SYNC_TEST=1`. It checks a 500-row page, cached Back, rating rollback and dislike-skip without sending account writes.
+
 No test signs in to a real Google account. Do not add one that does.
 
 ## Run an isolated instance

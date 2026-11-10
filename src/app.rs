@@ -50,6 +50,7 @@ mod playback;
 mod player_bar;
 mod queue_panel;
 mod sidebar;
+mod sync;
 mod video;
 mod window;
 
@@ -92,6 +93,7 @@ pub struct Music {
     pending_mutations: HashSet<String>,
     ratings: HashMap<String, Rating>,
     account_revision: u64,
+    sync: sync::SyncState,
     track_state: track_state::Worker,
     track_state_id: Option<u64>,
     focus: FocusHandle,

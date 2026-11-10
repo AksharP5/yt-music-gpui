@@ -141,6 +141,8 @@ impl Mutation {
 pub enum Effect {
     Changed,
     CreatedPlaylist { id: String },
+    PlaylistAdded { additions: Vec<(String, String)> },
+    AlreadyAdded,
 }
 #[derive(Clone)]
 pub struct Connection {
@@ -510,18 +512,12 @@ impl Catalog {
         let effect = mutation_effect(mutation, &response)?;
         let playlist = match (&effect, mutation) {
             (Effect::CreatedPlaylist { id }, _) => Some(id),
-            (
-                _,
-                Mutation::EditPlaylist { id, .. }
-                | Mutation::AddToPlaylist { id, .. }
-                | Mutation::RemoveFromPlaylist { id, .. }
-                | Mutation::MoveInPlaylist { id, .. },
-            ) => Some(id),
+            (_, Mutation::EditPlaylist { id, .. }) => Some(id),
             _ => None,
         };
         if let Some(id) = playlist {
             self.wait_for_playlist(id, current, expected, |page| {
-                playlist_change_visible(mutation, &response, page)
+                playlist_metadata_visible(mutation, page)
             })?;
         }
         Ok(effect)
@@ -693,7 +689,7 @@ impl Catalog {
     }
 }
 
-fn playlist_change_visible(mutation: &Mutation, response: &Value, page: &Page) -> bool {
+fn playlist_metadata_visible(mutation: &Mutation, page: &Page) -> bool {
     let tracks = page.tracks();
     match mutation {
         Mutation::CreatePlaylist {
@@ -719,52 +715,7 @@ fn playlist_change_visible(mutation: &Mutation, response: &Value, page: &Page) -
                 && page.description == *description
                 && page.privacy.as_deref() == Some(privacy.value())
         }
-        Mutation::AddToPlaylist { .. } => {
-            let added: Vec<_> = response["playlistEditResults"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|result| {
-                    result
-                        .pointer("/playlistEditVideoAddedResultData/setVideoId")
-                        .and_then(Value::as_str)
-                })
-                .collect();
-            !added.is_empty()
-                && (page.continuation.is_some()
-                    || added.iter().all(|id| {
-                        tracks
-                            .iter()
-                            .any(|track| track.details.set_video_id.as_deref() == Some(id))
-                    }))
-        }
-        Mutation::RemoveFromPlaylist { set_video_id, .. } => !tracks
-            .iter()
-            .any(|track| track.details.set_video_id.as_ref() == Some(set_video_id)),
-        Mutation::MoveInPlaylist {
-            set_video_id,
-            before,
-            ..
-        } => {
-            let position = |id: &str| {
-                tracks
-                    .iter()
-                    .position(|track| track.details.set_video_id.as_deref() == Some(id))
-            };
-            let moved = position(set_video_id);
-            match before {
-                Some(before) => match (moved, position(before)) {
-                    (Some(moved), Some(successor)) => moved + 1 == successor,
-                    (None, None) => page.continuation.is_some(),
-                    _ => false,
-                },
-                None => match moved {
-                    Some(index) => page.continuation.is_none() && index + 1 == tracks.len(),
-                    None => page.continuation.is_some(),
-                },
-            }
-        }
-        _ => true,
+        _ => false,
     }
 }
 
@@ -777,8 +728,66 @@ fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
                 .to_owned(),
         });
     }
+    if let Mutation::AddToPlaylist {
+        video_ids,
+        duplicates,
+        ..
+    } = mutation
+    {
+        if !duplicates && duplicate_response(response) {
+            return Ok(Effect::AlreadyAdded);
+        }
+        let additions: Vec<_> = response["playlistEditResults"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|result| {
+                let added = &result["playlistEditVideoAddedResultData"];
+                Some((
+                    added["videoId"].as_str()?.to_owned(),
+                    added["setVideoId"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        ensure!(
+            additions
+                .iter()
+                .map(|(_, occurrence)| occurrence)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == additions.len(),
+            "YouTube returned repeated playlist occurrences. Refresh the playlist."
+        );
+        let mut remaining = additions.clone();
+        for id in video_ids {
+            let index = remaining.iter().position(|(video, occurrence)| video == id && !occurrence.is_empty())
+                .context("YouTube accepted the request but did not confirm every added song. Refresh the playlist before retrying.")?;
+            remaining.remove(index);
+        }
+        ensure!(
+            remaining.is_empty() && !additions.is_empty(),
+            "YouTube returned unexpected playlist additions. Refresh the playlist."
+        );
+        return Ok(Effect::PlaylistAdded { additions });
+    }
     Ok(Effect::Changed)
 }
+
+fn duplicate_response(response: &Value) -> bool {
+    let notification = find(response, "notificationActionRenderer")
+        .map(|renderer| crate::catalog::text(&renderer["responseText"]));
+    let dialog = find(response, "confirmDialogRenderer")
+        .map(|renderer| crate::catalog::text(&renderer["title"]));
+    notification.into_iter().chain(dialog).any(|text| {
+        matches!(
+            text.as_str(),
+            "This track is already in the playlist"
+                | "Song already in playlist"
+                | "Already in playlist"
+        )
+    })
+}
+
 fn confirm_mutation(endpoint: &str, response: &Value, playlist_id: Option<&str>) -> Result<()> {
     if endpoint == "feedback" {
         let feedback = response["feedbackResponses"]
@@ -831,7 +840,18 @@ fn send_current_mutation(
         .get("playlistId")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let adding_without_duplicates = endpoint == "browse/edit_playlist"
+        && body["actions"].as_array().is_some_and(|actions| {
+            !actions.is_empty()
+                && actions.iter().all(|action| {
+                    action["action"] == "ACTION_ADD_VIDEO" && action.get("dedupeOption").is_none()
+                })
+        });
     let response = send(endpoint, body)?;
+    require_current_session(current, expected)?;
+    if adding_without_duplicates && duplicate_response(&response) {
+        return Ok(response);
+    }
     confirm_mutation(endpoint, &response, playlist_id.as_deref())?;
     Ok(response)
 }
@@ -890,7 +910,7 @@ mod tests {
                 privacy: Privacy::Private,
             },
         ] {
-            assert!(playlist_change_visible(&mutation, &json!({}), &ready));
+            assert!(playlist_metadata_visible(&mutation, &ready));
             for stale in [
                 Page {
                     title: "Old name".into(),
@@ -905,114 +925,124 @@ mod tests {
                     ..ready.clone()
                 },
             ] {
-                assert!(!playlist_change_visible(&mutation, &json!({}), &stale));
+                assert!(!playlist_metadata_visible(&mutation, &stale));
             }
         }
     }
 
     #[test]
-    fn playlist_refresh_matches_added_removed_and_moved_occurrences() {
-        let added = Mutation::AddToPlaylist {
-            id: "PLedited".into(),
-            video_ids: vec!["abcdefghijk".into()],
-            duplicates: true,
-        };
-        let response = json!({"playlistEditResults":[{"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"new"}}]});
-        assert!(!playlist_change_visible(
-            &added,
-            &response,
-            &playlist_page(&["original"])
-        ));
-        assert!(playlist_change_visible(
-            &added,
-            &response,
-            &playlist_page(&["original", "new"])
-        ));
-        let removed = Mutation::RemoveFromPlaylist {
-            id: "PLedited".into(),
-            video_id: "abcdefghijk".into(),
-            set_video_id: "new".into(),
-        };
-        assert!(!playlist_change_visible(
-            &removed,
-            &json!({}),
-            &playlist_page(&["original", "new"])
-        ));
-        assert!(playlist_change_visible(
-            &removed,
-            &json!({}),
-            &playlist_page(&["original"])
-        ));
-        let moved = Mutation::MoveInPlaylist {
-            id: "PLedited".into(),
-            set_video_id: "third".into(),
-            before: Some("second".into()),
-        };
-        assert!(!playlist_change_visible(
-            &moved,
-            &json!({}),
-            &playlist_page(&["first", "second", "third"])
-        ));
-        assert!(playlist_change_visible(
-            &moved,
-            &json!({}),
-            &playlist_page(&["first", "third", "second"])
-        ));
-        let to_end = Mutation::MoveInPlaylist {
-            id: "PLedited".into(),
-            set_video_id: "first".into(),
-            before: None,
-        };
-        assert!(!playlist_change_visible(
-            &to_end,
-            &json!({}),
-            &playlist_page(&["first", "second", "third"])
-        ));
-        assert!(playlist_change_visible(
-            &to_end,
-            &json!({}),
-            &playlist_page(&["second", "third", "first"])
-        ));
+    fn playlist_occurrence_edits_require_server_acknowledgement_without_a_partial_readback() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let catalog = Catalog::new().unwrap().for_session(Some(expected.clone()));
+        for (mutation, action) in [
+            (
+                Mutation::RemoveFromPlaylist {
+                    id: "PLedited".into(),
+                    video_id: "abcdefghijk".into(),
+                    set_video_id: "later-occurrence".into(),
+                },
+                "ACTION_REMOVE_VIDEO",
+            ),
+            (
+                Mutation::MoveInPlaylist {
+                    id: "PLedited".into(),
+                    set_video_id: "later-occurrence".into(),
+                    before: Some("another-later-occurrence".into()),
+                },
+                "ACTION_MOVE_VIDEO_BEFORE",
+            ),
+        ] {
+            for status in [
+                Value::Null,
+                json!("STATUS_FAILED"),
+                json!("STATUS_SUCCEEDED"),
+            ] {
+                let result = send_current_mutation(
+                    &shared,
+                    &expected,
+                    || catalog.mutation_request(&mutation),
+                    |endpoint, body| {
+                        assert_eq!(endpoint, "browse/edit_playlist");
+                        assert_eq!(body["playlistId"], "PLedited");
+                        assert_eq!(body["actions"][0]["setVideoId"], "later-occurrence");
+                        assert_eq!(body["actions"][0]["action"], action);
+                        Ok(json!({"status":status}))
+                    },
+                );
+                assert_eq!(result.is_ok(), status == "STATUS_SUCCEEDED");
+            }
+        }
     }
 
     #[test]
-    fn playlist_refresh_does_not_scan_unaffected_pages() {
-        let mut partial = playlist_page(&["visible"]);
-        partial.continuation = parse_page(
-            &json!({"contents":[],"nextContinuationData":{"continuation":"next"}}),
-            "Playlist",
+    fn playlist_additions_require_each_returned_video_and_occurrence() {
+        let mutation = Mutation::AddToPlaylist {
+            id: "PLedited".into(),
+            video_ids: vec!["abcdefghijk".into(), "abcdefghijk".into()],
+            duplicates: true,
+        };
+        for results in [
+            json!([]),
+            json!([{"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"first"}}]),
+            json!([{"playlistEditVideoAddedResultData":{"videoId":"wrong-video","setVideoId":"first"}}]),
+        ] {
+            assert!(mutation_effect(&mutation, &json!({"playlistEditResults":results})).is_err());
+        }
+        let effect = mutation_effect(
+            &mutation,
+            &json!({"playlistEditResults":[
+                {"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"first"}},
+                {"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"second"}}
+            ]}),
         )
-        .unwrap()
-        .continuation;
-        let added = Mutation::AddToPlaylist {
+        .unwrap();
+        assert!(
+            matches!(effect, Effect::PlaylistAdded { additions } if additions.len() == 2 && additions[0].1 == "first" && additions[1].1 == "second")
+        );
+    }
+
+    #[test]
+    fn duplicate_addition_prompts_without_retrying_and_generic_failure_stays_an_error() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let catalog = Catalog::new().unwrap().for_session(Some(expected.clone()));
+        let mutation = Mutation::AddToPlaylist {
+            id: "PLedited".into(),
+            video_ids: vec!["abcdefghijk".into()],
+            duplicates: false,
+        };
+        let response = json!({"status":"STATUS_FAILED","actions":[{"addToToastAction":{"item":{"notificationActionRenderer":{"responseText":{"runs":[{"text":"This track is already in the playlist"}]}}}}}]});
+        let returned = send_current_mutation(
+            &shared,
+            &expected,
+            || catalog.mutation_request(&mutation),
+            |_, body| {
+                assert!(body["actions"][0].get("dedupeOption").is_none());
+                Ok(response.clone())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            mutation_effect(&mutation, &returned).unwrap(),
+            Effect::AlreadyAdded
+        ));
+        assert!(
+            send_current_mutation(
+                &shared,
+                &expected,
+                || catalog.mutation_request(&mutation),
+                |_, _| Ok(json!({"status":"STATUS_FAILED"}))
+            )
+            .is_err()
+        );
+        let anyway = Mutation::AddToPlaylist {
             id: "PLedited".into(),
             video_ids: vec!["abcdefghijk".into()],
             duplicates: true,
         };
-        let response = json!({"playlistEditResults":[{"playlistEditVideoAddedResultData":{"setVideoId":"appended"}}]});
-        assert!(playlist_change_visible(&added, &response, &partial));
-        let moved = Mutation::MoveInPlaylist {
-            id: "PLedited".into(),
-            set_video_id: "later".into(),
-            before: Some("also-later".into()),
-        };
-        assert!(playlist_change_visible(&moved, &json!({}), &partial));
-        let before_visible = Mutation::MoveInPlaylist {
-            id: "PLedited".into(),
-            set_video_id: "later".into(),
-            before: Some("visible".into()),
-        };
-        assert!(!playlist_change_visible(
-            &before_visible,
-            &json!({}),
-            &partial
-        ));
-        let to_end = Mutation::MoveInPlaylist {
-            id: "PLedited".into(),
-            set_video_id: "visible".into(),
-            before: None,
-        };
-        assert!(!playlist_change_visible(&to_end, &json!({}), &partial));
+        let (_, body) = catalog.mutation_request(&anyway).unwrap();
+        assert_eq!(body["actions"][0]["dedupeOption"], "DEDUPE_OPTION_SKIP");
     }
 
     #[test]

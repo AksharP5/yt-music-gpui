@@ -3,6 +3,29 @@
 use super::*;
 
 impl Music {
+    pub(super) fn set_rating(&mut self, id: &str, rating: Option<Rating>) {
+        if let Some(rating) = rating {
+            self.ratings.insert(id.into(), rating);
+        } else {
+            self.ratings.remove(id);
+        }
+        for track in self.library.queue.tracks.iter_mut().chain(
+            self.page
+                .shelves
+                .iter_mut()
+                .flat_map(|shelf| &mut shelf.items)
+                .chain(&mut self.rows)
+                .filter_map(|item| match item {
+                    Item::Track(track) => Some(track),
+                    _ => None,
+                }),
+        ) {
+            if track.id == id {
+                track.details.rating = rating;
+            }
+        }
+    }
+
     pub(in crate::app) fn save(&mut self) {
         if let Some(store) = &self.store {
             store.save(&self.library);

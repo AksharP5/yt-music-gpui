@@ -27,6 +27,10 @@ pub(in crate::app) enum Overlay {
         duplicates: bool,
         error: Option<String>,
     },
+    AlreadyAdded {
+        id: String,
+        video_ids: Vec<String>,
+    },
     PlaylistForm {
         form: Entity<PlaylistForm>,
     },
@@ -334,6 +338,7 @@ impl Music {
                                 Overlay::Chapters(_) => "Chapters".into(),
                                 Overlay::Track { track, .. } => track.title.clone(),
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
+                                Overlay::AlreadyAdded { .. } => "Already added".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::SongText { title, .. } => title.clone(),
                                 Overlay::PlaylistForm { .. } | Overlay::CountryPicker(_) => {
@@ -913,6 +918,37 @@ impl Music {
                         .child(error.clone()),
                 );
             }
+        } else if let Overlay::AlreadyAdded { id, video_ids } = kind {
+            body = body.child(
+                div()
+                    .p(px(12.))
+                    .child("This song is already in the playlist."),
+            );
+            let id = id.clone();
+            let video_ids = video_ids.clone();
+            body = body.child(self.menu_action(
+                "add-anyway",
+                "Add anyway",
+                cx,
+                move |view, window, cx| {
+                    if view.mutate(
+                        Mutation::AddToPlaylist {
+                            id: id.clone(),
+                            video_ids: video_ids.clone(),
+                            duplicates: true,
+                        },
+                        cx,
+                    ) {
+                        view.close_overlay(window, cx);
+                    }
+                },
+            ));
+            body = body.child(self.menu_action(
+                "cancel-duplicate",
+                "Cancel",
+                cx,
+                |view, window, cx| view.close_overlay(window, cx),
+            ));
         } else if let Overlay::DeletePlaylist { id, title } = kind {
             body = body.child(div().mb(px(18.)).child(format!(
                 "Delete {title}? This removes the playlist from your YouTube Music account."

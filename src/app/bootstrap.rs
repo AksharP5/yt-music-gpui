@@ -111,8 +111,9 @@ impl Music {
                                     &mut view.library.queue.tracks,
                                     &mut view.ratings,
                                     &track,
-                                    true,
+                                    !view.sync.rating_overrides.contains(&track.id),
                                 );
+                                view.overlay_ratings();
                             }
                             Ok(_) => {}
                             Err(error) => {
@@ -241,6 +242,7 @@ impl Music {
             pending_mutations: HashSet::new(),
             ratings: HashMap::new(),
             account_revision: 0,
+            sync: sync::SyncState::default(),
             track_state,
             track_state_id: None,
             focus: cx.focus_handle(),

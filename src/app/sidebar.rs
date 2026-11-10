@@ -177,6 +177,13 @@ impl Music {
                 "sidebar-playlists",
                 playlists.len(),
                 cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
+                    if view.account.is_some()
+                        && range.end.saturating_add(5) >= view.sidebar_playlists.len()
+                        && !view.catalog_requests.is_loading(CatalogTarget::Sidebar)
+                        && let Some(token) = view.sync.sidebar_continuation.clone()
+                    {
+                        view.request(Query::SidebarMore(token), cx);
+                    }
                     let playlists = if view.account.is_some() {
                         &view.sidebar_playlists
                     } else {

@@ -43,12 +43,15 @@ pub(in crate::app) enum Query {
     PlaylistChoices,
     SidebarPlaylists,
     PlaylistChoicesMore(Continuation),
+    SidebarMore(Continuation),
+    Revalidate(Box<Query>),
 }
 impl Query {
     pub(in crate::app) fn target(&self) -> CatalogTarget {
         match self {
             Self::PlaylistChoices | Self::PlaylistChoicesMore(_) => CatalogTarget::PlaylistPicker,
-            Self::SidebarPlaylists => CatalogTarget::Sidebar,
+            Self::SidebarPlaylists | Self::SidebarMore(_) => CatalogTarget::Sidebar,
+            Self::Revalidate(query) => query.target(),
             _ => CatalogTarget::Page,
         }
     }
@@ -63,6 +66,7 @@ pub(in crate::app) struct CatalogResult {
     pub(in crate::app) id: u64,
     pub(in crate::app) account_revision: u64,
     pub(in crate::app) append: bool,
+    pub(in crate::app) revalidate: bool,
     pub(in crate::app) result: Result<Page, String>,
     pub(in crate::app) session_rejected: bool,
     pub(in crate::app) target: CatalogTarget,
@@ -143,6 +147,7 @@ impl CatalogRequests {
 pub(in crate::app) struct NavigationState {
     pub(in crate::app) route: Route,
     pub(in crate::app) page: Option<Page>,
+    pub(in crate::app) fetched_at: Option<Instant>,
     pub(in crate::app) list_scroll: UniformListScrollHandle,
     pub(in crate::app) detail_list: DetailList,
     pub(in crate::app) shelf_scroll: HashMap<usize, ScrollHandle>,
@@ -151,6 +156,9 @@ pub(in crate::app) struct NavigationState {
 impl Music {
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
+        if target == CatalogTarget::Page {
+            self.sync.page_changes.clear();
+        }
         let session = self
             .account
             .as_ref()
@@ -176,13 +184,14 @@ impl Music {
         self.artwork.cancel_pending();
         self.video_open = false;
         if self.route != route {
-            let cached = (self.account.is_none()
-                && !self.catalog_requests.is_loading(CatalogTarget::Page)
+            let cached = ((!self.rows.is_empty()
+                || !self.catalog_requests.is_loading(CatalogTarget::Page))
                 && self.error.is_none())
             .then(|| self.page.clone());
             self.back.push(NavigationState {
                 route: self.route.clone(),
                 page: cached,
+                fetched_at: self.sync.page_fetched_at,
                 list_scroll: std::mem::replace(
                     &mut self.list_scroll,
                     UniformListScrollHandle::new(),
@@ -196,6 +205,7 @@ impl Music {
         }
         self.list_id = self.list_id.wrapping_add(1);
         self.route = route.clone();
+        self.sync.page_fetched_at = None;
         self.error = None;
         self.notice = None;
         self.page.shelves.clear();
@@ -252,6 +262,9 @@ impl Music {
         self.rows.clear();
         self.list_rows.clear();
         self.append_rows(0);
+        if let Some(Overlay::Track { track, index }) = &mut self.overlay {
+            *index = self.rows.iter().position(|item| matches!(item, Item::Track(current) if current.id == track.id && current.details.set_video_id == track.details.set_video_id));
+        }
         if self.page.header.is_some()
             || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
         {
@@ -345,7 +358,7 @@ impl Music {
             return;
         }
         let Some(state) = self.back.pop() else { return };
-        if let Some(page) = state.page.filter(|_| self.account.is_none()) {
+        if let Some(page) = state.page {
             self.catalog_requests.cancel(CatalogTarget::Page);
             self.artwork.cancel_pending();
             self.list_id = self.list_id.wrapping_add(1);
@@ -355,10 +368,15 @@ impl Music {
                     .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
             }
             self.page = page;
+            self.sync.page_fetched_at = state.fetched_at;
             self.error = None;
             self.notice = None;
             self.rebuild_rows();
-            self.refresh_local();
+            if self.account.is_some() {
+                self.revalidate_page(cx);
+            } else {
+                self.refresh_local();
+            }
         } else {
             self.route = state.route.clone();
             self.navigate(state.route, cx);
@@ -379,7 +397,15 @@ impl Music {
         if result.target == CatalogTarget::Sidebar {
             match result.result {
                 Ok(page) => {
-                    self.sidebar_playlists = page
+                    let complete = page.continuation.is_none();
+                    if complete
+                        || result.append
+                        || !result.revalidate
+                        || self.sidebar_playlists.is_empty()
+                    {
+                        self.sync.sidebar_continuation = page.continuation;
+                    }
+                    let choices: Vec<_> = page
                         .shelves
                         .into_iter()
                         .flat_map(|shelf| shelf.items)
@@ -392,6 +418,23 @@ impl Music {
                             _ => None,
                         })
                         .collect();
+                    if !result.append && !result.revalidate {
+                        self.sidebar_playlists.clear();
+                    } else if result.revalidate && complete {
+                        self.sidebar_playlists
+                            .retain(|current| choices.iter().any(|choice| choice.id == current.id));
+                    }
+                    for collection in choices {
+                        if let Some(current) = self
+                            .sidebar_playlists
+                            .iter_mut()
+                            .find(|current| current.id == collection.id)
+                        {
+                            *current = collection;
+                        } else {
+                            self.sidebar_playlists.push(collection);
+                        }
+                    }
                     self.sidebar_error = None;
                 }
                 Err(error) => self.sidebar_error = Some(error),
@@ -420,6 +463,9 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
+                for mutation in self.sync.page_changes.drain(..) {
+                    sync::patch_page(&mut page, &self.route, &mutation);
+                }
                 if result.account_revision != self.account_revision {
                     for track in page
                         .shelves
@@ -454,11 +500,18 @@ impl Music {
                     {
                         continue;
                     }
+                    if self.sync.rating_overrides.contains(&track.id) {
+                        continue;
+                    }
                     if let Some(rating) = track.details.rating {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                if result.append {
+                self.sync.page_fetched_at = Some(Instant::now());
+                if result.revalidate {
+                    sync::merge_page(&mut self.page, page);
+                    self.rebuild_rows();
+                } else if result.append {
                     let first_shelf = self.page.shelves.len();
                     let previous_rows = self.list_rows.len();
                     self.page.continuation = page.continuation;
@@ -480,6 +533,7 @@ impl Music {
             }
             Err(error) => self.error = Some(error),
         }
+        self.overlay_ratings();
         cx.notify();
     }
 }
@@ -503,20 +557,31 @@ impl CatalogRequests {
                         }
                         let append = matches!(
                             job.query,
-                            Query::More { .. } | Query::PlaylistChoicesMore(_)
+                            Query::More { .. }
+                                | Query::PlaylistChoicesMore(_)
+                                | Query::SidebarMore(_)
                         );
+                        let revalidate = matches!(job.query, Query::Revalidate(_));
+                        let query = match &job.query {
+                            Query::Revalidate(query) => query.as_ref(),
+                            query => query,
+                        };
                         let result = match &catalog {
                             Err(e) => Err(anyhow::anyhow!("{e:#}")),
                             Ok(catalog) => {
                                 let catalog = catalog.for_session(job.session);
-                                match &job.query {
+                                match query {
                                     Query::Home => catalog.home(),
                                     Query::Explore => catalog.explore(),
                                     Query::Library(section) => catalog.library(*section),
                                     Query::PlaylistChoices | Query::SidebarPlaylists => {
                                         catalog.library(Section::Playlists)
                                     }
-                                    Query::PlaylistChoicesMore(token) => catalog.more(token),
+                                    Query::PlaylistChoicesMore(token)
+                                    | Query::SidebarMore(token) => catalog.more(token),
+                                    Query::Revalidate(_) => {
+                                        unreachable!("revalidation unwrapped above")
+                                    }
                                     Query::Search(search) => catalog.search_filtered(
                                         &search.query,
                                         search.filter,
@@ -547,6 +612,7 @@ impl CatalogRequests {
                                 id: job.id,
                                 account_revision: job.account_revision,
                                 append,
+                                revalidate,
                                 result,
                                 session_rejected,
                                 target,

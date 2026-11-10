@@ -41,6 +41,7 @@ pub(in crate::app) enum BrowserConnection {
 impl Music {
     pub(in crate::app) fn clear_account_state(&mut self, cx: &mut Context<Self>) {
         self.next_session_refresh = None;
+        self.sync = sync::SyncState::default();
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -315,7 +316,14 @@ impl Music {
             Some(AccountOperation::Connecting(_, BrowserConnection::Ready(_)))
         ) {
             self.read_browser_account(cx);
-        } else if self.account.is_some() && self.account_operation.is_none() {
+        } else if self.account.is_some()
+            && self.account_operation.is_none()
+            && sync::needs_refresh(
+                self.sync.refreshed_at.max(self.sync.page_fetched_at),
+                Instant::now(),
+            )
+            && !self.catalog_requests.is_loading(CatalogTarget::Page)
+        {
             self.refresh_remote(cx);
         }
     }
@@ -426,6 +434,18 @@ impl Music {
         if self.pending_mutations.contains(&key) {
             return false;
         }
+        let optimistic = if let Mutation::RateSong { track, rating } = &mutation {
+            Some((
+                track.clone(),
+                *rating,
+                self.ratings
+                    .get(&track.id)
+                    .copied()
+                    .or(track.details.rating),
+            ))
+        } else {
+            None
+        };
         let submitted = match self.account_commands.try_send(account::Command::Apply {
             session: connection.session.clone(),
             mutation: Box::new(mutation),
@@ -440,6 +460,22 @@ impl Music {
                 false
             }
         };
+        if submitted && let Some((track, rating, previous)) = optimistic {
+            self.sync
+                .optimistic_ratings
+                .insert(track.id.clone(), previous);
+            self.sync.rating_overrides.insert(track.id.clone());
+            self.set_rating(&track.id, Some(rating));
+            if rating == Rating::Dislike
+                && self
+                    .library
+                    .queue
+                    .current()
+                    .is_some_and(|current| current.id == track.id)
+            {
+                self.next(false, cx);
+            }
+        }
         cx.notify();
         submitted
     }
@@ -500,19 +536,12 @@ impl Music {
     }
 
     pub(in crate::app) fn refresh_remote(&mut self, cx: &mut Context<Self>) {
-        self.account_revision = self.account_revision.wrapping_add(1);
-        let query = match &self.route {
-            Route::Home => Query::Home,
-            Route::Explore => Query::Explore,
-            Route::Search(search) => Query::Search(search.clone()),
-            Route::Browse(link) => Query::Browse(link.clone()),
-            Route::Liked => Query::Library(Section::Liked),
-            Route::Recent => Query::Library(Section::History),
-            Route::Saved => Query::Library(Section::Songs),
-            Route::Library(section) => Query::Library(*section),
-        };
-        self.request(query, cx);
-        self.request(Query::SidebarPlaylists, cx);
+        self.sync
+            .rating_overrides
+            .retain(|id| self.sync.optimistic_ratings.contains_key(id));
+        self.sync.refreshed_at = Some(Instant::now());
+        self.revalidate_page(cx);
+        self.request(Query::Revalidate(Box::new(Query::SidebarPlaylists)), cx);
         self.refresh_current_account(cx);
     }
 
@@ -778,6 +807,9 @@ impl Music {
                                             view.song_text.cancel();
                                             view.now_playing = None;
                                             view.media_pair = None;
+                                            for (id, rating) in std::mem::take(&mut view.sync.optimistic_ratings) { view.set_rating(&id, rating); }
+                                            view.sync.rating_overrides.clear();
+                                            view.sync.page_changes.clear();
                                             view.ratings.clear();
                                             view.pending_mutations.clear();
                                             for track in &mut view.library.queue.tracks { track.details.clear_account_state(); }
@@ -847,50 +879,30 @@ impl Music {
                 }
                 let mutation = *mutation;
                 self.pending_mutations.remove(&mutation.key());
+                let rollback = if let Mutation::RateSong { track, .. } = &mutation {
+                    self.sync
+                        .optimistic_ratings
+                        .remove(&track.id)
+                        .map(|rating| (track.id.clone(), rating))
+                } else {
+                    None
+                };
                 match result {
                     Ok(effect) => {
                         let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
                         acknowledge_song_change(
-                            self.library.queue.tracks.iter_mut().chain(
-                                self.page
-                                    .shelves
-                                    .iter_mut()
-                                    .flat_map(|shelf| &mut shelf.items)
-                                    .chain(&mut self.rows)
-                                    .filter_map(|item| match item {
-                                        Item::Track(track) => Some(track),
-                                        _ => None,
-                                    }),
-                            ),
+                            self.library.queue.tracks.iter_mut(),
                             &mut self.ratings,
                             &mutation,
                         );
-                        if let Mutation::CollectionLibrary { collection, save } = &mutation {
-                            if matches!(&self.route, Route::Browse(link) if link.id == collection.id)
-                                && let Some(header) = &mut self.page.header
-                                && collection.id.starts_with("UC")
-                            {
-                                header.subscribed = Some(*save);
-                                header.subscription_label =
-                                    if *save { "Subscribed" } else { "Subscribe" }.into();
-                            }
-                            for item in self
-                                .page
-                                .shelves
-                                .iter_mut()
-                                .flat_map(|shelf| &mut shelf.items)
-                                .chain(&mut self.rows)
-                            {
-                                if let Item::Collection(current) = item
-                                    && current.id == collection.id
-                                {
-                                    current.details.saved = Some(*save);
-                                }
-                            }
-                        }
                         self.notice = Some("Saved to YouTube Music".into());
+                        self.patch_confirmed(&mutation, cx);
                         match effect {
                             Effect::CreatedPlaylist { id } => {
+                                self.request(
+                                    Query::Revalidate(Box::new(Query::SidebarPlaylists)),
+                                    cx,
+                                );
                                 if self.overlay.is_none() {
                                     self.navigate(
                                         Route::Browse(BrowseLink::new(
@@ -901,16 +913,32 @@ impl Music {
                                     );
                                 }
                             }
+                            Effect::AlreadyAdded => {
+                                if let Mutation::AddToPlaylist { id, video_ids, .. } = mutation {
+                                    self.notice = None;
+                                    self.overlay = Some(Overlay::AlreadyAdded { id, video_ids });
+                                }
+                            }
+                            Effect::PlaylistAdded { additions } => {
+                                if let Mutation::AddToPlaylist { id, .. } = &mutation {
+                                    self.patch_added(id, &additions, cx);
+                                }
+                            }
                             Effect::Changed => {
                                 if deleting {
+                                    self.request(
+                                        Query::Revalidate(Box::new(Query::SidebarPlaylists)),
+                                        cx,
+                                    );
                                     self.navigate(Route::Library(Section::Playlists), cx);
-                                } else {
-                                    self.refresh_remote(cx);
                                 }
                             }
                         }
                     }
                     Err(error) => {
+                        if let Some((id, rating)) = rollback {
+                            self.set_rating(&id, rating);
+                        }
                         self.notice = None;
                         self.error = Some(error);
                     }
@@ -953,7 +981,7 @@ impl Music {
                                 Route::Recent | Route::Library(Section::History)
                             ) =>
                     {
-                        self.request(Query::Library(Section::History), cx);
+                        self.revalidate_page(cx);
                     }
                     Ok(()) => {}
                     Err(error) => {

@@ -275,6 +275,7 @@ impl Music {
                             }
                             self.reset_radio();
                         }
+                        self.overlay_ratings();
                         let current = self.library.queue.current();
                         if watch
                             .current

@@ -43,6 +43,8 @@ Your profile menu shows the connected name and handle. Use **Switch account** to
 
 Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
 
+Focus refreshes wait three minutes and preserve loaded rows. Likes and dislikes update immediately and revert if saving fails. Playlist edits wait for confirmation.
+
 ## Controls
 
 | Key | Action |
