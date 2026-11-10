@@ -1528,6 +1528,13 @@ async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                                 );
                             }
                             if scrolled {
+                                if home {
+                                    assert_eq!(
+                                        pixel(width as u32 - 2, 200),
+                                        bg,
+                                        "The Home wash must scroll out with the feed"
+                                    );
+                                }
                                 assert_eq!(pixel(8, 4), bg);
                                 assert_eq!(
                                     pixel(300, 64),

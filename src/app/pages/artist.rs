@@ -217,23 +217,27 @@ impl Music {
         if self.player_open {
             return None;
         }
+        let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
         if self.route.is_home() {
+            let wash = 300.;
+            if scrolled <= -wash {
+                return None;
+            }
             return Some(
                 div()
                     .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(64.))
-                    .bottom_0()
+                    .top(px(64. + scrolled))
+                    .h(px(wash))
                     .bg(linear_gradient(
                         180.,
                         linear_color_stop(rgb(0x14252c), 0.),
-                        linear_color_stop(self.theme.bg, 0.65),
+                        linear_color_stop(self.theme.bg, 1.),
                     )),
             );
         }
         let left = if compact { 72. } else { 240. };
-        let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
         if let Some(url) = self.wash_url() {
             // The web covers the window's top 49vh with the art, blurred by
             // 80px, under a black gradient from 60% to the page color over
