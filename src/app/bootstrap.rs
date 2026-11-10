@@ -302,6 +302,7 @@ impl Music {
             video_click: None,
             active_id: None,
             history_track: None,
+            listening: playback::listening::ListeningState::default(),
             playback: Playback::Stopped,
             position: 0.,
             pending_seek: None,
@@ -328,6 +329,7 @@ impl Music {
 
 impl Drop for Music {
     fn drop(&mut self) {
+        self.finish_listening(false);
         if let Some(
             AccountOperation::Connecting(operation, _)
             | AccountOperation::Restoring(operation)

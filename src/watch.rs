@@ -280,6 +280,10 @@ fn parse_watch(
             .map(|index| &mut queue[index])
             .context("YouTube Music did not include the requested episode in its playback queue")?;
         current.details.episode = Some(episode.clone());
+        current.details.resume_seconds = current
+            .details
+            .resume_seconds
+            .or(seed.details.resume_seconds);
         if episode.show_id.is_some() {
             current.artist = seed.artist.clone();
         }

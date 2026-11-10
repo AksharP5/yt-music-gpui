@@ -16,6 +16,21 @@ use std::{
 // The account-bound query tokens must stay out of logs and persisted models.
 struct HistoryUrl(Url);
 
+pub struct PlaybackTracking {
+    pub resume_seconds: Option<f64>,
+    video_id: String,
+    watchtime: HistoryUrl,
+    cpn: String,
+}
+
+pub struct Watchtime {
+    pub playback_id: u64,
+    pub video_id: String,
+    pub intervals: Vec<crate::listening::Interval>,
+    pub position: f64,
+    pub final_report: bool,
+}
+
 impl HistoryUrl {
     fn from_player(response: &Value, video_id: &str) -> Result<Self> {
         ensure!(
@@ -33,6 +48,10 @@ impl HistoryUrl {
     }
 
     fn parse(raw: &str, video_id: &str) -> Result<Self> {
+        Self::parse_path(raw, video_id, "/api/stats/playback")
+    }
+
+    fn parse_path(raw: &str, video_id: &str, path: &str) -> Result<Self> {
         let invalid =
             || anyhow::anyhow!("YouTube Music returned an invalid playback history destination");
         ensure!(
@@ -50,7 +69,7 @@ impl HistoryUrl {
         ensure!(
             url.scheme() == "https"
                 && matches!(url.host_str(), Some("s.youtube.com" | "www.youtube.com"))
-                && url.path() == "/api/stats/playback"
+                && url.path() == path
                 && url.port_or_known_default() == Some(443)
                 && url.username().is_empty()
                 && url.password().is_none()
@@ -68,7 +87,11 @@ impl HistoryUrl {
 }
 
 impl Catalog {
-    pub fn report_playback(&self, video_id: &str, current: &SharedSession) -> Result<()> {
+    pub fn report_playback(
+        &self,
+        video_id: &str,
+        current: &SharedSession,
+    ) -> Result<PlaybackTracking> {
         let expected = self
             .session
             .as_ref()
@@ -79,31 +102,78 @@ impl Catalog {
             video_id,
             || self.request("player", player_request(video_id)?),
             |response| expected.verify_account_identity(response, &self.client),
-            |url| {
-                let cpn = playback_nonce()?;
-                let mut request = self
-                    .client
-                    .get(url.0)
-                    .header("Origin", ORIGIN)
-                    .header("Referer", format!("{ORIGIN}/"))
-                    .query(&[("ver", "2"), ("c", "WEB_REMIX"), ("cpn", &cpn)]);
-                if let Some(delegated) = &expected.delegated_session_id {
-                    request = request.header("X-Goog-PageId", delegated);
-                }
-                // apply computes a fresh authorization timestamp for this second request.
-                let request = expected
-                    .apply(request)?
-                    .build()
-                    .map_err(reqwest::Error::without_url)?;
-                require_current_session(current, expected)?;
-                let response = self
-                    .client
-                    .execute(request)
-                    .map_err(reqwest::Error::without_url)
-                    .context("Could not report playback to YouTube Music")?;
-                Ok(response.status())
+            |url, cpn| {
+                self.send_stats(
+                    expected,
+                    current,
+                    url,
+                    &[
+                        ("ver", "2".into()),
+                        ("c", "WEB_REMIX".into()),
+                        ("cpn", cpn.into()),
+                    ],
+                )
             },
         )
+    }
+
+    pub fn report_watchtime(
+        &self,
+        tracking: &PlaybackTracking,
+        report: &Watchtime,
+        current: &SharedSession,
+    ) -> Result<()> {
+        let expected = self
+            .session
+            .as_ref()
+            .context("Connect your Google account first")?;
+        ensure!(
+            tracking.video_id == report.video_id,
+            "The listening session changed"
+        );
+        let params = watchtime_params(&tracking.cpn, report)?;
+        let status = self.send_stats(expected, current, &tracking.watchtime, &params)?;
+        ensure!(
+            status == StatusCode::NO_CONTENT,
+            "YouTube Music did not confirm listening time (HTTP {})",
+            status.as_u16()
+        );
+        Ok(())
+    }
+
+    fn send_stats(
+        &self,
+        expected: &Arc<Session>,
+        current: &SharedSession,
+        url: &HistoryUrl,
+        params: &[(&str, String)],
+    ) -> Result<StatusCode> {
+        require_current_session(current, expected)?;
+        let mut request = self
+            .client
+            .get(stats_url(url, params))
+            .header("Origin", ORIGIN)
+            .header("Referer", format!("{ORIGIN}/"));
+        if let Some(delegated) = &expected.delegated_session_id {
+            request = request.header("X-Goog-PageId", delegated);
+        }
+        let request = expected
+            .apply(request)?
+            .build()
+            .map_err(reqwest::Error::without_url)?;
+        require_current_session(current, expected)?;
+        let response = self
+            .client
+            .execute(request)
+            .map_err(reqwest::Error::without_url)
+            .context("Could not report listening to YouTube Music")?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Err(crate::auth::RejectedSession.into());
+        }
+        Ok(response.status())
     }
 }
 
@@ -126,8 +196,8 @@ fn report_current_playback(
     video_id: &str,
     player: impl FnOnce() -> Result<Value>,
     verify: impl FnOnce(&Value) -> Result<()>,
-    report: impl FnOnce(HistoryUrl) -> Result<StatusCode>,
-) -> Result<()> {
+    report: impl FnOnce(&HistoryUrl, &str) -> Result<StatusCode>,
+) -> Result<PlaybackTracking> {
     ensure!(
         valid_video_id(video_id),
         "This song has an invalid YouTube Music ID"
@@ -135,16 +205,87 @@ fn report_current_playback(
     require_current_session(current, expected)?;
     let response = player()?;
     require_current_session(current, expected)?;
-    let tracking = HistoryUrl::from_player(&response, video_id)?;
+    let playback = HistoryUrl::from_player(&response, video_id)?;
+    let watchtime = response
+        .pointer("/playbackTracking/videostatsWatchtimeUrl/baseUrl")
+        .and_then(Value::as_str)
+        .context("YouTube Music did not provide a listening time destination")?;
+    let watchtime = HistoryUrl::parse_path(watchtime, video_id, "/api/stats/watchtime")?;
+    let cpn = playback_nonce()?;
     verify(&response)?;
     require_current_session(current, expected)?;
-    let status = report(tracking)?;
+    let status = report(&playback, &cpn)?;
     ensure!(
         status == StatusCode::NO_CONTENT,
         "YouTube Music did not confirm playback history (HTTP {})",
         status.as_u16()
     );
-    Ok(())
+    let resume_seconds = response
+        .pointer("/playerConfig/playbackStartConfig/startSeconds")
+        .and_then(|seconds| seconds.as_f64().or_else(|| seconds.as_str()?.parse().ok()))
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.);
+    Ok(PlaybackTracking {
+        resume_seconds,
+        video_id: video_id.into(),
+        watchtime,
+        cpn,
+    })
+}
+
+fn stats_url(url: &HistoryUrl, params: &[(&str, String)]) -> Url {
+    let mut url = url.0.clone();
+    let retained: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| !params.iter().any(|(name, _)| key == name))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(retained)
+        .extend_pairs(params.iter().map(|(key, value)| (*key, value.as_str())));
+    url
+}
+
+fn watchtime_params(cpn: &str, report: &Watchtime) -> Result<Vec<(&'static str, String)>> {
+    ensure!(
+        report.position.is_finite() && report.position >= 0.,
+        "Invalid listening position"
+    );
+    ensure!(
+        report
+            .intervals
+            .iter()
+            .all(|interval| interval.start.is_finite()
+                && interval.end.is_finite()
+                && interval.start >= 0.
+                && interval.end > interval.start),
+        "Invalid listening interval"
+    );
+    Ok(vec![
+        ("ver", "2".into()),
+        ("c", "WEB_REMIX".into()),
+        ("cpn", cpn.into()),
+        (
+            "st",
+            report
+                .intervals
+                .iter()
+                .map(|interval| format!("{:.3}", interval.start))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            "et",
+            report
+                .intervals
+                .iter()
+                .map(|interval| format!("{:.3}", interval.end))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        ("cmt", format!("{:.3}", report.position)),
+        ("final", if report.final_report { "1" } else { "0" }.into()),
+    ])
 }
 
 fn playback_nonce() -> Result<String> {
@@ -180,7 +321,7 @@ mod tests {
             "responseContext":{"mainAppWebResponseContext":{"loggedOut":false,"datasyncId":"user||"}},
             "playbackTracking":{"videostatsPlaybackUrl":{"baseUrl":format!(
                 "https://s.youtube.com/api/stats/playback?docid={VIDEO_ID}&ei=synthetic-secret"
-            )}}
+            )},"videostatsWatchtimeUrl":{"baseUrl":format!("https://s.youtube.com/api/stats/watchtime?docid={VIDEO_ID}&ei=synthetic-secret")}}
         })
     }
 
@@ -261,7 +402,7 @@ mod tests {
                     VIDEO_ID,
                     || Ok(response),
                     |response| expected.verify_server_identity(response),
-                    |_| {
+                    |_, _| {
                         dispatched.set(true);
                         Ok(StatusCode::NO_CONTENT)
                     }
@@ -288,7 +429,7 @@ mod tests {
                         Ok(response())
                     },
                     |response| expected.verify_server_identity(response),
-                    |_| {
+                    |_, _| {
                         dispatched.set(true);
                         Ok(StatusCode::NO_CONTENT)
                     }
@@ -307,7 +448,7 @@ mod tests {
                         Ok(response())
                     },
                     |response| expected.verify_server_identity(response),
-                    |_| Ok(StatusCode::NO_CONTENT)
+                    |_, _| Ok(StatusCode::NO_CONTENT)
                 )
                 .is_err()
             );
@@ -342,7 +483,7 @@ mod tests {
                         VIDEO_ID,
                         || Ok(response),
                         |response| expected.verify_server_identity(response),
-                        |_| {
+                        |_, _| {
                             dispatched.set(true);
                             Ok(StatusCode::NO_CONTENT)
                         }
@@ -363,7 +504,7 @@ mod tests {
                     VIDEO_ID,
                     || Ok(proven.clone()),
                     |response| expected.verify_server_identity(response),
-                    |_| Ok(StatusCode::NO_CONTENT)
+                    |_, _| Ok(StatusCode::NO_CONTENT)
                 )
                 .is_ok()
             );
@@ -382,7 +523,7 @@ mod tests {
                         VIDEO_ID,
                         || Ok(conflicting),
                         |response| expected.verify_server_identity(response),
-                        |_| panic!("conflicting identity must not dispatch")
+                        |_, _| panic!("conflicting identity must not dispatch")
                     )
                     .is_err()
                 );
@@ -401,7 +542,7 @@ mod tests {
                 VIDEO_ID,
                 || Ok(response()),
                 |response| expected.verify_server_identity(response),
-                |_| Ok(StatusCode::from_u16(status).unwrap()),
+                |_, _| Ok(StatusCode::from_u16(status).unwrap()),
             );
             assert_eq!(result.is_ok(), status == 204);
         }
@@ -433,7 +574,7 @@ mod tests {
                     expected
                         .verify_server_identity(&json!({"LOGGED_IN":true,"DATASYNC_ID":"user||"}))
                 },
-                |_| {
+                |_, _| {
                     dispatched.set(true);
                     Ok(StatusCode::NO_CONTENT)
                 },
@@ -457,9 +598,113 @@ mod tests {
                     *shared.write().unwrap() = replacement;
                     Ok(())
                 },
-                |_| panic!("Revoked account must not report playback"),
+                |_, _| panic!("Revoked account must not report playback"),
             );
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn player_start_config_is_used_only_for_explicit_resume_positions() {
+        let shared = auth::shared(Some(session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        for (value, wanted) in [
+            (json!(120.5), Some(120.5)),
+            (json!("120.5"), Some(120.5)),
+            (json!(0), None),
+            (json!(-1), None),
+            (json!("invalid"), None),
+        ] {
+            let mut response = response();
+            response["playerConfig"]["playbackStartConfig"]["startSeconds"] = value;
+            let tracking = report_current_playback(
+                &shared,
+                &expected,
+                VIDEO_ID,
+                || Ok(response),
+                |response| expected.verify_server_identity(response),
+                |_, _| Ok(StatusCode::NO_CONTENT),
+            )
+            .unwrap();
+            assert_eq!(tracking.resume_seconds, wanted);
+        }
+    }
+
+    #[test]
+    fn playback_and_watchtime_share_nonce_and_replace_old_query_values() {
+        let shared = auth::shared(Some(session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let sent = std::cell::RefCell::new(String::new());
+        let tracking = report_current_playback(
+            &shared,
+            &expected,
+            VIDEO_ID,
+            || Ok(response()),
+            |response| expected.verify_server_identity(response),
+            |_, cpn| {
+                *sent.borrow_mut() = cpn.into();
+                Ok(StatusCode::NO_CONTENT)
+            },
+        )
+        .unwrap();
+        let report = Watchtime {
+            playback_id: 1,
+            video_id: VIDEO_ID.into(),
+            intervals: vec![
+                crate::listening::Interval {
+                    start: 10.,
+                    end: 20.,
+                },
+                crate::listening::Interval {
+                    start: 80.,
+                    end: 85.,
+                },
+            ],
+            position: 85.,
+            final_report: true,
+        };
+        let params = watchtime_params(&tracking.cpn, &report).unwrap();
+        let raw = HistoryUrl::parse_path(
+            &format!(
+                "https://s.youtube.com/api/stats/watchtime?docid={VIDEO_ID}&cpn=old&st=0&et=85"
+            ),
+            VIDEO_ID,
+            "/api/stats/watchtime",
+        )
+        .unwrap();
+        let url = stats_url(&raw, &params);
+        let values: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(values["cpn"].as_ref(), sent.borrow().as_str());
+        assert_eq!(values["st"], "10.000,80.000");
+        assert_eq!(values["et"], "20.000,85.000");
+        assert_eq!(values["cmt"], "85.000");
+        assert_eq!(values["final"], "1");
+        assert_eq!(url.query_pairs().filter(|(key, _)| key == "cpn").count(), 1);
+    }
+
+    #[test]
+    fn watchtime_requires_a_matching_player_destination_before_reporting() {
+        let shared = auth::shared(Some(session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        for destination in [
+            Value::Null,
+            json!("https://evil.invalid/api/stats/watchtime?docid=abcdefghijk"),
+            json!("https://s.youtube.com/api/stats/watchtime?docid=differentid"),
+            json!("https://s.youtube.com/api/stats/playback?docid=abcdefghijk"),
+        ] {
+            let mut response = response();
+            response["playbackTracking"]["videostatsWatchtimeUrl"]["baseUrl"] = destination;
+            assert!(
+                report_current_playback(
+                    &shared,
+                    &expected,
+                    VIDEO_ID,
+                    || Ok(response),
+                    |response| expected.verify_server_identity(response),
+                    |_, _| panic!("Invalid tracking must not be sent")
+                )
+                .is_err()
+            );
         }
     }
 
@@ -491,6 +736,12 @@ mod tests {
         if let Some(raw) = tracking {
             let tracking = HistoryUrl::parse(raw, video_id).unwrap();
             assert_eq!(tracking.0.path(), "/api/stats/playback");
+        }
+        if let Some(raw) = response
+            .pointer("/playbackTracking/videostatsWatchtimeUrl/baseUrl")
+            .and_then(Value::as_str)
+        {
+            assert!(HistoryUrl::parse_path(raw, video_id, "/api/stats/watchtime").is_ok());
         }
     }
 }

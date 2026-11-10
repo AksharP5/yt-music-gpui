@@ -32,6 +32,7 @@ impl Repeat {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
+    pub positions: crate::listening::ResumePositions,
     pub liked: Vec<Track>,
     pub recent: Vec<Track>,
     pub saved: Vec<Collection>,
@@ -48,6 +49,7 @@ pub struct Library {
 impl Default for Library {
     fn default() -> Self {
         Self {
+            positions: crate::listening::ResumePositions::default(),
             liked: Vec::new(),
             recent: Vec::new(),
             saved: Vec::new(),

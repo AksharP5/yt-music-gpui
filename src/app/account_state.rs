@@ -40,6 +40,7 @@ pub(in crate::app) enum BrowserConnection {
 
 impl Music {
     pub(in crate::app) fn clear_account_state(&mut self, cx: &mut Context<Self>) {
+        self.finish_listening(false);
         self.next_session_refresh = None;
         self.sync = sync::SyncState::default();
         self.catalog_requests.cancel(CatalogTarget::Page);
@@ -961,6 +962,8 @@ impl Music {
                 video_id,
                 result,
                 session_rejected,
+                watchtime,
+                resume_seconds,
             } => {
                 if !self
                     .account
@@ -969,12 +972,25 @@ impl Music {
                 {
                     return;
                 }
+                if result.is_ok()
+                    && let Some(seconds) = resume_seconds
+                    && self
+                        .library
+                        .queue
+                        .current()
+                        .is_some_and(|track| track.id == video_id)
+                    && let Some(index) = self.library.queue.index
+                {
+                    self.library.queue.tracks[index].details.resume_seconds = Some(seconds);
+                    self.resume_account_position(cx);
+                }
                 if session_rejected {
                     self.refresh_session(true, cx);
                 }
                 match result {
                     Ok(())
-                        if self.overlay.is_none()
+                        if !watchtime
+                            && self.overlay.is_none()
                             && !self.catalog_requests.is_loading(CatalogTarget::Page)
                             && matches!(
                                 self.route,

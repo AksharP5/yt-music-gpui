@@ -37,6 +37,7 @@ impl Music {
             return;
         }
 
+        self.finish_listening(false);
         self.reset_radio();
         self.player_command(Player::stop);
         self.active_id = None;
@@ -276,6 +277,7 @@ impl Music {
                             self.reset_radio();
                         }
                         self.overlay_ratings();
+                        self.resume_account_position(cx);
                         let current = self.library.queue.current();
                         if watch
                             .current
@@ -306,7 +308,7 @@ impl Music {
                             if switch_mode {
                                 self.set_video_mode(self.library.video, cx);
                             }
-                            self.play_current_at(0., paused, WatchMode::Details, cx);
+                            self.play_current_resuming(paused, WatchMode::Details, cx);
                         } else if switch_mode {
                             self.set_video_mode(self.library.video, cx);
                         } else {
@@ -546,7 +548,7 @@ impl Music {
                 self.now_playing = None;
                 self.library.queue.replace(vec![track], 0);
                 self.video_open = self.library.video;
-                self.play_current_at(0., false, mode, cx);
+                self.play_current_resuming(false, mode, cx);
             }
         }
     }
@@ -558,6 +560,7 @@ impl Music {
     }
 
     pub(in crate::app) fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
+        self.finish_listening(natural);
         let playback = self.playback;
         if let Some(resume) = self
             .account_operation
@@ -706,7 +709,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         if playback != Playback::Stopped {
-            self.play_current_at(0., playback.is_paused(), WatchMode::Details, cx);
+            self.play_current_resuming(playback.is_paused(), WatchMode::Details, cx);
             return;
         }
         self.stop_playback(cx);

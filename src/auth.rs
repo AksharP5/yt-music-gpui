@@ -196,6 +196,10 @@ impl Session {
     pub fn disconnect() -> Result<()> {
         clear_keyring(&KEYRING_ATTRIBUTES)
     }
+    pub(crate) fn resume_scope(&self) -> String {
+        format!("{:x}", Sha1::digest(self.data_sync_id.as_bytes()))
+    }
+
     pub fn validate_playback_identity(&self) -> Result<()> {
         ensure!(
             self.authuser.parse::<u32>().is_ok()

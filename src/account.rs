@@ -259,6 +259,11 @@ pub enum Command {
     ReportPlayback {
         session: Arc<Session>,
         video_id: String,
+        playback_id: u64,
+    },
+    ReportWatchtime {
+        session: Arc<Session>,
+        report: crate::history::Watchtime,
     },
 }
 pub enum Event {
@@ -294,6 +299,8 @@ pub enum Event {
         video_id: String,
         result: Result<(), String>,
         session_rejected: bool,
+        watchtime: bool,
+        resume_seconds: Option<f64>,
     },
 }
 
@@ -326,6 +333,7 @@ pub fn start(
         .spawn(move || -> Result<()> {
             let catalog = Catalog::new();
             let mut cleanup_error = None;
+            let mut playback_tracking: Option<(std::sync::Weak<Session>, u64, crate::history::PlaybackTracking)> = None;
             while let Ok(command) = commands.recv_blocking() {
                 let event = match command {
                     Command::Connect(operation) => {
@@ -381,6 +389,7 @@ pub fn start(
                         Event::Connected { operation, result: result.map_err(|error: anyhow::Error| format!("{error:#}")), save_session: refreshed }
                     }
                     Command::Disconnect { operation, playback } => {
+                        playback_tracking = None;
                         // End in-memory authority even if keyring removal needs another attempt.
                         if let Ok(mut current) = session.write() { *current = None; }
                         let result = finish_disconnect(playback, auth::Session::disconnect);
@@ -403,14 +412,28 @@ pub fn start(
                         })().map_err(|error| format!("{error:#}"));
                         Event::Persisted { session: expected, result }
                     }
-                    Command::ReportPlayback { session: expected, video_id } => {
+                    Command::ReportPlayback { session: expected, video_id, playback_id } => {
+                        playback_tracking = None;
                         let result = (|| {
                             catalog.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?
                                 .for_session(Some(expected.clone())).report_playback(&video_id, &session)
                         })();
                         let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
-                        let result = result.map_err(|error| format!("{error:#}"));
-                        Event::PlaybackReported { session: expected, video_id, result, session_rejected }
+                        let mut resume_seconds = None;
+                        let result = result.map(|tracking| { resume_seconds = tracking.resume_seconds; playback_tracking = Some((Arc::downgrade(&expected), playback_id, tracking)); }).map_err(|error| format!("{error:#}"));
+                        Event::PlaybackReported { session: expected, video_id, result, session_rejected, watchtime: false, resume_seconds }
+                    }
+                    Command::ReportWatchtime { session: expected, report } => {
+                        let result = (|| {
+                            require_current_session(&session, &expected)?;
+                            let (owner, id, tracking) = playback_tracking.as_ref().context("Playback history was not started for this listening session")?;
+                            ensure!(owner.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, &expected)) && *id == report.playback_id, "The listening session changed");
+                            catalog.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?
+                                .for_session(Some(expected.clone())).report_watchtime(tracking, &report, &session)
+                        })();
+                        let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                        let result = result.map_err(|error: anyhow::Error| format!("{error:#}"));
+                        Event::PlaybackReported { session: expected, video_id: report.video_id, result, session_rejected, watchtime: true, resume_seconds: None }
                     }
                 };
                 // Closing the UI must not discard a queued sign-out behind this event.

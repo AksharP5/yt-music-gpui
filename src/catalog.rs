@@ -282,6 +282,8 @@ pub struct TrackDetails {
     #[serde(skip)]
     pub rating: Option<Rating>,
     #[serde(skip)]
+    pub resume_seconds: Option<f64>,
+    #[serde(skip)]
     pub in_library: Option<bool>,
     #[serde(skip)]
     pub add_library: Option<String>,
@@ -302,6 +304,7 @@ impl TrackDetails {
     pub fn clear_account_state(&mut self) {
         self.watch = None;
         self.rating = None;
+        self.resume_seconds = None;
         self.in_library = None;
         self.add_library = None;
         self.remove_library = None;
@@ -1350,6 +1353,7 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> Tra
             }),
         watch: WatchTarget::from_row(row, video_id).map(Arc::new),
         rating: item_rating(row),
+        resume_seconds: crate::listening::account_progress(row),
         set_video_id: row
             .pointer("/playlistItemData/setVideoId")
             .and_then(Value::as_str)

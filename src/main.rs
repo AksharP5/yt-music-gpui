@@ -8,6 +8,7 @@ mod country_picker;
 mod history;
 mod input;
 mod library;
+mod listening;
 mod mpris;
 mod player;
 mod playlist_form;

@@ -143,6 +143,7 @@ pub struct Music {
     video_click: Option<Task<()>>,
     active_id: Option<u64>,
     history_track: Option<u64>,
+    listening: playback::listening::ListeningState,
     playback: Playback,
     position: f64,
     pending_seek: Option<SeekIntent>,

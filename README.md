@@ -43,7 +43,7 @@ Your profile menu shows the connected name and handle. Use **Switch account** to
 
 Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload changes made in the web client.
 
-Focus refreshes wait three minutes and preserve loaded rows. Likes and dislikes update immediately and revert if saving fails. Playlist edits wait for confirmation.
+Podcast episodes and videos with resume information keep a local listening position across restarts. Connected accounts also read the progress supplied by YouTube Music and report playback and listening intervals. Focus refreshes wait three minutes and preserve loaded rows. Likes and dislikes update immediately and revert if saving fails. Playlist edits wait for confirmation.
 
 ## Controls
 

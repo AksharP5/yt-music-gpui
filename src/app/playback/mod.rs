@@ -1,6 +1,7 @@
 //! Playback state, libmpv commands/events, seeking, and media quality.
 
 pub(in crate::app) mod desktop;
+pub(in crate::app) mod listening;
 pub(in crate::app) mod queue;
 
 use super::*;
@@ -171,6 +172,8 @@ impl Music {
     }
 
     pub(in crate::app) fn seek_current(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        self.report_listening(false);
+        self.listening_discontinuity();
         if let Some(Some(PlaybackIntent::Track(resume))) = self
             .account_operation
             .as_mut()
@@ -210,7 +213,7 @@ impl Music {
     }
 
     pub(in crate::app) fn play_current(&mut self, cx: &mut Context<Self>) {
-        self.play_current_at(0., false, WatchMode::Details, cx);
+        self.play_current_resuming(false, WatchMode::Details, cx);
     }
 
     pub(in crate::app) fn play_current_at(
@@ -220,6 +223,7 @@ impl Music {
         watch_mode: WatchMode,
         cx: &mut Context<Self>,
     ) {
+        self.finish_listening(false);
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -603,6 +607,7 @@ impl Music {
     }
 
     pub(in crate::app) fn stop_playback(&mut self, cx: &mut Context<Self>) {
+        self.finish_listening(false);
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -691,12 +696,14 @@ impl Music {
                     && let Some(track) = self.library.queue.current().cloned()
                 {
                     self.history_track = Some(track_id);
+                    self.begin_listening(&track, track_id);
                     if let Some(connection) = &self.account {
                         if self
                             .account_commands
                             .try_send(account::Command::ReportPlayback {
                                 session: connection.session.clone(),
                                 video_id: track.id,
+                                playback_id: track_id,
                             })
                             .is_err()
                         {
@@ -719,6 +726,7 @@ impl Music {
             {
                 changed = self.position.floor() != seconds.floor();
                 self.position = seconds;
+                self.sample_listening();
                 if let Some(service) = &self.mpris {
                     service.position_sample(track_id, seconds);
                 }
@@ -742,6 +750,8 @@ impl Music {
                 match result {
                     Ok(seconds) => {
                         self.position = seconds;
+                        self.sample_listening();
+                        self.checkpoint_listening(false);
                         seeked = Some((track_id, seconds));
                     }
                     Err(error) if latest => self.error = Some(error),
@@ -752,13 +762,19 @@ impl Music {
                 self.duration = seconds
             }
             PlayerEvent::Paused { track_id, paused } if Some(track_id) == self.active_id => {
-                self.playback = self.playback.with_pause(paused)
+                self.playback = self.playback.with_pause(paused);
+                self.sample_listening();
+                self.checkpoint_listening(false);
+                if paused {
+                    self.report_listening(false);
+                }
             }
             PlayerEvent::Buffering {
                 track_id,
                 buffering,
             } if Some(track_id) == self.active_id => {
                 self.playback = self.playback.with_buffering(buffering);
+                self.sample_listening();
             }
             PlayerEvent::Ended { track_id } if Some(track_id) == self.active_id => {
                 self.next(true, cx);
