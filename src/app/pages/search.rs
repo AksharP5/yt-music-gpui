@@ -1,6 +1,7 @@
 //! Search scopes, category filters, and featured results.
 
 use super::super::*;
+use super::artist::soft_edges;
 
 /// A top result action: the web fills the first and outlines the second.
 fn result_action(
@@ -84,15 +85,19 @@ impl Music {
             let item = self.rows[id].clone();
             let (byline, explicit, wide) = match &item {
                 Item::Track(track) => (
-                    track
-                        .details
-                        .byline
-                        .clone()
-                        .unwrap_or_else(|| track.artist.clone()),
+                    self.linked_text(
+                        track
+                            .details
+                            .byline
+                            .clone()
+                            .unwrap_or_else(|| track.artist.clone()),
+                        &track.details.links,
+                        cx,
+                    ),
                     track.details.explicit,
                     track.details.wide_thumbnail,
                 ),
-                _ => (item.subtitle().to_owned(), false, false),
+                _ => (item.subtitle().to_owned().into_any_element(), false, false),
             };
             let art = self.row_thumbnail(
                 item.thumbnail(),
@@ -106,9 +111,9 @@ impl Music {
                     .id(("featured-related", id))
                     .keyboard_control(self.theme)
                     .group("featured-row")
+                    .relative()
                     .w_full()
                     .h(px(72.))
-                    .px(px(16.))
                     .flex()
                     .items_center()
                     .gap(px(16.))
@@ -119,6 +124,7 @@ impl Music {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .mr(px(14.))
                             .flex()
                             .flex_col()
                             .gap(px(4.))
@@ -136,6 +142,11 @@ impl Music {
                         self.menu_button(("featured-menu", id), cx, move |view, window, cx| {
                             view.open_item_menu(id, window, cx);
                         })
+                        // The web floats the menu over the row's end, past the
+                        // padding, so titles run to 16px from the row's edge.
+                        .absolute()
+                        .top(px(18.))
+                        .right(px(-18.))
                         .opacity(0.)
                         .group_hover("featured-row", |style| style.opacity(1.))
                         .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
@@ -266,7 +277,7 @@ impl Music {
             .relative()
             .flex_1()
             .min_w(px(280.))
-            .pl(px(16.))
+            .pl(px(15.))
             .flex()
             .items_center()
             .gap(px(16.))
@@ -282,10 +293,10 @@ impl Music {
             .on_click(cx.listener(move |view, _, _, cx| view.play_item(index, cx)));
         let card = if compact {
             card.h(px(132.))
-                .pr(px(8.))
+                .pr(px(7.))
                 .child(text)
                 .child(actions)
-                .child(details)
+                .child(details.ml(px(-8.)))
         } else {
             let corner = if matches!(&item, Item::Track(_)) {
                 self.menu_button(("featured-menu", index), cx, move |view, window, cx| {
@@ -296,24 +307,56 @@ impl Music {
                 details.into_any_element()
             };
             card.h(px(232.))
-                .pr(px(16.))
-                .child(text.child(actions.mt(px(12.))))
+                .pr(px(15.))
+                .child(text.child(actions.mt(px(4.))))
                 .child(div().absolute().top(px(4.)).right(px(8.)).child(corner))
         };
+        // The web lays the result over its own art, blurred by 60px at 70%
+        // under a gradient to black, then lightens the card by 10% and the
+        // related songs by 5%. Both halves pad 16px, so they split evenly.
+        let backdrop = item.thumbnail().and_then(|url| self.artwork.get_wash(url));
         let panel = div()
+            .relative()
             .w_full()
             .rounded(px(8.))
             .overflow_hidden()
-            .bg(linear_gradient(
+            .bg(self.theme.bg)
+            .when_some(backdrop, |panel, image| {
+                panel
+                    .child(
+                        img(image)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .opacity(0.7),
+                    )
+                    .children(soft_edges(self.theme.bg, 120.))
+            })
+            .child(div().absolute().inset_0().bg(linear_gradient(
                 180.,
-                linear_color_stop(rgb(0x292929), 0.),
-                linear_color_stop(rgb(0x101010), 1.),
-            ))
+                linear_color_stop(rgba(0x0000000d), 0.),
+                linear_color_stop(gpui::black(), 0.8667),
+            )))
             .flex()
             .flex_wrap()
-            .child(card)
+            .child(
+                card.bg(gpui::white().opacity(0.1))
+                    .rounded(px(8.))
+                    .when(!related.is_empty(), |card| card.rounded_r(px(0.))),
+            )
             .when(!related.is_empty(), |body| {
-                body.child(div().flex_1().min_w(px(280.)).py(px(8.)).children(related))
+                body.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(280.))
+                        .pl(px(15.))
+                        .pr(px(17.))
+                        .py(px(8.))
+                        .rounded_r(px(8.))
+                        .bg(gpui::white().opacity(0.05))
+                        .children(related),
+                )
             });
         div()
             .w_full()

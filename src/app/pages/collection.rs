@@ -41,7 +41,7 @@ impl Music {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .when(stacked, |d| d.items_center().text_center());
+            .when(stacked, |d| d.w_full().items_center().text_center());
         if let Some(header) = header {
             let avatar = header.artist_thumbnail.as_deref().and_then(|url| {
                 self.artwork.get(url).map(|image| {
@@ -127,28 +127,30 @@ impl Music {
             );
         }
         if !self.page.description.is_empty() {
-            heading = heading.child(
-                div()
-                    .id("page-description")
-                    .keyboard_control(self.theme)
-                    .w_full()
-                    .text_size(px(text_size))
-                    .text_color(self.theme.muted)
-                    .line_height(relative(1.2))
-                    .line_clamp(2)
-                    .text_ellipsis()
-                    .overflow_hidden()
-                    .cursor_pointer()
-                    .child(self.page.description.clone())
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        window.focus(&view.focus, cx);
-                        view.overlay = Some(Overlay::Description {
-                            title: view.page.title.clone(),
-                            text: view.page.description.clone(),
-                        });
-                        cx.notify();
-                    })),
-            );
+            let description = div()
+                .id("page-description")
+                .keyboard_control(self.theme)
+                .flex_1()
+                .min_w_0()
+                .mx(px(-4.))
+                .text_size(px(text_size))
+                .text_color(self.theme.muted)
+                .line_height(relative(1.2))
+                .line_clamp(2)
+                .text_ellipsis()
+                .overflow_hidden()
+                .cursor_pointer()
+                .child(self.page.description.clone())
+                .on_click(cx.listener(|view, _, window, cx| {
+                    window.focus(&view.focus, cx);
+                    view.overlay = Some(Overlay::Description {
+                        title: view.page.title.clone(),
+                        text: view.page.description.clone(),
+                    });
+                    cx.notify();
+                }));
+            // Extra measured width avoids GPUI wrapping a line that fits on the web.
+            heading = heading.child(div().w_full().flex().child(description));
         }
         let mut actions = div()
             .flex()

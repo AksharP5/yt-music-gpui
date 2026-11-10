@@ -137,22 +137,10 @@ impl Music {
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .gap(px(4.))
                     .cursor_pointer()
                     .when(self.route == route, |d| d.bg(self.theme.selection))
                     .hover(|d| d.bg(gpui::white().opacity(0.1)))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(self.theme.muted)
-                            .child(subtitle),
-                    )
+                    .child(entry_lines(title, subtitle, self.theme))
                     .on_click(cx.listener(move |view, _, window, cx| {
                         window.focus(&view.focus, cx);
                         view.navigate(route.clone(), cx);
@@ -170,21 +158,13 @@ impl Music {
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .gap(px(4.))
                     .cursor_pointer()
                     .hover(|d| d.bg(gpui::white().opacity(0.1)))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Episodes for Later"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(self.theme.muted)
-                            .child("Auto playlist"),
-                    )
+                    .child(entry_lines(
+                        "Episodes for Later",
+                        "Auto playlist",
+                        self.theme,
+                    ))
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.navigate(Route::Library(Section::Episodes), cx)
                     })),
@@ -229,23 +209,13 @@ impl Music {
                                 .flex()
                                 .flex_col()
                                 .justify_center()
-                                .gap(px(4.))
                                 .cursor_pointer()
                                 .hover(|d| d.bg(view.theme.raised))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(14.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(playlist.title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(12.))
-                                        .text_color(view.theme.muted)
-                                        .child(playlist.subtitle.clone()),
-                                )
+                                .child(entry_lines(
+                                    playlist.title.clone(),
+                                    playlist.subtitle.clone(),
+                                    view.theme,
+                                ))
                                 .on_click(cx.listener(move |view, _, window, cx| {
                                     window.focus(&view.focus, cx);
                                     view.navigate(Route::Browse(link.clone()), cx);
@@ -283,4 +253,32 @@ impl Music {
         }
         sidebar.into_any_element()
     }
+}
+
+/// A guide entry's title and subtitle, 20px apart like the web's.
+fn entry_lines(
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    theme: Theme,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .truncate()
+                .text_size(px(14.))
+                .line_height(px(18.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .text_color(theme.muted)
+                .child(subtitle.into()),
+        )
 }

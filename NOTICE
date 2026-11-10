@@ -72,3 +72,10 @@ Source: https://github.com/google/material-design-icons
   thumb-down-filled ("thumb_down"). new-releases combines the "new_releases"
   badge outline with a scaled "music_note".
   These entries replace any earlier source listed above for the same files.
+
+The rounded voting glyphs in assets/icons/thumb-up.svg, thumb-down.svg and
+thumb-up-filled.svg are from the icons rendered by https://music.youtube.com/.
+Copyright Google LLC. thumb-down-filled.svg rotates the filled thumb-up glyph.
+These replace the earlier Material Symbols source listed for those four files.
+The back.svg and forward.svg chevrons are project-drawn, sized to the web's
+8x12px carousel glyphs.

@@ -73,7 +73,7 @@ impl Music {
         let sidebar_width = if compact { 72. } else { 240. };
         let available = width - sidebar_width;
         let inset = if available >= 1000. { 100. } else { 32. };
-        let background = self.page_background(compact, width, height);
+        let background = self.page_background(compact, width, height, window, cx);
         let header = (!fullscreen).then(|| self.header(inset, compact, width, cx));
         let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
         let divider = (!fullscreen).then(|| self.header_divider()).flatten();

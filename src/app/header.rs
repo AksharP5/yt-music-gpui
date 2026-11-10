@@ -51,8 +51,7 @@ impl Music {
             100.
         };
         let scrolled = self.page_scrolled();
-        // Unscrolled, Home tints the header beside the guide, which keeps its
-        // own background and border up to the top of the window.
+        // Home tints the content header; the guide keeps its own background.
         let home_band = self.route.is_home() && !self.player_open && !scrolled;
         div()
             .h(px(64.))
@@ -61,19 +60,18 @@ impl Music {
             .relative()
             .flex()
             .items_center()
-            .when(home_band, |d| {
-                d.bg(rgb(0x14252c)).child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .h_full()
-                        .w(px(if compact { 72. } else { 240. }))
-                        .bg(self.theme.bg)
-                        .border_r_1()
-                        .border_color(self.theme.border),
-                )
-            })
+            .when(home_band, |d| d.bg(rgb(0x14252c)))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .w(px(if compact { 72. } else { 240. }))
+                    .bg(self.theme.bg)
+                    .border_r_1()
+                    .border_color(self.theme.border),
+            )
             .when(!home_band && (scrolled || !self.immersive_header()), |d| {
                 d.bg(self.theme.bg)
             })

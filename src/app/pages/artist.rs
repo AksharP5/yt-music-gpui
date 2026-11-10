@@ -211,6 +211,8 @@ impl Music {
         compact: bool,
         width: f32,
         height: f32,
+        window: &Window,
+        cx: &Context<Self>,
     ) -> Option<Div> {
         if self.player_open {
             return None;
@@ -218,16 +220,25 @@ impl Music {
         let left = if compact { 72. } else { 240. };
         let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
         if let Some(url) = self.wash_url() {
-            // The web blurs the art over the top 49vh and fades it out by 50vh.
-            let wash = height * 0.5;
+            // The web covers the window's top 49vh with the art, blurred by
+            // 80px, under a black gradient from 60% to the page color over
+            // 122vh. The blur fades the art into the page across about two
+            // blur radii at each edge, so the wash is brightest well below the
+            // window top and spills past the art's box.
+            let art = height * 0.49;
+            let fade = 160.;
+            let wash = art + fade;
             if scrolled <= -wash {
                 return None;
             }
             let image = self.artwork.get_wash(&url)?;
+            let bg = self.theme.bg;
+            let mut shade = bg;
+            shade.a = 0.6 + 0.4 * wash / (height * 1.22);
             return Some(
                 div()
                     .absolute()
-                    .left(px(left))
+                    .left_0()
                     .right_0()
                     .top(px(scrolled))
                     .h(px(wash))
@@ -235,14 +246,30 @@ impl Music {
                     .child(
                         img(image)
                             .absolute()
-                            .inset_0()
-                            .size_full()
+                            .top(px(-fade))
+                            .left_0()
+                            .w_full()
+                            .h(px(art + 2. * fade))
                             .object_fit(ObjectFit::Cover),
+                    )
+                    .children(soft_edges(bg, fade))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(art - fade))
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(bg.opacity(0.), 0.),
+                                linear_color_stop(bg, 1.),
+                            )),
                     )
                     .child(div().absolute().inset_0().bg(linear_gradient(
                         180.,
                         linear_color_stop(rgba(0x00000099), 0.),
-                        linear_color_stop(self.theme.bg, 1.),
+                        linear_color_stop(shade, 1.),
                     ))),
             );
         }
@@ -250,12 +277,23 @@ impl Music {
             return None;
         }
         // The hero spans the header and the artist heading in list row 0.
-        let hero = 64. + f32::from(self.detail_list.state.bounds_for_item(0)?.size.height);
+        let url = self.page.header.as_ref()?.thumbnail.clone()?;
+        let image = self.artwork.get_hero(&url)?;
+        let Some(heading) = self.detail_list.state.bounds_for_item(0) else {
+            // Cached artwork has no completion event to redraw the content
+            // after the new list measures its heading in this frame.
+            if self.detail_list.state.logical_scroll_top().item_ix == 0 {
+                let music = cx.entity().downgrade();
+                window.on_next_frame(move |_, cx| {
+                    let _ = music.update(cx, |_, cx| cx.notify());
+                });
+            }
+            return None;
+        };
+        let hero = 64. + f32::from(heading.size.height);
         if scrolled <= -hero {
             return None;
         }
-        let url = self.page.header.as_ref()?.thumbnail.clone()?;
-        let image = self.artwork.get_hero(&url)?;
         // The web lays the photo window-wide from 72px left of the content,
         // keeps its top edge, dims it by 40%, and fades it out behind the heading.
         let size = image.size(0);
@@ -294,6 +332,24 @@ impl Music {
                 ),
         )
     }
+}
+
+/// Fades a blurred image's top, left and right edges into the page over
+/// `fade`, about two blur radii, the way a CSS blur turns its box's edges
+/// half transparent.
+pub(super) fn soft_edges(bg: Hsla, fade: f32) -> [Div; 3] {
+    let band = |angle: f32, from: f32, to: f32| {
+        div().absolute().bg(linear_gradient(
+            angle,
+            linear_color_stop(bg.opacity(from), 0.),
+            linear_color_stop(bg.opacity(to), 1.),
+        ))
+    };
+    [
+        band(180., 0.5, 0.).top_0().left_0().right_0().h(px(fade)),
+        band(90., 0.5, 0.).top_0().bottom_0().left_0().w(px(fade)),
+        band(90., 0., 0.5).top_0().bottom_0().right_0().w(px(fade)),
+    ]
 }
 
 /// Where the web's artist photo starts fading, from the window top, and how
