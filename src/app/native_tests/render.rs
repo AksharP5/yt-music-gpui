@@ -690,6 +690,90 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
     println!("INLINE_LINKS forward=passed reverse=passed enter=passed row_playback=unchanged");
 }
 
+fn prepare_x11_capture(id: u64) -> (u32, u32) {
+    unsafe extern "C" {
+        fn XOpenDisplay(name: *const libc::c_char) -> *mut libc::c_void;
+        fn XGetGeometry(
+            display: *mut libc::c_void,
+            window: libc::c_ulong,
+            root: *mut libc::c_ulong,
+            x: *mut libc::c_int,
+            y: *mut libc::c_int,
+            width: *mut libc::c_uint,
+            height: *mut libc::c_uint,
+            border: *mut libc::c_uint,
+            depth: *mut libc::c_uint,
+        ) -> libc::c_int;
+        fn XTranslateCoordinates(
+            display: *mut libc::c_void,
+            source: libc::c_ulong,
+            destination: libc::c_ulong,
+            source_x: libc::c_int,
+            source_y: libc::c_int,
+            x: *mut libc::c_int,
+            y: *mut libc::c_int,
+            child: *mut libc::c_ulong,
+        ) -> libc::c_int;
+        fn XMoveWindow(
+            display: *mut libc::c_void,
+            window: libc::c_ulong,
+            x: libc::c_int,
+            y: libc::c_int,
+        ) -> libc::c_int;
+        fn XSync(display: *mut libc::c_void, discard: libc::c_int) -> libc::c_int;
+        fn XCloseDisplay(display: *mut libc::c_void) -> libc::c_int;
+    }
+    // The private connection touches only this app's live window and root geometry.
+    // Every output pointer refers to a local, and we close the connection on error.
+    unsafe {
+        let display = XOpenDisplay(std::ptr::null());
+        assert!(!display.is_null(), "Connect to X11 for native pixel checks");
+        let geometry = |window| {
+            let (mut root, mut x, mut y, mut width, mut height, mut border, mut depth) =
+                (0, 0, 0, 0, 0, 0, 0);
+            let status = XGetGeometry(
+                display,
+                window,
+                &mut root,
+                &mut x,
+                &mut y,
+                &mut width,
+                &mut height,
+                &mut border,
+                &mut depth,
+            );
+            if status == 0 {
+                XCloseDisplay(display);
+                panic!("Read X11 geometry for window {window}");
+            }
+            (root, width, height)
+        };
+        let (root, width, height) = geometry(id);
+        let (_, desktop_width, desktop_height) = geometry(root);
+        let (mut x, mut y, mut child) = (0, 0, 0);
+        let translated = XTranslateCoordinates(display, id, root, 0, 0, &mut x, &mut y, &mut child);
+        if translated == 0 || width > desktop_width || height > desktop_height {
+            XCloseDisplay(display);
+            panic!(
+                "App window {id} ({width}x{height}) must fit the X11 desktop ({desktop_width}x{desktop_height})"
+            );
+        }
+        // ImageMagick clips to the root even for an override-redirect popup.
+        // Keep the entire test drawable onscreen without changing its size.
+        let left = x.clamp(0, (desktop_width - width) as i32);
+        let top = y.clamp(0, (desktop_height - height) as i32);
+        if (x, y) != (left, top) {
+            XMoveWindow(display, id, left, top);
+            XSync(display, 0);
+            println!(
+                "CAPTURE_X11_POSITION from=({x},{y}) to=({left},{top}) size=({width},{height}) desktop=({desktop_width},{desktop_height})"
+            );
+        }
+        XCloseDisplay(display);
+        (width, height)
+    }
+}
+
 pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let id = match HasWindowHandle::window_handle(window).unwrap().as_raw() {
         RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
@@ -698,6 +782,7 @@ pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     };
     let path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
         .join(format!("{name}.png"));
+    let actual = prepare_x11_capture(id);
     let output = std::process::Command::new("import")
         .args(["-window", &id.to_string()])
         .arg(&path)
@@ -713,12 +798,16 @@ pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let scale = window.scale_factor();
     assert_eq!(
         image.dimensions(),
-        (
-            (f32::from(viewport.width) * scale).round() as u32,
-            (f32::from(viewport.height) * scale).round() as u32
-        ),
-        "Capture must contain the app window at its actual dimensions"
+        actual,
+        "Capture must contain the app window at its actual X11 dimensions"
     );
+    let gpui_size = (
+        (f32::from(viewport.width) * scale).round() as u32,
+        (f32::from(viewport.height) * scale).round() as u32,
+    );
+    if actual != gpui_size {
+        println!("CAPTURE_X11_GEOMETRY name={name} gpui={gpui_size:?} x11={actual:?}");
+    }
     // Comparison loops use the pixels immediately. Keep representative states,
     // rather than dozens of nearly identical PNGs in a quota-limited runtime.
     if (name.starts_with("Lyrics-") || name.starts_with("Related-") || name.starts_with("artist-"))
