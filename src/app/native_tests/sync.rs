@@ -66,7 +66,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             let mut shelf = view.page.shelves[0].clone();
             shelf.items = tail;
             view.page.shelves.push(shelf);
-            view.sync.page_coverage = crate::app::sync::PageCoverage { first_page_shelves: 1, continued: true };
+            view.sync.page_coverage = crate::app::sync::PageCoverage { first_page_len: 1, continued: true };
             view.page.title = "Sync validation playlist".into();
             view.rebuild_rows();
             view
@@ -224,7 +224,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 view.page = response(&[("Songs",(0..500).collect())],Some("tail"),true);
                 view.page.header = crate::catalog::parse_page(&json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Collection anchor"}}},"contents":[]}),"Collection anchor").unwrap().header;
                 view.page.title = "Collection anchor".into();
-                view.sync.page_coverage = crate::app::sync::PageCoverage { first_page_shelves:1,continued:false };
+                view.sync.page_coverage = crate::app::sync::PageCoverage { first_page_len:1,continued:false };
                 view.rebuild_rows();
                 view.detail_list.state.scroll_to(ListOffset { item_ix:401,offset_in_item:px(8.) });
                 let track = view.page.tracks()[400].clone();
@@ -320,6 +320,33 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 let after = view.detail_list.state.logical_scroll_top();
                 assert_eq!((after.item_ix,after.offset_in_item),expected,"The next frame must preserve Home's scroll position");
             }).unwrap();
+            window.update(cx,|view,_,cx| {
+                view.navigate(Route::Recent,cx);
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).find(|job| job.query.target()==CatalogTarget::Page).unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,append:false,revalidate:false,result:Ok(response(&[("Today",vec![0]),("Yesterday",vec![1])],Some("older"),false)),session_rejected:false,target:CatalogTarget::Page },cx);
+                view.request(Query::More { token:view.page.continuation.clone().unwrap(), search:None },cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,append:true,revalidate:false,result:Ok(response(&[("Yesterday",vec![2,5]),("Last week",vec![3])],Some("oldest"),false)),session_rejected:false,target:CatalogTarget::Page },cx);
+                let headings = view.list_rows.iter().filter_map(|row| match row { crate::app::ListRow::Heading(index)=>Some(view.page.shelves[*index].title.as_str()),_=>None }).collect::<Vec<_>>();
+                assert_eq!(headings,["Today","Yesterday","Last week"],"A continued day gets one heading");
+                view.detail_list.state.scroll_to(ListOffset { item_ix:3,offset_in_item:px(0.) });
+                view.revalidate_page(cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,append:false,revalidate:true,result:Ok(response(&[("Today",vec![2,0]),("Yesterday",vec![4])],Some("fresh"),false)),session_rejected:false,target:CatalogTarget::Page },cx);
+                let display = view.list_rows.iter().map(|row| match row {
+                    crate::app::ListRow::Heading(index)=>view.page.shelves[*index].title.clone(),
+                    crate::app::ListRow::Item(index)=>view.rows[*index].id().to_owned(),
+                    _=>panic!("Unexpected History row")
+                }).collect::<Vec<_>>();
+                assert_eq!(display,vec!["Today".into(),format!("{:011}",2),format!("{:011}",0),"Yesterday".into(),format!("{:011}",4),format!("{:011}",5),"Last week".into(),format!("{:011}",3)]);
+                assert_eq!(view.detail_list.state.item_count(),8);
+                view.page.title = "History".into();
+                view.detail_list.state.scroll_to(ListOffset::default());
+                cx.notify();
+            }).unwrap();
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            window.update(cx,|_,window,_| { super::render::capture(window,"history-day-groups"); }).unwrap();
+            println!("HISTORY_GROUPS continuation=passed replay_refresh=passed virtual_rows=8");
             result.store(true,Ordering::Release);
             println!("SYNC_SCREENSHOT home-scroll-preserved");
             cx.update(|cx| cx.quit());

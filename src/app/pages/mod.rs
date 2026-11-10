@@ -183,6 +183,16 @@ impl Music {
         PageLayout::new(width, width - sidebar)
     }
 
+    pub(in crate::app) fn history_groups(&self) -> bool {
+        matches!(self.route, Route::Recent | Route::Library(Section::History))
+    }
+
+    pub(in crate::app) fn grouped_rows(&self) -> bool {
+        self.page.header.is_some()
+            || self.history_groups()
+            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
+    }
+
     pub(in crate::app) fn list_row(
         &mut self,
         index: usize,
@@ -199,6 +209,9 @@ impl Music {
                 .flex()
                 .items_center()
                 .text_size(px(24.))
+                .when(self.history_groups(), |heading| {
+                    heading.line_height(px(32.))
+                })
                 .font_weight(FontWeight::BOLD)
                 .child(self.page.shelves[shelf].title.clone())
                 .into_any_element(),
@@ -360,8 +373,7 @@ impl Music {
                     .rows
                     .iter()
                     .all(|item| matches!(item, Item::Collection(_)));
-            let grouped =
-                matches!(&self.route,Route::Search(search) if search.filter==SearchFilter::All);
+            let grouped = self.grouped_rows();
             let list = if collection && stacked && self.rows.is_empty() {
                 div()
                     .flex_1()

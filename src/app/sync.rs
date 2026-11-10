@@ -6,6 +6,7 @@ pub(in crate::app) struct SyncState {
     pub refreshed_at: Option<Instant>,
     pub page_fetched_at: Option<Instant>,
     pub sidebar_continuation: Option<Continuation>,
+    pub sidebar_coverage: PageCoverage,
     pub rating_overrides: HashSet<String>,
     pub page_changes: Vec<PageChange>,
     pub optimistic_ratings: HashMap<String, Option<Rating>>,
@@ -16,7 +17,7 @@ pub(in crate::app) struct SyncState {
 
 #[derive(Clone, Copy, Default)]
 pub(in crate::app) struct PageCoverage {
-    pub first_page_shelves: usize,
+    pub first_page_len: usize,
     pub continued: bool,
 }
 
@@ -71,30 +72,102 @@ pub(super) struct PageReload {
     rows: usize,
 }
 
-/// Replace the first response's shelves, preserving only separately loaded pages.
-pub(super) fn merge_page(loaded: &mut Page, mut fresh: Page, coverage: &mut PageCoverage) {
-    let first_page_shelves = fresh.shelves.len();
-    if fresh.continuation.is_some() && coverage.continued {
-        let keys: HashSet<_> = fresh
-            .shelves
-            .iter()
-            .flat_map(|shelf| &shelf.items)
-            .map(item_key)
-            .collect();
-        let mut tail = loaded.shelves.split_off(coverage.first_page_shelves);
-        for shelf in &mut tail {
-            // Playlist occurrence IDs distinguish repeated songs. History has no
-            // occurrence IDs, so a replay moves the song out of its old day bucket.
-            shelf.items.retain(|item| !keys.contains(&item_key(item)));
-        }
-        tail.retain(|shelf| !shelf.items.is_empty());
-        fresh.shelves.extend(tail);
-        fresh.continuation = loaded.continuation.take();
+/// Replace the authoritative first response and filter moved entries from loaded continuations.
+fn merge_first_page<T>(
+    loaded: &mut Vec<T>,
+    mut fresh: Vec<T>,
+    coverage: &mut PageCoverage,
+    paginated: bool,
+    filter_tail: impl FnOnce(&mut Vec<T>, &[T]),
+) -> bool {
+    let first_page_len = fresh.len();
+    let preserve_tail = paginated && coverage.continued;
+    if preserve_tail {
+        let mut tail = loaded.split_off(coverage.first_page_len.min(loaded.len()));
+        filter_tail(&mut tail, &fresh);
+        fresh.extend(tail);
     } else {
         coverage.continued = false;
     }
-    coverage.first_page_shelves = first_page_shelves;
+    coverage.first_page_len = first_page_len;
     *loaded = fresh;
+    preserve_tail
+}
+
+pub(super) fn merge_page(loaded: &mut Page, mut fresh: Page, coverage: &mut PageCoverage) {
+    if merge_first_page(
+        &mut loaded.shelves,
+        std::mem::take(&mut fresh.shelves),
+        coverage,
+        fresh.continuation.is_some(),
+        |tail, fresh| {
+            let keys: HashSet<_> = fresh
+                .iter()
+                .flat_map(|shelf| &shelf.items)
+                .map(item_key)
+                .collect();
+            // A replay moves a History song out of its old day bucket. Playlist
+            // occurrence IDs still distinguish repeated songs.
+            tail.retain_mut(|shelf| {
+                shelf.items.retain(|item| !keys.contains(&item_key(item)));
+                !shelf.items.is_empty()
+            });
+        },
+    ) {
+        fresh.continuation = loaded.continuation.take();
+    }
+    fresh.shelves = std::mem::take(&mut loaded.shelves);
+    *loaded = fresh;
+}
+
+impl SyncState {
+    pub(super) fn update_sidebar(
+        &mut self,
+        playlists: &mut Vec<Collection>,
+        page: Page,
+        append: bool,
+        revalidate: bool,
+    ) {
+        let mut seen = HashSet::new();
+        let choices = page
+            .shelves
+            .into_iter()
+            .flat_map(|shelf| shelf.items)
+            .filter_map(|item| match item {
+                Item::Collection(collection)
+                    if !matches!(collection.id.as_str(), "VLLM" | "VLSE")
+                        && seen.insert(collection.id.clone()) =>
+                {
+                    Some(collection)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if append {
+            let mut loaded: HashSet<_> = playlists.iter().map(|item| item.id.clone()).collect();
+            playlists.extend(
+                choices
+                    .into_iter()
+                    .filter(|item| loaded.insert(item.id.clone())),
+            );
+            self.sidebar_coverage.continued = true;
+            self.sidebar_continuation = page.continuation;
+            return;
+        }
+        if !revalidate {
+            self.sidebar_coverage = PageCoverage::default();
+        }
+        let preserve_tail = merge_first_page(
+            playlists,
+            choices,
+            &mut self.sidebar_coverage,
+            page.continuation.is_some(),
+            |tail, _| tail.retain(|collection| !seen.contains(&collection.id)),
+        );
+        if !preserve_tail {
+            self.sidebar_continuation = page.continuation;
+        }
+    }
 }
 
 pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
@@ -277,9 +350,7 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) {
 impl Music {
     pub(super) fn page_anchor(&self) -> PageAnchor {
         let home = self.route.is_home() || matches!(self.route, Route::Explore);
-        let detailed = home
-            || self.page.header.is_some()
-            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
+        let detailed = home || self.grouped_rows();
         let top = self.detail_list.state.logical_scroll_top();
         let detail = if home {
             top.item_ix
@@ -548,8 +619,16 @@ impl Music {
             }
         }
         if let Mutation::DeletePlaylist { id } = mutation {
+            let mut index = 0;
+            let first_page_len = &mut self.sync.sidebar_coverage.first_page_len;
+            let boundary = *first_page_len;
             self.sidebar_playlists.retain(|collection| {
-                collection.id.trim_start_matches("VL") != id.trim_start_matches("VL")
+                let keep = collection.id.trim_start_matches("VL") != id.trim_start_matches("VL");
+                if !keep && index < boundary {
+                    *first_page_len -= 1;
+                }
+                index += 1;
+                keep
             });
         }
         if let Mutation::EditPlaylist { id, title, .. } = mutation {
@@ -566,7 +645,7 @@ impl Music {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{PageCoverage, merge_page, needs_refresh, patch_page};
+    use super::{PageCoverage, SyncState, merge_page, needs_refresh, patch_page};
     use crate::{
         account::Mutation,
         app::Route,
@@ -657,6 +736,134 @@ pub(super) mod tests {
         }), "Synthetic library").unwrap()
     }
 
+    fn sidebar_page(ids: &[&str], token: Option<&str>) -> Page {
+        let mut page = response(&[("Playlists", vec![0])], token, false);
+        page.shelves[0].items = ids
+            .iter()
+            .map(|id| {
+                Item::Collection(
+                    serde_json::from_value(
+                        json!({"id":id,"title":id,"subtitle":"Synthetic playlist"}),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        page
+    }
+
+    #[test]
+    fn sidebar_refresh_replaces_first_page_order_and_deduplicates_loaded_continuations() {
+        let mut sync = SyncState::default();
+        let mut playlists = Vec::new();
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLa", "VLb", "VLc"], Some("first-tail")),
+            false,
+            false,
+        );
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLc", "VLd", "VLe"], Some("loaded-tail")),
+            true,
+            false,
+        );
+        assert_eq!(
+            playlists
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["VLa", "VLb", "VLc", "VLd", "VLe"]
+        );
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLd", "VLb", "VLd", "VLLM", "VLSE"], Some("fresh-tail")),
+            false,
+            true,
+        );
+        assert_eq!(
+            playlists
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["VLd", "VLb", "VLe"]
+        );
+        assert_eq!(
+            sync.sidebar_continuation.as_ref().unwrap().token(),
+            "loaded-tail"
+        );
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLb"], Some("fresh-tail-2")),
+            false,
+            true,
+        );
+        assert_eq!(
+            playlists
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["VLb", "VLe"]
+        );
+    }
+
+    #[test]
+    fn complete_sidebar_refresh_adopts_server_order_and_removals() {
+        let mut sync = SyncState::default();
+        let mut playlists = Vec::new();
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLa", "VLb", "VLc"], Some("tail")),
+            false,
+            false,
+        );
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLc", "VLb"], None),
+            false,
+            true,
+        );
+        assert_eq!(
+            playlists
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["VLc", "VLb"]
+        );
+        assert!(sync.sidebar_continuation.is_none());
+        sync.update_sidebar(&mut playlists, sidebar_page(&[], None), false, true);
+        assert!(playlists.is_empty());
+    }
+
+    #[test]
+    fn sidebar_refresh_without_loaded_continuations_replaces_the_whole_old_first_page() {
+        let mut sync = SyncState::default();
+        let mut playlists = Vec::new();
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLa", "VLb"], Some("stale-tail")),
+            false,
+            false,
+        );
+        sync.update_sidebar(
+            &mut playlists,
+            sidebar_page(&["VLb"], Some("new-tail")),
+            false,
+            true,
+        );
+        assert_eq!(
+            playlists
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["VLb"]
+        );
+        assert_eq!(
+            sync.sidebar_continuation.as_ref().unwrap().token(),
+            "new-tail"
+        );
+    }
+
     fn ids(page: &Page) -> Vec<String> {
         page.shelves
             .iter()
@@ -680,7 +887,7 @@ pub(super) mod tests {
         }
         loaded.continuation = response(&[], Some("page-11"), true).continuation;
         let mut coverage = PageCoverage {
-            first_page_shelves: 1,
+            first_page_len: 1,
             continued: true,
         };
         // The old last row is removed, a new like arrives first, and all other
@@ -719,7 +926,7 @@ pub(super) mod tests {
         };
         repeated.id = format!("{:011}", 3);
         let mut coverage = PageCoverage {
-            first_page_shelves: 1,
+            first_page_len: 1,
             continued: true,
         };
         merge_page(
@@ -746,7 +953,7 @@ pub(super) mod tests {
             false,
         );
         let mut coverage = PageCoverage {
-            first_page_shelves: 1,
+            first_page_len: 1,
             continued: true,
         };
         merge_page(
@@ -771,7 +978,7 @@ pub(super) mod tests {
             [2, 0, 1, 3, 4, 5].map(|id| format!("{id:011}"))
         );
         assert_eq!(loaded.continuation.as_ref().unwrap().token(), "older");
-        assert_eq!(coverage.first_page_shelves, 2);
+        assert_eq!(coverage.first_page_len, 2);
     }
 
     #[test]
@@ -782,7 +989,7 @@ pub(super) mod tests {
             false,
         );
         let mut coverage = PageCoverage {
-            first_page_shelves: 1,
+            first_page_len: 1,
             continued: true,
         };
         merge_page(
@@ -801,7 +1008,7 @@ pub(super) mod tests {
     fn a_first_page_without_loaded_continuations_adopts_the_new_continuation() {
         let mut loaded = response(&[("Songs", vec![0, 1])], Some("stale"), true);
         let mut coverage = PageCoverage {
-            first_page_shelves: 1,
+            first_page_len: 1,
             continued: false,
         };
         merge_page(

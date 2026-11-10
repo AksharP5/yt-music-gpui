@@ -286,9 +286,7 @@ impl Music {
         }
         if self.route.is_home() || matches!(self.route, Route::Explore) {
             self.detail_list.state.remeasure();
-        } else if self.page.header.is_some()
-            || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
-        {
+        } else if self.grouped_rows() {
             self.detail_list.reset_rows(self.list_rows.len());
         } else {
             self.detail_list = DetailList::new();
@@ -300,6 +298,10 @@ impl Music {
         let search_all =
             matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
         for (index, shelf) in self.page.shelves.iter().enumerate().skip(first_shelf) {
+            if self.history_groups() {
+                self.rows.extend(shelf.items.iter().cloned());
+                continue;
+            }
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
             let carousel =
                 sectioned && matches!(shelf.layout, ShelfLayout::Cards | ShelfLayout::Videos);
@@ -318,6 +320,29 @@ impl Music {
             }
             if sectioned && !carousel && shelf.more.is_some() {
                 self.list_rows.push(ListRow::More(index));
+            }
+        }
+        if self.history_groups() {
+            self.list_rows.clear();
+            let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+            let mut days = HashMap::new();
+            let mut offset = 0;
+            for (index, shelf) in self.page.shelves.iter().enumerate() {
+                let group = *days.entry(shelf.title.as_str()).or_insert_with(|| {
+                    groups.push((index, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[group].1.extend(offset..offset + shelf.items.len());
+                offset += shelf.items.len();
+            }
+            for (shelf, items) in groups {
+                if items.is_empty() {
+                    continue;
+                }
+                if !self.page.shelves[shelf].title.is_empty() {
+                    self.list_rows.push(ListRow::Heading(shelf));
+                }
+                self.list_rows.extend(items.into_iter().map(ListRow::Item));
             }
         }
     }
@@ -424,44 +449,12 @@ impl Music {
         if result.target == CatalogTarget::Sidebar {
             match result.result {
                 Ok(page) => {
-                    let complete = page.continuation.is_none();
-                    if complete
-                        || result.append
-                        || !result.revalidate
-                        || self.sidebar_playlists.is_empty()
-                    {
-                        self.sync.sidebar_continuation = page.continuation;
-                    }
-                    let choices: Vec<_> = page
-                        .shelves
-                        .into_iter()
-                        .flat_map(|shelf| shelf.items)
-                        .filter_map(|item| match item {
-                            Item::Collection(collection)
-                                if !matches!(collection.id.as_str(), "VLLM" | "VLSE") =>
-                            {
-                                Some(collection)
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    if !result.append && !result.revalidate {
-                        self.sidebar_playlists.clear();
-                    } else if result.revalidate && complete {
-                        self.sidebar_playlists
-                            .retain(|current| choices.iter().any(|choice| choice.id == current.id));
-                    }
-                    for collection in choices {
-                        if let Some(current) = self
-                            .sidebar_playlists
-                            .iter_mut()
-                            .find(|current| current.id == collection.id)
-                        {
-                            *current = collection;
-                        } else {
-                            self.sidebar_playlists.push(collection);
-                        }
-                    }
+                    self.sync.update_sidebar(
+                        &mut self.sidebar_playlists,
+                        page,
+                        result.append,
+                        result.revalidate,
+                    );
                     self.sidebar_error = None;
                 }
                 Err(error) => self.sidebar_error = Some(error),
@@ -540,7 +533,7 @@ impl Music {
                     let anchor = self.page_anchor();
                     if self.sync.page_reload.is_some() {
                         self.sync.page_coverage = sync::PageCoverage {
-                            first_page_shelves: page.shelves.len(),
+                            first_page_len: page.shelves.len(),
                             continued: false,
                         };
                         self.page = page;
@@ -557,16 +550,18 @@ impl Music {
                     let previous_rows = self.list_rows.len();
                     self.page.continuation = page.continuation;
                     self.page.shelves.extend(page.shelves);
-                    self.append_rows(first_shelf);
-                    if self.page.header.is_some()
-                        || matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All)
-                    {
+                    if self.history_groups() {
+                        self.rebuild_rows();
+                    } else {
+                        self.append_rows(first_shelf);
+                    }
+                    if self.grouped_rows() && !self.history_groups() {
                         self.detail_list
                             .append_rows(self.list_rows.len() - previous_rows);
                     }
                 } else {
                     self.sync.page_coverage = sync::PageCoverage {
-                        first_page_shelves: page.shelves.len(),
+                        first_page_len: page.shelves.len(),
                         continued: false,
                     };
                     self.page = page;
