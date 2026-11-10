@@ -78,6 +78,8 @@ Settings includes playback speed, audio quality and video resolution limits. The
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, validation, integration tests and running an isolated instance next to your installed app. To sample CPU and memory for a running release build, use `bin/profile APP_PID 30`.
 
+Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR`. Normal shutdown, SIGTERM and SIGINT remove it.
+
 Local preferences, queue and guest library data live in `$XDG_DATA_HOME/yt-music-gpui/library.json`, defaulting to `~/.local/share/yt-music-gpui/library.json`.
 
 MIT licensed. Third-party attributions and licenses are listed in [NOTICE](NOTICE).

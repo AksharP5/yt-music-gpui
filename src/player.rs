@@ -11,7 +11,7 @@ use std::{
     fs::{self, File},
     io::{self, ErrorKind, Read, Seek, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -1274,15 +1274,32 @@ impl Drop for StreamPreparation {
     }
 }
 
+fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
+    let metadata = fs::symlink_metadata(parent)?;
+    ensure!(
+        parent.is_absolute()
+            && metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "The playback runtime directory must be private to your user"
+    );
+    tempfile::Builder::new()
+        .prefix("yt-music-gpui-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)
+        .context("Could not create the private playback directory")
+}
+
 fn run(
     options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
     wake: &OwnedFd,
     events: &async_channel::Sender<PlayerEvent>,
 ) -> Result<()> {
-    let runtime = tempfile::Builder::new()
-        .prefix("yt-music-gpui-")
-        .tempdir()?;
+    let parent = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .context("Set XDG_RUNTIME_DIR to a private playback runtime directory")?;
+    let runtime = playback_runtime(&parent)?;
     let socket_path = runtime.path().join("mpv.sock");
     let plugin_dir = write_account_extractor(runtime.path())?;
     let ytdlp = std::env::var_os("PATH")
@@ -2116,6 +2133,32 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_runtime_stays_private_under_the_desktop_runtime_and_cleans_up() {
+        let parent = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let runtime = playback_runtime(parent.path()).unwrap();
+        let path = runtime.path().to_owned();
+        assert_eq!(path.parent(), Some(parent.path()));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+        write_account_extractor(&path).unwrap();
+        drop(runtime);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn playback_runtime_rejects_shared_directories_and_symlinks() {
+        let parent = tempfile::tempdir().unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(playback_runtime(parent.path()).is_err());
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(parent.path(), &link).unwrap();
+        assert!(playback_runtime(&link).is_err());
+    }
 
     #[test]
     fn mismatched_extractor_uses_guest_streams_and_notifies_only_once() {

@@ -23,6 +23,40 @@ mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
+static TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn terminate(_: libc::c_int) {
+    TERMINATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn shutdown_on_signal(cx: &mut App) {
+    // Signal handlers only set a flag. Quit on GPUI's thread so player and video
+    // destructors can stop extraction and remove the private playback directory.
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = terminate as *const () as usize;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            eprintln!(
+                "Could not install shutdown handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    cx.spawn(async |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            if TERMINATE.load(std::sync::atomic::Ordering::Relaxed) {
+                cx.update(|cx| cx.quit());
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 fn main() {
     // A crash dump must not persist reusable account credentials.
     let limit = libc::rlimit {
@@ -88,6 +122,7 @@ fn main() {
                 eprintln!("Could not load the interface font: {error:#}");
             }
             input::init(cx);
+            shutdown_on_signal(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
