@@ -51,7 +51,7 @@ impl Music {
             100.
         };
         let scrolled = self.page_scrolled();
-        // Home tints the content header; the guide keeps its own background.
+        // Only an expanded, unscrolled guide has its own header background.
         let home_band = self.route.is_home() && !self.player_open && !scrolled;
         div()
             .h(px(64.))
@@ -61,17 +61,19 @@ impl Music {
             .flex()
             .items_center()
             .when(home_band, |d| d.bg(rgb(0x14252c)))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .h_full()
-                    .w(px(if compact { 72. } else { 240. }))
-                    .bg(self.theme.bg)
-                    .border_r_1()
-                    .border_color(self.theme.border),
-            )
+            .when(!compact && !scrolled, |header| {
+                header.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(px(240.))
+                        .bg(self.theme.bg)
+                        .border_r_1()
+                        .border_color(self.theme.border),
+                )
+            })
             .when(!home_band && (scrolled || !self.immersive_header()), |d| {
                 d.bg(self.theme.bg)
             })
@@ -86,8 +88,8 @@ impl Music {
                     .child(
                         button("guide-toggle", "menu", self.theme)
                             .size(px(40.))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.sidebar_collapsed = !view.sidebar_collapsed;
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.sidebar_collapsed = Some(!compact);
                                 cx.notify();
                             })),
                     )

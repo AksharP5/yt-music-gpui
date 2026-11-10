@@ -63,13 +63,17 @@ impl Music {
         window.focus(focus, cx);
     }
 
+    pub(in crate::app) fn sidebar_compact(&self, width: f32) -> bool {
+        self.sidebar_collapsed.unwrap_or(width < 1150.)
+    }
+
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let player_page = self.player_open && self.library.queue.current().is_some();
         let fullscreen = player_page && self.library.video && window.is_fullscreen();
         let viewport = window.viewport_size();
         let width: f32 = viewport.width.into();
         let height: f32 = viewport.height.into();
-        let compact = self.sidebar_collapsed || width < 1150.;
+        let compact = self.sidebar_compact(width);
         let sidebar_width = if compact { 72. } else { 240. };
         let available = width - sidebar_width;
         let inset = if available >= 1000. { 100. } else { 32. };

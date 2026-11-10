@@ -292,7 +292,7 @@ impl Music {
             shelf_scroll: HashMap::new(),
             list_scroll: UniformListScrollHandle::new(),
             detail_list: DetailList::new(),
-            sidebar_collapsed: false,
+            sidebar_collapsed: None,
             sidebar_playlists: Vec::new(),
             sidebar_error: None,
             sidebar_scroll: UniformListScrollHandle::new(),

@@ -1118,6 +1118,147 @@ async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut Async
     wait_for_presented_frame(window, cx).await;
 }
 
+async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    for width in [956., 1920.] {
+        for home in [true, false] {
+            for scrolled in [false, true] {
+                window
+                    .update(cx, |music, window, cx| {
+                        window.resize(size(px(width), px(1050.)));
+                        music.sidebar_collapsed = None;
+                        music.catalog_requests = crate::app::CatalogRequests::new();
+                        music.player_open = false;
+                        music.library.queue = Default::default();
+                        music.route = if home {
+                            crate::app::Route::Home
+                        } else {
+                            crate::app::Route::Explore
+                        };
+                        music.page = crate::app::sync::tests::page(6, false);
+                        music.page.shelves = vec![music.page.shelves[0].clone(); 8];
+                        music.error = None;
+                        music.notice = None;
+                        music.rebuild_rows();
+                        music.detail_list = crate::app::DetailList::new();
+                        cx.notify();
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                if scrolled {
+                    window
+                        .update(cx, |music, _, cx| {
+                            music.detail_list.state.scroll_to(gpui::ListOffset {
+                                item_ix: 2,
+                                offset_in_item: px(0.),
+                            });
+                            cx.notify();
+                        })
+                        .unwrap();
+                    wait_for_presented_frame(window, cx).await;
+                }
+                let automatic = width < 1150.;
+                for compact in [automatic, !automatic] {
+                    if compact != automatic {
+                        cx.update_window(window.into(), |_, window, cx| {
+                            let position = point(px(36.), px(32.));
+                            window.dispatch_event(
+                                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                                    button: gpui::MouseButton::Left,
+                                    position,
+                                    modifiers: Default::default(),
+                                    click_count: 1,
+                                    first_mouse: false,
+                                }),
+                                cx,
+                            );
+                            window.dispatch_event(
+                                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                                    button: gpui::MouseButton::Left,
+                                    position,
+                                    modifiers: Default::default(),
+                                    click_count: 1,
+                                }),
+                                cx,
+                            );
+                        })
+                        .unwrap();
+                        wait_for_presented_frame(window, cx).await;
+                    }
+                    window
+                        .update(cx, |music, window, _| {
+                            assert_eq!(
+                                music.sidebar_compact(width),
+                                compact,
+                                "Hamburger must override the automatic guide size"
+                            );
+                            assert_eq!(music.page_scrolled(), scrolled);
+                            let name = format!(
+                                "guide-{}-{}-{}-{}",
+                                if compact { "mini" } else { "expanded" },
+                                if home { "home" } else { "explore" },
+                                if scrolled { "scroll" } else { "top" },
+                                width as u32
+                            );
+                            let image = capture(window, &name);
+                            let pixel = |x, y| *image.get_pixel(x, y);
+                            let bg = image::Rgba([3, 3, 3, 255]);
+                            let border = image::Rgba([41, 41, 41, 255]);
+                            if compact || scrolled {
+                                assert_eq!(
+                                    pixel(8, 4),
+                                    pixel(180, 4),
+                                    "Header must not split at the mini guide: {name}"
+                                );
+                                assert_eq!(
+                                    pixel(72, 4),
+                                    pixel(300, 4),
+                                    "No guide rule may cross the mini or scrolled header: {name}"
+                                );
+                            } else {
+                                assert_eq!(pixel(238, 4), bg);
+                                assert_eq!(
+                                    pixel(239, 4),
+                                    border,
+                                    "Expanded rule starts at the top: {name}"
+                                );
+                            }
+                            if scrolled {
+                                assert_eq!(pixel(8, 4), bg);
+                                assert_eq!(
+                                    pixel(300, 64),
+                                    border,
+                                    "Scrolled header has a bottom rule: {name}"
+                                );
+                                let edge = if compact { 72 } else { 240 };
+                                assert_eq!(
+                                    pixel(edge, 68),
+                                    image::Rgba([28, 28, 28, 255]),
+                                    "Scrolled guide has an outer 10% rule: {name}"
+                                );
+                                assert_eq!(pixel(edge, image.height() - 1), pixel(edge, 68));
+                            } else if compact {
+                                assert_eq!(
+                                    pixel(71, 68),
+                                    pixel(72, 68),
+                                    "Unscrolled mini guide has no rule: {name}"
+                                );
+                                assert_eq!(pixel(72, 68), pixel(73, 68));
+                            }
+                            if !compact {
+                                assert_eq!(pixel(239, 68), border);
+                                assert_eq!(pixel(239, image.height() - 1), border);
+                            }
+                        })
+                        .unwrap();
+                }
+            }
+        }
+    }
+    println!(
+        "GUIDE_CHROME home_explore=passed top_scrolled=passed widths=956,1920 hamburger=passed"
+    );
+}
+
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn position_samples_only_render_the_player_bar() -> Result<()> {
@@ -1517,6 +1658,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 library_sort_and_compact_layouts(window, cx).await;
                 inline_links_follow_row_order(window, cx).await;
                 home_chips_and_narrow_error(window, cx).await;
+                guide_chrome(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })

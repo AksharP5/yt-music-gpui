@@ -255,7 +255,7 @@ impl PageLayout {
 impl Music {
     pub(in crate::app) fn page_layout(&self, window: &Window) -> PageLayout {
         let width = f32::from(window.viewport_size().width);
-        let sidebar = if self.sidebar_collapsed || width < 1150. {
+        let sidebar = if self.sidebar_compact(width) {
             72.
         } else {
             240.

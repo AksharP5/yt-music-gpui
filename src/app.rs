@@ -111,7 +111,8 @@ pub struct Music {
     shelf_scroll: HashMap<usize, ScrollHandle>,
     list_scroll: UniformListScrollHandle,
     detail_list: DetailList,
-    sidebar_collapsed: bool,
+    // None follows the window width until the guide is toggled.
+    sidebar_collapsed: Option<bool>,
     sidebar_playlists: Vec<Collection>,
     sidebar_error: Option<String>,
     sidebar_scroll: UniformListScrollHandle,
