@@ -782,7 +782,6 @@ impl Music {
                     .overflow_x_scroll()
                     .restrict_scroll_to_axis()
                     .track_scroll(&scroll)
-                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
                     .child(
                         div()
                             .relative()

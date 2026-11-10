@@ -157,7 +157,6 @@ impl Render for Music {
             .key_context("Music")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
-            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
                 if view.drag.is_some() {
                     view.drag_to(event.position, cx);
