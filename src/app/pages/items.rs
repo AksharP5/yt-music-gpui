@@ -30,13 +30,12 @@ impl Music {
             .items_center()
             .justify_center();
         let art = match image {
-            Some(image) => div().child(
-                img(image)
-                    .w(px(edge))
-                    .h(px(if wide { edge * 9. / 16. } else { edge }))
-                    .rounded(px(radius))
-                    .object_fit(ObjectFit::Cover),
-            ),
+            Some(image) => img(image)
+                .w(px(edge))
+                .h(px(if wide { edge * 9. / 16. } else { edge }))
+                .rounded(px(radius))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
             None => div()
                 .size(px(edge))
                 .rounded(px(radius))
@@ -44,7 +43,8 @@ impl Music {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(icon("music", edge.min(32.) * 0.6, self.theme.muted)),
+                .child(icon("music", edge.min(32.) * 0.6, self.theme.muted))
+                .into_any_element(),
         };
         frame
             .child(art)
@@ -71,17 +71,18 @@ impl Music {
         text: impl Into<SharedString>,
         size: f32,
     ) -> Div {
-        div()
+        let line = div()
             .min_w_0()
-            .flex()
-            .items_center()
-            .gap(px(4.))
             .text_size(px(size))
             .line_height(relative(1.2))
-            .text_color(self.theme.muted)
-            .when(explicit, |line| {
-                line.child(icon("explicit", 16., self.theme.muted).flex_shrink_0())
-            })
+            .text_color(self.theme.muted);
+        if !explicit {
+            return line.truncate().child(text.into());
+        }
+        line.flex()
+            .items_center()
+            .gap(px(4.))
+            .child(icon("explicit", 16., self.theme.muted).flex_shrink_0())
             .child(div().flex_1().min_w_0().truncate().child(text.into()))
     }
 
@@ -264,26 +265,23 @@ impl Music {
                 .justify_center()
                 .child(icon("music", 32., self.theme.muted))
         };
-        if !artist {
-            art = art.child(
-                div()
-                    .invisible()
-                    .group_hover("music-card", |style| style.visible())
-                    .absolute()
-                    .inset_0()
-                    .rounded(px(radius))
-                    .bg(linear_gradient(
-                        180.,
-                        linear_color_stop(rgba(0x00000080), 0.),
-                        linear_color_stop(rgba(0x00000000), 0.5),
-                    )),
-            );
-        }
+        // One hover layer holds the web's top scrim and play button.
+        let mut hover = div()
+            .invisible()
+            .group_hover("music-card", |style| style.visible())
+            .absolute()
+            .inset_0()
+            .rounded(px(radius))
+            .when(!artist, |layer| {
+                layer.bg(linear_gradient(
+                    180.,
+                    linear_color_stop(rgba(0x00000080), 0.),
+                    linear_color_stop(rgba(0x00000000), 0.5),
+                ))
+            });
         if playable {
             let play_button = div()
                 .id(("card-play", id))
-                .invisible()
-                .group_hover("music-card", |d| d.visible())
                 .absolute()
                 .right(px(12.))
                 .bottom(px(12.))
@@ -296,7 +294,7 @@ impl Music {
                 .justify_center()
                 .cursor_pointer()
                 .child(icon("play", 24., self.theme.text));
-            art = art.child(match play {
+            hover = hover.child(match play {
                 Some(target) => play_button.on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
                     window.focus(&view.focus, cx);
@@ -308,6 +306,9 @@ impl Music {
                     view.play_item(id, cx);
                 })),
             });
+        }
+        if playable || !artist {
+            art = art.child(hover);
         }
         div()
             .id(("card", id))
@@ -347,19 +348,19 @@ impl Music {
                     .when(artist, |title| title.text_center())
                     .child(title),
             )
-            .child(
-                div()
+            .child({
+                let line = div()
                     .mt(px(3.))
                     .w_full()
-                    .flex()
-                    .items_start()
-                    .gap(px(4.))
                     .text_size(px(text_size))
                     .line_height(relative(1.2))
                     .text_color(self.theme.muted)
-                    .when(artist, |line| line.justify_center().text_center())
-                    .when(explicit, |line| {
-                        line.child(
+                    .when(artist, |line| line.text_center());
+                if explicit {
+                    line.flex()
+                        .items_start()
+                        .gap(px(4.))
+                        .child(
                             div()
                                 .h(px(text_size * 1.2))
                                 .flex()
@@ -367,16 +368,18 @@ impl Music {
                                 .flex_shrink_0()
                                 .child(icon("explicit", 16., self.theme.muted)),
                         )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .line_clamp(2)
-                            .text_ellipsis()
-                            .child(subtitle),
-                    ),
-            )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .line_clamp(2)
+                                .text_ellipsis()
+                                .child(subtitle),
+                        )
+                } else {
+                    line.line_clamp(2).text_ellipsis().child(subtitle)
+                }
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |view, _, window, cx| {
