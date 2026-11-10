@@ -53,7 +53,7 @@ impl Music {
             let body = height - player_bar_height(width) - if fullscreen { 0. } else { 64. };
             self.player_page(width, sidebar_width, body, window, cx)
         } else {
-            self.content(inset, available, cx)
+            self.content(width, available, cx)
         };
         div()
             .size_full()

@@ -71,7 +71,6 @@ use player_bar::PlayerBar;
 use player_page::PlayerPage;
 use window::MusicContent;
 
-const CARD_WIDTH: f32 = 180.;
 const CARD_GAP: f32 = 24.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

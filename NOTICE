@@ -28,6 +28,9 @@ licensed under Apache License 2.0 (LICENSE-APACHE).
 Source: https://github.com/google/material-design-icons
   Unmodified: home-filled ("home"), home-outlined (outlined "home"),
   explore-filled ("explore") and explore-outlined (outlined "explore").
+  Also unmodified: explicit, new-releases (outlined "new_releases"),
+  trending-up ("trending_up") and mood (outlined "mood").
+  From Material Symbols, unmodified: podcasts ("podcasts").
 
 Icons in assets/icons adapted from Feather, Copyright 2013-2023 Cole Bemis,
 licensed under the MIT License (LICENSE-FEATHER).

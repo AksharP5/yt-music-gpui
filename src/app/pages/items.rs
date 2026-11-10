@@ -1,33 +1,178 @@
 //! Catalog cards and track/collection rows shared across pages.
 
 use super::super::*;
+use super::PageLayout;
+
+/// Web row thumbnails dim to this on hover behind the play glyph.
+const THUMBNAIL_SCRIM: u32 = 0x000000cc;
 
 impl Music {
+    /// A row thumbnail that swaps to a play glyph while its row is hovered.
+    /// Video and episode frames keep 16:9 instead of being cropped square.
+    pub(in crate::app) fn row_thumbnail(
+        &mut self,
+        url: Option<&str>,
+        edge: f32,
+        shape: ArtworkShape,
+        wide: bool,
+        group: &'static str,
+    ) -> AnyElement {
+        let image = url.and_then(|url| self.artwork.get(url));
+        let radius = match shape {
+            ArtworkShape::Square => 4.,
+            ArtworkShape::Circle => edge / 2.,
+        };
+        let frame = div()
+            .size(px(edge))
+            .flex_shrink_0()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center();
+        let art = match image {
+            Some(image) if wide => div()
+                .w(px(edge))
+                .h(px(edge * 9. / 16.))
+                .rounded(px(radius))
+                .overflow_hidden()
+                .child(img(image).size_full().object_fit(ObjectFit::Cover)),
+            Some(image) => div()
+                .size(px(edge))
+                .rounded(px(radius))
+                .overflow_hidden()
+                .child(img(image).size_full().object_fit(ObjectFit::Cover)),
+            None => div()
+                .size(px(edge))
+                .rounded(px(radius))
+                .bg(self.theme.raised)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon("music", edge.min(32.) * 0.6, self.theme.muted)),
+        };
+        frame
+            .child(art)
+            .child(
+                div()
+                    .invisible()
+                    .group_hover(group, |style| style.visible())
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(radius))
+                    .bg(rgba(THUMBNAIL_SCRIM))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("play", 24., self.theme.text)),
+            )
+            .into_any_element()
+    }
+
+    /// The explicit badge and secondary line shared by rows and cards.
+    pub(in crate::app) fn byline(
+        &self,
+        explicit: bool,
+        text: impl Into<SharedString>,
+        size: f32,
+    ) -> Div {
+        div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .text_size(px(size))
+            .line_height(relative(1.2))
+            .text_color(self.theme.muted)
+            .when(explicit, |line| {
+                line.child(icon("explicit", 16., self.theme.muted).flex_shrink_0())
+            })
+            .child(div().flex_1().min_w_0().truncate().child(text.into()))
+    }
+
+    fn mood_button(
+        &self,
+        link: BrowseLink,
+        id: usize,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let accent = link
+            .accent
+            .map_or(self.theme.muted, |color| rgb(color).into());
+        div()
+            .id(("mood", id))
+            .keyboard_control(self.theme)
+            .w(px(width))
+            .h(px(48.))
+            .flex_shrink_0()
+            .rounded(px(8.))
+            .overflow_hidden()
+            .bg(gpui::white().opacity(0.15))
+            .hover(|style| style.bg(gpui::white().opacity(0.2)))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(div().w(px(6.)).h_full().flex_shrink_0().bg(accent))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(12.))
+                    .text_size(px(14.))
+                    .line_height(relative(1.2))
+                    .font_weight(FontWeight::MEDIUM)
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .child(link.title.clone()),
+            )
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&view.focus, cx);
+                view.navigate(Route::Browse(link.clone()), cx);
+            }))
+            .into_any_element()
+    }
+
     pub(in crate::app) fn card(
         &mut self,
         item: Item,
         id: usize,
         width: f32,
         layout: ShelfLayout,
+        page: PageLayout,
         cx: &Context<Self>,
     ) -> AnyElement {
         if let Item::Navigation(link) = item {
-            return self
-                .navigation(link, ("shelf-link", id), cx)
-                .w(px(width))
-                .h(px(44.))
-                .into_any_element();
+            return self.mood_button(link, id, width, cx);
         }
+        let text_size = page.text_size();
         let title = item.title().to_owned();
-        let subtitle = item.subtitle().to_owned();
         if layout == ShelfLayout::Songs {
-            let art = self.art(item.thumbnail(), 48., ArtworkShape::Square);
+            let (byline, explicit, wide) = match &item {
+                Item::Track(track) => (
+                    track
+                        .details
+                        .byline
+                        .clone()
+                        .unwrap_or_else(|| track.artist.clone()),
+                    track.details.explicit,
+                    track.details.wide_thumbnail,
+                ),
+                _ => (item.subtitle().to_owned(), false, false),
+            };
+            let art = self.row_thumbnail(
+                item.thumbnail(),
+                48.,
+                ArtworkShape::Square,
+                wide,
+                "music-row",
+            );
             return div()
                 .id(("quick-pick", id))
                 .keyboard_control(self.theme)
                 .group("music-row")
                 .w(px(width))
-                .h(px(64.))
+                .h(px(48.))
+                .pl(px(8.))
                 .flex()
                 .items_center()
                 .gap(px(16.))
@@ -41,21 +186,16 @@ impl Music {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(5.))
+                        .gap(px(4.))
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(14.))
+                                .text_size(px(text_size))
+                                .line_height(relative(1.2))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(title),
                         )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(14.))
-                                .text_color(self.theme.muted)
-                                .child(subtitle),
-                        ),
+                        .child(self.byline(explicit, byline, text_size)),
                 )
                 .child(
                     button(("quick-menu", id), "more", self.theme)
@@ -80,6 +220,12 @@ impl Music {
                 }))
                 .into_any_element();
         }
+        let subtitle = item.subtitle().to_owned();
+        let explicit = match &item {
+            Item::Track(track) => track.details.explicit,
+            Item::Collection(collection) => collection.details.explicit,
+            Item::Navigation(_) => false,
+        };
         let image = item.thumbnail().and_then(|url| self.artwork.get(url));
         let artist =
             matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
@@ -87,6 +233,7 @@ impl Music {
             Item::Collection(collection) => collection.details.play.clone(),
             _ => None,
         };
+        let playable = play.is_some() || matches!(&item, Item::Track(_));
         let mut art = div()
             .relative()
             .w(px(width))
@@ -95,59 +242,61 @@ impl Music {
             } else {
                 width
             }))
-            .rounded(px(4.))
+            .rounded(px(8.))
             .when(artist, |d| d.rounded_full())
             .overflow_hidden()
             .bg(self.theme.raised);
         art = if let Some(image) = image {
-            art.child(
-                img(image)
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .when(artist, |image| image.rounded_full()),
-            )
+            art.child(img(image).size_full().object_fit(ObjectFit::Cover))
         } else {
             art.flex()
                 .items_center()
                 .justify_center()
                 .child(icon("music", 32., self.theme.muted))
         };
-        if let Some(target) = play {
-            art = art.child(
-                div()
-                    .id(("collection-play", id))
-                    .invisible()
-                    .group_hover("music-card", |d| d.visible())
-                    .absolute()
-                    .right(px(12.))
-                    .bottom(px(12.))
-                    .size(px(48.))
-                    .rounded_full()
-                    .bg(rgba(0x030303dd))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .child(icon("play", 28., self.theme.text))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        cx.stop_propagation();
-                        window.focus(&view.focus, cx);
-                        view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
-                    })),
-            );
-        } else if matches!(&item, Item::Track(_)) {
+        if !artist {
             art = art.child(
                 div()
                     .invisible()
                     .group_hover("music-card", |style| style.visible())
                     .absolute()
                     .inset_0()
-                    .bg(rgba(0x00000044))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon("play", 48., self.theme.text)),
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(rgba(0x00000080), 0.),
+                        linear_color_stop(rgba(0x00000000), 0.5),
+                    )),
             );
+        }
+        if playable {
+            let play_button = div()
+                .id(("card-play", id))
+                .invisible()
+                .group_hover("music-card", |d| d.visible())
+                .absolute()
+                .right(px(12.))
+                .bottom(px(12.))
+                .size(px(40.))
+                .rounded_full()
+                .bg(rgba(0x00000099))
+                .hover(|style| style.bg(rgba(0x000000cc)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(icon("play", 24., self.theme.text));
+            art = art.child(match play {
+                Some(target) => play_button.on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&view.focus, cx);
+                    view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                })),
+                None => play_button.on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&view.focus, cx);
+                    view.play_item(id, cx);
+                })),
+            });
         }
         div()
             .id(("card", id))
@@ -157,14 +306,15 @@ impl Music {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(px(8.))
             .cursor_pointer()
-            .child(
+            .when(artist, |card| card.items_center())
+            .child(art.when(!artist, |art| {
                 art.child(
                     button(("card-menu", id), "more", self.theme)
                         .absolute()
                         .right(px(4.))
-                        .top(px(4.))
+                        .top(px(8.))
+                        .size(px(36.))
                         .opacity(0.)
                         .group_hover("music-card", |style| style.opacity(1.))
                         .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
@@ -172,23 +322,49 @@ impl Music {
                             cx.stop_propagation();
                             view.open_item_menu(id, window, cx);
                         })),
-                ),
-            )
+                )
+            }))
             .child(
                 div()
+                    .mt(px(16.))
                     .w_full()
-                    .truncate()
-                    .text_size(px(16.))
+                    .text_size(px(text_size))
+                    .line_height(relative(1.2))
                     .font_weight(FontWeight::MEDIUM)
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .when(artist, |title| title.text_center())
                     .child(title),
             )
             .child(
                 div()
+                    .mt(px(3.))
                     .w_full()
-                    .truncate()
-                    .text_size(px(14.))
+                    .flex()
+                    .items_start()
+                    .gap(px(4.))
+                    .text_size(px(text_size))
+                    .line_height(relative(1.2))
                     .text_color(self.theme.muted)
-                    .child(subtitle),
+                    .when(artist, |line| line.justify_center().text_center())
+                    .when(explicit, |line| {
+                        line.child(
+                            div()
+                                .h(px(text_size * 1.2))
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .child(icon("explicit", 16., self.theme.muted)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .line_clamp(2)
+                            .text_ellipsis()
+                            .child(subtitle),
+                    ),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -212,7 +388,34 @@ impl Music {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item = self.rows[index].clone();
-        let artist = self.route.is_artist() && window.viewport_size().width >= px(1200.);
+        if let Item::Navigation(link) = item {
+            return self
+                .navigation(link, ("browse-link", index), cx)
+                .w_full()
+                .h(px(64.))
+                .px(px(inset))
+                .hover(|d| d.bg(self.theme.raised))
+                .into_any_element();
+        }
+        let page = self.page_layout(window);
+        let text_size = page.text_size();
+        let style = if self.route.is_artist() {
+            if window.viewport_size().width >= px(1200.) {
+                RowStyle::ArtistTable
+            } else {
+                RowStyle::List
+            }
+        } else if matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"))
+            && matches!(item, Item::Track(_))
+        {
+            RowStyle::Album
+        } else if self.page.header.is_some() {
+            RowStyle::Playlist
+        } else if matches!(self.route, Route::Search(_)) {
+            RowStyle::Search
+        } else {
+            RowStyle::List
+        };
         let active = self.library.queue.current().is_some_and(|current| {
             current.id == item.id()
                 && match &item {
@@ -222,20 +425,42 @@ impl Music {
                     _ => true,
                 }
         }) && self.active_id.is_some();
-        let collection = self.page.header.is_some() && !self.route.is_artist();
-        let numbered = matches!(&self.route,Route::Browse(link) if link.id.starts_with("MPRE"))
-            && matches!(item, Item::Track(_));
-        let art = if numbered {
+        let track = match &item {
+            Item::Track(track) => Some(track),
+            _ => None,
+        };
+        let explicit = match &item {
+            Item::Track(track) => track.details.explicit,
+            Item::Collection(collection) => collection.details.explicit,
+            Item::Navigation(_) => false,
+        };
+        let wide = track.is_some_and(|track| track.details.wide_thumbnail);
+        let art = if style == RowStyle::Album {
             div()
-                .w(px(32.))
-                .h(px(48.))
+                .size(px(48.))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(self.theme.muted)
+                .text_size(px(text_size))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(self.theme.text)
                 .when(active, |d| d.child(icon("volume", 20., self.theme.text)))
-                .when(!active, |d| d.child((index + 1).to_string()))
+                .when(!active, |d| {
+                    d.child(
+                        div()
+                            .group_hover("music-row", |d| d.invisible())
+                            .child((index + 1).to_string()),
+                    )
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover("music-row", |d| d.visible())
+                            .absolute()
+                            .child(icon("play", 24., self.theme.text)),
+                    )
+                })
+                .relative()
                 .into_any_element()
         } else {
             let thumbnail = item.thumbnail().map(str::to_owned).or_else(|| {
@@ -244,42 +469,63 @@ impl Music {
                     .as_ref()
                     .and_then(|header| header.thumbnail.clone())
             });
-            self.art(
+            let shape = if matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"))
+            {
+                ArtworkShape::Circle
+            } else {
+                ArtworkShape::Square
+            };
+            self.row_thumbnail(
                 thumbnail.as_deref(),
-                if artist { 40. } else { 48. },
-                if matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"))
-                {
-                    ArtworkShape::Circle
-                } else {
-                    ArtworkShape::Square
-                },
+                style.thumbnail(),
+                shape,
+                wide,
+                "music-row",
             )
         };
         let title = item.title().to_owned();
-        let subtitle = match &item {
-            Item::Track(track) if !artist => match &track.details.plays {
-                Some(plays) => format!("{} • {plays}", track.artist),
-                None => track.artist.clone(),
-            },
+        let plays = track.and_then(|track| track.details.plays.clone());
+        let joined = |parts: &[Option<&str>]| {
+            parts
+                .iter()
+                .flatten()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" • ")
+        };
+        let subtitle = match (style, track) {
+            (RowStyle::Search, Some(track)) => track
+                .details
+                .byline
+                .clone()
+                .unwrap_or_else(|| joined(&[Some(&track.artist), plays.as_deref()])),
+            (_, Some(track)) => joined(&[Some(&track.artist), plays.as_deref()]),
             _ => item.subtitle().to_owned(),
         };
+        let menu_index = index;
         let mut row = div()
             .id(("song", index))
             .keyboard_control(self.theme)
             .group("music-row")
             .relative()
             .w_full()
-            .h(px(if artist {
-                50.
-            } else if numbered || collection {
-                76.
-            } else {
-                64.
-            }))
+            .h(px(style.height()))
+            .pl(px(style.padding()))
+            .pr(px(16.))
             .flex()
             .items_center()
-            .gap(px(if artist { 24. } else { 14. }))
+            .gap(px(if style == RowStyle::ArtistTable {
+                24.
+            } else {
+                16.
+            }))
             .rounded(px(4.))
+            .when(style == RowStyle::ArtistTable, |row| {
+                row.rounded_none()
+                    .border_b_1()
+                    .border_color(gpui::white().opacity(0.1))
+            })
             .when(active, |d| d.bg(self.theme.selection))
             .hover(|d| d.bg(self.theme.raised))
             .cursor_pointer()
@@ -287,232 +533,228 @@ impl Music {
                 MouseButton::Right,
                 cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
-                    view.open_item_menu(index, window, cx);
+                    view.open_item_menu(menu_index, window, cx);
                 }),
             )
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
                 view.play_item(index, cx);
             }))
-            .child(art)
-            .child(if artist {
+            .child(art);
+        row = if style == RowStyle::ArtistTable {
+            let column = |text: Option<String>, flex: f32| {
+                div()
+                    .flex_grow(flex)
+                    .flex_basis(px(0.))
+                    .min_w_0()
+                    .truncate()
+                    .text_color(self.theme.muted)
+                    .child(text.unwrap_or_default())
+            };
+            row.child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap(px(24.))
+                    .gap(px(16.))
+                    .text_size(px(text_size))
                     .child(
                         div()
-                            .flex_1()
+                            .flex_grow(2.)
+                            .flex_basis(px(0.))
                             .min_w_0()
                             .truncate()
-                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .w(px(150.))
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(16.))
-                            .text_color(self.theme.muted)
-                            .child(subtitle),
-                    )
-                    .when_some(
-                        match &item {
-                            Item::Track(track) => track.details.plays.clone(),
-                            _ => None,
-                        },
-                        |d, plays| {
-                            d.child(
-                                div()
-                                    .w(px(130.))
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(16.))
-                                    .text_color(self.theme.muted)
-                                    .child(plays),
-                            )
-                        },
-                    )
-                    .when_some(
-                        match &item {
-                            Item::Track(track) => track.album.clone(),
-                            _ => None,
-                        },
-                        |d, album| {
-                            d.child(
-                                div()
-                                    .w(px(180.))
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(16.))
-                                    .text_color(self.theme.muted)
-                                    .child(album),
-                            )
-                        },
-                    )
-                    .into_any_element()
-            } else {
+                    .child(column(track.map(|track| track.artist.clone()), 1.))
+                    .child(column(plays, 1.))
+                    .child(column(track.and_then(|track| track.album.clone()), 1.)),
+            )
+            .child(div().w(px(120.)).flex_shrink_0())
+        } else {
+            row.child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(5.))
+                    .gap(px(if style == RowStyle::Search { 4. } else { 8. }))
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(if collection { 14. } else { 16. }))
+                            .text_size(px(text_size))
+                            .line_height(relative(1.2))
+                            .font_weight(FontWeight::MEDIUM)
                             .child(title),
                     )
-                    .when(
-                        !numbered
-                            || matches!(&item, Item::Track(track) if track.details.plays.is_some()),
-                        |d| {
-                            d.child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(14.))
-                                    .text_color(self.theme.muted)
-                                    .child(if numbered {
-                                        match &item {
-                                            Item::Track(track) => {
-                                                track.details.plays.clone().unwrap_or_default()
-                                            }
-                                            _ => String::new(),
-                                        }
-                                    } else {
-                                        subtitle
-                                    }),
-                            )
-                        },
-                    )
-                    .into_any_element()
+                    .when(!subtitle.is_empty() || explicit, |d| {
+                        d.child(self.byline(explicit, subtitle, text_size))
+                    }),
+            )
+        };
+        let Some(track) = track.cloned() else {
+            row = row.child(
+                button(("collection-menu", index), "more", self.theme)
+                    .opacity(0.)
+                    .group_hover("music-row", |style| style.opacity(1.))
+                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_item_menu(index, window, cx);
+                    })),
+            );
+            return div().w_full().px(px(inset)).child(row).into_any_element();
+        };
+        let liked = self.is_liked(&track);
+        let like_track = track.clone();
+        let menu_track = track.clone();
+        if style != RowStyle::ArtistTable {
+            let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
+                track
+                    .details
+                    .episode
+                    .as_ref()
+                    .map(|episode| episode.duration_text.clone())
+                    .unwrap_or_default()
             });
-        match item {
-            Item::Navigation(link) => {
-                return self
-                    .navigation(link, ("browse-link", index), cx)
-                    .w_full()
-                    .h(px(64.))
-                    .px(px(inset))
-                    .hover(|d| d.bg(self.theme.raised))
-                    .into_any_element();
-            }
-            Item::Track(track) => {
-                let liked = self.is_liked(&track);
-                let like_track = track.clone();
-                let menu_track = track.clone();
-                if !artist {
-                    row = row.child(
-                        div()
-                            .w(px(if track.details.episode.is_some() {
-                                100.
-                            } else {
-                                48.
-                            }))
-                            .text_size(px(14.))
-                            .text_color(self.theme.muted)
-                            .child(track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
-                                track
-                                    .details
-                                    .episode
-                                    .as_ref()
-                                    .map(|episode| episode.duration_text.clone())
-                                    .unwrap_or_default()
-                            })),
-                    );
-                }
-                let controls = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(
-                        button(
-                            ("like", index),
-                            if liked { "thumb-up-filled" } else { "thumb-up" },
-                            self.theme,
-                        )
-                        .when(!liked, |d| {
-                            d.opacity(0.)
-                                .group_hover("music-row", |d| d.opacity(1.))
-                                .focus_visible(|style| {
-                                    style.opacity(1.).border_color(self.theme.text)
-                                })
-                        })
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            cx.stop_propagation();
-                            view.toggle_like(&like_track, cx);
-                        })),
-                    )
-                    .when(!artist, |d| {
-                        d.child(
-                            button(("dislike", index), "thumb-down", self.theme)
-                                .opacity(0.)
-                                .group_hover("music-row", |d| d.opacity(1.))
-                                .focus_visible(|style| {
-                                    style.opacity(1.).border_color(self.theme.text)
-                                })
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    cx.stop_propagation();
-                                    if view.account.is_none() {
-                                        view.connect_account(window, cx);
-                                        return;
-                                    }
-                                    let disliked = view
-                                        .ratings
-                                        .get(&track.id)
-                                        .copied()
-                                        .or(track.details.rating)
-                                        == Some(Rating::Dislike);
-                                    view.mutate(
-                                        Mutation::RateSong {
-                                            track: track.clone(),
-                                            rating: if disliked {
-                                                Rating::Indifferent
-                                            } else {
-                                                Rating::Dislike
-                                            },
-                                        },
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .child(
-                        button(("track-menu", index), "more", self.theme)
-                            .opacity(0.)
-                            .group_hover("music-row", |d| d.opacity(1.))
-                            .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                cx.stop_propagation();
-                                view.open_track_menu(menu_track.clone(), Some(index), window, cx);
-                            })),
-                    );
-                row = row.child(
-                    controls
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .h_full()
-                        .group_hover("music-row", |style| style.bg(self.theme.raised)),
-                );
-            }
-            Item::Collection(_) => {
-                row = row.child(
-                    button(("collection-menu", index), "more", self.theme)
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(text_size))
+                    .text_color(self.theme.muted)
+                    .child(duration),
+            );
+        }
+        let artist_table = style == RowStyle::ArtistTable;
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .pr(px(8.))
+            .child(
+                button(
+                    ("like", index),
+                    if liked { "thumb-up-filled" } else { "thumb-up" },
+                    self.theme,
+                )
+                .when(!liked, |d| {
+                    d.opacity(0.)
+                        .group_hover("music-row", |d| d.opacity(1.))
+                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
+                })
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.toggle_like(&like_track, cx);
+                })),
+            )
+            .when(!artist_table, |d| {
+                d.child(
+                    button(("dislike", index), "thumb-down", self.theme)
                         .opacity(0.)
-                        .group_hover("music-row", |style| style.opacity(1.))
+                        .group_hover("music-row", |d| d.opacity(1.))
                         .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
                         .on_click(cx.listener(move |view, _, window, cx| {
                             cx.stop_propagation();
-                            view.open_item_menu(index, window, cx);
+                            if view.account.is_none() {
+                                view.connect_account(window, cx);
+                                return;
+                            }
+                            let disliked = view
+                                .ratings
+                                .get(&track.id)
+                                .copied()
+                                .or(track.details.rating)
+                                == Some(Rating::Dislike);
+                            view.mutate(
+                                Mutation::RateSong {
+                                    track: track.clone(),
+                                    rating: if disliked {
+                                        Rating::Indifferent
+                                    } else {
+                                        Rating::Dislike
+                                    },
+                                },
+                                cx,
+                            );
                         })),
-                );
-            }
+                )
+            })
+            .child(
+                button(("track-menu", index), "more", self.theme)
+                    .opacity(0.)
+                    .group_hover("music-row", |d| d.opacity(1.))
+                    .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_track_menu(menu_track.clone(), Some(index), window, cx);
+                    })),
+            );
+        row = row.child(
+            controls
+                .absolute()
+                .right_0()
+                .top_0()
+                .h_full()
+                .when(!artist_table, |controls| {
+                    controls.group_hover("music-row", |style| style.bg(self.theme.raised))
+                }),
+        );
+        div()
+            .w_full()
+            .px(px(inset))
+            .when(style.gap() > 0., |d| d.pb(px(style.gap())))
+            .child(row)
+            .into_any_element()
+    }
+}
+
+/// Row geometry per page, measured from music.youtube.com.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowStyle {
+    /// Search results: 56px art on an 80px pitch.
+    Search,
+    /// Album tracks: an index column instead of art.
+    Album,
+    /// Playlist and other collection tracks.
+    Playlist,
+    /// The artist page's Top songs table.
+    ArtistTable,
+    /// Library, history, charts and other plain lists.
+    List,
+}
+
+impl RowStyle {
+    fn height(self) -> f32 {
+        match self {
+            Self::Search => 80.,
+            Self::Album | Self::Playlist => 68.,
+            Self::ArtistTable => 49.,
+            Self::List => 64.,
         }
-        div().w_full().px(px(inset)).child(row).into_any_element()
+    }
+
+    /// Space below each row; uniform lists need the gap inside the row slot.
+    fn gap(self) -> f32 {
+        match self {
+            Self::Album | Self::Playlist => 8.,
+            _ => 0.,
+        }
+    }
+
+    fn padding(self) -> f32 {
+        match self {
+            Self::Album | Self::Playlist => 16.,
+            _ => 8.,
+        }
+    }
+
+    fn thumbnail(self) -> f32 {
+        match self {
+            Self::Search => 56.,
+            Self::ArtistTable => 32.,
+            _ => 48.,
+        }
     }
 }

@@ -45,21 +45,17 @@ impl Music {
             .items
             .iter()
             .all(|item| matches!(item, Item::Navigation(_)));
-        let available = f32::from(window.viewport_size().width)
-            - if self.sidebar_collapsed || window.viewport_size().width < px(1150.) {
-                72.
-            } else {
-                240.
-            }
-            - inset * 2.;
-        let width = shelf_card_width(layout, available, navigation);
+        let page = self.page_layout(window);
+        let available = page.column;
+        let gap = page.card_gap();
+        let width = page.shelf_width(layout);
         let content_height = if navigation {
-            4. * 56.
+            4. * 48. + 3. * 16.
         } else {
             match layout {
-                ShelfLayout::Songs => 4. * 64.,
-                ShelfLayout::Videos => width * 9. / 16. + 72.,
-                ShelfLayout::Cards | ShelfLayout::Featured => width + 72.,
+                ShelfLayout::Songs => 4. * 48. + 3. * 16.,
+                ShelfLayout::Videos => width * 9. / 16. + page.card_text_height(),
+                ShelfLayout::Cards | ShelfLayout::Featured => width + page.card_text_height(),
             }
         };
         let rows = if navigation || layout == ShelfLayout::Songs {
@@ -69,13 +65,9 @@ impl Music {
         };
         let count = shelf.items.len().div_ceil(rows);
         let scroll = self.shelf_scroll.entry(index).or_default().clone();
-        let range = visible_cards(
-            count,
-            (-scroll.offset().x).into(),
-            available,
-            width + CARD_GAP,
-        );
-        let stride = width + CARD_GAP;
+        let range = visible_cards(count, (-scroll.offset().x).into(), available, width + gap);
+        let stride = width + gap;
+        let heading_size = page.heading_size();
         let columns = range
             .clone()
             .map(|column| {
@@ -91,13 +83,24 @@ impl Music {
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
-                    .gap(px(if navigation { 12. } else { 0. }))
+                    .gap(px(if navigation || layout == ShelfLayout::Songs {
+                        16.
+                    } else {
+                        0.
+                    }))
                     .children(
                         items
                             .into_iter()
                             .enumerate()
                             .map(|(row, item)| {
-                                self.card(item, start + column * rows + row, width, layout, cx)
+                                self.card(
+                                    item,
+                                    start + column * rows + row,
+                                    width,
+                                    layout,
+                                    page,
+                                    cx,
+                                )
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -115,41 +118,44 @@ impl Music {
                 div()
                     .relative()
                     .flex_shrink_0()
-                    .w(px((count as f32 * stride - CARD_GAP).max(0.)))
+                    .w(px((count as f32 * stride - gap).max(0.)))
                     .h(px(content_height))
                     .child(
                         div()
                             .absolute()
                             .left(px(range.start as f32 * stride))
                             .flex()
-                            .gap(px(CARD_GAP))
+                            .gap(px(gap))
                             .children(columns),
                     ),
             );
+        let header_height = (heading_size * 1.2).max(36.);
         let previous = scroll.clone();
         let next = scroll.clone();
         div()
             .id(("shelf", index))
             .w_full()
             .min_w_0()
-            .h(px(content_height + 108.))
+            .h(px(32. + header_height + 16. + content_height + 48.))
             .px(px(inset))
-            .pt(px(8.))
+            .pt(px(32.))
             .flex()
             .flex_col()
-            .gap(px(20.))
+            .gap(px(16.))
             .child(
                 div()
-                    .h(px(40.))
+                    .h(px(header_height))
                     .flex()
-                    .items_center()
+                    .items_end()
                     .justify_between()
+                    .gap(px(8.))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(32.))
+                            .text_size(px(heading_size))
+                            .line_height(relative(1.2))
                             .font_weight(FontWeight::BOLD)
                             .child(title),
                     )
@@ -226,24 +232,4 @@ pub(in crate::app) fn visible_cards(
     let start = (offset / stride) as usize;
     let end = ((offset + viewport) / stride).ceil() as usize + 1;
     start.min(count)..end.min(count)
-}
-
-pub(in crate::app) fn shelf_card_width(
-    layout: ShelfLayout,
-    available: f32,
-    navigation: bool,
-) -> f32 {
-    let target = if navigation {
-        240.
-    } else {
-        match layout {
-            ShelfLayout::Songs => 360.,
-            ShelfLayout::Videos => 256.,
-            ShelfLayout::Cards | ShelfLayout::Featured => CARD_WIDTH,
-        }
-    };
-    let columns = ((available + CARD_GAP) / (target + CARD_GAP))
-        .floor()
-        .max(1.);
-    ((available + CARD_GAP) / columns - CARD_GAP).max(120.)
 }

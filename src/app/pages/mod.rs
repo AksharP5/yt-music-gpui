@@ -64,7 +64,114 @@ impl DetailList {
     }
 }
 
+/// Window-width tiers from music.youtube.com's media queries. The web keys its
+/// breakpoints on the whole window, not the content area beside the guide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::app) enum Tier {
+    Narrow,
+    Medium,
+    Wide,
+    Large,
+    Huge,
+}
+
+/// The centered content column every browse page shares, and the type and
+/// card sizes the web derives from it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::app) struct PageLayout {
+    pub(in crate::app) window: f32,
+    pub(in crate::app) tier: Tier,
+    pub(in crate::app) inset: f32,
+    pub(in crate::app) column: f32,
+}
+
+impl PageLayout {
+    pub(in crate::app) fn new(window: f32, available: f32) -> Self {
+        let tier = match window {
+            width if width < 936. => Tier::Narrow,
+            width if width < 1150. => Tier::Medium,
+            width if width < 1364. => Tier::Wide,
+            width if width < 1578. => Tier::Large,
+            _ => Tier::Huge,
+        };
+        let column = if tier >= Tier::Wide {
+            (available - 212.).min(1478.)
+        } else if window < 616. {
+            available - 32.
+        } else {
+            available - 112.
+        }
+        .max(0.);
+        Self {
+            window,
+            tier,
+            inset: (available - column) / 2.,
+            column,
+        }
+    }
+
+    pub(in crate::app) fn heading_size(self) -> f32 {
+        match self.tier {
+            Tier::Narrow | Tier::Medium => 24.,
+            Tier::Wide => 28.,
+            Tier::Large => 34.,
+            Tier::Huge => 45.,
+        }
+    }
+
+    pub(in crate::app) fn text_size(self) -> f32 {
+        if self.tier >= Tier::Large { 16. } else { 14. }
+    }
+
+    pub(in crate::app) fn card_gap(self) -> f32 {
+        if self.tier >= Tier::Wide { 24. } else { 16. }
+    }
+
+    /// Square card edge: five across on wide windows, six on large ones.
+    pub(in crate::app) fn card_width(self) -> f32 {
+        let gap = self.card_gap();
+        match self.tier {
+            Tier::Narrow | Tier::Medium => 180.,
+            Tier::Wide => (self.column - 4. * gap) / 5.,
+            Tier::Large | Tier::Huge => (self.column - 5. * gap) / 6.,
+        }
+    }
+
+    /// Quick picks column: fixed below the large breakpoint, three across above.
+    pub(in crate::app) fn song_width(self) -> f32 {
+        if self.tier >= Tier::Large {
+            (self.column - 2. * self.card_gap()) / 3.
+        } else {
+            self.column.min(436.)
+        }
+    }
+
+    /// Width of one carousel column for a shelf layout.
+    pub(in crate::app) fn shelf_width(self, layout: ShelfLayout) -> f32 {
+        match layout {
+            ShelfLayout::Songs => self.song_width(),
+            ShelfLayout::Videos => self.card_width() * 16. / 9.,
+            ShelfLayout::Cards | ShelfLayout::Featured => self.card_width(),
+        }
+    }
+
+    /// Card title and subtitle each reserve two lines, like the web's line clamp.
+    pub(in crate::app) fn card_text_height(self) -> f32 {
+        16. + 3. + 4. * self.text_size() * 1.2
+    }
+}
+
 impl Music {
+    pub(in crate::app) fn page_layout(&self, window: &Window) -> PageLayout {
+        let width = f32::from(window.viewport_size().width);
+        let sidebar = if self.sidebar_collapsed || width < 1150. {
+            72.
+        } else {
+            240.
+        };
+        PageLayout::new(width, width - sidebar)
+    }
+
     pub(in crate::app) fn list_row(
         &mut self,
         index: usize,
@@ -121,10 +228,12 @@ impl Music {
 
     pub(in crate::app) fn content(
         &mut self,
-        inset: f32,
+        window: f32,
         available: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let layout = PageLayout::new(window, available);
+        let inset = layout.inset;
         let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let search = matches!(self.route, Route::Search(_));
         let collection = !home && self.page.header.is_some();
@@ -158,7 +267,7 @@ impl Music {
             content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
         }
         if !home {
-            content = self.home_filters(content, inset, cx);
+            content = self.home_filters(content, layout, cx);
         }
         content = self.search_filters(content, inset, cx);
         content = self.library_filters(content, inset, cx);
@@ -235,7 +344,7 @@ impl Music {
                 .into_any_element();
         }
         if home {
-            content = self.home_content(content, inset, cx);
+            content = self.home_content(content, cx);
         } else {
             let grid = !collection
                 && self
@@ -309,11 +418,10 @@ impl Music {
                 .min_h_0()
                 .into_any_element()
             } else if grid {
-                let columns = ((available - inset * 2. + CARD_GAP) / (CARD_WIDTH + CARD_GAP))
-                    .floor()
-                    .max(1.) as usize;
-                let card_width =
-                    shelves::shelf_card_width(ShelfLayout::Cards, available - inset * 2., false);
+                let gap = layout.card_gap();
+                let card_width = layout.card_width();
+                let columns = ((layout.column + gap) / (card_width + gap)).floor().max(1.) as usize;
+                let row_height = card_width + layout.card_text_height() + 24.;
                 uniform_list(
                     ("collection-grid", self.list_id),
                     self.rows.len().div_ceil(columns),
@@ -329,10 +437,10 @@ impl Music {
                                     .cloned()
                                     .collect::<Vec<_>>();
                                 div()
-                                    .h(px(card_width + 94.))
+                                    .h(px(row_height))
                                     .px(px(inset))
                                     .flex()
-                                    .gap(px(CARD_GAP))
+                                    .gap(px(gap))
                                     .children(
                                         items
                                             .into_iter()
@@ -343,6 +451,7 @@ impl Music {
                                                     row * columns + column,
                                                     card_width,
                                                     ShelfLayout::Cards,
+                                                    layout,
                                                     cx,
                                                 )
                                             })

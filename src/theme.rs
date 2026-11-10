@@ -20,7 +20,7 @@ impl Theme {
             panel: rgb(0x212121).into(),
             raised: rgb(0x292929).into(),
             text: rgb(0xffffff).into(),
-            muted: rgb(0xaaaaaa).into(),
+            muted: rgb(0xb3b3b3).into(),
             border: rgb(0x292929).into(),
             accent: rgb(0xff0033).into(),
             selection: rgb(0x1d1d1d).into(),
