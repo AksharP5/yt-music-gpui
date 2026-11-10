@@ -552,6 +552,8 @@ pub struct PageHeader {
     pub thumbnail: Option<String>,
     pub artist: Option<HeaderArtist>,
     pub artist_thumbnail: Option<String>,
+    /// The playlist owner the web prints under the title, such as "YouTube Music".
+    pub owner: String,
     pub subtitle: String,
     pub stats: String,
     pub shuffle: Option<Arc<PlaylistTarget>>,
@@ -1865,6 +1867,11 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
                 })
             },
             artist_thumbnail: thumbnail(&header["straplineThumbnail"]),
+            owner: header
+                .pointer("/facepile/avatarStackViewModel/text/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             stats: text(&header["secondSubtitle"]),
             subtitle: ["subtitle", "monthlyListenerCount"]
                 .into_iter()
@@ -2701,6 +2708,7 @@ mod tests {
             let page = parse_page(&json!({
                 "header":{"musicResponsiveHeaderRenderer":{
                     "title":{"simpleText":"Album"},
+                    "facepile":{"avatarStackViewModel":{"text":{"content":"YouTube Music"}}},
                     "buttons":[
                         {"toggleButtonRenderer":{"defaultIcon":{"iconType":"BOOKMARK_BORDER"},"isToggled":saved}},
                         {"musicPlayButtonRenderer":{"playNavigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"OLAKalbum"}}}},
@@ -2711,7 +2719,9 @@ mod tests {
                     ]
                 }},"contents":[]
             }), "Album").unwrap();
-            let details = page.header.unwrap().collection;
+            let header = page.header.unwrap();
+            assert_eq!(header.owner, "YouTube Music");
+            let details = header.collection;
             assert_eq!(details.saved, Some(saved));
             assert_eq!(details.playlist_id.as_deref(), Some("OLAKalbum"));
             assert_eq!(

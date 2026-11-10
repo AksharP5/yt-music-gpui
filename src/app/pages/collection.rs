@@ -27,6 +27,7 @@ impl Music {
         &mut self,
         stacked: bool,
         edge: f32,
+        text_size: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let header = self.page.header.clone();
@@ -56,7 +57,7 @@ impl Music {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .text_size(px(14.))
+                    .text_size(px(text_size))
                     .line_height(relative(1.2))
                     .children(avatar);
                 match artist {
@@ -95,13 +96,21 @@ impl Music {
                     .font_weight(FontWeight::BOLD)
                     .child(title),
             );
+            if !header.owner.is_empty() {
+                heading = heading.child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .child(header.owner),
+                );
+            }
             if !header.subtitle.is_empty() || !header.stats.is_empty() {
                 heading = heading.child(
                     div()
                         .flex()
                         .flex_col()
                         .when(stacked, |d| d.items_center())
-                        .text_size(px(14.))
+                        .text_size(px(text_size))
                         .line_height(relative(1.2))
                         .text_color(self.theme.muted)
                         .when(!header.subtitle.is_empty(), |d| d.child(header.subtitle))
@@ -123,7 +132,7 @@ impl Music {
                     .id("page-description")
                     .keyboard_control(self.theme)
                     .w_full()
-                    .text_size(px(14.))
+                    .text_size(px(text_size))
                     .text_color(self.theme.muted)
                     .line_height(relative(1.2))
                     .line_clamp(2)

@@ -332,7 +332,7 @@ impl Music {
             );
         }
         if !home && !search && !collection && !library {
-            let heading = self.page_heading(false, 128., cx);
+            let heading = self.page_heading(false, 128., layout.text_size(), cx);
             content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
         }
         if !home {
@@ -403,7 +403,8 @@ impl Music {
             _ => (280., 546., 240.),
         };
         let list_width = list_width.min(available - header_width - 56.);
-        let heading = (collection && stacked).then(|| self.page_heading(true, cover, cx));
+        let heading =
+            (collection && stacked).then(|| self.page_heading(true, cover, layout.text_size(), cx));
         if self.rows.is_empty()
             && !collection
             && let Some(empty) = self.library_empty()
@@ -472,7 +473,7 @@ impl Music {
                             };
                         }
                         if inline && index == 0 {
-                            let heading = view.page_heading(true, 200., cx);
+                            let heading = view.page_heading(true, 200., layout.text_size(), cx);
                             return div()
                                 .w_full()
                                 .px(px(inset))
