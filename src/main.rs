@@ -49,7 +49,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading a saved account from the keyring\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen and Firefox. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts."
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading a saved account from the keyring\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen, Firefox, Chromium, Google Chrome and Brave. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts."
                 );
                 return;
             }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use std::{
+    ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     os::{
@@ -664,7 +665,7 @@ impl BrowserProfile {
         );
         let desktop = default_browser(operation)?;
         let profile =
-            serde_json::from_slice(&browser_helper("profile", Path::new(&desktop), operation)?)
+            serde_json::from_slice(&browser_helper("profile", &[desktop.as_ref()], operation)?)
                 .context("Could not identify the default browser profile")?;
         ensure!(!operation.is_cancelled(), "Account connection cancelled");
         // xdg-open reuses the normal browser. It is user-owned and must outlive us.
@@ -683,9 +684,12 @@ impl BrowserProfile {
 
     /// Read the named profile after consent, including refresh of its confirmed account.
     pub fn read_session(&self, operation: &Operation) -> Result<Session> {
-        let cookies: Vec<Cookie> =
-            serde_json::from_slice(&browser_helper("cookies", &self.path, operation)?)
-                .context("The browser returned an unreadable YouTube session")?;
+        let cookies: Vec<Cookie> = serde_json::from_slice(&browser_helper(
+            "cookies",
+            &[self.browser.as_ref(), self.path.as_os_str()],
+            operation,
+        )?)
+        .context("The browser returned an unreadable YouTube session")?;
         let (cookie, playback_cookie) = cookie_headers(&cookies)?;
         let mut header = HeaderValue::from_str(&cookie).context("Invalid YouTube cookies")?;
         header.set_sensitive(true);
@@ -744,7 +748,7 @@ fn default_browser(operation: &Operation) -> Result<String> {
     Ok(desktop)
 }
 
-fn browser_helper(mode: &str, value: &Path, operation: &Operation) -> Result<Vec<u8>> {
+fn browser_helper(mode: &str, values: &[&OsStr], operation: &Operation) -> Result<Vec<u8>> {
     // Rust owns cleanup even if cancellation kills the helper during a locked-DB read.
     let snapshot = (mode == "cookies")
         .then(|| {
@@ -757,12 +761,13 @@ fn browser_helper(mode: &str, value: &Path, operation: &Operation) -> Result<Vec
     let mut command = Command::new("/usr/bin/python3");
     command
         .args(["-I", "-c", include_str!("browser_session.py"), mode])
-        .arg(value)
+        .args(values)
         .stdin(Stdio::null());
     if let Some(snapshot) = &snapshot {
         command.arg(snapshot.path());
     }
-    let output = AccountProcess::output(&mut command, Some(operation), Duration::from_secs(10))?;
+    // Chromium-family reads may wait for the keyring to unlock their Safe Storage key.
+    let output = AccountProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
     ensure!(
         output.status.success(),
         "{}",
@@ -890,7 +895,7 @@ mod tests {
             "Launcher was not resolved"
         );
         let _: BrowserProfile =
-            serde_json::from_slice(&browser_helper("profile", Path::new(&desktop), &operation)?)?;
+            serde_json::from_slice(&browser_helper("profile", &[desktop.as_ref()], &operation)?)?;
         Ok(())
     }
     #[test]
