@@ -88,6 +88,49 @@ impl AssetSource for Assets {
             "collapse" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/collapse.svg"
             ))),
+            "thumb-down-filled" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/thumb-down-filled.svg"
+            ))),
+            "menu-mix" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-mix.svg"
+            ))),
+            "menu-play-next" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-play-next.svg"
+            ))),
+            "menu-add-queue" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-add-queue.svg"
+            ))),
+            "menu-library" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-library.svg"
+            ))),
+            "menu-like" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-like.svg"
+            ))),
+            "menu-save-playlist" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-save-playlist.svg"
+            ))),
+            "menu-remove" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-remove.svg"
+            ))),
+            "menu-album" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-album.svg"
+            ))),
+            "menu-artist" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-artist.svg"
+            ))),
+            "menu-credits" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-credits.svg"
+            ))),
+            "menu-share" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-share.svg"
+            ))),
+            "menu-delete" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-delete.svg"
+            ))),
+            "menu-up" => Some(Cow::Borrowed(include_bytes!("../assets/icons/menu-up.svg"))),
+            "menu-down" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/menu-down.svg"
+            ))),
             _ => None,
         })
     }

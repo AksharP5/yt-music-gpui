@@ -312,6 +312,7 @@ impl Music {
             settings_section: SettingsSection::General,
             settings_menu: None,
             overlay_anchor: None,
+            overlay_button: None,
             overlay_focus: cx.focus_handle(),
             settings_focus: cx.focus_handle(),
             overlay_return_focus: None,

@@ -258,6 +258,16 @@ impl Music {
                             self.autoplay_seeded = true;
                             self.notice = None;
                         }
+                        // A single song plays from its mix, which the watch names as on the web.
+                        if let [only] = self.library.queue.tracks.as_slice()
+                            && self.library.queue.playing_from.is_none()
+                            && watch
+                                .current
+                                .as_ref()
+                                .is_some_and(|issued| issued.id == only.id)
+                        {
+                            self.library.queue.playing_from = watch.source.clone();
+                        }
                         if let Some(track) = &watch.current {
                             apply_track_details(
                                 &mut self.library.queue.tracks,

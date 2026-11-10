@@ -39,7 +39,21 @@ fn control(
     cx: &mut Context<Music>,
     action: impl Fn(&mut Music, &mut Window, &mut Context<Music>) + 'static,
 ) -> Stateful<Div> {
-    button(id, name, theme)
+    tinted_control(id, name, theme.text, theme, cx, action)
+}
+
+/// The web draws the volume, repeat and shuffle buttons grey until they are active.
+const INACTIVE: u32 = 0x909090;
+
+fn tinted_control(
+    id: impl Into<ElementId>,
+    name: &'static str,
+    color: impl Into<Hsla>,
+    theme: Theme,
+    cx: &mut Context<Music>,
+    action: impl Fn(&mut Music, &mut Window, &mut Context<Music>) + 'static,
+) -> Stateful<Div> {
+    tinted_button(id, name, color, theme)
         .size(px(36.))
         .on_click(cx.listener(move |view, _, window, cx| {
             cx.stop_propagation();
@@ -91,11 +105,23 @@ impl Music {
                     paused: false,
                     buffering: true,
                 } => "Buffering…".into(),
-                _ => match &track.album {
-                    Some(album) if !album.is_empty() => format!("{} • {album}", track.artist),
-                    _ => track.artist.clone(),
-                },
+                _ => {
+                    // Search and chart rows can omit the album; the watch response has it.
+                    let issued = self
+                        .current_watch()
+                        .and_then(|watch| watch.current.as_ref());
+                    let album = track.album.as_deref().or_else(|| issued?.album.as_deref());
+                    let year = issued.and_then(|issued| issued.details.year.as_deref());
+                    [Some(track.artist.as_str()), album, year]
+                        .into_iter()
+                        .flatten()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" • ")
+                }
             };
+            // music.youtube.com switches the bar text to 16 px at its large breakpoint.
+            let text_size = if width >= 1364. { 16. } else { 14. };
             let like_track = track.clone();
             let dislike_track = track.clone();
             let menu_track = track.clone();
@@ -107,18 +133,17 @@ impl Music {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .line_height(px(19.))
+                        .text_size(px(text_size))
+                        .line_height(px(text_size * 1.2))
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(16.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(track.title),
                         )
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(16.))
                                 .text_color(gpui::white().opacity(0.7))
                                 .child(subtitle),
                         ),
@@ -130,52 +155,48 @@ impl Music {
                         .flex()
                         .items_center()
                         .gap(px(3.))
-                        .child(control(
-                            "like-current",
-                            if liked { "thumb-up-filled" } else { "thumb-up" },
-                            theme,
-                            cx,
-                            move |view, _, cx| view.toggle_like(&like_track, cx),
-                        ))
-                        .when(self.account.is_some() && !compact, |d| {
-                            d.child(
-                                control(
-                                    "dislike-current",
-                                    "thumb-down",
-                                    theme,
-                                    cx,
-                                    move |view, _, cx| {
-                                        view.mutate(
-                                            Mutation::RateSong {
-                                                track: dislike_track.clone(),
-                                                rating: if disliked {
-                                                    Rating::Indifferent
-                                                } else {
-                                                    Rating::Dislike
-                                                },
-                                            },
-                                            cx,
-                                        );
-                                    },
-                                )
-                                .opacity(if disliked {
-                                    1.
+                        .when(width >= 936., |d| {
+                            d.child(control(
+                                "like-current",
+                                if liked { "thumb-up-filled" } else { "thumb-up" },
+                                theme,
+                                cx,
+                                move |view, _, cx| view.toggle_like(&like_track, cx),
+                            ))
+                            .child(control(
+                                "dislike-current",
+                                if disliked {
+                                    "thumb-down-filled"
                                 } else {
-                                    0.7
-                                }),
-                            )
-                        })
-                        .child(
-                            control(
-                                "current-song-menu",
-                                "more",
+                                    "thumb-down"
+                                },
                                 theme,
                                 cx,
                                 move |view, window, cx| {
-                                    window.focus(&view.focus, cx);
-                                    view.open_track_menu(menu_track.clone(), None, window, cx);
+                                    // Guests are asked to sign in, as on the web.
+                                    if view.account.is_none() {
+                                        view.connect_account(window, cx);
+                                        return;
+                                    }
+                                    view.mutate(
+                                        Mutation::RateSong {
+                                            track: dislike_track.clone(),
+                                            rating: if disliked {
+                                                Rating::Indifferent
+                                            } else {
+                                                Rating::Dislike
+                                            },
+                                        },
+                                        cx,
+                                    );
                                 },
-                            )
+                            ))
+                        })
+                        .child(
+                            self.menu_button("current-song-menu", cx, move |view, window, cx| {
+                                view.open_track_menu(menu_track.clone(), None, window, cx);
+                            })
+                            .size(px(36.))
                             .ml(px(13.)),
                         ),
                 );
@@ -183,6 +204,7 @@ impl Music {
         let seek_bounds = self.seek_bounds.clone();
         let volume_bounds = self.volume_bounds.clone();
         let adjusting_volume = self.drag == Some(Drag::Volume);
+        let seeking = self.drag == Some(Drag::Seek);
         let repeat = self.library.repeat;
         div()
             .id("player-bar")
@@ -199,10 +221,10 @@ impl Music {
                 div()
                     .id("seek-track")
                     .absolute()
-                    .top(px(-6.))
+                    .top(px(-8.))
                     .left_0()
                     .right_0()
-                    .h(px(12.))
+                    .h(px(16.))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, event: &MouseDownEvent, _, cx| {
@@ -211,7 +233,7 @@ impl Music {
                             view.drag_to(event.position, cx);
                         }),
                     )
-                    .child(slider(progress, seek_bounds, theme)),
+                    .child(seek_bar(progress, seek_bounds, seeking, theme)),
             )
             .child(
                 div()
@@ -252,7 +274,7 @@ impl Music {
                             .child(control("next", "next", theme, cx, |view, _, cx| {
                                 view.next(false, cx)
                             }))
-                            .when(!compact, |d| {
+                            .when(width >= 936., |d| {
                                 d.child(div().text_size(px(12.)).text_color(theme.muted).child(
                                     format!("{} / {}", clock(position), clock(self.duration)),
                                 ))
@@ -310,13 +332,14 @@ impl Music {
                                                 )),
                                         )
                                     })
-                                    .child(control(
+                                    .child(tinted_control(
                                         "mute-toggle",
                                         if self.library.volume == 0. {
                                             "mute"
                                         } else {
                                             "volume"
                                         },
+                                        rgb(INACTIVE),
                                         theme,
                                         cx,
                                         |view, _, cx| {
@@ -329,29 +352,41 @@ impl Music {
                                     )),
                             )
                             .child(
-                                control("repeat", "repeat", theme, cx, |view, _, cx| {
-                                    view.library.repeat = view.library.repeat.next();
-                                    view.save_preferences();
-                                    cx.notify();
-                                })
-                                .opacity(if repeat == Repeat::Off { 0.6 } else { 1. })
-                                .when(
-                                    repeat == Repeat::One,
-                                    |d| {
-                                        d.child(
-                                            div()
-                                                .absolute()
-                                                .top_0()
-                                                .right_0()
-                                                .text_size(px(9.))
-                                                .child("1"),
-                                        )
+                                tinted_control(
+                                    "repeat",
+                                    "repeat",
+                                    if repeat == Repeat::Off {
+                                        rgb(INACTIVE).into()
+                                    } else {
+                                        theme.text
                                     },
-                                ),
+                                    theme,
+                                    cx,
+                                    |view, _, cx| {
+                                        view.library.repeat = view.library.repeat.next();
+                                        view.save_preferences();
+                                        cx.notify();
+                                    },
+                                )
+                                .when(repeat == Repeat::One, |d| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .right_0()
+                                            .text_size(px(9.))
+                                            .child("1"),
+                                    )
+                                }),
                             )
-                            .child(control("shuffle", "shuffle", theme, cx, |view, _, cx| {
-                                view.shuffle_queue(cx)
-                            }))
+                            .child(tinted_control(
+                                "shuffle",
+                                "shuffle",
+                                rgb(INACTIVE),
+                                theme,
+                                cx,
+                                |view, _, cx| view.shuffle_queue(cx),
+                            ))
                             .child(
                                 control(
                                     "player-page-toggle",

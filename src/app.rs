@@ -68,7 +68,7 @@ use pages::{DetailList, ListRow};
 use playback::queue::adopt_watch_queue;
 use playback::*;
 use player_bar::PlayerBar;
-use player_page::{PlayerPage, PlayerTab};
+use player_page::PlayerPage;
 use window::MusicContent;
 
 const CARD_WIDTH: f32 = 180.;
@@ -155,6 +155,8 @@ pub struct Music {
     settings_section: SettingsSection,
     settings_menu: Option<SettingMenu>,
     overlay_anchor: Option<Point<Pixels>>,
+    /// The "More options" button whose menu is open, so the menu can align to it.
+    overlay_button: Option<Bounds<Pixels>>,
     overlay_focus: FocusHandle,
     settings_focus: FocusHandle,
     overlay_return_focus: Option<FocusHandle>,

@@ -1,6 +1,7 @@
 //! The player page: artwork or video beside the Up next, Lyrics and Related tabs.
 
 use super::*;
+use pages::shelves::visible_cards;
 use queue_panel::Reorder;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,11 +38,17 @@ pub(in crate::app) struct PlayerPage {
     latest_request: u64,
     lyrics: Option<Details>,
     related: Option<Details>,
+    related_list: ListState,
     related_scroll: Vec<ScrollHandle>,
+    /// Focus handles for each shelf's items, so keyboard focus can scroll its carousel.
+    related_focus: Vec<Vec<FocusHandle>>,
     pub(in crate::app) queue_scroll: UniformListScrollHandle,
     pub(in crate::app) queue_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(in crate::app) reorder: Option<Reorder>,
     pub(in crate::app) hovered_row: Option<usize>,
+    /// The pointer while reordering Up next, kept for edge auto-scroll between moves.
+    pub(in crate::app) drag_pointer: Point<Pixels>,
+    pub(in crate::app) autoscrolling: bool,
     pub(in crate::app) video_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
@@ -69,11 +76,15 @@ impl PlayerPage {
             latest_request: 0,
             lyrics: None,
             related: None,
+            related_list: ListState::new(0, ListAlignment::Top, px(400.)),
             related_scroll: Vec::new(),
+            related_focus: Vec::new(),
             queue_scroll: UniformListScrollHandle::new(),
             queue_bounds: Rc::new(Cell::new(Bounds::default())),
             reorder: None,
             hovered_row: None,
+            drag_pointer: Point::default(),
+            autoscrolling: false,
             video_bounds: Rc::new(Cell::new(None)),
         }
     }
@@ -98,6 +109,7 @@ impl PlayerPage {
                 .iter()
                 .map(|_| ScrollHandle::new())
                 .collect();
+            self.related_list.reset(related.shelves.len());
         }
         slot.result = Some(event.result);
         Some(event.session_rejected)
@@ -109,6 +121,8 @@ impl PlayerPage {
         self.lyrics = None;
         self.related = None;
         self.related_scroll.clear();
+        self.related_focus.clear();
+        self.related_list.reset(0);
     }
 
     fn details(&mut self, tab: PlayerTab) -> Option<&mut Option<Details>> {
@@ -164,13 +178,6 @@ impl Music {
         cx.notify();
     }
 
-    pub(in crate::app) fn show_player_tab(&mut self, tab: PlayerTab, cx: &mut Context<Self>) {
-        self.overlay = None;
-        self.player_open = self.library.queue.current().is_some();
-        self.player_page.tab = tab;
-        cx.notify();
-    }
-
     /// Album pages list tracks without artwork, so fall back to the watch response's.
     pub(in crate::app) fn current_thumbnail(&self) -> Option<String> {
         let current = self.library.queue.current()?;
@@ -181,7 +188,7 @@ impl Music {
     }
 
     /// The watch details for the current song, once they have loaded.
-    fn current_watch(&self) -> Option<&Watch> {
+    pub(in crate::app) fn current_watch(&self) -> Option<&Watch> {
         let current = self.library.queue.current()?;
         self.now_playing
             .as_ref()
@@ -242,9 +249,30 @@ impl Music {
 
     fn player_details_loaded(&mut self, event: song_text::Event, cx: &mut Context<Self>) {
         let session = self.account.as_ref().map(|account| &account.session);
+        let related =
+            (self.player_page.related.as_ref()).is_some_and(|slot| slot.request == event.id);
         let Some(rejected) = self.player_page.complete(event, session) else {
             return;
         };
+        if related
+            && let Some(Ok(SongText::Related(page))) = self
+                .player_page
+                .related
+                .as_ref()
+                .and_then(|slot| slot.result.as_ref())
+        {
+            self.player_page.related_focus = page
+                .shelves
+                .iter()
+                .map(|shelf| {
+                    shelf
+                        .items
+                        .iter()
+                        .map(|_| cx.focus_handle().tab_index(0).tab_stop(true))
+                        .collect()
+                })
+                .collect();
+        }
         if rejected {
             self.refresh_session(false, cx);
         }
@@ -342,7 +370,7 @@ impl Music {
         let body = match self.player_page.tab {
             PlayerTab::UpNext => self.up_next(cx),
             PlayerTab::Lyrics => self.lyrics_tab(),
-            PlayerTab::Related => self.related_tab(side, cx),
+            PlayerTab::Related => self.related_tab(width, side, cx),
         };
         let side_panel = div()
             .w(px(side))
@@ -420,6 +448,7 @@ impl Music {
         let option = move |id: &'static str, label: &'static str, selected: bool| {
             div()
                 .id(id)
+                .keyboard_control(theme)
                 .h(px(28.))
                 .px(px(16.))
                 .rounded_full()
@@ -431,6 +460,15 @@ impl Music {
                 .when(selected, |option| option.bg(gpui::white().opacity(0.2)))
                 .when(!selected, |option| option.text_color(theme.muted))
                 .child(label)
+                .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                    // Keep keyboard focus on the choice; a click hands it back to the app.
+                    if !matches!(event, ClickEvent::Keyboard(_)) {
+                        window.focus(&view.focus, cx);
+                    }
+                    if view.library.video == selected {
+                        view.set_video_mode(!selected, cx);
+                    }
+                }))
         };
         div()
             .h(px(TOGGLE_HEIGHT))
@@ -442,23 +480,12 @@ impl Music {
                     .rounded_full()
                     .bg(theme.panel)
                     .flex()
-                    .child(
-                        option("song-mode", if episode { "Audio" } else { "Song" }, !video)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                window.focus(&view.focus, cx);
-                                if view.library.video {
-                                    view.set_video_mode(false, cx);
-                                }
-                            })),
-                    )
-                    .child(option("video-mode", "Video", video).on_click(cx.listener(
-                        |view, _, window, cx| {
-                            window.focus(&view.focus, cx);
-                            if !view.library.video {
-                                view.set_video_mode(true, cx);
-                            }
-                        },
-                    ))),
+                    .child(option(
+                        "song-mode",
+                        if episode { "Audio" } else { "Song" },
+                        !video,
+                    ))
+                    .child(option("video-mode", "Video", video)),
             )
             .into_any_element()
     }
@@ -480,11 +507,14 @@ impl Music {
             .children(PlayerTab::ALL.into_iter().map(|tab| {
                 let active = tab == selected;
                 let enabled = available(tab);
+                // Tabs share spare width on top of their label, like the web's `flex: 1 0 auto`.
                 div()
                     .id(tab.label())
+                    .when(enabled, |tab| tab.keyboard_control(self.theme))
                     .flex_auto()
                     .h(px(48.))
                     .px(px(12.))
+                    .relative()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -493,13 +523,23 @@ impl Music {
                     .text_color(if active {
                         self.theme.text
                     } else if enabled {
-                        self.theme.muted
+                        gpui::white().opacity(0.7)
                     } else {
                         gpui::white().opacity(0.3)
                     })
-                    .when(active, |tab| tab.border_b_2().border_color(self.theme.text))
                     .when(enabled, |tab| tab.cursor_pointer())
                     .child(tab.label())
+                    .when(active, |tab| {
+                        tab.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(px(1.))
+                                .bg(self.theme.text),
+                        )
+                    })
                     .on_click(cx.listener(move |view, _, _, cx| {
                         if enabled && view.player_page.tab != tab {
                             view.player_page.tab = tab;
@@ -516,14 +556,7 @@ impl Music {
             .lyrics
             .as_ref()
             .filter(|loaded| self.tab_source(PlayerTab::Lyrics).as_ref() == Some(&loaded.id));
-        let message = |text: &str| {
-            div()
-                .pt(px(24.))
-                .text_size(px(16.))
-                .text_color(self.theme.muted)
-                .child(text.to_owned())
-                .into_any_element()
-        };
+        let message = |text: &str| related_message(text.to_owned(), self.theme);
         let lyrics = match loaded.and_then(|loaded| loaded.result.as_ref()) {
             Some(Ok(SongText::Lyrics(lyrics))) => lyrics,
             Some(Err(error)) => return message(error),
@@ -541,64 +574,65 @@ impl Music {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .pt(px(24.))
+            .pt(px(16.))
             .pb(px(32.))
-            .child(
-                div()
-                    .text_size(px(16.))
-                    .line_height(px(19.2))
-                    .text_color(gpui::white().opacity(0.7))
-                    .child(lyrics.text.clone()),
-            )
+            .text_size(px(14.))
+            .line_height(px(19.6))
+            .child(lyrics.text.clone())
             .when_some(lyrics.source.clone(), |body, source| {
-                body.child(
-                    div()
-                        .pt(px(28.))
-                        .text_size(px(14.))
-                        .text_color(self.theme.muted)
-                        .child(source),
-                )
+                body.child(div().my(px(16.)).text_color(self.theme.muted).child(source))
             })
             .into_any_element()
     }
 
-    fn related_tab(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    /// Related shelves, rendered like the web's player-page carousels. Only shelves in
+    /// view, and only the columns in view within each, are built.
+    fn related_tab(&mut self, width: f32, side: f32, cx: &mut Context<Self>) -> AnyElement {
         let loaded = self
             .player_page
             .related
             .as_ref()
             .filter(|loaded| self.tab_source(PlayerTab::Related).as_ref() == Some(&loaded.id));
-        let page = match loaded.and_then(|loaded| loaded.result.as_ref()) {
-            Some(Ok(SongText::Related(page))) => page.clone(),
+        match loaded.and_then(|loaded| loaded.result.as_ref()) {
+            Some(Ok(SongText::Related(_))) => {}
             Some(Err(error)) => return related_message(error.clone(), self.theme),
             Some(Ok(_)) => return related_message("Nothing related yet".into(), self.theme),
             None => return related_message("Loading…".into(), self.theme),
-        };
-        let id = loaded.map_or(String::new(), |loaded| loaded.id.clone());
-        let shelves = page
-            .shelves
-            .iter()
-            .enumerate()
-            .filter(|(_, shelf)| !shelf.items.is_empty())
-            .map(|(index, shelf)| self.related_shelf(index, shelf, width, cx))
-            .collect::<Vec<_>>();
-        div()
-            .id(SharedString::from(format!("related-{id}")))
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pb(px(32.))
-            .children(shelves)
-            .into_any_element()
+        }
+        list(
+            self.player_page.related_list.clone(),
+            cx.processor(move |view, index: usize, window, cx| {
+                view.related_shelf(index, width, side, window, cx)
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
     }
 
     fn related_shelf(
         &mut self,
         index: usize,
-        shelf: &Shelf,
         width: f32,
+        side: f32,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let Some(Ok(SongText::Related(page))) = self
+            .player_page
+            .related
+            .as_ref()
+            .and_then(|loaded| loaded.result.as_ref())
+        else {
+            return div().into_any_element();
+        };
+        let Some(shelf) = page
+            .shelves
+            .get(index)
+            .filter(|shelf| !shelf.items.is_empty())
+        else {
+            return div().into_any_element();
+        };
         let scroll = self
             .player_page
             .related_scroll
@@ -606,34 +640,68 @@ impl Music {
             .cloned()
             .unwrap_or_default();
         let songs = shelf.layout == ShelfLayout::Songs;
-        let column = if songs { width - 56. } else { 160. };
-        let gap = if songs { 8. } else { 24. };
+        let (column, gap) = related_columns(songs, width, side);
         let stride = column + gap;
-        let columns = if songs {
-            shelf
-                .items
-                .chunks(4)
-                .enumerate()
-                .map(|(column_index, items)| {
-                    div()
-                        .w(px(column))
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_col()
-                        .children(items.iter().enumerate().map(|(row, item)| {
-                            self.related_song(item, (index, column_index * 4 + row), cx)
-                        }))
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            shelf
-                .items
-                .iter()
-                .enumerate()
-                .map(|(card, item)| self.related_card(item, (index, card), cx))
-                .collect()
-        };
+        let rows = if songs { 4 } else { 1 };
+        let count = shelf.items.len().div_ceil(rows);
+        let focus = self.player_page.related_focus.get(index).map(Vec::as_slice);
+        // Tabbing onto a clipped column scrolls it into view, as a browser does.
+        if window.last_input_was_keyboard()
+            && let Some(item) =
+                focus.and_then(|items| items.iter().position(|item| item.is_focused(window)))
+        {
+            let left = (item / rows) as f32 * stride;
+            let shown = -f32::from(scroll.offset().x);
+            let target = if left < shown {
+                left
+            } else if left + column > shown + side {
+                left + column - side
+            } else {
+                shown
+            };
+            if target != shown {
+                scroll.set_offset(point(px(-target), scroll.offset().y));
+            }
+        }
+        let range = visible_cards(count, (-scroll.offset().x).into(), side, stride);
+        let title = shelf.title.clone();
+        let visible = shelf
+            .items
+            .iter()
+            .skip(range.start * rows)
+            .take(range.len() * rows)
+            .cloned()
+            .collect::<Vec<_>>();
+        let handles = focus
+            .unwrap_or_default()
+            .iter()
+            .skip(range.start * rows)
+            .take(range.len() * rows)
+            .cloned()
+            .collect::<Vec<_>>();
+        let columns = visible
+            .chunks(rows)
+            .enumerate()
+            .map(|(offset, items)| {
+                let column_index = range.start + offset;
+                div()
+                    .w(px(column))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.))
+                    .children(items.iter().enumerate().map(|(row, item)| {
+                        let id = (index, column_index * rows + row);
+                        let focus = handles.get(offset * rows + row).cloned();
+                        if songs {
+                            self.related_song(item, id, focus, cx)
+                        } else {
+                            self.related_card(item, id, focus, cx)
+                        }
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let previous = scroll.clone();
         let next = scroll.clone();
         let theme = self.theme;
@@ -645,7 +713,9 @@ impl Music {
                 .opacity(if enabled { 1. } else { 0.35 })
         };
         div()
+            .w_full()
             .pt(px(32.))
+            .pb(px(48.))
             .flex()
             .flex_col()
             .gap(px(16.))
@@ -653,55 +723,84 @@ impl Music {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(px(24.))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
                             .text_size(px(24.))
+                            .line_height(px(28.8))
                             .font_weight(FontWeight::BOLD)
-                            .child(shelf.title.clone()),
+                            .line_clamp(2)
+                            .child(title),
                     )
                     .child(
-                        arrow(
-                            ("related-previous", index),
-                            "back",
-                            scroll.offset().x < px(-1.),
-                        )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let offset = previous.offset();
-                            previous
-                                .set_offset(point((offset.x + px(stride)).min(px(0.)), offset.y));
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        arrow(
-                            ("related-next", index),
-                            "forward",
-                            scroll.offset().x > -scroll.max_offset().x + px(1.),
-                        )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let offset = next.offset();
-                            next.set_offset(point(
-                                (offset.x - px(stride)).max(-next.max_offset().x),
-                                offset.y,
-                            ));
-                            cx.notify();
-                        })),
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .gap(px(16.))
+                            .child(
+                                arrow(
+                                    ("related-previous", index),
+                                    "back",
+                                    scroll.offset().x < px(-1.),
+                                )
+                                .on_click(cx.listener(
+                                    move |_, _, _, cx| {
+                                        let offset = previous.offset();
+                                        previous.set_offset(point(
+                                            (offset.x + px(stride)).min(px(0.)),
+                                            offset.y,
+                                        ));
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                arrow(
+                                    ("related-next", index),
+                                    "forward",
+                                    scroll.offset().x > -scroll.max_offset().x + px(1.),
+                                )
+                                .on_click(cx.listener(
+                                    move |_, _, _, cx| {
+                                        let offset = next.offset();
+                                        next.set_offset(point(
+                                            (offset.x - px(stride)).max(-next.max_offset().x),
+                                            offset.y,
+                                        ));
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
                     ),
             )
             .child(
                 div()
                     .id(("related-carousel", index))
                     .w_full()
-                    .flex()
-                    .gap(px(gap))
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
                     .track_scroll(&scroll)
                     .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                    .children(columns),
+                    .child(
+                        div()
+                            .relative()
+                            .w(px((count as f32 * stride - gap).max(0.)))
+                            .h(px(if songs {
+                                4. * 48. + 3. * 16.
+                            } else {
+                                RELATED_CARD + 8. + 4. * 16.8 + 4.
+                            }))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(range.start as f32 * stride))
+                                    .flex()
+                                    .gap(px(gap))
+                                    .children(columns),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -710,13 +809,20 @@ impl Music {
         &mut self,
         item: &Item,
         id: (usize, usize),
+        focus: Option<FocusHandle>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let art = self.art(item.thumbnail(), 48., ArtworkShape::Square);
         let target = item.clone();
+        let (artist, album) = match item {
+            Item::Track(track) => (track.artist.clone(), track.album.clone()),
+            _ => (item.subtitle().to_owned(), None),
+        };
         div()
             .id(("related-song", id.0 * 1000 + id.1))
-            .h(px(64.))
+            .when_some(focus, |row, focus| row.track_focus(&focus))
+            .keyboard_control(self.theme)
+            .h(px(48.))
             .px(px(8.))
             .flex()
             .items_center()
@@ -731,24 +837,31 @@ impl Music {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
-                    .line_height(px(19.))
+                    .gap(px(3.))
+                    .text_size(px(14.))
+                    .line_height(px(16.8))
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(16.))
                             .font_weight(FontWeight::MEDIUM)
                             .child(item.title().to_owned()),
                     )
                     .child(
                         div()
-                            .truncate()
-                            .text_size(px(16.))
-                            .text_color(self.theme.muted)
-                            .child(item.subtitle().to_owned()),
+                            .flex()
+                            .min_w_0()
+                            .text_color(gpui::white().opacity(0.7))
+                            .child(div().min_w_0().truncate().child(artist))
+                            .when_some(album.filter(|album| !album.is_empty()), |line, album| {
+                                line.child(div().flex_shrink_0().child("\u{a0}•\u{a0}"))
+                                    .child(div().min_w_0().truncate().child(album))
+                            }),
                     ),
             )
-            .on_click(cx.listener(move |view, _, _, cx| view.open_related(&target, cx)))
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&view.focus, cx);
+                view.open_related(&target, cx)
+            }))
             .into_any_element()
     }
 
@@ -756,13 +869,14 @@ impl Music {
         &mut self,
         item: &Item,
         id: (usize, usize),
+        focus: Option<FocusHandle>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let artist =
             matches!(item, Item::Collection(collection) if collection.id.starts_with("UC"));
         let art = self.art(
             item.thumbnail(),
-            160.,
+            RELATED_CARD,
             if artist {
                 ArtworkShape::Circle
             } else {
@@ -772,30 +886,40 @@ impl Music {
         let target = item.clone();
         div()
             .id(("related-card", id.0 * 1000 + id.1))
-            .w(px(160.))
+            .when_some(focus, |card, focus| card.track_focus(&focus))
+            .keyboard_control(self.theme)
+            .w(px(RELATED_CARD))
             .flex_shrink_0()
             .flex()
             .flex_col()
             .gap(px(8.))
             .cursor_pointer()
+            .text_size(px(14.))
+            .line_height(px(16.8))
             .child(art)
             .child(
                 div()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .line_clamp(2)
-                    .when(artist, |title| title.text_center())
-                    .child(item.title().to_owned()),
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .when(artist, |text| text.items_center().text_center())
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .line_clamp(2)
+                            .child(item.title().to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_color(gpui::white().opacity(0.7))
+                            .line_clamp(2)
+                            .child(item.subtitle().to_owned()),
+                    ),
             )
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .text_color(self.theme.muted)
-                    .line_clamp(2)
-                    .when(artist, |subtitle| subtitle.text_center())
-                    .child(item.subtitle().to_owned()),
-            )
-            .on_click(cx.listener(move |view, _, _, cx| view.open_related(&target, cx)))
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&view.focus, cx);
+                view.open_related(&target, cx)
+            }))
             .into_any_element()
     }
 
@@ -811,6 +935,23 @@ impl Music {
     }
 }
 
+/// Player-page card artwork edge, as on music.youtube.com.
+const RELATED_CARD: f32 = 160.;
+
+/// Column width and gap for a Related carousel. Song lists follow the web's responsive
+/// list item width, capped at 200 px below its large breakpoint, plus 8 px row padding.
+fn related_columns(songs: bool, width: f32, side: f32) -> (f32, f32) {
+    let large = width >= 1364.;
+    let gap = if large { 24. } else { 16. };
+    let column = match (songs, width) {
+        (false, _) => RELATED_CARD,
+        (true, ..936.) => side.min(436.),
+        (true, ..1364.) => 216.,
+        (true, _) => ((width - 452.).min(1478.) - 96.) / 3. + 16.,
+    };
+    (column, gap)
+}
+
 fn same_session(a: Option<&Arc<Session>>, b: Option<&Arc<Session>>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -821,8 +962,8 @@ fn same_session(a: Option<&Arc<Session>>, b: Option<&Arc<Session>>) -> bool {
 
 fn related_message(text: String, theme: Theme) -> AnyElement {
     div()
-        .pt(px(24.))
-        .text_size(px(16.))
+        .pt(px(16.))
+        .text_size(px(14.))
         .text_color(theme.muted)
         .child(text)
         .into_any_element()

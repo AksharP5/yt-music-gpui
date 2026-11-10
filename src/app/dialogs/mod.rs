@@ -5,6 +5,8 @@ pub(in crate::app) mod settings;
 
 use super::*;
 
+// Music holds a single overlay, so the inline song in `Track` costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(in crate::app) enum Overlay {
     Help,
@@ -25,7 +27,8 @@ pub(in crate::app) enum Overlay {
     },
     Collection(Collection),
     PlaylistPicker {
-        track: Track,
+        /// One song from its menu, or the whole queue from Up next's Save.
+        tracks: Vec<Track>,
         page: Option<Box<Page>>,
         duplicates: bool,
         error: Option<String>,
@@ -125,10 +128,10 @@ impl Music {
         cx.notify();
     }
 
-    pub(in crate::app) fn playlist_picker(&mut self, track: Track, cx: &mut Context<Self>) {
+    pub(in crate::app) fn playlist_picker(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
         self.error = None;
         self.overlay = Some(Overlay::PlaylistPicker {
-            track,
+            tracks,
             page: None,
             duplicates: false,
             error: None,
@@ -169,6 +172,7 @@ impl Music {
         self.overlay_return_focus = window.focused(cx);
         window.focus(&self.overlay_focus, cx);
         self.overlay_anchor = Some(window.mouse_position());
+        self.overlay_button = None;
         self.overlay = Some(Overlay::Track {
             track,
             index,
@@ -207,6 +211,7 @@ impl Music {
         self.overlay_return_focus = window.focused(cx);
         window.focus(&self.overlay_focus, cx);
         self.overlay_anchor = Some(window.mouse_position());
+        self.overlay_button = None;
         self.overlay = Some(Overlay::Collection(collection));
         let view = cx.weak_entity();
         window.on_next_frame(move |window, cx| {
@@ -270,6 +275,7 @@ impl Music {
         self.overlay = None;
         self.settings_menu = None;
         self.overlay_anchor = None;
+        self.overlay_button = None;
         self.overlay_subscription = None;
         window.focus(
             self.overlay_return_focus
@@ -314,25 +320,27 @@ impl Music {
         label: impl Into<SharedString>,
         cx: &Context<Self>,
         action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let id = id.into();
         let glyph = match &id {
             ElementId::Name(name) => match name.as_ref() {
-                "menu-radio" => Some("radio"),
-                "menu-next" => Some("play-next"),
-                "menu-enqueue" => Some("queue"),
-                "menu-playlist" | "menu-library" => Some("playlist-add"),
-                "menu-artist" | "menu-show" => Some("person"),
-                "menu-album" => Some("album"),
-                "menu-like" => Some("thumb-up"),
-                "menu-dislike" => Some("thumb-down"),
-                "menu-history" => Some("history"),
-                "menu-remove-occurrence" | "menu-remove-queue" => Some("close"),
-                "menu-share" => Some("link"),
-                "menu-credits" | "menu-lyrics" | "menu-episode" | "menu-chapters" => {
-                    Some("description")
-                }
-                "menu-related" => Some("music"),
+                "menu-radio" => Some("menu-mix"),
+                "menu-shuffle" => Some("shuffle"),
+                "collection-play" => Some("play"),
+                "menu-next" => Some("menu-play-next"),
+                "menu-enqueue" => Some("menu-add-queue"),
+                "menu-library" => Some("menu-library"),
+                "menu-like" => Some("menu-like"),
+                "menu-playlist" => Some("menu-save-playlist"),
+                "menu-remove-queue" => Some("menu-remove"),
+                "menu-history" | "menu-remove-occurrence" => Some("menu-delete"),
+                "menu-move-up" => Some("menu-up"),
+                "menu-move-down" => Some("menu-down"),
+                "menu-album" => Some("menu-album"),
+                "menu-artist" | "menu-show" => Some("menu-artist"),
+                "menu-credits" => Some("menu-credits"),
+                "menu-share" => Some("menu-share"),
+                "menu-episode" | "menu-chapters" => Some("description"),
                 _ => None,
             },
             _ => None,
@@ -355,6 +363,7 @@ impl Music {
                 action(view, window, cx);
                 view.finish_menu_action(previous, window, cx);
             }))
+            .into_any_element()
     }
 
     pub(in crate::app) fn finish_menu_action(
@@ -485,6 +494,8 @@ impl Music {
                             ),
                     ),
             );
+        let mut actions = Vec::new();
+        let mut menu_extra = 0.;
         if matches!(kind, Overlay::Help) {
             for (key, action) in [
                 ("/ or Ctrl K", "Search"),
@@ -582,13 +593,15 @@ impl Music {
                 if !episode.subtitle.is_empty() {
                     body = body.child(
                         div()
+                            .mx(px(16.))
                             .mb(px(16.))
                             .text_color(self.theme.muted)
                             .child(episode.subtitle.clone()),
                     );
+                    menu_extra += 36.;
                 }
                 let target = BrowseLink::new(format!("MPED{}", track.id), track.title.clone());
-                body = body.child(self.menu_action(
+                actions.push(self.menu_action(
                     "menu-episode",
                     "Episode details",
                     cx,
@@ -599,7 +612,7 @@ impl Music {
                 ));
                 if !episode.chapters.is_empty() {
                     let track = track.clone();
-                    body = body.child(self.menu_action(
+                    actions.push(self.menu_action(
                         "menu-chapters",
                         "Chapters",
                         cx,
@@ -612,7 +625,7 @@ impl Music {
                 }
                 if let Some(id) = &episode.show_id {
                     let target = BrowseLink::new(id.clone(), track.artist.clone());
-                    body = body.child(self.menu_action(
+                    actions.push(self.menu_action(
                         "menu-show",
                         "Go to podcast",
                         cx,
@@ -622,12 +635,11 @@ impl Music {
                         },
                     ));
                 }
-            }
-            if track.details.episode.is_none() {
+            } else {
                 let song = track.clone();
-                body = body.child(self.menu_action(
+                actions.push(self.menu_action(
                     "menu-radio",
-                    "Start radio",
+                    "Start mix",
                     cx,
                     move |view, _, cx| {
                         view.overlay = None;
@@ -641,74 +653,82 @@ impl Music {
                     },
                 ));
             }
-            if let Some(watch) = &self.now_playing
-                && watch
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.id == track.id)
-            {
-                if watch.lyrics.is_some() {
-                    body = body.child(self.menu_action(
-                        "menu-lyrics",
-                        "Lyrics",
-                        cx,
-                        |view, _, cx| view.show_player_tab(PlayerTab::Lyrics, cx),
-                    ));
-                }
-                if watch.related.is_some() {
-                    body = body.child(self.menu_action(
-                        "menu-related",
-                        "Related music",
-                        cx,
-                        |view, _, cx| view.show_player_tab(PlayerTab::Related, cx),
-                    ));
-                }
-            }
-            if let Some(id) = track.credits_id() {
-                let title = track.title.clone();
-                body = body.child(self.menu_action(
-                    "menu-credits",
-                    "Song credits",
-                    cx,
-                    move |view, _, cx| {
-                        view.show_song_text(TextQuery::Credits(id.clone()), &title, cx)
-                    },
-                ));
-            }
             let song = track.clone();
-            body = body.child(self.menu_action(
-                "menu-like",
-                if self.is_liked(track) {
-                    "Remove like"
-                } else {
-                    "Like"
-                },
-                cx,
-                move |view, _, cx| {
+            actions.push(
+                self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
+                    let index = view.library.queue.index.map_or(0, |i| i + 1);
+                    view.library.queue.tracks.insert(index, song.clone());
+                    view.queue_changed(cx);
                     view.overlay = None;
-                    view.toggle_like(&song, cx);
-                },
-            ));
+                    view.save();
+                    cx.notify();
+                }),
+            );
             let song = track.clone();
-            body =
-                body.child(
-                    self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
-                        let index = view.library.queue.index.map_or(0, |i| i + 1);
-                        view.library.queue.tracks.insert(index, song.clone());
-                        view.queue_changed(cx);
-                        view.overlay = None;
-                        view.save();
-                        cx.notify();
-                    }),
-                );
-            let song = track.clone();
-            body = body.child(self.menu_action(
+            actions.push(self.menu_action(
                 "menu-enqueue",
                 "Add to queue",
                 cx,
                 move |view, _, cx| {
                     view.overlay = None;
                     view.enqueue(song.clone(), cx);
+                },
+            ));
+            if self.account.is_some()
+                && (track.details.add_library.is_some() || track.details.remove_library.is_some())
+            {
+                let song = track.clone();
+                let save = track.details.in_library != Some(true);
+                actions.push(self.menu_action(
+                    "menu-library",
+                    if save {
+                        "Save to library"
+                    } else {
+                        "Remove from library"
+                    },
+                    cx,
+                    move |view, _, cx| {
+                        view.overlay = None;
+                        view.mutate(
+                            Mutation::SongLibrary {
+                                track: song.clone(),
+                                save,
+                            },
+                            cx,
+                        );
+                    },
+                ));
+            }
+            // Page rows have their own like buttons, so only the player bar and Up next
+            // menus offer this, as on the web.
+            if index.is_none() {
+                let song = track.clone();
+                actions.push(self.menu_action(
+                    "menu-like",
+                    if self.is_liked(track) {
+                        "Remove from liked songs"
+                    } else {
+                        "Add to liked songs"
+                    },
+                    cx,
+                    move |view, _, cx| {
+                        view.overlay = None;
+                        view.toggle_like(&song, cx);
+                    },
+                ));
+            }
+            let song = track.clone();
+            actions.push(self.menu_action(
+                "menu-playlist",
+                "Save to playlist",
+                cx,
+                move |view, window, cx| {
+                    if view.account.is_none() {
+                        view.overlay = None;
+                        view.connect_account(window, cx);
+                        return;
+                    }
+                    view.playlist_picker(vec![song.clone()], cx);
                 },
             ));
             if let Some(queued) = queue_index.filter(|&queued| {
@@ -718,7 +738,7 @@ impl Music {
                     .get(queued)
                     .is_some_and(|entry| entry.id == track.id)
             }) {
-                body = body.child(self.menu_action(
+                actions.push(self.menu_action(
                     "menu-remove-queue",
                     "Remove from queue",
                     cx,
@@ -729,69 +749,9 @@ impl Music {
                 ));
             }
             if self.account.is_some() {
-                let song = track.clone();
-                let disliked = self
-                    .ratings
-                    .get(&track.id)
-                    .copied()
-                    .or(track.details.rating)
-                    == Some(Rating::Dislike);
-                body = body.child(self.menu_action(
-                    "menu-dislike",
-                    if disliked {
-                        "Remove dislike"
-                    } else {
-                        "Dislike"
-                    },
-                    cx,
-                    move |view, _, cx| {
-                        view.overlay = None;
-                        view.mutate(
-                            Mutation::RateSong {
-                                track: song.clone(),
-                                rating: if disliked {
-                                    Rating::Indifferent
-                                } else {
-                                    Rating::Dislike
-                                },
-                            },
-                            cx,
-                        );
-                    },
-                ));
-                if track.details.add_library.is_some() || track.details.remove_library.is_some() {
-                    let song = track.clone();
-                    let save = track.details.in_library != Some(true);
-                    body = body.child(self.menu_action(
-                        "menu-library",
-                        if save {
-                            "Save to library"
-                        } else {
-                            "Remove from library"
-                        },
-                        cx,
-                        move |view, _, cx| {
-                            view.overlay = None;
-                            view.mutate(
-                                Mutation::SongLibrary {
-                                    track: song.clone(),
-                                    save,
-                                },
-                                cx,
-                            );
-                        },
-                    ));
-                }
-                let song = track.clone();
-                body = body.child(self.menu_action(
-                    "menu-playlist",
-                    "Add to playlist",
-                    cx,
-                    move |view, _, cx| view.playlist_picker(song.clone(), cx),
-                ));
                 if let Some(token) = &track.details.remove_history {
                     let token = token.clone();
-                    body = body.child(self.menu_action(
+                    actions.push(self.menu_action(
                         "menu-history",
                         "Remove from history",
                         cx,
@@ -814,7 +774,7 @@ impl Music {
                     let playlist = link.id.clone();
                     let set = set_id.clone();
                     let video_id = track.id.clone();
-                    body = body.child(self.menu_action(
+                    actions.push(self.menu_action(
                         "menu-remove-occurrence",
                         "Remove from playlist",
                         cx,
@@ -855,7 +815,7 @@ impl Music {
                             if let Some(before) = before {
                                 let playlist = link.id.clone();
                                 let set = set_id.clone();
-                                body = body.child(self.menu_action(
+                                actions.push(self.menu_action(
                                     key,
                                     label,
                                     cx,
@@ -878,6 +838,12 @@ impl Music {
             }
             for (id, label, title, target) in [
                 (
+                    "menu-album",
+                    "Go to album",
+                    "Album",
+                    &track.details.album_id,
+                ),
+                (
                     "menu-artist",
                     if track.details.episode.is_some() {
                         "Go to creator"
@@ -887,37 +853,35 @@ impl Music {
                     "Artist",
                     &track.details.artist_id,
                 ),
-                (
-                    "menu-album",
-                    "Go to album",
-                    "Album",
-                    &track.details.album_id,
-                ),
             ] {
                 if let Some(target) = target {
                     let target = target.clone();
-                    body = body.child(self.menu_action(id, label, cx, move |view, _, cx| {
+                    actions.push(self.menu_action(id, label, cx, move |view, _, cx| {
                         view.overlay = None;
                         view.navigate(Route::Browse(BrowseLink::new(target.clone(), title)), cx);
                     }));
                 }
             }
+            if let Some(id) = track.credits_id() {
+                let title = track.title.clone();
+                actions.push(self.menu_action(
+                    "menu-credits",
+                    "View song credits",
+                    cx,
+                    move |view, _, cx| {
+                        view.show_song_text(TextQuery::Credits(id.clone()), &title, cx)
+                    },
+                ));
+            }
             let url = format!("https://music.youtube.com/watch?v={}", track.id);
-            body = body.child(self.menu_action(
-                "menu-share",
-                if track.details.episode.is_some() {
-                    "Copy episode link"
-                } else {
-                    "Copy song link"
-                },
-                cx,
-                move |view, _, cx| {
+            actions.push(
+                self.menu_action("menu-share", "Share", cx, move |view, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
                     view.overlay = None;
                     view.notice = Some("Link copied".into());
                     cx.notify();
-                },
-            ));
+                }),
+            );
         } else if let Overlay::Collection(collection) = kind {
             for (id, label, target) in [
                 (
@@ -928,14 +892,14 @@ impl Music {
                 ("menu-radio", "Start mix", collection.details.mix.clone()),
             ] {
                 if let Some(target) = target {
-                    body = body.child(self.menu_action(id, label, cx, move |view, window, cx| {
+                    actions.push(self.menu_action(id, label, cx, move |view, window, cx| {
                         view.close_overlay(window, cx);
                         view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
                     }));
                 }
             }
             if let Some(target) = collection.details.play.clone() {
-                body = body.child(self.menu_action(
+                actions.push(self.menu_action(
                     "collection-play",
                     "Play",
                     cx,
@@ -947,7 +911,7 @@ impl Music {
             }
             let saved = self.is_saved(collection);
             let selected = collection.clone();
-            body = body.child(self.menu_action(
+            actions.push(self.menu_action(
                 "menu-library",
                 if collection.id.starts_with("UC") {
                     if saved { "Unsubscribe" } else { "Subscribe" }
@@ -967,16 +931,13 @@ impl Music {
                 },
             ));
             let url = format!("https://music.youtube.com/browse/{}", collection.id);
-            body = body.child(self.menu_action(
-                "menu-share",
-                "Copy link",
-                cx,
-                move |view, window, cx| {
+            actions.push(
+                self.menu_action("menu-share", "Share", cx, move |view, window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
                     view.close_overlay(window, cx);
                     view.notice = Some("Link copied".into());
-                },
-            ));
+                }),
+            );
         } else if let Overlay::SongText { content, .. } = kind {
             match content {
                 None => body = body.child(div().text_color(self.theme.muted).child("Loading…")),
@@ -1010,19 +971,24 @@ impl Music {
                 }
             }
         } else if let Overlay::PlaylistPicker {
-            track,
+            tracks,
             page,
             duplicates,
             error,
         } = kind
         {
-            let song = track.clone();
-            body = body.child(self.menu_action(
-                "create-from-picker",
-                "New playlist",
-                cx,
-                move |view, window, cx| view.playlist_form(false, Some(song.clone()), window, cx),
-            ));
+            // A new playlist starts from one song, so it is offered for single songs only.
+            if let [song] = tracks.as_slice() {
+                let song = song.clone();
+                body = body.child(self.menu_action(
+                    "create-from-picker",
+                    "New playlist",
+                    cx,
+                    move |view, window, cx| {
+                        view.playlist_form(false, Some(song.clone()), window, cx)
+                    },
+                ));
+            }
             body = body.child(self.menu_action(
                 "allow-duplicates",
                 if *duplicates {
@@ -1055,7 +1021,10 @@ impl Music {
                     .overflow_y_scroll();
                 for (index, playlist) in choices.enumerate() {
                     let id = playlist.id.clone();
-                    let song = track.id.clone();
+                    let video_ids = tracks
+                        .iter()
+                        .map(|track| track.id.clone())
+                        .collect::<Vec<_>>();
                     let duplicates = *duplicates;
                     list = list.child(self.menu_action(
                         ("playlist-choice", index),
@@ -1066,7 +1035,7 @@ impl Music {
                             view.mutate(
                                 Mutation::AddToPlaylist {
                                     id: id.clone(),
-                                    video_ids: vec![song.clone()],
+                                    video_ids: video_ids.clone(),
                                     duplicates,
                                 },
                                 cx,
@@ -1188,12 +1157,16 @@ impl Music {
             }
         }
         if matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)) {
-            let position = self.overlay_anchor.unwrap_or_else(|| {
-                point(
-                    window.viewport_size().width / 2.,
-                    window.viewport_size().height / 3.,
-                )
-            });
+            let viewport = window.viewport_size();
+            let menu = size(
+                px(MENU_WIDTH),
+                px(34. + 48. * actions.len() as f32 + menu_extra),
+            );
+            let position = match (self.overlay_button, self.overlay_anchor) {
+                (Some(button), _) => menu_origin(button, menu, viewport),
+                (None, Some(pointer)) => pointer,
+                (None, None) => point(viewport.width / 2., viewport.height / 3.),
+            };
             return div()
                 .id("menu-focus")
                 .absolute()
@@ -1211,17 +1184,45 @@ impl Music {
                         .position(position)
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            body.w(px(240.))
+                            body.children(actions)
+                                .w(px(MENU_WIDTH))
                                 .px(px(0.))
                                 .py(px(16.))
                                 .rounded(px(2.))
-                                .max_h(window.viewport_size().height - px(16.)),
+                                .max_h(viewport.height - px(16.)),
                         ),
                 )
                 .into_any_element();
         }
         self.backdrop(body.into_any_element(), cx)
     }
+}
+
+/// The song menu's width on music.youtube.com, including its 1 px border.
+const MENU_WIDTH: f32 = 242.;
+
+/// Place a menu against the button that opened it, as music.youtube.com does: below and
+/// left-aligned, aligned to the button's right edge when that would overflow, and above
+/// when it does not fit below.
+fn menu_origin(
+    button: Bounds<Pixels>,
+    menu: Size<Pixels>,
+    viewport: Size<Pixels>,
+) -> Point<Pixels> {
+    let margin = px(8.);
+    let x = if button.left() + menu.width <= viewport.width - margin {
+        button.left()
+    } else {
+        button.right() - menu.width
+    };
+    let below = button.bottom() + margin;
+    let above = button.top() - margin - menu.height;
+    let y = if below + menu.height <= viewport.height - margin || above < margin {
+        below
+    } else {
+        above
+    };
+    point(x, y)
 }
 
 pub(in crate::app) fn playlist_move_down(
@@ -1234,5 +1235,33 @@ pub(in crate::app) fn playlist_move_down(
         Some(successor) => successor.details.set_video_id.clone().map(Some),
         None if !has_more => Some(None),
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MENU_WIDTH, menu_origin};
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn menus_open_against_their_button_like_the_web() {
+        let viewport = size(px(1280.), px(800.));
+        let menu = size(px(MENU_WIDTH), px(514.));
+        let button = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), size(px(36.), px(36.)));
+        // Room below and to the right: below, left edges aligned.
+        assert_eq!(
+            menu_origin(button(400., 100.), menu, viewport),
+            point(px(400.), px(144.))
+        );
+        // A row button near the right edge: right edges aligned, as on album pages.
+        assert_eq!(
+            menu_origin(button(1091., 220.), menu, viewport),
+            point(px(1127. - MENU_WIDTH), px(264.))
+        );
+        // The player bar's button: above, ending 8 px over it.
+        assert_eq!(
+            menu_origin(button(825., 746.), menu, viewport),
+            point(px(825.), px(746. - 8. - 514.))
+        );
     }
 }

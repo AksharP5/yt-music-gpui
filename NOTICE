@@ -41,3 +41,8 @@ covered by its MIT license (LICENSE).
 assets/icons/bookmark.svg and bookmark-filled.svg are unmodified Google Material
 Icons (bookmark_border and bookmark), Copyright Google LLC, Apache License 2.0.
 Source: https://github.com/google/material-design-icons/tree/master/src/action
+
+assets/icons/thumb-down-filled.svg is adapted from Google Material Icons
+("thumb_up", rotated), Copyright Google LLC, Apache License 2.0.
+The menu-* icons in assets/icons were drawn for this project and are covered
+by its MIT license (LICENSE).

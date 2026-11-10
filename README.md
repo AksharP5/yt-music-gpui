@@ -63,7 +63,7 @@ Podcast episodes and videos with resume information keep a local listening posit
 | ? | Keyboard help |
 | Ctrl Q | Quit |
 
-Settings includes playback speed, audio quality and video resolution limits. The song menu has radio, queue, sharing, lyrics and credits actions when available.
+Settings includes playback speed, audio quality and video resolution limits. The song menu has mix, queue, playlist, sharing and credits actions when available, in the same order as YouTube Music.
 
 ## Development
 
