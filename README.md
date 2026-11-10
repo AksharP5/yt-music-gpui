@@ -2,6 +2,8 @@
 
 A native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv and yt-dlp. It runs on Wayland and X11 with YouTube Music's dark interface.
 
+![Home page with Quick picks and playlist shelves](docs/screenshot.webp)
+
 - Browse Home, Explore, charts, artists, albums and playlists, with search suggestions and category filters.
 - Play audio and video with a persistent, drag-to-reorder queue, shuffle, repeat, radio and autoplay. Click the player bar to open the player page with Up next, lyrics and related music.
 - Read lyrics and credits, and browse podcasts with episode descriptions and chapters.
@@ -41,9 +43,14 @@ Once connected, the browser can stay closed. The app restores your saved account
 
 Your profile menu shows the connected name and handle. Use **Switch account** to connect another account. Closing the sign-in dialog cancels an unfinished connection.
 
-Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect. Press Ctrl R to reload the current page from YouTube Music, including its order and removals. The app replaces loaded rows and reloads continuations to find the visible song again, up to the previous loaded depth.
+Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect.
 
-Podcast episodes and videos with resume information keep a local listening position across restarts. Connected accounts also read the progress supplied by YouTube Music and report playback and listening intervals. Focus refreshes wait three minutes. They replace the first page in the server's order and preserve loaded deeper pages, removing occurrences that moved into the first page. History refreshes after a playback report do the same. A response without a continuation replaces the entire list. Likes and dislikes update immediately and revert if saving fails. Playlist edits wait for confirmation.
+### Staying in sync
+
+- Songs you play show up in your YouTube Music history, and listening time is reported the way the web player reports it.
+- Podcast episodes and long videos resume where you left off, including progress saved by YouTube Music.
+- Likes and dislikes apply immediately and revert if YouTube Music rejects them. Playlist edits wait for confirmation.
+- When you return to the window after three minutes or more, the current page picks up changes made elsewhere in YouTube Music's order, without losing your scroll position. Ctrl R reloads the page right away.
 
 ## Controls
 
@@ -62,6 +69,8 @@ Podcast episodes and videos with resume information keep a local listening posit
 | Escape | Dismiss a dialog or leave fullscreen, the player page or search |
 | ? | Keyboard help |
 | Ctrl Q | Quit |
+
+Tab and Shift+Tab move through every control, arrow keys move through open menus, and right-clicking a song, card or collection opens its menu.
 
 Settings includes playback speed, audio quality and video resolution limits. The song menu has mix, queue, playlist, sharing and credits actions when available, in the same order as YouTube Music.
 
