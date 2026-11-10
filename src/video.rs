@@ -4,7 +4,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 use std::{
     ffi::{c_ulong, c_void},
     ptr::NonNull,
-    sync::Mutex,
+    sync::{Mutex, TryLockError},
 };
 
 unsafe extern "C" {
@@ -102,7 +102,7 @@ pub(crate) struct NativeVideo {
 }
 
 // All calls into this handle are serialized. Only start/stop cross to the actor;
-// creation, geometry, and destruction stay within the live window's scope.
+// creation and geometry use the live window; close/quit fence background cleanup.
 unsafe impl Send for NativeVideo {}
 unsafe impl Sync for NativeVideo {}
 
@@ -141,10 +141,14 @@ impl NativeVideo {
     }
 
     pub(crate) fn ready(&self) -> Result<bool> {
-        let handle = self.handle.lock().unwrap();
+        let handle = match self.handle.try_lock() {
+            Ok(handle) => handle,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("The video renderer stopped"),
+        };
         let handle = handle.context("The video surface was detached")?;
         match unsafe { video_status(handle.as_ptr()) } {
-            1 => Ok(false),
+            0 | 1 => Ok(false),
             2 => Ok(true),
             -1 => anyhow::bail!("Could not initialize the video renderer"),
             -2 => anyhow::bail!("The video renderer stopped. Switch to Audio and try Video again."),
@@ -156,7 +160,11 @@ impl NativeVideo {
 
     pub(crate) fn set_bounds(&self, bounds: Bounds<Pixels>, scale: f32) -> Result<()> {
         let geometry = Geometry::new(bounds, scale, self.x11)?;
-        let handle = self.handle.lock().unwrap();
+        let handle = match self.handle.try_lock() {
+            Ok(handle) => handle,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("The video renderer stopped"),
+        };
         let Some(handle) = *handle else { return Ok(()) };
         ensure!(
             unsafe {

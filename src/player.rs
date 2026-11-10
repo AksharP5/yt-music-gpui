@@ -1,7 +1,7 @@
 use crate::auth::{PlaybackCredentials, sealed_file};
 use crate::video::NativeVideo;
 use anyhow::{Context, Result, bail, ensure};
-use gpui::{AnyWindowHandle, App, Bounds, Pixels, Subscription, Window};
+use gpui::{AnyWindowHandle, App, BackgroundExecutor, Bounds, Pixels, Subscription, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -267,11 +267,10 @@ enum PlayerCommand {
     },
     AttachVideo {
         video: Arc<NativeVideo>,
-        reply: Sender<Result<()>>,
     },
     DetachVideo {
         video: Arc<NativeVideo>,
-        reply: Sender<()>,
+        reply: async_channel::Sender<()>,
     },
     Stop,
     Quit,
@@ -475,17 +474,42 @@ impl Player {
     /// Create with the view, before paint/input callbacks borrow the platform window.
     pub fn video_attachment(&self, window: &mut Window, cx: &mut App) -> VideoAttachment {
         let binding: Rc<RefCell<VideoState>> = Rc::new(RefCell::new(VideoState::Detached));
+        let cleanup = Rc::new(RefCell::new(Vec::<async_channel::Receiver<()>>::new()));
         let weak = Rc::downgrade(&binding);
-        window.on_window_should_close(cx, move |_, _| {
+        let closing = Rc::new(std::cell::Cell::new(false));
+        let close_pending = closing.clone();
+        let pending = cleanup.clone();
+        window.on_window_should_close(cx, move |window, cx| {
+            if close_pending.replace(true) {
+                return false;
+            }
             if let Some(binding) = weak.upgrade() {
                 *binding.borrow_mut() = VideoState::Detached;
             }
-            true
+            let completions = pending.borrow().clone();
+            if completions.iter().all(async_channel::Receiver::is_closed) {
+                return true;
+            }
+            window
+                .spawn(cx, async move |cx| {
+                    for completion in completions {
+                        let _ = completion.recv().await;
+                    }
+                    let _ = cx.update(|window, _| window.remove_window());
+                })
+                .detach();
+            false
         });
         let weak = Rc::downgrade(&binding);
+        let pending = cleanup.clone();
         let quit = cx.on_app_quit(move |_| {
             if let Some(binding) = weak.upgrade() {
                 *binding.borrow_mut() = VideoState::Detached;
+            }
+            // GPUI destroys windows before awaiting quit futures. Drain here while
+            // the borrowed Wayland parent/display and X11 parent are still live.
+            for completion in pending.borrow().iter() {
+                let _ = completion.recv_blocking();
             }
             async {}
         });
@@ -493,6 +517,9 @@ impl Player {
             binding,
             commands: self.commands.clone(),
             window: window.window_handle(),
+            cleanup,
+            executor: cx.background_executor().clone(),
+            closing,
             _quit: quit,
         }
     }
@@ -534,6 +561,9 @@ pub struct VideoAttachment {
     commands: CommandSender,
     window: AnyWindowHandle,
     _quit: Subscription,
+    cleanup: Rc<RefCell<Vec<async_channel::Receiver<()>>>>,
+    executor: BackgroundExecutor,
+    closing: Rc<std::cell::Cell<bool>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -570,6 +600,9 @@ impl VideoAttachment {
             self.window == window.window_handle(),
             "The video attachment belongs to another window"
         );
+        if self.closing.get() {
+            return Ok(());
+        }
         let mut state = self.binding.borrow_mut();
         if let VideoState::Failed(message) = &*state {
             bail!("{message}");
@@ -586,18 +619,16 @@ impl VideoAttachment {
         }
         let result: Result<VideoBinding> = (|| {
             let video = Arc::new(NativeVideo::new(bounds, window)?);
-            let (reply, received) = mpsc::channel();
             self.commands
                 .send(PlayerCommand::AttachVideo {
                     video: video.clone(),
-                    reply,
                 })
                 .context("The player stopped")?;
-            // Keep the borrowed window alive until the actor accepts or rejects it.
-            received.recv().context("The player stopped")??;
             Ok(VideoBinding {
                 video,
                 commands: self.commands.clone(),
+                cleanup: self.cleanup.clone(),
+                executor: self.executor.clone(),
             })
         })();
         match result {
@@ -612,7 +643,7 @@ impl VideoAttachment {
         }
     }
 
-    /// Completes before returning. Call before programmatic window removal.
+    /// Retire the renderer off the UI thread. Window close and app quit drain cleanup.
     /// Also clears a previous failure to allow an explicit user retry.
     pub fn detach(&self) {
         *self.binding.borrow_mut() = VideoState::Detached;
@@ -628,23 +659,31 @@ impl Drop for VideoAttachment {
 struct VideoBinding {
     video: Arc<NativeVideo>,
     commands: CommandSender,
+    cleanup: Rc<RefCell<Vec<async_channel::Receiver<()>>>>,
+    executor: BackgroundExecutor,
 }
 
 impl Drop for VideoBinding {
     fn drop(&mut self) {
-        let (reply, received) = mpsc::channel();
-        if self
-            .commands
-            .send(PlayerCommand::DetachVideo {
-                video: self.video.clone(),
-                reply,
+        let (reply, received) = async_channel::bounded(1);
+        let (done, completion) = async_channel::bounded::<()>(1);
+        let mut cleanup = self.cleanup.borrow_mut();
+        cleanup.retain(|completion| !completion.is_closed());
+        cleanup.push(completion);
+        let _ = self.commands.send(PlayerCommand::DetachVideo {
+            video: self.video.clone(),
+            reply,
+        });
+        let video = self.video.clone();
+        self.executor
+            .spawn(async move {
+                // A closed channel also fences actor failure: its renderer guard is
+                // dropped before the command receiver and before the mpv core.
+                let _ = received.recv().await;
+                video.destroy();
+                drop(done);
             })
-            .is_ok()
-        {
-            let _ = received.recv();
-        }
-        // Actor failure stops its renderer guard before dropping the core.
-        self.video.destroy();
+            .detach();
     }
 }
 
@@ -1087,7 +1126,7 @@ fn run(
                     );
                     result?;
                 }
-                Ok(PlayerCommand::AttachVideo { video: next, reply }) => {
+                Ok(PlayerCommand::AttachVideo { video: next }) => {
                     let result = (|| {
                         ensure!(video.is_none(), "A video surface is already attached");
                         next.start(core.0.as_ptr())?;
@@ -1105,7 +1144,12 @@ fn run(
                         video = Some(attached);
                         Ok(())
                     })();
-                    let _ = reply.send(result);
+                    if let Err(error) = result {
+                        let _ = events.send_blocking(PlayerEvent::VideoError {
+                            message: format!("{error:#}"),
+                        });
+                    }
+                    let _ = events.send_blocking(PlayerEvent::VideoChanged);
                 }
                 Ok(PlayerCommand::DetachVideo {
                     video: current,
@@ -1128,7 +1172,7 @@ fn run(
                             });
                         }
                     }
-                    let _ = reply.send(());
+                    let _ = reply.send_blocking(());
                 }
                 Ok(PlayerCommand::Stop) => {
                     state.invalidate_seeks();

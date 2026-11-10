@@ -39,7 +39,7 @@ struct video {
     pthread_mutex_t mutex;
     pthread_cond_t condition;
     pthread_t worker;
-    int started, stop, status, wake, geometry_dirty;
+    int started, stop, status, wake, geometry_dirty, x11;
     int x, y, width, height, pixel_width, pixel_height;
     mpv_handle *core;
 };
@@ -69,23 +69,6 @@ static const struct wl_surface_listener surface_listener = {
     .enter = surface_enter, .leave = surface_leave,
 };
 
-struct egl_state {
-    EGLDisplay display;
-    EGLContext context;
-    EGLSurface draw, read;
-    EGLenum api;
-};
-static struct egl_state save_egl(void) {
-    return (struct egl_state){eglGetCurrentDisplay(), eglGetCurrentContext(),
-        eglGetCurrentSurface(EGL_DRAW), eglGetCurrentSurface(EGL_READ), eglQueryAPI()};
-}
-static void restore_egl(struct egl_state previous, EGLDisplay display) {
-    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    eglBindAPI(previous.api);
-    if (previous.display != EGL_NO_DISPLAY)
-        eglMakeCurrent(previous.display, previous.draw, previous.read, previous.context);
-}
-
 /* Serialized by the Rust owner; safe on the actor or window thread. */
 void video_stop(struct video *v) {
     if (!v->started) return;
@@ -98,7 +81,7 @@ void video_stop(struct video *v) {
     v->core = NULL;
 }
 
-/* Called while the borrowed GPUI display and parent still exist. */
+/* Cleanup runs in the background; Rust fences it before the window/display dies. */
 void video_destroy(struct video *v) {
     if (!v) return;
     video_stop(v);
@@ -136,7 +119,6 @@ struct video *video_create(void *display, void *parent) {
     v->egl_display = EGL_NO_DISPLAY;
     v->context = EGL_NO_CONTEXT;
     v->egl_surface = EGL_NO_SURFACE;
-    struct egl_state previous = save_egl();
     v->queue = wl_display_create_queue(v->display);
     if (!v->queue) goto fail;
     struct wl_display *wrapper = wl_proxy_create_wrapper(v->display);
@@ -164,25 +146,9 @@ struct video *video_create(void *display, void *parent) {
     wl_surface_set_buffer_scale(v->surface, 1);
     v->window = wl_egl_window_create(v->surface, 1, 1);
     if (!v->window) goto fail;
-    v->egl_display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, v->display, NULL);
-    EGLint major, minor;
-    if (v->egl_display == EGL_NO_DISPLAY || !eglInitialize(v->egl_display, &major, &minor)) goto fail;
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) goto fail;
-    const EGLint attributes[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE
-    };
-    EGLConfig config;
-    EGLint count;
-    if (!eglChooseConfig(v->egl_display, attributes, &config, 1, &count) || count < 1) goto fail;
-    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-    v->context = eglCreateContext(v->egl_display, config, EGL_NO_CONTEXT, context_attributes);
-    v->egl_surface = eglCreateWindowSurface(v->egl_display, config, v->window, NULL);
-    if (v->context == EGL_NO_CONTEXT || v->egl_surface == EGL_NO_SURFACE) goto fail;
-    restore_egl(previous, v->egl_display);
+
     return v;
 fail:
-    if (v->egl_display != EGL_NO_DISPLAY) restore_egl(previous, v->egl_display);
     video_destroy(v);
     return NULL;
 }
@@ -196,52 +162,8 @@ struct video *video_create_x11(unsigned long parent) {
     v->egl_display = EGL_NO_DISPLAY;
     v->context = EGL_NO_CONTEXT;
     v->egl_surface = EGL_NO_SURFACE;
-    struct egl_state previous = save_egl();
-    v->x_display = XOpenDisplay(NULL);
-    if (!v->x_display) goto fail;
-    XWindowAttributes parent_attributes;
-    if (!XGetWindowAttributes(v->x_display, v->x_parent, &parent_attributes)) goto fail;
-    int shape_event, shape_error;
-    if (!XShapeQueryExtension(v->x_display, &shape_event, &shape_error)) goto fail;
-    v->egl_display = eglGetPlatformDisplay(EGL_PLATFORM_X11_KHR, v->x_display, NULL);
-    EGLint major, minor;
-    if (v->egl_display == EGL_NO_DISPLAY || !eglInitialize(v->egl_display, &major, &minor)) goto fail;
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) goto fail;
-    const EGLint attributes[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 0, EGL_NONE
-    };
-    EGLConfig config;
-    EGLint count, visual_id;
-    if (!eglChooseConfig(v->egl_display, attributes, &config, 1, &count) || count < 1) goto fail;
-    if (!eglGetConfigAttrib(v->egl_display, config, EGL_NATIVE_VISUAL_ID, &visual_id)) goto fail;
-    XVisualInfo wanted = { .visualid = visual_id, .screen = XScreenNumberOfScreen(parent_attributes.screen) };
-    int matches;
-    XVisualInfo *visual = XGetVisualInfo(v->x_display, VisualIDMask | VisualScreenMask, &wanted, &matches);
-    if (!visual || matches < 1) { if (visual) XFree(visual); goto fail; }
-    v->x_colormap = XCreateColormap(v->x_display, parent_attributes.root, visual->visual, AllocNone);
-    if (!v->x_colormap) { XFree(visual); goto fail; }
-    XSetWindowAttributes child_attributes = { .colormap=v->x_colormap, .border_pixel=0, .background_pixel=0 };
-    v->x_child = XCreateWindow(v->x_display, v->x_parent, 0, 0, 1, 1, 0, visual->depth,
-        InputOutput, visual->visual, CWColormap | CWBorderPixel | CWBackPixel, &child_attributes);
-    XFree(visual);
-    if (!v->x_child) goto fail;
-    XShapeCombineRectangles(v->x_display, v->x_child, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted);
-    int n = -1, order;
-    XRectangle *input = XShapeGetRectangles(v->x_display, v->x_child, ShapeInput, &n, &order);
-    if (input) XFree(input);
-    if (n != 0) goto fail;
-    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-    v->context = eglCreateContext(v->egl_display, config, EGL_NO_CONTEXT, context_attributes);
-    v->egl_surface = eglCreateWindowSurface(v->egl_display, config, (EGLNativeWindowType)v->x_child, NULL);
-    if (v->context == EGL_NO_CONTEXT || v->egl_surface == EGL_NO_SURFACE) goto fail;
-    XSync(v->x_display, False);
-    restore_egl(previous, v->egl_display);
+    v->x11 = 1;
     return v;
-fail:
-    if (v->egl_display != EGL_NO_DISPLAY) restore_egl(previous, v->egl_display);
-    video_destroy(v);
-    return NULL;
 }
 
 int video_resize(struct video *v, int x, int y, int width, int height, int pixel_width, int pixel_height) {
@@ -254,7 +176,7 @@ int video_resize(struct video *v, int x, int y, int width, int height, int pixel
     }
     v->x = x; v->y = y; v->width = width; v->height = height;
     v->pixel_width = pixel_width; v->pixel_height = pixel_height;
-    if (!v->x_display) {
+    if (!v->x11) {
         wl_subsurface_set_position(v->subsurface, x, y);
         wp_viewport_set_destination(v->viewport, width, height);
     }
@@ -275,10 +197,59 @@ static void *get_proc_address(void *context, const char *name) {
     (void)context;
     return (void *)eglGetProcAddress(name);
 }
+static int initialize_egl(struct video *v) {
+    XWindowAttributes parent_attributes;
+    if (v->x11) {
+        v->x_display = XOpenDisplay(NULL);
+        if (!v->x_display) return 0;
+        if (!XGetWindowAttributes(v->x_display, v->x_parent, &parent_attributes)) return 0;
+        int shape_event, shape_error;
+        if (!XShapeQueryExtension(v->x_display, &shape_event, &shape_error)) return 0;
+        v->egl_display = eglGetPlatformDisplay(EGL_PLATFORM_X11_KHR, v->x_display, NULL);
+    } else {
+        v->egl_display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, v->display, NULL);
+    }
+    EGLint major, minor;
+    if (v->egl_display == EGL_NO_DISPLAY || !eglInitialize(v->egl_display, &major, &minor)) return 0;
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) return 0;
+    const EGLint attributes[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, v->x11 ? 0 : 8, EGL_NONE
+    };
+    EGLConfig config;
+    EGLint count, visual_id;
+    if (!eglChooseConfig(v->egl_display, attributes, &config, 1, &count) || count < 1) return 0;
+    if (v->x11) {
+        if (!eglGetConfigAttrib(v->egl_display, config, EGL_NATIVE_VISUAL_ID, &visual_id)) return 0;
+        XVisualInfo wanted = { .visualid = visual_id, .screen = XScreenNumberOfScreen(parent_attributes.screen) };
+        int matches;
+        XVisualInfo *visual = XGetVisualInfo(v->x_display, VisualIDMask | VisualScreenMask, &wanted, &matches);
+        if (!visual || matches < 1) { if (visual) XFree(visual); return 0; }
+        v->x_colormap = XCreateColormap(v->x_display, parent_attributes.root, visual->visual, AllocNone);
+        if (!v->x_colormap) { XFree(visual); return 0; }
+        XSetWindowAttributes child_attributes = { .colormap=v->x_colormap, .border_pixel=0, .background_pixel=0 };
+        v->x_child = XCreateWindow(v->x_display, v->x_parent, 0, 0, 1, 1, 0, visual->depth,
+            InputOutput, visual->visual, CWColormap | CWBorderPixel | CWBackPixel, &child_attributes);
+        XFree(visual);
+        if (!v->x_child) return 0;
+        XShapeCombineRectangles(v->x_display, v->x_child, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted);
+        int n = -1, order;
+        XRectangle *input = XShapeGetRectangles(v->x_display, v->x_child, ShapeInput, &n, &order);
+        if (input) XFree(input);
+        if (n != 0) return 0;
+    }
+    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+    v->context = eglCreateContext(v->egl_display, config, EGL_NO_CONTEXT, context_attributes);
+    v->egl_surface = eglCreateWindowSurface(v->egl_display, config,
+        v->x11 ? (EGLNativeWindowType)v->x_child : (EGLNativeWindowType)v->window, NULL);
+    return v->context != EGL_NO_CONTEXT && v->egl_surface != EGL_NO_SURFACE;
+}
+
 static void *render_worker(void *data) {
     struct video *v = data;
     mpv_render_context *render = NULL;
     int status = -1, mapped = 0;
+    if (!initialize_egl(v)) goto done;
     eglBindAPI(EGL_OPENGL_ES_API);
     if (!eglMakeCurrent(v->egl_display, v->egl_surface, v->egl_surface, v->context)) goto done;
     eglSwapInterval(v->egl_display, 0);
@@ -354,7 +325,8 @@ done:
         mpv_render_context_set_update_callback(render, NULL, NULL);
         mpv_render_context_free(render);
     }
-    eglMakeCurrent(v->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (v->egl_display != EGL_NO_DISPLAY)
+        eglMakeCurrent(v->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     pthread_mutex_lock(&v->mutex);
     v->status = status;
     pthread_cond_signal(&v->condition);
@@ -371,12 +343,9 @@ int video_start(struct video *v, mpv_handle *core) {
     v->stop = 0;
     v->started = pthread_create(&v->worker, NULL, render_worker, v) == 0;
     if (!v->started) { v->status = -1; return 0; }
-    pthread_mutex_lock(&v->mutex);
-    while (!v->status) pthread_cond_wait(&v->condition, &v->mutex);
-    int ready = v->status;
-    pthread_mutex_unlock(&v->mutex);
-    if (ready < 0) video_stop(v);
-    return ready > 0;
+    /* Renderer initialization can take hundreds of milliseconds. The actor/UI
+       observes video_status instead of waiting for EGL/mpv initialization. */
+    return 1;
 }
 
 /* Zero before start, one before the first swap, two after it, three after stop. */
