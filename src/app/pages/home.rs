@@ -21,6 +21,7 @@ impl Music {
                     .flex()
                     .gap(px(12.))
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
                     .children(
                         self.page
                             .chips
@@ -57,53 +58,67 @@ impl Music {
         inset: f32,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut links = Vec::new();
-        let mut shelves = Vec::new();
-        for (index, shelf) in self.page.shelves.iter().enumerate() {
-            if shelf.title.is_empty()
-                && shelf
-                    .items
-                    .iter()
-                    .all(|item| matches!(item, Item::Navigation(_)))
-            {
-                for (i, item) in shelf.items.iter().enumerate() {
-                    if let Item::Navigation(link) = item {
-                        links.push(
-                            self.navigation(link.clone(), ("discovery-link", index * 1000 + i), cx)
-                                .h(px(72.))
-                                .px(px(24.))
-                                .rounded(px(4.))
-                                .bg(self.theme.raised)
-                                .flex_1(),
-                        );
-                    }
-                }
-            } else {
-                shelves.push(index);
-            }
+        let count = self.page.shelves.len() + 1;
+        let state = &self.detail_list.state;
+        match state.item_count().cmp(&count) {
+            std::cmp::Ordering::Less => state.splice(
+                state.item_count()..state.item_count(),
+                count - state.item_count(),
+            ),
+            std::cmp::Ordering::Greater => state.reset(count),
+            std::cmp::Ordering::Equal => {}
         }
         content = content
-            .when(!links.is_empty(), |d| {
-                d.child(
-                    div()
-                        .mx(px(inset))
-                        .mb(px(36.))
-                        .flex()
-                        .gap(px(24.))
-                        .children(links),
-                )
-            })
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(rgb(0x14252c), 0.),
+                linear_color_stop(self.theme.bg, 0.65),
+            ))
             .child(
-                uniform_list(
-                    ("home-shelves", self.list_id),
-                    shelves.len(),
-                    cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
-                        range
-                            .map(|i| view.shelf(shelves[i], inset, window, cx))
-                            .collect::<Vec<_>>()
+                list(
+                    self.detail_list.state.clone(),
+                    cx.processor(move |view, index: usize, window, cx| {
+                        if index == 0 {
+                            return view.home_filters(div(), inset, cx).into_any_element();
+                        }
+                        view.prefetch_page(index, view.page.shelves.len(), 2, cx);
+                        let shelf = &view.page.shelves[index - 1];
+                        if shelf.title.is_empty()
+                            && shelf
+                                .items
+                                .iter()
+                                .all(|item| matches!(item, Item::Navigation(_)))
+                        {
+                            return div()
+                                .mx(px(inset))
+                                .mb(px(36.))
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(24.))
+                                .children(shelf.items.iter().enumerate().filter_map(
+                                    |(item, link)| {
+                                        let Item::Navigation(link) = link else {
+                                            return None;
+                                        };
+                                        Some(
+                                            view.navigation(
+                                                link.clone(),
+                                                ("discovery-link", (index - 1) * 1000 + item),
+                                                cx,
+                                            )
+                                            .h(px(72.))
+                                            .px(px(24.))
+                                            .rounded(px(4.))
+                                            .bg(view.theme.raised)
+                                            .flex_1(),
+                                        )
+                                    },
+                                ))
+                                .into_any_element();
+                        }
+                        view.shelf(index - 1, inset, window, cx)
                     }),
                 )
-                .track_scroll(&self.list_scroll)
                 .flex_1()
                 .min_h_0(),
             );

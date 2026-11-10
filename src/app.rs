@@ -73,7 +73,6 @@ use window::MusicContent;
 
 const CARD_WIDTH: f32 = 180.;
 const CARD_GAP: f32 = 24.;
-const SHELF_HEIGHT: f32 = 350.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Startup {

@@ -11,6 +11,7 @@ impl Music {
     ) -> Stateful<Div> {
         div()
             .id(id)
+            .keyboard_control(self.theme)
             .flex()
             .items_center()
             .gap(px(8.))
@@ -44,13 +45,21 @@ impl Music {
             .items
             .iter()
             .all(|item| matches!(item, Item::Navigation(_)));
-        let width = if navigation {
-            240.
+        let available = f32::from(window.viewport_size().width)
+            - if self.sidebar_collapsed || window.viewport_size().width < px(1150.) {
+                72.
+            } else {
+                240.
+            }
+            - inset * 2.;
+        let width = shelf_card_width(layout, available, navigation);
+        let content_height = if navigation {
+            4. * 56.
         } else {
             match layout {
-                ShelfLayout::Cards | ShelfLayout::Featured => CARD_WIDTH,
-                ShelfLayout::Videos => 256.,
-                ShelfLayout::Songs => 360.,
+                ShelfLayout::Songs => 4. * 64.,
+                ShelfLayout::Videos => width * 9. / 16. + 72.,
+                ShelfLayout::Cards | ShelfLayout::Featured => width + 72.,
             }
         };
         let rows = if navigation || layout == ShelfLayout::Songs {
@@ -63,7 +72,7 @@ impl Music {
         let range = visible_cards(
             count,
             (-scroll.offset().x).into(),
-            window.viewport_size().width.into(),
+            available,
             width + CARD_GAP,
         );
         let stride = width + CARD_GAP;
@@ -100,6 +109,7 @@ impl Music {
             .min_w_0()
             .flex()
             .overflow_x_scroll()
+            .restrict_scroll_to_axis()
             .track_scroll(&scroll)
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .child(
@@ -107,7 +117,7 @@ impl Music {
                     .relative()
                     .flex_shrink_0()
                     .w(px((count as f32 * stride - CARD_GAP).max(0.)))
-                    .h(px(260.))
+                    .h(px(content_height))
                     .child(
                         div()
                             .absolute()
@@ -123,7 +133,7 @@ impl Music {
             .id(("shelf", index))
             .w_full()
             .min_w_0()
-            .h(px(SHELF_HEIGHT))
+            .h(px(content_height + 108.))
             .px(px(inset))
             .pt(px(8.))
             .flex()
@@ -151,6 +161,7 @@ impl Music {
                             .children(more.map(|link| {
                                 div()
                                     .id(("carousel-more", index))
+                                    .keyboard_control(self.theme)
                                     .h(px(36.))
                                     .px(px(16.))
                                     .rounded_full()
@@ -216,4 +227,24 @@ pub(in crate::app) fn visible_cards(
     let start = (offset / stride) as usize;
     let end = ((offset + viewport) / stride).ceil() as usize + 1;
     start.min(count)..end.min(count)
+}
+
+pub(in crate::app) fn shelf_card_width(
+    layout: ShelfLayout,
+    available: f32,
+    navigation: bool,
+) -> f32 {
+    let target = if navigation {
+        240.
+    } else {
+        match layout {
+            ShelfLayout::Songs => 360.,
+            ShelfLayout::Videos => 256.,
+            ShelfLayout::Cards | ShelfLayout::Featured => CARD_WIDTH,
+        }
+    };
+    let columns = ((available + CARD_GAP) / (target + CARD_GAP))
+        .floor()
+        .max(1.);
+    ((available + CARD_GAP) / columns - CARD_GAP).max(120.)
 }

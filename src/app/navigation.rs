@@ -290,7 +290,7 @@ impl Music {
                 self.list_rows.push(ListRow::Heading(index));
             }
             for (item_index, item) in shelf.items.iter().enumerate() {
-                if !carousel && !(featured && item_index == 0) {
+                if !carousel && !(featured && item_index <= 3) {
                     self.list_rows.push(ListRow::Item(self.rows.len()));
                 }
                 self.rows.push(item.clone());

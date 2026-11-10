@@ -72,6 +72,7 @@ impl Music {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.prefetch_page(index, self.list_rows.len(), 8, cx);
         match self.list_rows[index] {
             ListRow::Featured(index) => self.featured_result(index, inset, cx),
             ListRow::Heading(shelf) => div()
@@ -99,6 +100,7 @@ impl Music {
                     .child(
                         div()
                             .id(("shelf-more", index))
+                            .keyboard_control(self.theme)
                             .h(px(36.))
                             .px(px(16.))
                             .rounded_full()
@@ -128,7 +130,13 @@ impl Music {
         let collection = !home && self.page.header.is_some();
         let artist = collection && self.route.is_artist();
         let stacked = collection && !artist && available >= 980.;
-        let mut content = div().flex_1().min_w_0().min_h_0().flex().flex_col();
+        let mut content = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(search, |content| content.max_w(px(1060.)).mx_auto());
         if !home && !artist {
             content = content.child(
                 div()
@@ -149,7 +157,9 @@ impl Music {
             let heading = self.page_heading(false, 128., cx);
             content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
         }
-        content = self.home_filters(content, inset, cx);
+        if !home {
+            content = self.home_filters(content, inset, cx);
+        }
         content = self.search_filters(content, inset, cx);
         content = self.library_filters(content, inset, cx);
         if !matches!(self.overlay, Some(Overlay::SignIn))
@@ -203,7 +213,7 @@ impl Music {
                 .into_any_element();
         }
         let heading = (collection && stacked)
-            .then(|| self.page_heading(true, if stacked { 264. } else { 200. }, cx));
+            .then(|| self.page_heading(true, if available < 1200. { 240. } else { 264. }, cx));
         if self.rows.is_empty() && !collection {
             let message = match self.route {
                 Route::Liked => "Music you like will appear here.",
@@ -301,10 +311,13 @@ impl Music {
                 let columns = ((available - inset * 2. + CARD_GAP) / (CARD_WIDTH + CARD_GAP))
                     .floor()
                     .max(1.) as usize;
+                let card_width =
+                    shelves::shelf_card_width(ShelfLayout::Cards, available - inset * 2., false);
                 uniform_list(
                     ("collection-grid", self.list_id),
                     self.rows.len().div_ceil(columns),
                     cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                        view.prefetch_page(range.end, view.rows.len().div_ceil(columns), 2, cx);
                         range
                             .map(|row| {
                                 let items = view
@@ -315,7 +328,7 @@ impl Music {
                                     .cloned()
                                     .collect::<Vec<_>>();
                                 div()
-                                    .h(px(274.))
+                                    .h(px(card_width + 94.))
                                     .px(px(inset))
                                     .flex()
                                     .gap(px(CARD_GAP))
@@ -327,7 +340,7 @@ impl Music {
                                                 view.card(
                                                     item,
                                                     row * columns + column,
-                                                    CARD_WIDTH,
+                                                    card_width,
                                                     ShelfLayout::Cards,
                                                     cx,
                                                 )
@@ -349,6 +362,7 @@ impl Music {
                     ("music-results", self.list_id),
                     self.rows.len(),
                     cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
+                        view.prefetch_page(range.end, view.rows.len(), 12, cx);
                         range
                             .map(|i| view.row(i, row_inset, window, cx))
                             .collect::<Vec<_>>()
@@ -364,7 +378,8 @@ impl Music {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .px(px(60.))
+                        .px(px(inset + 6.))
+                        .pt(px(40.))
                         .flex()
                         .gap(px(56.))
                         .child(
@@ -384,40 +399,48 @@ impl Music {
                     .child(list)
             };
         }
-        if self.page.continuation.is_some() {
+        if self.page.continuation.is_some() && self.catalog_requests.is_loading(CatalogTarget::Page)
+        {
             content = content.child(
                 div()
-                    .id("load-more")
-                    .h(px(40.))
+                    .h(px(32.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(self.theme.muted)
-                    .cursor_pointer()
-                    .child(if self.catalog_requests.is_loading(CatalogTarget::Page) {
-                        "Loading…"
-                    } else {
-                        "Load more"
-                    })
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        if !view.catalog_requests.is_loading(CatalogTarget::Page)
-                            && let Some(token) = view.page.continuation.clone()
-                        {
-                            view.request(
-                                Query::More {
-                                    token,
-                                    search: match &view.route {
-                                        Route::Search(search) => Some(search.clone()),
-                                        _ => None,
-                                    },
-                                },
-                                cx,
-                            );
-                        }
-                    })),
+                    .child("Loading…"),
             );
         }
         content.into_any_element()
+    }
+}
+
+impl Music {
+    pub(in crate::app) fn prefetch_page(
+        &mut self,
+        visible_end: usize,
+        count: usize,
+        ahead: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if visible_end.saturating_add(ahead) < count
+            || self.catalog_requests.is_loading(CatalogTarget::Page)
+            || self.error.is_some()
+        {
+            return;
+        }
+        if let Some(token) = self.page.continuation.clone() {
+            self.request(
+                Query::More {
+                    token,
+                    search: match &self.route {
+                        Route::Search(search) => Some(search.clone()),
+                        _ => None,
+                    },
+                },
+                cx,
+            );
+        }
     }
 }
