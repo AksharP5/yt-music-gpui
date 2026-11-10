@@ -461,7 +461,7 @@ impl Music {
                 div()
                     .id("search-filters")
                     .mx(px(inset))
-                    .mt(px(23.))
+                    .mt(px(6.))
                     .mb(px(6.))
                     .flex_shrink_0()
                     .flex()
