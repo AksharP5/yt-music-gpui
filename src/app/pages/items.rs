@@ -786,7 +786,9 @@ impl Music {
         row = row.child(controls.absolute().right_0().top_0().h_full());
         wrap_row(row)
             .when(style.gap() > 0., |d| d.pb(px(style.gap())))
-            .when(artist_table, |d| {
+            .when(artist_table && self.list_rows.windows(2).any(|rows| {
+                matches!(rows, [super::ListRow::Item(current), super::ListRow::Item(_)] if *current == index)
+            }), |d| {
                 d.child(div().h(px(1.)).bg(gpui::white().opacity(0.1)))
             })
             .into_any_element()

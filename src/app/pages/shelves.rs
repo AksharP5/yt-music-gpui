@@ -62,24 +62,73 @@ impl Music {
         } else {
             (page.shelf_width(layout), page.card_gap())
         };
-        let content_height = if navigation {
-            4. * 48. + 3. * 16.
-        } else {
-            match layout {
-                ShelfLayout::Songs => 4. * 48. + 3. * 16.,
-                ShelfLayout::Episodes => 3. * EPISODE_ROW + 2. * 16.,
-                ShelfLayout::Videos => width * 9. / 16. + page.card_text_height(),
-                ShelfLayout::Cards if album => width + 19. + 3. * page.text_size() * 1.2,
-                ShelfLayout::Cards | ShelfLayout::SmallCards | ShelfLayout::Featured => {
-                    width + page.card_text_height()
-                }
-            }
-        };
         let rows = match layout {
             _ if navigation => 4,
             ShelfLayout::Songs => 4,
             ShelfLayout::Episodes => 3,
             _ => 1,
+        };
+        // Include offscreen text when sizing the carousel so its height stays
+        // steady when a longer title scrolls out of the rendered columns.
+        let card_height = if rows == 1 {
+            let line_height = page.text_size() * 1.2;
+            let text_height = |text: &str, width: f32, weight, clamp| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: Font {
+                        weight,
+                        ..font("Roboto")
+                    },
+                    ..Default::default()
+                };
+                match window.text_system().shape_text(
+                    text.to_owned().into(),
+                    px(page.text_size()),
+                    &[run],
+                    Some(px(width)),
+                    Some(clamp),
+                ) {
+                    Ok(lines) => lines
+                        .iter()
+                        .map(|line| f32::from(line.size(px(line_height)).height))
+                        .sum::<f32>(),
+                    Err(error) => {
+                        eprintln!("Could not measure shelf text: {error:#}");
+                        line_height * clamp as f32
+                    }
+                }
+            };
+            let subtitle_lines = if album && layout == ShelfLayout::Cards {
+                1
+            } else {
+                2
+            };
+            shelf
+                .items
+                .iter()
+                .map(|item| {
+                    let explicit = match item {
+                        Item::Track(track) => track.details.explicit,
+                        Item::Collection(collection) => collection.details.explicit,
+                        Item::Navigation(_) => false,
+                    };
+                    let title = text_height(item.title(), width, FontWeight::MEDIUM, 2);
+                    let subtitle = text_height(
+                        item.subtitle(),
+                        width - if explicit { 20. } else { 0. },
+                        FontWeight::NORMAL,
+                        subtitle_lines,
+                    );
+                    let art = if layout == ShelfLayout::Videos {
+                        width * 9. / 16.
+                    } else {
+                        width
+                    };
+                    art + 19. + title + subtitle
+                })
+                .fold(0., f32::max)
+        } else {
+            0.
         };
         let count = shelf.items.len().div_ceil(rows);
         let scroll = self.shelf_scroll.entry(index).or_default().clone();
@@ -134,26 +183,29 @@ impl Music {
             .collect::<Vec<_>>();
         let contents = div()
             .id(("carousel", index))
-            .w_full()
+            .w(px(available + 8.))
             .min_w_0()
+            .p(px(4.))
+            .m(px(-4.))
             .flex()
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
             .track_scroll(&scroll)
             .child(
                 div()
-                    .relative()
+                    .flex()
+                    .gap(px(gap))
                     .flex_shrink_0()
                     .w(px((count as f32 * stride - gap).max(0.)))
-                    .h(px(content_height))
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(range.start as f32 * stride))
-                            .flex()
-                            .gap(px(gap))
-                            .children(columns),
-                    ),
+                    .min_h(px(card_height))
+                    .when(range.start > 0, |row| {
+                        row.child(
+                            div()
+                                .w(px(range.start as f32 * stride - gap))
+                                .flex_shrink_0(),
+                        )
+                    })
+                    .children(columns),
             );
         let header_height = (heading_size * 1.2).max(36.);
         let previous = scroll.clone();
@@ -162,9 +214,9 @@ impl Music {
             .id(("shelf", index))
             .w_full()
             .min_w_0()
-            .h(px(32. + header_height + 16. + content_height + 48.))
             .px(px(inset))
             .pt(px(32.))
+            .pb(px(48.))
             .flex()
             .flex_col()
             .gap(px(16.))
@@ -193,6 +245,7 @@ impl Music {
                                 div()
                                     .id(("carousel-more", index))
                                     .keyboard_control(self.theme)
+                                    .mr(px(8.))
                                     .h(px(36.))
                                     .px(px(16.))
                                     .rounded_full()

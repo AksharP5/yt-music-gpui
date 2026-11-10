@@ -1118,6 +1118,58 @@ async fn scrolled_artist_survives_tab(
             }
         }
     }
+    let sidebar = window
+        .update(cx, |music, window, cx| {
+            window.resize(size(px(1280.), px(900.)));
+            let sidebar = music.sidebar_collapsed;
+            music.sidebar_collapsed = Some(false);
+            for shelf in &mut music.page.shelves[1..] {
+                let Item::Collection(album) = &mut shelf.items[0] else {
+                    unreachable!()
+                };
+                album.title = "Random Access Memories (Drumless Edition)".into();
+            }
+            music.detail_list.state.remeasure();
+            music.detail_list.state.scroll_to(gpui::ListOffset {
+                item_ix: albums_row,
+                offset_in_item: px(0.),
+            });
+            window.focus(&music.focus, cx);
+            cx.notify();
+            sidebar
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    let shelf_height = window
+        .update(cx, |music, window, _| {
+            let height = f32::from(music.detail_list.state.bounds_for_item(albums_row).unwrap().size.height);
+            assert!((height - 347.8).abs() < 1., "A two-line title and one-line subtitle shelf must match the web's 347.8px pitch, got {height}");
+            println!("SHELF_GEOMETRY width=1280 pitch={height:.2} web=347.8");
+            capture(window, "shelf-geometry-1280");
+            let scroll = &music.shelf_scroll[&1];
+            scroll.set_offset(point(-scroll.max_offset().x, px(0.)));
+            window.refresh();
+            height
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, _, _| {
+            assert_eq!(
+                f32::from(
+                    music
+                        .detail_list
+                        .state
+                        .bounds_for_item(albums_row)
+                        .unwrap()
+                        .size
+                        .height
+                ),
+                shelf_height,
+                "Scrolling past a wrapped title must not change shelf height"
+            );
+        })
+        .unwrap();
     artist_revisit_shows_hero(window, cx).await;
     window
         .update(cx, |music, window, cx| {
@@ -1125,6 +1177,7 @@ async fn scrolled_artist_survives_tab(
                 paused: false,
                 buffering: false,
             };
+            music.sidebar_collapsed = sidebar;
             window.resize(size(px(850.), px(560.)));
             window.focus(&music.focus, cx);
             cx.notify();
