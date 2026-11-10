@@ -444,3 +444,16 @@ fn play_starts_a_stopped_wait_and_loading_toggles_preserve_the_retry_budget() {
     );
     assert_eq!(loading.toggled().toggled(), loading);
 }
+
+#[test]
+fn displayed_durations_round_to_the_nearest_second() {
+    for (seconds, expected) in [
+        (337.8, "5:38"),
+        (59.5, "1:00"),
+        (3599.5, "1:00:00"),
+        (266., "4:26"),
+        (-1., "0:00"),
+    ] {
+        assert_eq!(super::clock(seconds), expected);
+    }
+}
