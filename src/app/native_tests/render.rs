@@ -974,7 +974,7 @@ async fn scrolled_artist_survives_tab(window: WindowHandle<Music>, cx: &mut Asyn
     wait_for_presented_frame(window, cx).await;
 }
 
-async fn home_chips_and_browse_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     let chip = |label, selected, params| {
         serde_json::json!({"chipCloudChipRenderer": {
             "text":{"simpleText":label}, "isSelected":selected,
@@ -987,30 +987,67 @@ async fn home_chips_and_browse_rows(window: WindowHandle<Music>, cx: &mut AsyncA
             chip("Relax", true, "relax-filter"), chip("Focus", false, "focus-filter")
         ]}}}
     }}}]}}});
+    window.update(cx, |music, window, cx| {
+        window.resize(size(px(956.), px(1050.)));
+        music.player_open = false;
+        music.playback = Playback::Stopped;
+        music.route = crate::app::Route::Home;
+        music.catalog_requests.cancel(CatalogTarget::Page);
+        music.page = crate::catalog::parse_home(&response, "Home").unwrap();
+        assert_eq!(music.page.chips.len(), 3);
+        music.page.shelves = crate::app::sync::tests::page(1, false).shelves;
+        music.rebuild_rows();
+        music.detail_list.state.scroll_to(gpui::ListOffset::default());
+        music.notice = None;
+        music.error = Some("Could not load Home: error sending request for url (https://music.youtube.com/youtubei/v1/browse): client error (Connect): dns error: failed to lookup address information".into());
+        cx.notify();
+    }).unwrap();
+    wait_for_presented_frame(window, cx).await;
     window
-        .update(cx, |music, window, cx| {
-            window.resize(size(px(956.), px(1050.)));
-            music.player_open = false;
-            music.playback = Playback::Stopped;
-            music.route = crate::app::Route::Home;
-            music.catalog_requests.cancel(CatalogTarget::Page);
-            music.page = crate::catalog::parse_home(&response, "Home").unwrap();
-            assert_eq!(music.page.chips.len(), 3);
-            music.page.shelves = crate::app::sync::tests::page(1, false).shelves;
-            music.rebuild_rows();
-            music
-                .detail_list
-                .state
-                .scroll_to(gpui::ListOffset::default());
-            music.notice = None;
-            music.error = None;
-            cx.notify();
+        .update(cx, |_, window, _| {
+            capture(window, "home-chips-network-error-956");
         })
         .unwrap();
+    // The dismiss control stays at the right of the constrained content column.
+    let position = window
+        .update(cx, |music, window, _| {
+            let layout = music.page_layout(window);
+            point(
+                window.viewport_size().width - px(layout.inset + 20.),
+                px(84.),
+            )
+        })
+        .unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
     wait_for_presented_frame(window, cx).await;
     window
         .update(cx, |music, window, cx| {
-            capture(window, "home-chips-956");
+            assert!(
+                music.error.is_none(),
+                "The visible dismiss button must accept a click at 956px"
+            );
+            capture(window, "home-chips-dismissed-956");
             // This browse row used to add a second hover style to navigation().
             music.route = crate::app::Route::Browse(crate::catalog::BrowseLink::new(
                 "FEmusic_moods_and_genres",
@@ -1024,7 +1061,7 @@ async fn home_chips_and_browse_rows(window: WindowHandle<Music>, cx: &mut AsyncA
                 ));
             music.rebuild_rows();
             cx.notify();
-            println!("DEBUG_HOME_CHIPS rendered=true browse_rows=true");
+            println!("DEBUG_HOME_CHIPS rendered=true narrow_error_dismissed=true");
         })
         .unwrap();
     wait_for_presented_frame(window, cx).await;
@@ -1410,7 +1447,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 keyboard_survives_replacement_and_scrolls_lists(window, cx).await;
                 library_sort_and_compact_layouts(window, cx).await;
                 inline_links_follow_row_order(window, cx).await;
-                home_chips_and_browse_rows(window, cx).await;
+                home_chips_and_narrow_error(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })

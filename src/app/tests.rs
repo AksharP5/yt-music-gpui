@@ -13,6 +13,25 @@ use gpui::{ListOffset, px};
 use std::collections::HashMap;
 
 #[test]
+fn errors_show_a_short_summary_with_the_diagnostic_left_intact() {
+    let detail = "Could not load Home: error sending request for url (https://music.youtube.com/youtubei/v1/browse): client error (Connect): dns error: failed to lookup address information";
+    assert_eq!(
+        super::pages::error_summary(detail),
+        "Could not connect to YouTube Music. Check your connection and try again."
+    );
+    assert_eq!(
+        super::pages::error_summary("Could not save your music: disk full"),
+        "Could not save your music"
+    );
+    assert!(
+        super::pages::error_summary(&"long diagnostic ".repeat(100))
+            .chars()
+            .count()
+            <= 161
+    );
+}
+
+#[test]
 fn collection_layout_preserves_scroll_when_the_header_moves_between_columns() {
     let mut details = DetailList::new();
     details.reset_rows(100);

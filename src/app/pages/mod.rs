@@ -10,6 +10,48 @@ pub(in crate::app) mod shelves;
 
 use super::*;
 
+pub(super) fn error_summary(error: &str) -> String {
+    if [
+        "error sending request",
+        "dns error",
+        "Connection refused",
+        "operation timed out",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|cause| error.contains(cause))
+    {
+        return "Could not connect to YouTube Music. Check your connection and try again.".into();
+    }
+    let message = error.lines().next().unwrap_or("Could not load music");
+    let message = message.split(": ").next().unwrap_or(message);
+    let mut summary: String = message.chars().take(160).collect();
+    if message.chars().count() > 160 {
+        summary.push('…');
+    }
+    summary
+}
+
+struct ErrorDetails {
+    text: SharedString,
+    theme: Theme,
+}
+
+impl Render for ErrorDetails {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .p(px(12.))
+            .max_w(px(480.))
+            .max_h(px(280.))
+            .overflow_hidden()
+            .bg(self.theme.raised)
+            .text_color(self.theme.text)
+            .text_size(px(12.))
+            .whitespace_normal()
+            .child(self.text.clone())
+    }
+}
+
 pub(in crate::app) enum ListRow {
     Featured(usize),
     Heading(usize),
@@ -363,24 +405,42 @@ impl Music {
         if !matches!(self.overlay, Some(Overlay::SignIn))
             && let Some(error) = &self.error
         {
+            let detail = SharedString::from(error.clone());
+            let theme = self.theme;
             content = content.child(
                 div()
                     .mx(px(inset))
                     .mb(px(16.))
+                    .min_w_0()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(16.))
                     .text_color(rgb(0xf1a6ae))
                     .text_size(px(14.))
-                    .child(div().flex_1().child(error.clone()))
                     .child(
-                        button("dismiss-error", "close", self.theme).on_click(cx.listener(
-                            |view, _, _, cx| {
+                        div()
+                            .id("error-message")
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(error_summary(error))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| ErrorDetails {
+                                    text: detail.clone(),
+                                    theme,
+                                })
+                                .into()
+                            }),
+                    )
+                    .child(
+                        button("dismiss-error", "close", self.theme)
+                            .flex_shrink_0()
+                            .on_click(cx.listener(|view, _, _, cx| {
                                 view.error = None;
                                 view.sync.page_error = None;
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     ),
             );
         }
