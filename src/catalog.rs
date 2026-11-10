@@ -938,6 +938,7 @@ fn banner_thumbnail(value: &Value) -> Option<String> {
     if parsed.query().is_some() {
         return Some(url.to_owned());
     }
+    // Keep the web's 2.4:1 crop (it asks for w1080-h450) at sharper pixels.
     let parameters = parameters
         .split('-')
         .map(|part| match part.as_bytes().split_first() {
@@ -945,7 +946,7 @@ fn banner_thumbnail(value: &Value) -> Option<String> {
                 "w1920"
             }
             Some((b'h', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
-                "h1080"
+                "h800"
             }
             Some((b's', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
                 "s1920"
@@ -2380,12 +2381,12 @@ mod tests {
         );
         assert_eq!(
             banner_thumbnail(&value).as_deref(),
-            Some("https://lh3.googleusercontent.com/banner=w1920-h1080-l90-rj")
+            Some("https://lh3.googleusercontent.com/banner=w1920-h800-l90-rj")
         );
         let page = parse_page(&json!({"header":{"musicImmersiveHeaderRenderer":{"title":{"simpleText":"Artist"},"thumbnail":value}},"contents":[]}), "Artist").unwrap();
         assert_eq!(
             page.header.unwrap().thumbnail.as_deref(),
-            Some("https://lh3.googleusercontent.com/banner=w1920-h1080-l90-rj")
+            Some("https://lh3.googleusercontent.com/banner=w1920-h800-l90-rj")
         );
     }
 

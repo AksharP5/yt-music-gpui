@@ -1,7 +1,7 @@
 //! Artist hero background, heading, and artist actions.
 
 use super::super::*;
-use super::Tier;
+use super::{PageLayout, Tier};
 use crate::catalog::CollectionDetails;
 
 impl Music {
@@ -12,15 +12,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let header = self.page.header.clone().expect("artist page header");
-        let layout = self.page_layout(window);
-        // The web's immersive header pads its title down by window tier.
-        let top = match layout.tier {
-            Tier::Narrow => 128.,
-            Tier::Medium => 168.,
-            Tier::Wide => 228.,
-            Tier::Large => 288.,
-            Tier::Huge => 368.,
-        };
+        let (_, top) = hero_lines(self.page_layout(window).tier);
         let Route::Browse(link) = &self.route else {
             unreachable!("artist pages are browse routes");
         };
@@ -149,8 +141,9 @@ impl Music {
             .flex()
             .flex_col()
             .child(
+                // Unlike Home and album pages, the web keeps this title at 28px.
                 div()
-                    .text_size(px(layout.heading_size()))
+                    .text_size(px(28.))
                     .line_height(relative(1.2))
                     .font_weight(FontWeight::BOLD)
                     .child(self.page.title.clone()),
@@ -211,12 +204,19 @@ impl Music {
         !self.player_open && (self.route.is_artist() || self.wash_url().is_some())
     }
 
-    /// The artist hero or collection wash behind the header and page top.
-    pub(in crate::app) fn page_background(&mut self, compact: bool, height: f32) -> Option<Div> {
+    /// The artist hero or collection wash behind the header and page top. Both
+    /// scroll away with the page, as on the web.
+    pub(in crate::app) fn page_background(
+        &mut self,
+        compact: bool,
+        width: f32,
+        height: f32,
+    ) -> Option<Div> {
         if self.player_open {
             return None;
         }
         let left = if compact { 72. } else { 240. };
+        let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
         if let Some(url) = self.wash_url() {
             let image = self.artwork.get_wash(&url)?;
             // The web blurs the art over the top 49vh and fades it out by 50vh.
@@ -242,27 +242,64 @@ impl Music {
                     ))),
             );
         }
-        let artist_top = self.detail_list.state.logical_scroll_top();
-        if !self.route.is_artist() || artist_top.item_ix != 0 {
+        if !self.route.is_artist() {
+            return None;
+        }
+        // The hero spans the header and the artist heading in list row 0.
+        let hero = 64. + f32::from(self.detail_list.state.bounds_for_item(0)?.size.height);
+        if scrolled <= -hero {
             return None;
         }
         let url = self.page.header.as_ref()?.thumbnail.clone()?;
         let image = self.artwork.get_hero(&url)?;
-        let offset = -artist_top.offset_in_item;
+        // The web lays the photo window-wide from 72px left of the content,
+        // keeps its top edge, dims it by 40%, and fades it out behind the heading.
+        let size = image.size(0);
+        let natural = width * size.height.0 as f32 / size.width.0.max(1) as f32;
+        let (fade, _) = hero_lines(PageLayout::new(width, width - left).tier);
         Some(
             div()
                 .absolute()
                 .left(px(left))
                 .right_0()
-                .top(offset)
-                .h(px(564.))
+                .top(px(scrolled))
+                .h(px(hero))
                 .overflow_hidden()
-                .child(img(image).size_full().object_fit(ObjectFit::Cover))
-                .child(div().absolute().inset_0().bg(linear_gradient(
-                    180.,
-                    linear_color_stop(rgba(0x03030388), 0.),
-                    linear_color_stop(self.theme.bg, 1.),
-                ))),
+                .child(
+                    img(image)
+                        .absolute()
+                        .top_0()
+                        .left(px(-72.))
+                        .w(px(width))
+                        .h(px(natural.max(hero)))
+                        .object_fit(ObjectFit::Cover),
+                )
+                .child(div().absolute().inset_0().bg(rgba(0x00000066)))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(fade))
+                        .bottom_0()
+                        .bg(linear_gradient(
+                            180.,
+                            linear_color_stop(rgba(0x03030300), 0.),
+                            linear_color_stop(self.theme.bg, 0.91),
+                        )),
+                ),
         )
+    }
+}
+
+/// Where the web's artist photo starts fading, from the window top, and how
+/// far its title sits below the header, by window tier.
+fn hero_lines(tier: Tier) -> (f32, f32) {
+    match tier {
+        Tier::Narrow => (128., 102.),
+        Tier::Medium => (168., 152.),
+        Tier::Wide => (228., 228.),
+        Tier::Large => (288., 303.),
+        Tier::Huge => (368., 405.),
     }
 }

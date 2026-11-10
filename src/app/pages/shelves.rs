@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::PageLayout;
+use super::Tier;
 
 impl Music {
     pub(in crate::app) fn navigation(
@@ -70,7 +71,21 @@ impl Music {
         let scroll = self.shelf_scroll.entry(index).or_default().clone();
         let range = visible_cards(count, (-scroll.offset().x).into(), available, width + gap);
         let stride = width + gap;
-        let heading_size = page.heading_size();
+        // The web scales shelf titles with the window on Home, Explore and
+        // album pages; artist titles stay small and playlists stop at 28px.
+        let heading_size = match &self.route {
+            route if route.is_artist() => {
+                if page.tier >= Tier::Wide {
+                    24.
+                } else {
+                    20.
+                }
+            }
+            Route::Browse(link) if self.page.header.is_some() && !link.id.starts_with("MPRE") => {
+                page.heading_size().min(28.)
+            }
+            _ => page.heading_size(),
+        };
         let columns = range
             .clone()
             .map(|column| {
