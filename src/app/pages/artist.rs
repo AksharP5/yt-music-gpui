@@ -204,8 +204,8 @@ impl Music {
         !self.player_open && (self.route.is_artist() || self.wash_url().is_some())
     }
 
-    /// The artist hero or collection wash behind the header and page top. Both
-    /// scroll away with the page, as on the web.
+    /// Backgrounds behind the page and transparent guide/header. Artist and
+    /// collection artwork scrolls away with the page.
     pub(in crate::app) fn page_background(
         &mut self,
         compact: bool,
@@ -216,6 +216,21 @@ impl Music {
     ) -> Option<Div> {
         if self.player_open {
             return None;
+        }
+        if self.route.is_home() {
+            return Some(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(64.))
+                    .bottom_0()
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(rgb(0x14252c), 0.),
+                        linear_color_stop(self.theme.bg, 0.65),
+                    )),
+            );
         }
         let left = if compact { 72. } else { 240. };
         let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
@@ -294,15 +309,15 @@ impl Music {
         if scrolled <= -hero {
             return None;
         }
-        // The web lays the photo window-wide from 72px left of the content,
-        // keeps its top edge, dims it by 40%, and fades it out behind the heading.
+        // The mini guide shares the hero; the expanded guide covers its left edge.
+        // Keep the photo's position while revealing it behind the mini guide.
         let size = image.size(0);
         let natural = width * size.height.0 as f32 / size.width.0.max(1) as f32;
         let (fade, _) = hero_lines(PageLayout::new(width, width - left).tier);
         Some(
             div()
                 .absolute()
-                .left(px(left))
+                .left(px(if compact { 0. } else { left }))
                 .right_0()
                 .top(px(scrolled))
                 .h(px(hero))
@@ -311,7 +326,7 @@ impl Music {
                     img(image)
                         .absolute()
                         .top_0()
-                        .left(px(-72.))
+                        .left(px(if compact { 0. } else { -72. }))
                         .w(px(width))
                         .h(px(natural.max(hero)))
                         .object_fit(ObjectFit::Cover),

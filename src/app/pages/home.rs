@@ -124,7 +124,7 @@ impl Music {
             .into_any_element()
     }
 
-    pub(in crate::app) fn home_content(&mut self, mut content: Div, cx: &mut Context<Self>) -> Div {
+    pub(in crate::app) fn home_content(&mut self, content: Div, cx: &mut Context<Self>) -> Div {
         let count = self.page.shelves.len() + 1;
         let state = &self.detail_list.state;
         match state.item_count().cmp(&count) {
@@ -134,13 +134,6 @@ impl Music {
             ),
             std::cmp::Ordering::Greater => state.reset(count),
             std::cmp::Ordering::Equal => {}
-        }
-        if self.route.is_home() {
-            content = content.bg(linear_gradient(
-                180.,
-                linear_color_stop(rgb(0x14252c), 0.),
-                linear_color_stop(self.theme.bg, 0.65),
-            ));
         }
         content.child(
             list(

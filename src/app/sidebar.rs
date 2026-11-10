@@ -45,18 +45,33 @@ impl Music {
     }
 
     pub(in crate::app) fn sidebar(&self, compact: bool, cx: &Context<Self>) -> impl IntoElement {
+        let width = if compact { 72. } else { 240. };
+        let scrolled = self.page_scrolled();
         let mut sidebar = div()
             .id("sidebar")
-            .w(px(if compact { 72. } else { 240. }))
+            .relative()
+            .w(px(width))
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
             .px(px(if compact { 4. } else { 8. }))
             .pt(px(8.))
-            .border_r_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.bg)
+            .when(!compact, |sidebar| {
+                sidebar.border_r_1().border_color(self.theme.border)
+            })
+            .when(!compact || scrolled, |sidebar| sidebar.bg(self.theme.bg))
+            .when(scrolled, |sidebar| {
+                sidebar.child(
+                    div()
+                        .absolute()
+                        .left(px(width))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(1.))
+                        .bg(self.theme.bg.blend(gpui::white().opacity(0.1))),
+                )
+            })
             .child(self.nav(
                 "home-nav",
                 ("home-outlined", "home-filled"),
