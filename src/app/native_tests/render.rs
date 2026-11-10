@@ -584,6 +584,71 @@ async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut 
     );
 }
 
+async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::{CatalogRequests, Route};
+    use crate::catalog::{BrowseLink, Item};
+    let links = [
+        BrowseLink::new("UCfirst", "First artist"),
+        BrowseLink::new("UCsecond", "Second artist"),
+        BrowseLink::new("MPREalbum", "Album"),
+    ];
+    for reverse in [false, true] {
+        for (index, expected) in links.iter().enumerate() {
+            let queue = window.update(cx, |music, window, cx| {
+                music.account = None;
+                music.library.saved.clear();
+                music.player_open = false;
+                music.overlay = None;
+                music.back.clear();
+                music.catalog_requests = CatalogRequests::new();
+                music.route = Route::Browse(BrowseLink::new("VLkeyboard", "Keyboard playlist"));
+                music.page = crate::app::sync::tests::page(2, false);
+                music.page.header = crate::catalog::parse_page(&serde_json::json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Keyboard playlist"}}},"contents":[]}), "Keyboard playlist").unwrap().header;
+                for item in &mut music.page.shelves[0].items {
+                    let Item::Track(track) = item else { unreachable!() };
+                    track.artist = "First artist & Second artist".into();
+                    track.album = Some("Album".into());
+                    track.details.links = links.to_vec();
+                }
+                music.error = None;
+                music.notice = None;
+                music.rebuild_rows();
+                music.detail_list = crate::app::DetailList::new();
+                music.detail_list.reset_rows(music.list_rows.len());
+                window.resize(size(px(850.), px(560.)));
+                window.focus(&music.focus, cx);
+                cx.notify();
+                (music.library.queue.current().unwrap().id.clone(), music.active_id)
+            }).unwrap();
+            wait_for_presented_frame(window, cx).await;
+            // Four header controls, three sidebar controls, three playlist
+            // actions, then the row, its two artists, its album and row actions.
+            for _ in 0..if reverse { 14 } else { 12 + index } {
+                key(window, cx, "tab").await;
+            }
+            if reverse {
+                for _ in index..2 {
+                    key(window, cx, "shift-tab").await;
+                }
+            }
+            if !reverse {
+                window
+                    .update(cx, |_, window, _| {
+                        capture(window, &format!("inline-link-{index}"));
+                    })
+                    .unwrap();
+            }
+            key(window, cx, "enter").await;
+            window.update(cx, |music, _, _| {
+                assert!(music.route == Route::Browse(expected.clone()), "Enter must open the inline link in text order, reverse={reverse} index={index}");
+                assert_eq!((music.library.queue.current().unwrap().id.clone(), music.active_id), queue, "Activating an inline link must not play its row");
+                assert!(music.overlay.is_none(), "Inline activation must not open the row menu");
+            }).unwrap();
+        }
+    }
+    println!("INLINE_LINKS forward=passed reverse=passed enter=passed row_playback=unchanged");
+}
+
 pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let id = match HasWindowHandle::window_handle(window).unwrap().as_raw() {
         RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
@@ -1288,6 +1353,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     .unwrap();
                 keyboard_survives_replacement_and_scrolls_lists(window, cx).await;
                 library_sort_and_compact_layouts(window, cx).await;
+                inline_links_follow_row_order(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })

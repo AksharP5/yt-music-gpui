@@ -112,6 +112,7 @@ impl Music {
                     return span.into_any_element();
                 };
                 span.id(SharedString::from(format!("text-link-{}-{index}", link.id)))
+                    .keyboard_control(self.theme)
                     .cursor_pointer()
                     .hover(|style| style.underline())
                     .on_click(cx.listener(move |view, _, window, cx| {
