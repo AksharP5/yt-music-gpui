@@ -135,6 +135,19 @@ impl Music {
                         view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
                     })),
             );
+        } else if matches!(&item, Item::Track(_)) {
+            art = art.child(
+                div()
+                    .invisible()
+                    .group_hover("music-card", |style| style.visible())
+                    .absolute()
+                    .inset_0()
+                    .bg(rgba(0x00000044))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("play", 48., self.theme.text)),
+            );
         }
         div()
             .id(("card", id))
@@ -352,7 +365,6 @@ impl Music {
                         div()
                             .truncate()
                             .text_size(px(if collection { 14. } else { 16. }))
-                            .when(active, |d| d.text_color(self.theme.accent))
                             .child(title),
                     )
                     .when(
