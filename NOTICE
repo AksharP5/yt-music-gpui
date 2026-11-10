@@ -10,11 +10,30 @@ assets/fonts/Roboto.ttf is Roboto, Copyright 2011 The Roboto Project Authors.
 Licensed under the SIL Open Font License 1.1, included in assets/fonts/OFL.txt.
 Source: https://github.com/google/fonts/tree/main/ofl/roboto
 
-The YouTube Music wordmark and symbol are from
+The YouTube Music wordmark and symbol in assets/icons/brand.svg and
+assets/icons/wordmark.svg are from
 https://music.youtube.com/img/on_platform_logo_dark.svg.
 YouTube and YouTube Music are trademarks of Google LLC.
 
-The radio, album, playlist-add, play-next, link, description, logout and
-switch-account icons are from
-Google Material Design Icons, licensed under Apache-2.0 (LICENSE-APACHE).
+Icons in assets/icons from Google Material Icons, Copyright Google LLC,
+licensed under Apache License 2.0 (LICENSE-APACHE).
 Source: https://github.com/google/material-design-icons
+  Unmodified: album, description, link, logout, playlist-add, radio,
+  switch-account, and play-next (Material "playlist_play").
+  Adapted: menu, person, thumb-up and thumb-up-filled (Material "thumb_up"),
+  and thumb-down (thumb-up rotated).
+
+Icons in assets/icons adapted from Feather, Copyright 2013-2023 Cole Bemis,
+licensed under the MIT License (LICENSE-FEATHER).
+Source: https://github.com/feathericons/feather
+  heart and heart-filled ("heart"), music, fullscreen ("maximize"),
+  exit-fullscreen ("minimize"), next ("skip-forward"), previous
+  ("skip-back"), home, help ("help-circle"), more ("more-vertical"),
+  mute ("volume-x") and volume ("volume-2").
+
+assets/icons/repeat.svg is adapted from Lucide's "repeat", Copyright Lucide
+Icons and Contributors, licensed under the ISC License (LICENSE-LUCIDE).
+Source: https://github.com/lucide-icons/lucide
+
+The remaining icons in assets/icons were drawn for this project and are
+covered by its MIT license (LICENSE).
