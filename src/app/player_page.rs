@@ -25,6 +25,8 @@ impl PlayerTab {
 /// Tab details for the browse ID YouTube Music issued with the current song.
 struct Details {
     id: String,
+    /// The account session the request was made with; another account must not reuse it.
+    session: Option<Arc<Session>>,
     request: u64,
     result: Option<Result<SongText, String>>,
 }
@@ -57,6 +59,10 @@ impl PlayerPage {
             }
         })
         .detach();
+        Self::new(worker)
+    }
+
+    fn new(worker: song_text::Worker) -> Self {
         Self {
             tab: PlayerTab::UpNext,
             worker,
@@ -70,6 +76,39 @@ impl PlayerPage {
             hovered_row: None,
             video_bounds: Rc::new(Cell::new(None)),
         }
+    }
+
+    /// Store a finished request when it is still wanted by `session`'s account, returning
+    /// whether YouTube Music rejected that session.
+    fn complete(
+        &mut self,
+        event: song_text::Event,
+        session: Option<&Arc<Session>>,
+    ) -> Option<bool> {
+        let slot = [&mut self.lyrics, &mut self.related]
+            .into_iter()
+            .flatten()
+            .find(|slot| slot.request == event.id && slot.result.is_none())?;
+        if !same_session(slot.session.as_ref(), session) {
+            return None;
+        }
+        if let Ok(SongText::Related(related)) = &event.result {
+            self.related_scroll = related
+                .shelves
+                .iter()
+                .map(|_| ScrollHandle::new())
+                .collect();
+        }
+        slot.result = Some(event.result);
+        Some(event.session_rejected)
+    }
+
+    /// Drop Lyrics and Related loaded or loading for an account that is no longer current.
+    pub(in crate::app) fn reset_account(&mut self) {
+        self.worker.cancel();
+        self.lyrics = None;
+        self.related = None;
+        self.related_scroll.clear();
     }
 
     fn details(&mut self, tab: PlayerTab) -> Option<&mut Option<Details>> {
@@ -164,10 +203,13 @@ impl Music {
         let Some(id) = self.tab_source(tab) else {
             return;
         };
+        let session = self.account.as_ref().map(|account| account.session.clone());
         let latest = self.player_page.latest_request;
         let current = self.player_page.details(tab).and_then(|slot| slot.as_ref());
         if current.is_some_and(|loaded| {
-            loaded.id == id && (loaded.result.is_some() || loaded.request == latest)
+            loaded.id == id
+                && same_session(loaded.session.as_ref(), session.as_ref())
+                && (loaded.result.is_some() || loaded.request == latest)
         }) {
             return;
         }
@@ -176,18 +218,19 @@ impl Music {
             PlayerTab::Related => TextQuery::Related(id.clone()),
             PlayerTab::UpNext => return,
         };
-        let session = self.account.as_ref().map(|account| account.session.clone());
-        let details = match self.player_page.worker.load(query, session) {
+        let details = match self.player_page.worker.load(query, session.clone()) {
             Ok(request) => {
                 self.player_page.latest_request = request;
                 Details {
                     id,
+                    session,
                     request,
                     result: None,
                 }
             }
             Err(error) => Details {
                 id,
+                session,
                 request: 0,
                 result: Some(Err(format!("{error:#}"))),
             },
@@ -198,25 +241,13 @@ impl Music {
     }
 
     fn player_details_loaded(&mut self, event: song_text::Event, cx: &mut Context<Self>) {
-        if event.session_rejected {
-            self.refresh_session(false, cx);
-        }
-        let page = &mut self.player_page;
-        let Some(slot) = [&mut page.lyrics, &mut page.related]
-            .into_iter()
-            .flatten()
-            .find(|slot| slot.request == event.id)
-        else {
+        let session = self.account.as_ref().map(|account| &account.session);
+        let Some(rejected) = self.player_page.complete(event, session) else {
             return;
         };
-        if let Ok(SongText::Related(related)) = &event.result {
-            page.related_scroll = related
-                .shelves
-                .iter()
-                .map(|_| ScrollHandle::new())
-                .collect();
+        if rejected {
+            self.refresh_session(false, cx);
         }
-        slot.result = Some(event.result);
         cx.notify();
     }
 
@@ -780,6 +811,14 @@ impl Music {
     }
 }
 
+fn same_session(a: Option<&Arc<Session>>, b: Option<&Arc<Session>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn related_message(text: String, theme: Theme) -> AnyElement {
     div()
         .pt(px(24.))
@@ -830,7 +869,64 @@ fn paint_around(
 
 #[cfg(test)]
 mod tests {
-    use super::large_artwork;
+    use super::{Details, PlayerPage, large_artwork};
+    use crate::{
+        auth::Session,
+        song_text::{self, Content, Lyrics},
+    };
+    use std::sync::Arc;
+
+    fn session(identity: &str) -> Arc<Session> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "cookie":"synthetic", "playback_cookie":"synthetic", "authuser":"0",
+                "data_sync_id":identity, "client_version":"synthetic"
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn rejected_lyrics(id: u64) -> song_text::Event {
+        song_text::Event {
+            id,
+            result: Ok(Content::Lyrics(Lyrics {
+                text: "Another account's lyrics".into(),
+                source: None,
+            })),
+            session_rejected: true,
+        }
+    }
+
+    #[test]
+    fn tab_details_from_a_previous_account_are_dropped_without_renewing_the_new_one() {
+        let (worker, _events) = song_text::Worker::start();
+        let mut page = PlayerPage::new(worker);
+        let first = session("first-account");
+        let pending = || Details {
+            id: "MPLYsong".into(),
+            session: Some(first.clone()),
+            request: 7,
+            result: None,
+        };
+
+        // Renewed or switched session: the old request finishes after the change.
+        page.lyrics = Some(pending());
+        assert_eq!(
+            page.complete(rejected_lyrics(7), Some(&session("second-account"))),
+            None
+        );
+        assert!(page.lyrics.as_ref().unwrap().result.is_none());
+
+        // Account replaced: the hook clears the request, so its completion matches nothing.
+        page.reset_account();
+        assert_eq!(page.complete(rejected_lyrics(7), Some(&first)), None);
+        assert!(page.lyrics.is_none());
+
+        // The same account still receives its own result and rejection.
+        page.lyrics = Some(pending());
+        assert_eq!(page.complete(rejected_lyrics(7), Some(&first)), Some(true));
+        assert!(page.lyrics.as_ref().unwrap().result.is_some());
+    }
 
     #[test]
     fn player_page_artwork_requests_a_large_cover_only_from_resizable_hosts() {

@@ -66,6 +66,7 @@ impl Music {
         self.track_state_id = None;
         self.history_track = None;
         self.song_text.cancel();
+        self.player_page.reset_account();
         self.pending_mutations.clear();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
         self.watch_pending = None;
@@ -808,6 +809,7 @@ impl Music {
                                             view.track_state.cancel();
                                             view.track_state_id = None;
                                             view.song_text.cancel();
+                                            view.player_page.reset_account();
                                             view.now_playing = None;
                                             view.media_pair = None;
                                             for (id, rating) in std::mem::take(&mut view.sync.optimistic_ratings) { view.set_rating(&id, rating); }
