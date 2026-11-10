@@ -111,12 +111,12 @@ impl Music {
                 if !self.set_volume(volume, cx) {
                     return;
                 }
-                self.save();
+                self.save_preferences();
             }
             mpris::Event::Rate(speed) => self.player_command(|player| player.set_speed(speed)),
             mpris::Event::LoopStatus(repeat) => {
                 self.library.repeat = repeat;
-                self.save();
+                self.save_preferences();
             }
             mpris::Event::Error(error) => self.error = Some(error),
         }

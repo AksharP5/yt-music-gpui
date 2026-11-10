@@ -32,6 +32,12 @@ impl Music {
         }
     }
 
+    pub(in crate::app) fn save_preferences(&mut self) {
+        if let Some(store) = &self.store {
+            store.save_preferences(&self.library);
+        }
+    }
+
     pub(in crate::app) fn is_liked(&self, track: &Track) -> bool {
         if self.account.is_some() {
             self.ratings

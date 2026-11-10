@@ -373,6 +373,44 @@ impl Music {
         self.play_current_at(seconds as f64, false, WatchMode::Details, cx);
     }
 
+    /// Lets the player resolve the natural successor ahead of time. Cheap to call on
+    /// every render: the player ignores an unchanged candidate.
+    pub(in crate::app) fn prepare_upcoming(&mut self) {
+        let queue = &self.library.queue;
+        let next = (self.active_id.is_some() && self.playback != Playback::Stopped)
+            .then(|| {
+                let index = queue.index?;
+                if self.library.repeat == Repeat::One {
+                    return queue.current();
+                }
+                queue.tracks.get(index + 1).or_else(|| {
+                    if queue.incomplete {
+                        return None;
+                    }
+                    if self.library.repeat == Repeat::All {
+                        return queue.tracks.first();
+                    }
+                    self.library
+                        .music_autoplay()
+                        .then(|| self.autoplay_tracks.front())
+                        .flatten()
+                })
+            })
+            .flatten();
+        if let Some(player) = &self.player
+            && let Err(error) = player.prepare_next(
+                next.map(|track| track.id.as_str()),
+                PlayOptions {
+                    quality: self.library.quality,
+                    video: self.library.video.then_some(self.library.video_quality),
+                    ..Default::default()
+                },
+            )
+        {
+            self.error = Some(error.to_string());
+        }
+    }
+
     pub(in crate::app) fn set_audio_quality(
         &mut self,
         quality: AudioQuality,
@@ -390,7 +428,7 @@ impl Music {
                 self.error = Some(error.to_string());
             }
         }
-        self.save();
+        self.save_preferences();
         cx.notify();
     }
 
@@ -470,7 +508,7 @@ impl Music {
                 self.error = Some(error.to_string());
             }
         }
-        self.save();
+        self.save_preferences();
         cx.notify();
     }
 
@@ -644,6 +682,7 @@ impl Music {
                 changed = self.seekable != seekable;
                 self.seekable = seekable;
             }
+            PlayerEvent::Notice(message) => self.notice = Some(message),
             PlayerEvent::VideoChanged => {}
             PlayerEvent::VideoError { message } => {
                 if self
@@ -664,7 +703,7 @@ impl Music {
                 changed = self.library.speed != speed;
                 self.library.speed = speed;
                 if changed {
-                    self.save();
+                    self.save_preferences();
                 }
             }
             PlayerEvent::Error {

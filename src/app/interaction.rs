@@ -40,7 +40,7 @@ impl Music {
                     self.seek_current(seconds, cx);
                 }
             }
-            Some(Drag::Volume) => self.save(),
+            Some(Drag::Volume) => self.save_preferences(),
             Some(Drag::Queue) => self.drop_queue_row(cx),
             None => return,
         }
@@ -124,12 +124,12 @@ impl Music {
             }
             "up" => {
                 if self.set_volume(self.library.volume + 5., cx) {
-                    self.save();
+                    self.save_preferences();
                 }
             }
             "down" => {
                 if self.set_volume(self.library.volume - 5., cx) {
-                    self.save();
+                    self.save_preferences();
                 }
             }
             "l" => {

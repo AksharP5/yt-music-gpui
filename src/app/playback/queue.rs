@@ -505,7 +505,7 @@ impl Music {
             }
             self.reset_radio();
         }
-        self.save();
+        self.save_preferences();
         cx.notify();
     }
 

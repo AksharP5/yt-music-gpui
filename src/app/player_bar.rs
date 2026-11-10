@@ -48,6 +48,16 @@ fn control(
 }
 
 impl Music {
+    pub(in crate::app) fn shuffle_queue(&mut self, cx: &mut Context<Self>) {
+        let session = self.account.as_ref().map(|account| &account.session);
+        match self.queue_source.shuffle(&mut self.library.queue, session) {
+            Ok(()) => self.notice = Some("Upcoming songs shuffled".into()),
+            Err(error) => self.error = Some(error),
+        }
+        self.save();
+        cx.notify();
+    }
+
     pub(in crate::app) fn player_bar(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let compact = width < 1120.;
         let theme = self.theme;
@@ -314,14 +324,14 @@ impl Music {
                                                 if view.library.volume > 0. { 0. } else { 60. },
                                                 cx,
                                             );
-                                            view.save();
+                                            view.save_preferences();
                                         },
                                     )),
                             )
                             .child(
                                 control("repeat", "repeat", theme, cx, |view, _, cx| {
                                     view.library.repeat = view.library.repeat.next();
-                                    view.save();
+                                    view.save_preferences();
                                     cx.notify();
                                 })
                                 .opacity(if repeat == Repeat::Off { 0.6 } else { 1. })
@@ -340,11 +350,7 @@ impl Music {
                                 ),
                             )
                             .child(control("shuffle", "shuffle", theme, cx, |view, _, cx| {
-                                view.library.queue.shuffle_upcoming();
-                                view.notice = Some("Upcoming songs shuffled".into());
-                                view.prefetch_queue(cx);
-                                view.save();
-                                cx.notify();
+                                view.shuffle_queue(cx)
                             }))
                             .child(
                                 control(

@@ -323,7 +323,7 @@ impl Music {
                                     let speed = PlaybackSpeed::ALL[index];
                                     view.library.speed = speed;
                                     view.player_command(|player| player.set_speed(speed));
-                                    view.save();
+                                    view.save_preferences();
                                     cx.notify();
                                 }
                                 SettingMenu::AudioQuality => {
