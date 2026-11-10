@@ -196,6 +196,7 @@ impl Music {
             actions = actions.child(
                 div()
                     .id("page-chapters")
+                    .keyboard_control(self.theme)
                     .px(px(12.))
                     .py(px(10.))
                     .cursor_pointer()

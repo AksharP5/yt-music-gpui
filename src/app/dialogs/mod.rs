@@ -351,11 +351,31 @@ impl Music {
             .children(glyph.map(|glyph| div().mx(px(8.)).child(icon(glyph, 18., self.theme.text))))
             .child(div().mx(px(8.)).flex_1().min_w_0().child(label.into()))
             .on_click(cx.listener(move |view, _, window, cx| {
+                let previous = view.overlay.as_ref().map(std::mem::discriminant);
                 action(view, window, cx);
-                if view.overlay.is_none() && view.overlay_anchor.is_some() {
-                    view.close_overlay(window, cx);
-                }
+                view.finish_menu_action(previous, window, cx);
             }))
+    }
+
+    pub(in crate::app) fn finish_menu_action(
+        &mut self,
+        previous: Option<std::mem::Discriminant<Overlay>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.is_none() {
+            self.close_overlay(window, cx);
+            window.focus(&self.focus, cx);
+            return;
+        }
+        if previous != self.overlay.as_ref().map(std::mem::discriminant)
+            && !matches!(
+                self.overlay,
+                Some(Overlay::CountryPicker(_) | Overlay::PlaylistForm { .. })
+            )
+        {
+            window.focus(&self.overlay_focus, cx);
+        }
     }
 
     pub(in crate::app) fn backdrop(&self, body: AnyElement, cx: &Context<Self>) -> AnyElement {
@@ -514,6 +534,7 @@ impl Music {
                     body = body.child(
                         div()
                             .id(("chapter", index))
+                            .keyboard_control(self.theme)
                             .py(px(12.))
                             .px(px(8.))
                             .flex()
@@ -530,8 +551,9 @@ impl Music {
                                     .child(clock(seconds as f64)),
                             )
                             .child(div().flex_1().min_w_0().child(chapter.title.clone()))
-                            .on_click(cx.listener(move |view, _, _, cx| {
+                            .on_click(cx.listener(move |view, _, window, cx| {
                                 view.play_chapter((*selected).clone(), seconds, cx);
+                                view.close_overlay(window, cx);
                             })),
                     );
                 }

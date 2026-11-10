@@ -181,6 +181,7 @@ impl Music {
     }
 
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.focus_after_navigation(cx);
         self.artwork.cancel_pending();
         self.player_open = false;
         if self.route != route {
@@ -352,6 +353,7 @@ impl Music {
     }
 
     pub(in crate::app) fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.focus_after_navigation(cx);
         if self.player_open {
             self.player_open = false;
             cx.notify();
@@ -535,6 +537,19 @@ impl Music {
         }
         self.overlay_ratings();
         cx.notify();
+    }
+}
+
+impl Music {
+    fn focus_after_navigation(&self, cx: &mut Context<Self>) {
+        let focus = self.focus.clone();
+        // The activated row or card can disappear with the old page. Restore a
+        // stable focus target so shortcuts keep reaching Music after navigation.
+        cx.defer(move |cx| {
+            for window in cx.windows() {
+                let _ = window.update(cx, |_, window, cx| window.focus(&focus, cx));
+            }
+        });
     }
 }
 

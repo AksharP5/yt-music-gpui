@@ -24,7 +24,11 @@ impl Music {
             .hover(|row| row.bg(gpui::white().opacity(0.1)))
             .child(icon(glyph, 18., self.theme.text))
             .child(label)
-            .on_click(cx.listener(move |view, _, window, cx| action(view, window, cx)))
+            .on_click(cx.listener(move |view, _, window, cx| {
+                let previous = view.overlay.as_ref().map(std::mem::discriminant);
+                action(view, window, cx);
+                view.finish_menu_action(previous, window, cx);
+            }))
     }
 
     pub(in crate::app) fn account_popup(
