@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: bin/test
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: "3.x"
+      - name: Install the reviewed yt-dlp
+        run: |
+          version=$(grep -oP '__version__ != "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          python -m pip install --quiet "yt-dlp==$version"
+      - name: Test yt-dlp contracts
+        env:
+          YT_DLP_TEST_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: >-
+          bin/test -- --ignored --exact
+          player::tests::quality_selectors_respect_audio_classes_and_video_caps
+          player::tests::embedded_extractor_binds_the_selected_account

@@ -1,0 +1,20 @@
+name: Set up build
+description: Install the system libraries and Rust toolchain the app builds against.
+runs:
+  using: composite
+  steps:
+    - name: Install system libraries
+      shell: bash
+      # build.rs links EGL, GLESv2, X11, Xext, Wayland and libmpv; GPUI needs xcb, xkbcommon,
+      # fontconfig and freetype.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}

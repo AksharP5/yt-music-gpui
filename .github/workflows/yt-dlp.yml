@@ -1,0 +1,49 @@
+# Signed-in playback only runs on the yt-dlp release pinned in src/ytdlp_account.py.
+# This checks the newest release weekly so the pin can be reviewed and bumped promptly.
+name: yt-dlp release
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  latest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: "3.x"
+      - name: Install the latest yt-dlp
+        id: yt-dlp
+        run: |
+          pinned=$(grep -oP '__version__ != "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          python -m pip install --quiet --upgrade yt-dlp
+          latest=$(python -c 'from yt_dlp.version import __version__; print(__version__)')
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          # Test the latest release as if the pin were already bumped.
+          sed -i "s/__version__ != \"$pinned\"/__version__ != \"$latest\"/" src/ytdlp_account.py
+          grep -qF "__version__ != \"$latest\"" src/ytdlp_account.py
+      - name: Test yt-dlp contracts
+        env:
+          YT_DLP_TEST_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: >-
+          bin/test -- --ignored --exact
+          player::tests::quality_selectors_respect_audio_classes_and_video_caps
+          player::tests::embedded_extractor_binds_the_selected_account
+      - name: Require the pin to match the latest release
+        if: steps.yt-dlp.outputs.latest != steps.yt-dlp.outputs.pinned
+        run: |
+          echo "::error file=src/ytdlp_account.py::yt-dlp ${{ steps.yt-dlp.outputs.latest }} is out and the contract tests above pass with it. Review the release and bump the pin from ${{ steps.yt-dlp.outputs.pinned }}."
+          exit 1
