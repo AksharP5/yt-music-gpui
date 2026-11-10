@@ -140,6 +140,10 @@ impl Render for CountryPicker {
                     .child(
                         div()
                             .id("close-country-picker")
+                            .tab_index(0)
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text))
                             .p(px(6.))
                             .cursor_pointer()
                             .child(svg().path("close").size(px(20.)).text_color(theme.muted))
@@ -177,6 +181,12 @@ impl Render for CountryPicker {
                                     let choice = &picker.choices[picker.filtered[index]];
                                     div()
                                         .id(("country", index))
+                                        .tab_index(0)
+                                        .border_1()
+                                        .border_color(gpui::transparent_black())
+                                        .focus_visible(|style| {
+                                            style.border_color(picker.theme.text)
+                                        })
                                         .w_full()
                                         .h(px(44.))
                                         .px(px(12.))

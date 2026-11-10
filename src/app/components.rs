@@ -2,6 +2,19 @@
 
 use super::*;
 
+pub(in crate::app) trait KeyboardControl:
+    StatefulInteractiveElement + Styled + Sized
+{
+    fn keyboard_control(self, theme: Theme) -> Self {
+        self.tab_index(0)
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus_visible(move |style| style.border_color(theme.text))
+    }
+}
+
+impl<T: StatefulInteractiveElement + Styled> KeyboardControl for T {}
+
 #[derive(Clone, Copy)]
 pub(in crate::app) enum ArtworkShape {
     Square,
@@ -88,6 +101,8 @@ pub(in crate::app) fn button(
         "volume" => "Mute",
         "mute" => "Unmute",
         "plus" => "Add",
+        "bookmark" => "Save to library",
+        "bookmark-filled" => "Remove from library",
         "back" => "Go back",
         "help" => "Keyboard shortcuts",
         "settings" => "Settings",
@@ -96,6 +111,7 @@ pub(in crate::app) fn button(
     };
     div()
         .id(id)
+        .keyboard_control(theme)
         .relative()
         .size(px(40.))
         .flex_shrink_0()
@@ -117,6 +133,7 @@ pub(in crate::app) fn filter_chip(
 ) -> Stateful<Div> {
     div()
         .id(id)
+        .keyboard_control(theme)
         .h(px(36.))
         .px(px(12.))
         .flex_shrink_0()
@@ -127,6 +144,13 @@ pub(in crate::app) fn filter_chip(
         .text_color(if selected { theme.bg } else { theme.text })
         .text_size(px(14.))
         .cursor_pointer()
+        .hover(move |style| {
+            style.bg(if selected {
+                theme.text
+            } else {
+                rgb(0x3f3f3f).into()
+            })
+        })
         .child(label.into())
 }
 pub(in crate::app) fn slider(

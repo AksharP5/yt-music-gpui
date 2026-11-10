@@ -77,6 +77,8 @@ impl Music {
         self.overlay_subscription = None;
         for collection in &mut self.library.saved {
             collection.details.play = None;
+            collection.details.shuffle = None;
+            collection.details.mix = None;
         }
         for track in self
             .library

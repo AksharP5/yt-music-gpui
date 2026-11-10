@@ -17,6 +17,7 @@ impl Music {
             || (route == Route::Saved && matches!(self.route, Route::Library(_)));
         div()
             .id(id)
+            .keyboard_control(self.theme)
             .h(px(if compact { 68. } else { 48. }))
             .flex_shrink_0()
             .px(px(if compact { 4. } else { 16. }))
@@ -75,6 +76,7 @@ impl Music {
             .child(
                 div()
                     .id("sidebar-new-playlist")
+                    .keyboard_control(self.theme)
                     .mx(px(12.))
                     .h(px(36.))
                     .mb(px(16.))
@@ -109,6 +111,7 @@ impl Music {
             sidebar = sidebar.child(
                 div()
                     .id(id)
+                    .keyboard_control(self.theme)
                     .h(px(56.))
                     .px(px(16.))
                     .rounded(px(8.))
@@ -141,6 +144,7 @@ impl Music {
             sidebar = sidebar.child(
                 div()
                     .id("saved-episodes-nav")
+                    .keyboard_control(self.theme)
                     .h(px(56.))
                     .px(px(16.))
                     .rounded(px(8.))
@@ -195,6 +199,7 @@ impl Music {
                             let link = BrowseLink::new(playlist.id.clone(), playlist.title.clone());
                             div()
                                 .id(("sidebar-playlist", index))
+                                .keyboard_control(view.theme)
                                 .h(px(56.))
                                 .px(px(16.))
                                 .rounded(px(8.))
@@ -242,6 +247,7 @@ impl Music {
                     .child(
                         div()
                             .id("retry-sidebar")
+                            .keyboard_control(self.theme)
                             .mt(px(8.))
                             .text_color(self.theme.text)
                             .cursor_pointer()

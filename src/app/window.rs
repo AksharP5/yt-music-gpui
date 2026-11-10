@@ -136,7 +136,17 @@ impl Render for Music {
             self.overlay
                 .as_ref()
                 .map(|kind| self.overlay(kind, window, cx))
-        };
+        }
+        .map(|overlay| {
+            div()
+                .id("overlay-focus")
+                .track_focus(&self.overlay_focus)
+                .tab_group()
+                .tab_stop(false)
+                .absolute()
+                .inset_0()
+                .child(overlay)
+        });
         div()
             .size_full()
             .relative()

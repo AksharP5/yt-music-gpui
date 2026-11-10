@@ -49,7 +49,7 @@ Podcast episodes and videos with resume information keep a local listening posit
 
 | Key | Action |
 | --- | --- |
-| Ctrl K | Search |
+| / or Ctrl K | Search |
 | Ctrl R | Refresh |
 | Alt Left | Go back |
 | Space | Play or pause |

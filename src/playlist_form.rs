@@ -145,7 +145,7 @@ impl Focusable for PlaylistForm {
 }
 
 impl Render for PlaylistForm {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let can_save = !self.title.read(cx).value().trim().is_empty();
         div()
@@ -205,18 +205,16 @@ impl Render for PlaylistForm {
                         PRIVACY_CHOICES.into_iter().enumerate().map(
                             |(index, (id, label, privacy))| {
                                 let selected = self.privacy == privacy;
-                                let focused = self.privacy_focus[index].is_focused(window);
                                 div()
                                     .id(id)
                                     .track_focus(&self.privacy_focus[index])
+                                    .focus_visible(|style| style.border_color(theme.text))
                                     .flex_1()
                                     .py(px(10.))
                                     .text_center()
                                     .rounded(px(6.))
                                     .border_1()
-                                    .border_color(if focused {
-                                        theme.text
-                                    } else if selected {
+                                    .border_color(if selected {
                                         theme.accent
                                     } else {
                                         theme.border
@@ -257,11 +255,8 @@ impl Render for PlaylistForm {
                             .py(px(10.))
                             .rounded(px(6.))
                             .border_1()
-                            .border_color(if self.cancel_focus.is_focused(window) {
-                                theme.text
-                            } else {
-                                gpui::transparent_black()
-                            })
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text))
                             .cursor_pointer()
                             .hover(|style| style.bg(theme.raised))
                             .child("Cancel")
@@ -283,11 +278,8 @@ impl Render for PlaylistForm {
                             .py(px(10.))
                             .rounded(px(6.))
                             .border_1()
-                            .border_color(if self.save_focus.is_focused(window) {
-                                theme.text
-                            } else {
-                                gpui::transparent_black()
-                            })
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text))
                             .bg(if can_save { theme.accent } else { theme.raised })
                             .text_color(if can_save { theme.bg } else { theme.muted })
                             .font_weight(FontWeight::SEMIBOLD)

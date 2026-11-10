@@ -45,6 +45,7 @@ impl Music {
             .child(
                 div()
                     .id(("setting-value", kind as usize))
+                    .keyboard_control(self.theme)
                     .relative()
                     .w(px(field_width))
                     .min_w(px(100.))
@@ -69,8 +70,9 @@ impl Music {
                     .child(icon("back", 18., self.theme.muted).with_transformation(
                         Transformation::rotate(Radians(-std::f32::consts::FRAC_PI_2)),
                     ))
-                    .on_click(cx.listener(move |view, _, _, cx| {
+                    .on_click(cx.listener(move |view, _, window, cx| {
                         view.settings_menu = Some(kind);
+                        window.focus(&view.settings_focus, cx);
                         let bounds = field_bounds.get();
                         view.overlay_anchor = Some(point(bounds.left(), bounds.bottom()));
                         cx.notify();
@@ -98,6 +100,7 @@ impl Music {
             categories = categories.child(
                 div()
                     .id(("settings-category", section as usize))
+                    .keyboard_control(self.theme)
                     .h(px(48.))
                     .px(px(24.))
                     .flex()
@@ -145,6 +148,7 @@ impl Music {
                         .child(
                             div()
                                 .id("audio-only-setting")
+                                .keyboard_control(self.theme)
                                 .w(px(36.))
                                 .h(px(24.))
                                 .flex_shrink_0()
@@ -210,6 +214,7 @@ impl Music {
                     .child(
                         div()
                             .id("music-project")
+                            .keyboard_control(self.theme)
                             .mt(px(24.))
                             .text_size(px(14.))
                             .text_color(rgb(0x3ea6ff))
@@ -296,6 +301,9 @@ impl Music {
             };
             let menu = div()
                 .id("settings-options")
+                .track_focus(&self.settings_focus)
+                .tab_group()
+                .tab_stop(false)
                 .w(px(186.))
                 .max_h(px(320.))
                 .overflow_y_scroll()
@@ -305,6 +313,7 @@ impl Music {
                 .children(choices.into_iter().enumerate().map(|(index, label)| {
                     div()
                         .id(("setting-option", index))
+                        .keyboard_control(self.theme)
                         .px(px(16.))
                         .h(px(40.))
                         .flex()
@@ -316,8 +325,9 @@ impl Music {
                         })
                         .hover(|row| row.bg(gpui::white().opacity(0.1)))
                         .child(label)
-                        .on_click(cx.listener(move |view, _, _, cx| {
+                        .on_click(cx.listener(move |view, _, window, cx| {
                             view.settings_menu = None;
+                            window.focus(&view.overlay_focus, cx);
                             match kind {
                                 SettingMenu::Speed => {
                                     let speed = PlaybackSpeed::ALL[index];
@@ -342,9 +352,10 @@ impl Music {
                     .occlude()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|view, _, _, cx| {
+                        cx.listener(|view, _, window, cx| {
                             cx.stop_propagation();
                             view.settings_menu = None;
+                            window.focus(&view.overlay_focus, cx);
                             cx.notify();
                         }),
                     )

@@ -209,12 +209,14 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
         page.shelves[0].items.insert(0, Item::Track(track));
     }
     if let Mutation::CollectionLibrary { collection, save } = mutation
-        && collection.id.starts_with("UC")
         && matches!(route, Route::Browse(link) if link.id == collection.id)
         && let Some(header) = &mut page.header
     {
-        header.subscribed = Some(*save);
-        header.subscription_label = if *save { "Subscribed" } else { "Subscribe" }.into();
+        header.collection.saved = Some(*save);
+        if collection.id.starts_with("UC") {
+            header.subscribed = Some(*save);
+            header.subscription_label = if *save { "Subscribed" } else { "Subscribe" }.into();
+        }
     }
     if let Mutation::EditPlaylist {
         id,

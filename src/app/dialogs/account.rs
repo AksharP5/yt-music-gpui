@@ -13,6 +13,7 @@ impl Music {
     ) -> impl IntoElement {
         div()
             .id(id)
+            .keyboard_control(self.theme)
             .h(px(40.))
             .px(px(16.))
             .flex()
@@ -71,6 +72,7 @@ impl Music {
                                 .child(
                                     div()
                                         .id("manage-google-account")
+                                        .keyboard_control(self.theme)
                                         .mt(px(8.))
                                         .text_size(px(14.))
                                         .text_color(rgb(0x3ea6ff))
@@ -132,6 +134,7 @@ impl Music {
                 },
             )));
         div()
+            .id("account-focus")
             .absolute()
             .inset_0()
             .occlude()
@@ -220,6 +223,7 @@ impl Music {
                         div().mt(px(24.)).flex().justify_end().child(
                             div()
                                 .id("retry-sign-in")
+                                .keyboard_control(self.theme)
                                 .px(px(16.))
                                 .h(px(36.))
                                 .flex()

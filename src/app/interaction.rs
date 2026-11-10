@@ -65,13 +65,50 @@ impl Music {
             return;
         }
         if self.overlay.is_some() && key != "escape" {
+            let menu = self.settings_menu.is_some()
+                || matches!(
+                    self.overlay,
+                    Some(Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Account)
+                );
+            if !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform
+                && (key == "tab" || (menu && matches!(key, "up" | "down" | "home" | "end")))
+            {
+                if matches!(key, "home" | "end") {
+                    window.focus(
+                        if self.settings_menu.is_some() {
+                            &self.settings_focus
+                        } else {
+                            &self.overlay_focus
+                        },
+                        cx,
+                    );
+                }
+                self.move_overlay_focus(modifiers.shift || matches!(key, "up" | "end"), window, cx);
+                cx.stop_propagation();
+            }
             return;
         }
-        if control && key == "k" {
+        if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
+            if modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if (control && key == "k")
+            || (key == "/"
+                && !modifiers.modified()
+                && !self.search.focus_handle(cx).is_focused(window))
+        {
             if self.player_open && window.is_fullscreen() {
                 self.toggle_video_fullscreen(window, cx);
             }
             window.focus(&self.search.focus_handle(cx), cx);
+            cx.stop_propagation();
             return;
         }
         if control && key == "r" {
@@ -93,6 +130,9 @@ impl Music {
             return;
         }
         if self.search.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        if key == "space" && !self.focus.is_focused(window) {
             return;
         }
         if control {
@@ -140,6 +180,7 @@ impl Music {
             "q" => self.toggle_player_page(cx),
             "escape" => {
                 if self.settings_menu.take().is_some() {
+                    window.focus(&self.overlay_focus, cx);
                     cx.notify();
                     return;
                 }

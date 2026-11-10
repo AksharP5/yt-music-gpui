@@ -24,6 +24,8 @@ impl Music {
             let art = self.art(item.thumbnail(), 48., ArtworkShape::Square);
             return div()
                 .id(("quick-pick", id))
+                .keyboard_control(self.theme)
+                .group("music-row")
                 .w(px(width))
                 .h(px(64.))
                 .flex()
@@ -43,7 +45,7 @@ impl Music {
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(16.))
+                                .text_size(px(14.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(title),
                         )
@@ -56,15 +58,21 @@ impl Music {
                         ),
                 )
                 .child(
-                    button(("quick-menu", id), "more", self.theme).on_click(cx.listener(
-                        move |view, _, window, cx| {
+                    button(("quick-menu", id), "more", self.theme)
+                        .opacity(0.)
+                        .group_hover("music-row", |style| style.opacity(1.))
+                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
+                        .on_click(cx.listener(move |view, _, window, cx| {
                             cx.stop_propagation();
-                            window.focus(&view.focus, cx);
-                            if let Some(Item::Track(track)) = view.rows.get(id) {
-                                view.open_track_menu(track.clone(), Some(id), window, cx);
-                            }
-                        },
-                    )),
+                            view.open_item_menu(id, window, cx);
+                        })),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.open_item_menu(id, window, cx);
+                    }),
                 )
                 .on_click(cx.listener(move |view, _, window, cx| {
                     window.focus(&view.focus, cx);
@@ -130,6 +138,7 @@ impl Music {
         }
         div()
             .id(("card", id))
+            .keyboard_control(self.theme)
             .group("music-card")
             .w(px(width))
             .flex_shrink_0()
@@ -137,7 +146,21 @@ impl Music {
             .flex_col()
             .gap(px(8.))
             .cursor_pointer()
-            .child(art)
+            .child(
+                art.child(
+                    button(("card-menu", id), "more", self.theme)
+                        .absolute()
+                        .right(px(4.))
+                        .top(px(4.))
+                        .opacity(0.)
+                        .group_hover("music-card", |style| style.opacity(1.))
+                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            cx.stop_propagation();
+                            view.open_item_menu(id, window, cx);
+                        })),
+                ),
+            )
             .child(
                 div()
                     .w_full()
@@ -150,9 +173,16 @@ impl Music {
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(16.))
+                    .text_size(px(14.))
                     .text_color(self.theme.muted)
                     .child(subtitle),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_item_menu(id, window, cx);
+                }),
             )
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
@@ -179,6 +209,7 @@ impl Music {
                     _ => true,
                 }
         }) && self.active_id.is_some();
+        let collection = self.page.header.is_some() && !self.route.is_artist();
         let numbered = matches!(&self.route,Route::Browse(link) if link.id.starts_with("MPRE"))
             && matches!(item, Item::Track(_));
         let art = if numbered {
@@ -221,10 +252,17 @@ impl Music {
         };
         let mut row = div()
             .id(("song", index))
+            .keyboard_control(self.theme)
             .group("music-row")
             .relative()
             .w_full()
-            .h(px(if artist || numbered { 50. } else { 64. }))
+            .h(px(if artist {
+                50.
+            } else if numbered || collection {
+                76.
+            } else {
+                64.
+            }))
             .flex()
             .items_center()
             .gap(px(if artist { 24. } else { 14. }))
@@ -232,6 +270,13 @@ impl Music {
             .when(active, |d| d.bg(self.theme.selection))
             .hover(|d| d.bg(self.theme.raised))
             .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    view.open_item_menu(index, window, cx);
+                }),
+            )
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
                 view.play_item(index, cx);
@@ -249,7 +294,7 @@ impl Music {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(16.))
+                            .text_size(px(14.))
                             .child(title),
                     )
                     .child(
@@ -306,19 +351,32 @@ impl Music {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(16.))
+                            .text_size(px(if collection { 14. } else { 16. }))
                             .when(active, |d| d.text_color(self.theme.accent))
                             .child(title),
                     )
-                    .when(!numbered, |d| {
-                        d.child(
-                            div()
-                                .truncate()
-                                .text_size(px(14.))
-                                .text_color(self.theme.muted)
-                                .child(subtitle),
-                        )
-                    })
+                    .when(
+                        !numbered
+                            || matches!(&item, Item::Track(track) if track.details.plays.is_some()),
+                        |d| {
+                            d.child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .text_color(self.theme.muted)
+                                    .child(if numbered {
+                                        match &item {
+                                            Item::Track(track) => {
+                                                track.details.plays.clone().unwrap_or_default()
+                                            }
+                                            _ => String::new(),
+                                        }
+                                    } else {
+                                        subtitle
+                                    }),
+                            )
+                        },
+                    )
                     .into_any_element()
             });
         match item {
@@ -365,8 +423,12 @@ impl Music {
                             if liked { "thumb-up-filled" } else { "thumb-up" },
                             self.theme,
                         )
-                        .when(!liked && !artist, |d| {
-                            d.invisible().group_hover("music-row", |d| d.visible())
+                        .when(!liked, |d| {
+                            d.opacity(0.)
+                                .group_hover("music-row", |d| d.opacity(1.))
+                                .focus_visible(|style| {
+                                    style.opacity(1.).border_color(self.theme.text)
+                                })
                         })
                         .on_click(cx.listener(move |view, _, _, cx| {
                             cx.stop_propagation();
@@ -375,60 +437,68 @@ impl Music {
                     )
                     .when(!artist, |d| {
                         d.child(
-                            button(("add", index), "plus", self.theme)
-                                .invisible()
-                                .group_hover("music-row", |d| d.visible())
-                                .on_click(cx.listener(move |view, _, _, cx| {
+                            button(("dislike", index), "thumb-down", self.theme)
+                                .opacity(0.)
+                                .group_hover("music-row", |d| d.opacity(1.))
+                                .focus_visible(|style| {
+                                    style.opacity(1.).border_color(self.theme.text)
+                                })
+                                .on_click(cx.listener(move |view, _, window, cx| {
                                     cx.stop_propagation();
-                                    view.enqueue(track.clone(), cx);
+                                    if view.account.is_none() {
+                                        view.connect_account(window, cx);
+                                        return;
+                                    }
+                                    let disliked = view
+                                        .ratings
+                                        .get(&track.id)
+                                        .copied()
+                                        .or(track.details.rating)
+                                        == Some(Rating::Dislike);
+                                    view.mutate(
+                                        Mutation::RateSong {
+                                            track: track.clone(),
+                                            rating: if disliked {
+                                                Rating::Indifferent
+                                            } else {
+                                                Rating::Dislike
+                                            },
+                                        },
+                                        cx,
+                                    );
                                 })),
                         )
                     })
                     .child(
                         button(("track-menu", index), "more", self.theme)
-                            .when(!artist, |d| {
-                                d.invisible().group_hover("music-row", |d| d.visible())
-                            })
+                            .opacity(0.)
+                            .group_hover("music-row", |d| d.opacity(1.))
+                            .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 view.open_track_menu(menu_track.clone(), Some(index), window, cx);
                             })),
                     );
-                row = row.child(if artist {
+                row = row.child(
                     controls
                         .absolute()
                         .right_0()
                         .top_0()
                         .h_full()
-                        .bg(self.theme.raised)
-                        .invisible()
-                        .group_hover("music-row", |d| d.visible())
-                } else {
-                    controls
-                });
+                        .group_hover("music-row", |style| style.bg(self.theme.raised)),
+                );
             }
-            Item::Collection(collection) => {
-                let saved = self.is_saved(&collection);
-                row = row
-                    .child(div().text_size(px(14.)).text_color(self.theme.muted).child(
-                        if collection.id.starts_with("UC") {
-                            "Artist"
-                        } else {
-                            "Collection"
-                        },
-                    ))
-                    .child(
-                        button(
-                            ("save", index),
-                            if saved { "heart-filled" } else { "plus" },
-                            self.theme,
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
+            Item::Collection(_) => {
+                row = row.child(
+                    button(("collection-menu", index), "more", self.theme)
+                        .opacity(0.)
+                        .group_hover("music-row", |style| style.opacity(1.))
+                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
+                        .on_click(cx.listener(move |view, _, window, cx| {
                             cx.stop_propagation();
-                            view.save_collection(collection.clone(), cx);
+                            view.open_item_menu(index, window, cx);
                         })),
-                    )
-                    .child(icon("forward", 17., self.theme.text).text_color(self.theme.muted));
+                );
             }
         }
         div().w_full().px(px(inset)).child(row).into_any_element()

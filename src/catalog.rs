@@ -321,6 +321,10 @@ impl TrackDetails {
 pub struct CollectionDetails {
     #[serde(skip)]
     pub play: Option<Arc<PlaylistTarget>>,
+    #[serde(skip)]
+    pub shuffle: Option<Arc<PlaylistTarget>>,
+    #[serde(skip)]
+    pub mix: Option<Arc<PlaylistTarget>>,
     pub playlist_id: Option<String>,
     pub saved: Option<bool>,
     #[serde(skip)]
@@ -524,6 +528,7 @@ pub enum HeaderArtist {
 
 #[derive(Clone, Debug)]
 pub struct PageHeader {
+    pub collection: CollectionDetails,
     pub thumbnail: Option<String>,
     pub artist: Option<HeaderArtist>,
     pub subtitle: String,
@@ -1353,8 +1358,11 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
     CollectionDetails {
         play: row.pointer("/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint")
             .or_else(|| row.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint"))
+            .or_else(|| find(&row["buttons"], "musicPlayButtonRenderer").and_then(|button| button.get("playNavigationEndpoint")))
             .and_then(PlaylistTarget::from_navigation)
             .map(Arc::new),
+        shuffle: collection_action(row, "MUSIC_SHUFFLE"),
+        mix: collection_action(row, "MIX"),
         playlist_id: playlist_id.map(str::to_owned),
         saved: subscribed.or_else(|| item_rating(row).map(|rating| rating == Rating::Like)),
         editable: browse_id.strip_prefix("VL").filter(|id| !id.is_empty()).is_some_and(|id| {
@@ -1368,6 +1376,19 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
                 })
         }),
     }
+}
+
+fn collection_action(row: &Value, icon: &str) -> Option<Arc<PlaylistTarget>> {
+    let menu = row
+        .pointer("/menu/menuRenderer")
+        .or_else(|| find(&row["buttons"], "menuRenderer"))?;
+    menu["items"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("menuNavigationItemRenderer"))
+        .find(|item| item.pointer("/icon/iconType").and_then(Value::as_str) == Some(icon))
+        .and_then(|item| PlaylistTarget::from_navigation(&item["navigationEndpoint"]))
+        .map(Arc::new)
 }
 
 pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> TrackDetails {
@@ -1664,6 +1685,44 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     let mut page = Page {
         title,
         header: header.map(|header| PageHeader {
+            collection: {
+                let mut details = collection_details(header, "");
+                let save_button = header["buttons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|button| button.get("toggleButtonRenderer"))
+                    .find(|button| {
+                        matches!(
+                            button
+                                .pointer("/defaultIcon/iconType")
+                                .and_then(Value::as_str),
+                            Some("BOOKMARK" | "BOOKMARK_BORDER")
+                        )
+                    });
+                details.saved = details
+                    .saved
+                    .or_else(|| save_button.and_then(|button| button["isToggled"].as_bool()));
+                details.playlist_id = details
+                    .playlist_id
+                    .or_else(|| {
+                        details
+                            .play
+                            .as_ref()
+                            .and_then(|target| target.0.playlist_id.clone())
+                    })
+                    .or_else(|| {
+                        save_button
+                            .and_then(|button| {
+                                button.pointer(
+                                    "/defaultServiceEndpoint/likeEndpoint/target/playlistId",
+                                )
+                            })
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                details
+            },
             thumbnail: if artist_header.is_some() {
                 banner_thumbnail(&header["thumbnail"])
             } else {
@@ -2337,6 +2396,64 @@ mod tests {
             track.details.plays.is_none(),
             "A mixed subtitle is not a dedicated play-count column"
         );
+    }
+
+    #[test]
+    fn collection_header_keeps_save_state_and_distinct_issued_actions() {
+        for saved in [false, true] {
+            let page = parse_page(&json!({
+                "header":{"musicResponsiveHeaderRenderer":{
+                    "title":{"simpleText":"Album"},
+                    "buttons":[
+                        {"toggleButtonRenderer":{"defaultIcon":{"iconType":"BOOKMARK_BORDER"},"isToggled":saved}},
+                        {"musicPlayButtonRenderer":{"playNavigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"OLAKalbum"}}}},
+                        {"menuRenderer":{"items":[
+                            {"menuNavigationItemRenderer":{"icon":{"iconType":"MUSIC_SHUFFLE"},"navigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"OLAKalbum","params":"shuffle%3D"}}}},
+                            {"menuNavigationItemRenderer":{"icon":{"iconType":"MIX"},"navigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"RDmix","params":"mix%3D"}}}}
+                        ]}}
+                    ]
+                }},"contents":[]
+            }), "Album").unwrap();
+            let details = page.header.unwrap().collection;
+            assert_eq!(details.saved, Some(saved));
+            assert_eq!(details.playlist_id.as_deref(), Some("OLAKalbum"));
+            assert_eq!(
+                details.play.as_ref().unwrap().request(),
+                json!({"playlistId":"OLAKalbum"})
+            );
+            assert_eq!(
+                details.shuffle.as_ref().unwrap().request(),
+                json!({"playlistId":"OLAKalbum","params":"shuffle%3D"})
+            );
+            assert_eq!(
+                details.mix.as_ref().unwrap().request(),
+                json!({"playlistId":"RDmix","params":"mix%3D"})
+            );
+            let restored: CollectionDetails =
+                serde_json::from_value(serde_json::to_value(details).unwrap()).unwrap();
+            assert!(
+                restored.play.is_none() && restored.shuffle.is_none() && restored.mix.is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn podcast_header_uses_the_save_buttons_library_id_without_a_play_button() {
+        let page = parse_page(
+            &json!({"header":{"musicResponsiveHeaderRenderer":{
+            "title":{"simpleText":"Podcast"},
+            "buttons":[{"toggleButtonRenderer":{
+                "defaultIcon":{"iconType":"BOOKMARK_BORDER"}, "isToggled":false,
+                "defaultServiceEndpoint":{"likeEndpoint":{"target":{"playlistId":"PLpodcast"}}}
+            }}]
+        }},"contents":[]}),
+            "Podcast",
+        )
+        .unwrap();
+        let details = page.header.unwrap().collection;
+        assert_eq!(details.playlist_id.as_deref(), Some("PLpodcast"));
+        assert_eq!(details.saved, Some(false));
+        assert!(details.play.is_none());
     }
 
     #[test]

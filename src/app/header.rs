@@ -57,7 +57,11 @@ impl Music {
             .flex()
             .items_center()
             .when(!self.route.is_artist() || self.player_open, |d| {
-                d.bg(self.theme.bg)
+                d.bg(if self.route.is_home() && !self.player_open {
+                    rgb(0x14252c).into()
+                } else {
+                    self.theme.bg
+                })
             })
             .child(
                 div()
@@ -78,6 +82,7 @@ impl Music {
                     .child(
                         div()
                             .id("brand-home")
+                            .keyboard_control(self.theme)
                             .flex()
                             .items_center()
                             .gap(px(4.))
@@ -103,7 +108,16 @@ impl Music {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .pl(px(if compact { 0. } else { inset }))
+                    .pl(px(if compact {
+                        0.
+                    } else {
+                        inset
+                            + if matches!(self.route, Route::Search(_)) {
+                                ((width - 240. - 1060.) / 2.).max(0.)
+                            } else {
+                                0.
+                            }
+                    }))
                     .pr(px(account_inset))
                     .flex()
                     .items_center()
@@ -133,6 +147,7 @@ impl Music {
                         header.child(
                             div()
                                 .id("account-menu")
+                                .keyboard_control(self.theme)
                                 .size(px(40.))
                                 .flex_shrink_0()
                                 .flex()
@@ -141,7 +156,8 @@ impl Music {
                                 .cursor_pointer()
                                 .child(avatar)
                                 .on_click(cx.listener(|view, _, window, cx| {
-                                    window.focus(&view.focus, cx);
+                                    view.overlay_return_focus = window.focused(cx);
+                                    window.focus(&view.overlay_focus, cx);
                                     view.overlay_anchor = Some(point(
                                         window.viewport_size().width
                                             - px(if matches!(view.route, Route::Search(_)) {
@@ -165,7 +181,8 @@ impl Music {
                                 .gap(px(8.))
                                 .child(button("guest-account-menu", "more", self.theme).on_click(
                                     cx.listener(move |view, _, window, cx| {
-                                        window.focus(&view.focus, cx);
+                                        view.overlay_return_focus = window.focused(cx);
+                                        window.focus(&view.overlay_focus, cx);
                                         view.overlay_anchor = Some(point(
                                             window.viewport_size().width - px(account_inset + 380.),
                                             px(56.),
@@ -177,6 +194,7 @@ impl Music {
                                 .child(
                                     div()
                                         .id("sign-in")
+                                        .keyboard_control(self.theme)
                                         .h(px(32.))
                                         .px(px(16.))
                                         .flex_shrink_0()

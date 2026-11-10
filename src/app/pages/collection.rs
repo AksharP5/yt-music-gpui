@@ -3,6 +3,26 @@
 use super::super::*;
 
 impl Music {
+    pub(in crate::app) fn page_collection(&self) -> Option<Collection> {
+        let Route::Browse(link) = &self.route else {
+            return None;
+        };
+        if !["MPRE", "VL", "MPSP"]
+            .iter()
+            .any(|prefix| link.id.starts_with(prefix))
+        {
+            return None;
+        }
+        let header = self.page.header.as_ref()?;
+        Some(Collection {
+            id: link.id.clone(),
+            title: self.page.title.clone(),
+            subtitle: header.subtitle.clone(),
+            thumbnail: header.thumbnail.clone(),
+            details: header.collection.clone(),
+        })
+    }
+
     pub(in crate::app) fn page_heading(
         &mut self,
         stacked: bool,
@@ -12,17 +32,20 @@ impl Music {
         let header = self.page.header.clone();
         let title = self.page.title.clone();
         let has_tracks = self.rows.iter().any(|item| matches!(item, Item::Track(_)));
+        let collection = self.page_collection();
+        let podcast = matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPSP"));
         let mut cover = None;
         let mut creator = None;
         let mut heading = div()
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(8.))
             .when(stacked, |d| d.items_center().text_center());
         if let Some(header) = header {
             creator = header.artist.map(|artist| match artist {
                 HeaderArtist::Link(link) => div()
                     .id("collection-artist")
+                    .keyboard_control(self.theme)
                     .text_size(px(14.))
                     .cursor_pointer()
                     .child(link.title.clone())
@@ -33,12 +56,18 @@ impl Music {
                 HeaderArtist::Text(text) => div().text_size(px(14.)).child(text).into_any_element(),
             });
             if let Some(url) = header.thumbnail {
-                cover = Some(self.art(Some(&url), edge, ArtworkShape::Square));
+                cover = Some(
+                    div()
+                        .rounded(px(12.))
+                        .overflow_hidden()
+                        .child(self.art(Some(&url), edge, ArtworkShape::Square))
+                        .into_any_element(),
+                );
             }
             heading = heading.child(
                 div()
                     .w_full()
-                    .text_size(px(if stacked { 24. } else { 32. }))
+                    .text_size(px(if stacked { 28. } else { 32. }))
                     .font_weight(FontWeight::BOLD)
                     .child(title),
             );
@@ -68,6 +97,7 @@ impl Music {
             heading = heading.child(
                 div()
                     .id("page-description")
+                    .keyboard_control(self.theme)
                     .w_full()
                     .text_size(px(14.))
                     .text_color(self.theme.muted)
@@ -94,23 +124,65 @@ impl Music {
             .flex_wrap()
             .gap(px(12.))
             .when(stacked, |d| d.justify_center());
-        if has_tracks {
+        if let Some(collection) = collection.as_ref() {
+            let selected = collection.clone();
+            let saved = self.is_saved(collection);
+            actions = actions.child(
+                button(
+                    "save-collection",
+                    if saved { "bookmark-filled" } else { "bookmark" },
+                    self.theme,
+                )
+                .bg(self.theme.panel)
+                .when(podcast, |button| {
+                    button.w_auto().px(px(16.)).gap(px(8.)).child(if saved {
+                        "Saved to library"
+                    } else {
+                        "Save to library"
+                    })
+                })
+                .on_click(
+                    cx.listener(move |view, _, _, cx| view.save_collection(selected.clone(), cx)),
+                ),
+            );
+        }
+        if has_tracks && !podcast {
             actions = actions.child(
                 div()
                     .id("play-all")
-                    .h(px(40.))
-                    .px(px(24.))
+                    .keyboard_control(self.theme)
+                    .size(px(64.))
                     .rounded_full()
                     .bg(self.theme.text)
                     .text_color(self.theme.bg)
                     .flex()
                     .items_center()
+                    .justify_center()
                     .gap(px(8.))
                     .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
-                    .child(icon("play", 24., self.theme.bg))
-                    .child("Play")
+                    .hover(|style| style.bg(rgb(0xe0e0e0)))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| Hint {
+                            text: "Play",
+                            theme: Theme::load(),
+                        })
+                        .into()
+                    })
+                    .child(icon("play", 32., self.theme.bg))
                     .on_click(cx.listener(|view, _, _, cx| view.replace_page_queue(0, cx))),
+            );
+        }
+        if let Some(collection) = collection {
+            actions = actions.child(
+                button("collection-header-menu", "more", self.theme)
+                    .bg(self.theme.panel)
+                    .on_click(cx.listener(move |view, event, window, cx| {
+                        view.open_collection_menu(collection.clone(), window, cx);
+                        if let ClickEvent::Keyboard(event) = event {
+                            view.overlay_anchor = Some(event.bounds.bottom_left());
+                        }
+                    })),
             );
         }
         if let [Item::Track(track)] = self.rows.as_slice()

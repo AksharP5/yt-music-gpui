@@ -10,14 +10,15 @@ impl Music {
     ) -> AnyElement {
         let header = self.page.header.clone().expect("artist page header");
         let mut actions = div().flex().items_center().flex_wrap().gap(px(8.));
-        for (id, label, target) in [
-            ("artist-shuffle", "Shuffle", header.shuffle),
-            ("artist-mix", "Mix", header.mix),
+        for (id, label, glyph, target) in [
+            ("artist-shuffle", "Shuffle", "shuffle", header.shuffle),
+            ("artist-mix", "Mix", "radio", header.mix),
         ] {
             if let Some(target) = target {
                 actions = actions.child(
                     div()
                         .id(id)
+                        .keyboard_control(self.theme)
                         .w(px(136.))
                         .h(px(36.))
                         .rounded_full()
@@ -26,8 +27,24 @@ impl Music {
                         .flex()
                         .items_center()
                         .justify_center()
+                        .gap(px(8.))
+                        .when(id == "artist-mix", |style| {
+                            style
+                                .bg(gpui::transparent_black())
+                                .text_color(self.theme.text)
+                                .border_color(self.theme.muted)
+                        })
                         .font_weight(FontWeight::MEDIUM)
                         .cursor_pointer()
+                        .child(icon(
+                            glyph,
+                            20.,
+                            if id == "artist-mix" {
+                                self.theme.text
+                            } else {
+                                self.theme.bg
+                            },
+                        ))
                         .child(label)
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
@@ -54,12 +71,13 @@ impl Music {
             actions = actions.child(
                 div()
                     .id("artist-subscribe")
+                    .keyboard_control(self.theme)
                     .h(px(36.))
                     .px(px(16.))
                     .rounded_full()
                     .border_1()
-                    .border_color(self.theme.accent)
-                    .text_color(self.theme.accent)
+                    .border_color(self.theme.border)
+                    .text_color(self.theme.text)
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -106,7 +124,7 @@ impl Music {
                     .gap(px(4.))
                     .child(
                         div()
-                            .text_size(px(28.))
+                            .text_size(px(34.))
                             .line_height(px(38.))
                             .font_weight(FontWeight::BOLD)
                             .child(self.page.title.clone()),
@@ -125,6 +143,7 @@ impl Music {
                 d.child(
                     div()
                         .id("artist-description")
+                        .keyboard_control(self.theme)
                         .max_w(px(640.))
                         .line_clamp(2)
                         .text_ellipsis()
