@@ -8,32 +8,56 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{sync::Arc, thread};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    /// The library's landing grid of saved collections.
+    Landing,
     Songs,
     Albums,
     Artists,
     Subscriptions,
+    Profiles,
     Playlists,
     Liked,
     History,
     Podcasts,
+    Channels,
     Episodes,
     Uploads,
     UploadAlbums,
     UploadArtists,
 }
 impl Section {
+    const ALL: [Self; 15] = [
+        Self::Landing,
+        Self::Songs,
+        Self::Albums,
+        Self::Artists,
+        Self::Subscriptions,
+        Self::Profiles,
+        Self::Playlists,
+        Self::Liked,
+        Self::History,
+        Self::Podcasts,
+        Self::Channels,
+        Self::Episodes,
+        Self::Uploads,
+        Self::UploadAlbums,
+        Self::UploadArtists,
+    ];
     pub fn title(self) -> &'static str {
         match self {
+            Self::Landing => "Library",
             Self::Songs => "Songs",
             Self::Albums => "Albums",
             Self::Artists => "Artists",
             Self::Subscriptions => "Subscriptions",
+            Self::Profiles => "Profiles",
             Self::Playlists => "Playlists",
             Self::Liked => "Liked songs",
             Self::History => "History",
             Self::Podcasts => "Podcasts",
+            Self::Channels => "Channels",
             Self::Episodes => "Episodes",
             Self::Uploads => "Uploaded songs",
             Self::UploadAlbums => "Uploaded albums",
@@ -42,19 +66,42 @@ impl Section {
     }
     fn browse_id(self) -> &'static str {
         match self {
+            Self::Landing => "FEmusic_library_landing",
             Self::Songs => "FEmusic_liked_videos",
             Self::Albums => "FEmusic_liked_albums",
             Self::Artists => "FEmusic_library_corpus_track_artists",
             Self::Subscriptions => "FEmusic_library_corpus_artists",
+            Self::Profiles => "FEmusic_library_user_profile_channels_list",
             Self::Playlists => "FEmusic_liked_playlists",
             Self::Liked => "VLLM",
             Self::History => "FEmusic_history",
             Self::Podcasts => "FEmusic_library_non_music_audio_list",
+            Self::Channels => "FEmusic_library_non_music_audio_channels_list",
             Self::Episodes => "VLSE",
             Self::Uploads => "FEmusic_library_privately_owned_tracks",
             Self::UploadAlbums => "FEmusic_library_privately_owned_releases",
             Self::UploadArtists => "FEmusic_library_privately_owned_artists",
         }
+    }
+    /// The parameters the web's library chips send with these pages.
+    fn params(self) -> Option<&'static str> {
+        match self {
+            Self::Subscriptions => Some("ggMCCAU%3D"),
+            Self::Profiles => Some("ggMCCAc%3D"),
+            Self::Channels => Some("ggMCCAQ%3D"),
+            _ => None,
+        }
+    }
+    pub fn link(self) -> crate::catalog::BrowseLink {
+        let mut link = crate::catalog::BrowseLink::new(self.browse_id(), self.title());
+        link.params = self.params().map(str::to_owned);
+        link
+    }
+    /// The library section a library chip opens, if this app knows it.
+    pub fn from_browse_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|section| section.browse_id() == id)
     }
 }
 
@@ -504,7 +551,11 @@ pub(crate) fn require_current_session(
 impl Catalog {
     pub fn library(&self, section: Section) -> Result<Page> {
         self.require_account()?;
-        let data = self.request("browse", json!({"browseId":section.browse_id()}))?;
+        let mut body = json!({"browseId":section.browse_id()});
+        if let Some(params) = section.params() {
+            body["params"] = json!(params);
+        }
+        let data = self.request("browse", body)?;
         let mut page = self.bind_page(parse_page(&data, section.title())?, &data, None)?;
         if section == Section::Liked {
             for shelf in &mut page.shelves {
@@ -914,6 +965,7 @@ mod tests {
             chips: Vec::new(),
             countries: Vec::new(),
             search_filters: Vec::new(),
+            library: None,
         }
     }
 

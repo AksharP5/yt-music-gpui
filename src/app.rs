@@ -142,6 +142,8 @@ pub struct Music {
     video: Option<VideoAttachment>,
     /// The full-window player page, showing artwork or video beside its tabs.
     player_open: bool,
+    /// The library sort menu is open.
+    sort_menu: bool,
     video_fullscreen: bool,
     video_transparent: bool,
     video_error: Option<String>,

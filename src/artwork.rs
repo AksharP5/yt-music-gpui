@@ -195,7 +195,9 @@ fn load(
         parsed.scheme() == "https"
             && parsed.host_str().is_some_and(|h| h == "i.ytimg.com"
                 || h.ends_with(".googleusercontent.com")
-                || h.ends_with(".ggpht.com")),
+                || h.ends_with(".ggpht.com")
+                // Library art such as Liked Music and Episodes for Later.
+                || (h == "www.gstatic.com" && parsed.path().starts_with("/youtube/media/ytm/"))),
         "Unsupported artwork host"
     );
     let key = format!("{:x}", Sha1::digest(request.url.as_bytes()));

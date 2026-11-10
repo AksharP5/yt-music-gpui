@@ -628,6 +628,27 @@ pub struct Page {
     pub chips: Vec<BrowseChoice>,
     pub countries: Vec<BrowseChoice>,
     pub search_filters: Vec<crate::search::SearchFilter>,
+    pub library: Option<LibraryFilters>,
+}
+
+/// A library page's filter chips, sort menu and empty state.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryFilters {
+    /// The icon-only chip that returns to the library landing page.
+    pub clear: Option<BrowseLink>,
+    /// Each chip targets its own page, or its deselected page when selected.
+    pub chips: Vec<BrowseChoice>,
+    pub sort: Vec<SortChoice>,
+    /// The service's title and explanation for an empty page.
+    pub empty: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SortChoice {
+    pub label: String,
+    pub selected: bool,
+    /// Reloads the same page in this order.
+    pub reload: Continuation,
 }
 
 impl Page {
@@ -732,9 +753,17 @@ impl Catalog {
         response: &Value,
         previous: Option<&Continuation>,
     ) -> Result<Page> {
-        if let Some(continuation) = &mut page.continuation {
-            continuation.session = self.session.clone();
-            continuation.visitor = match previous.and_then(|previous| previous.visitor.clone()) {
+        let sorts = page
+            .library
+            .iter_mut()
+            .flat_map(|filters| &mut filters.sort);
+        let mut tokens = page
+            .continuation
+            .iter_mut()
+            .chain(sorts.map(|sort| &mut sort.reload))
+            .peekable();
+        if tokens.peek().is_some() {
+            let visitor = match previous.and_then(|previous| previous.visitor.clone()) {
                 Some(visitor) => Some(visitor),
                 None => response
                     .pointer("/responseContext/visitorData")
@@ -749,6 +778,10 @@ impl Catalog {
                     })
                     .transpose()?,
             };
+            for continuation in tokens {
+                continuation.session = self.session.clone();
+                continuation.visitor = visitor.clone();
+            }
         }
         if let Some(album) = previous.and_then(|continuation| continuation.album.as_ref()) {
             album.apply(&mut page);
@@ -1889,6 +1922,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         chips: Vec::new(),
         countries: Vec::new(),
         search_filters: Vec::new(),
+        library: library_filters(data),
     };
     if let Some(album) = header.and_then(|header| {
         let kind = text(&header["subtitle"]);
@@ -1951,6 +1985,101 @@ impl AlbumMetadata {
             continuation.album = Some(self.clone());
         }
     }
+}
+
+/// Reads the chips and sort menu above a library page or its sorted reload.
+fn library_filters(data: &Value) -> Option<LibraryFilters> {
+    let list = data
+        .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer")
+        .or_else(|| data.pointer("/continuationContents/sectionListContinuation"))?;
+    let header = list.pointer("/header/musicSideAlignedItemRenderer")?;
+    let chips = header["startItems"]
+        .as_array()?
+        .iter()
+        .find_map(|item| item.pointer("/chipCloudRenderer/chips")?.as_array())?;
+    // Chips wrap their browse in a command list beside a client-side persist command.
+    fn browse(command: &Value) -> Option<&Value> {
+        command.get("browseEndpoint").or_else(|| {
+            command
+                .pointer("/commandExecutorCommand/commands")?
+                .as_array()?
+                .iter()
+                .find_map(|command| command.get("browseEndpoint"))
+        })
+    }
+    let mut filters = LibraryFilters::default();
+    for chip in chips
+        .iter()
+        .filter_map(|chip| chip.get("chipCloudChipRenderer"))
+    {
+        let selected = chip["isSelected"].as_bool().unwrap_or(false);
+        let label = text(&chip["text"]);
+        if label.trim().is_empty() {
+            if chip.pointer("/icon/iconType").and_then(Value::as_str) == Some("CLOSE") {
+                filters.clear = browse(&chip["navigationEndpoint"])
+                    .and_then(|endpoint| BrowseLink::from_endpoint(endpoint, "Library".into()));
+            }
+            continue;
+        }
+        let command = &chip[if selected {
+            "onDeselectedCommand"
+        } else {
+            "navigationEndpoint"
+        }];
+        if let Some(target) =
+            browse(command).and_then(|endpoint| BrowseLink::from_endpoint(endpoint, label.clone()))
+        {
+            filters.chips.push(BrowseChoice {
+                label,
+                selected,
+                target,
+            });
+        }
+    }
+    if let Some(button) = header["endItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|item| item.get("musicSortFilterButtonRenderer"))
+    {
+        let current = text(&button["title"]);
+        for option in button
+            .pointer("/menu/musicMultiSelectMenuRenderer/options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|option| option.get("musicMultiSelectMenuItemRenderer"))
+        {
+            let label = text(&option["title"]);
+            let token = option
+                .pointer("/selectedCommand/commandExecutorCommand/commands")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|command| {
+                    command
+                        .pointer("/browseSectionListReloadEndpoint/continuation/reloadContinuationData/continuation")?
+                        .as_str()
+                })
+                .filter(|token| !token.is_empty());
+            if let Some(token) = token
+                && !label.trim().is_empty()
+            {
+                filters.sort.push(SortChoice {
+                    selected: label == current,
+                    label,
+                    reload: Continuation::new(token),
+                });
+            }
+        }
+    }
+    filters.empty = find(list, "messageRenderer").map(|message| {
+        (
+            text(&message["text"]),
+            text(&message["subtext"]["messageSubtextRenderer"]["text"]),
+        )
+    });
+    Some(filters)
 }
 
 fn home_choices(data: &Value) -> Result<Vec<BrowseChoice>> {
@@ -2804,6 +2933,7 @@ mod tests {
             chips: Vec::new(),
             countries: Vec::new(),
             search_filters: Vec::new(),
+            library: None,
         };
         page.shelves = vec![
             Shelf {
@@ -3436,6 +3566,142 @@ mod tests {
             catalog
                 .page_request("browse", json!({}), Some(&guest_context))
                 .is_err()
+        );
+    }
+
+    /// A library page shaped like the web's: chips and a sort menu above a grid.
+    fn library_page(selected: Option<&str>) -> Value {
+        let browse = |id: &str| {
+            json!({"commandExecutorCommand":{"commands":[
+                {"browseEndpoint":{"browseId":id}},
+                {"musicLibraryPersistLaunchNavigationCommand":{"command":{"browseEndpoint":{"browseId":id}}}}
+            ]}})
+        };
+        let mut chips = Vec::new();
+        if selected.is_some() {
+            chips.push(json!({"chipCloudChipRenderer":{
+                "icon":{"iconType":"CLOSE"},"isSelected":true,
+                "navigationEndpoint":browse("FEmusic_library_landing"),
+                "onDeselectedCommand":browse("FEmusic_library_landing")
+            }}));
+        }
+        for (label, id) in [
+            ("Playlists", "FEmusic_liked_playlists"),
+            ("Songs", "FEmusic_liked_videos"),
+        ] {
+            if selected.is_some_and(|selected| selected != label) {
+                continue;
+            }
+            chips.push(json!({"chipCloudChipRenderer":{
+                "text":{"runs":[{"text":label}]},
+                "isSelected":selected == Some(label),
+                "navigationEndpoint":browse(id),
+                "onDeselectedCommand":browse("FEmusic_library_landing")
+            }}));
+        }
+        let option = |label: &str, token: &str| {
+            json!({"musicMultiSelectMenuItemRenderer":{
+                "title":{"runs":[{"text":label}]},
+                "selectedCommand":{"commandExecutorCommand":{"commands":[
+                    {"musicCheckboxFormItemMutatedCommand":{"newCheckedState":true}},
+                    {"browseSectionListReloadEndpoint":{"continuation":{"reloadContinuationData":{"continuation":token}}}}
+                ]}}
+            }})
+        };
+        json!({"responseContext":{"visitorData":"visitor"},"contents":{"singleColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{
+            "header":{"musicSideAlignedItemRenderer":{
+                "startItems":[{"chipCloudRenderer":{"chips":chips}}],
+                "endItems":[{"musicSortFilterButtonRenderer":{
+                    "title":{"runs":[{"text":"Recently saved"}]},
+                    "menu":{"musicMultiSelectMenuRenderer":{"options":[
+                        option("Recent activity", "activity-token"),
+                        option("Recently saved", "saved-token")
+                    ]}}
+                }}]
+            }},
+            "contents":[{"gridRenderer":{"items":[{"musicTwoRowItemRenderer":{
+                "title":{"runs":[{"text":"Liked Music"}]},
+                "subtitle":{"runs":[{"text":"Auto playlist"}]},
+                "navigationEndpoint":{"browseEndpoint":{"browseId":"VLLM"}}
+            }}],"itemSize":"COLLECTION_STYLE_ITEM_SIZE_SMALL"}}]
+        }}}}]}}})
+    }
+
+    #[test]
+    fn library_chips_and_sort_follow_the_service_and_stay_with_the_account() {
+        let session = Arc::new(
+            serde_json::from_value::<Session>(json!({
+                "cookie":"SAPISID=synthetic", "playback_cookie":"# Netscape HTTP Cookie File\n",
+                "authuser":"0", "delegated_session_id":null, "data_sync_id":"user||",
+                "client_version":"test"
+            }))
+            .unwrap(),
+        );
+        let catalog = Catalog::with_session(Some(session)).unwrap();
+        let response = library_page(None);
+        let page = catalog
+            .bind_page(parse_page(&response, "Library").unwrap(), &response, None)
+            .unwrap();
+        assert_eq!(page.shelves[0].items[0].id(), "VLLM");
+        let filters = page.library.unwrap();
+        assert!(filters.clear.is_none());
+        let chips: Vec<_> = filters
+            .chips
+            .iter()
+            .map(|chip| (chip.label.as_str(), chip.selected, chip.target.id.as_str()))
+            .collect();
+        assert_eq!(
+            chips,
+            [
+                ("Playlists", false, "FEmusic_liked_playlists"),
+                ("Songs", false, "FEmusic_liked_videos")
+            ]
+        );
+        let sort: Vec<_> = filters
+            .sort
+            .iter()
+            .map(|choice| {
+                (
+                    choice.label.as_str(),
+                    choice.selected,
+                    choice.reload.token(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sort,
+            [
+                ("Recent activity", false, "activity-token"),
+                ("Recently saved", true, "saved-token")
+            ]
+        );
+        // A sorted reload is a continuation of this account's page, never a guest's.
+        let reload = &filters.sort[0].reload;
+        assert!(
+            catalog
+                .page_request("browse", json!({}), Some(reload))
+                .is_ok()
+        );
+        assert!(
+            Catalog::new()
+                .unwrap()
+                .page_request("browse", json!({}), Some(reload))
+                .is_err()
+        );
+
+        let filters = parse_page(&library_page(Some("Songs")), "Songs")
+            .unwrap()
+            .library
+            .unwrap();
+        assert_eq!(filters.clear.unwrap().id, "FEmusic_library_landing");
+        assert_eq!(filters.chips.len(), 1);
+        assert!(filters.chips[0].selected);
+        assert_eq!(filters.chips[0].target.id, "FEmusic_library_landing");
+        assert!(
+            parse_page(&continued_page(json!("visitor"), "token"), "More")
+                .unwrap()
+                .library
+                .is_none()
         );
     }
 

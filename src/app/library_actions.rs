@@ -105,9 +105,13 @@ impl Music {
         }
         collection.details.saved.unwrap_or(matches!(
             self.route,
-            Route::Library(
-                Section::Albums | Section::Playlists | Section::Subscriptions | Section::Podcasts
-            )
+            Route::Saved
+                | Route::Library(
+                    Section::Albums
+                        | Section::Playlists
+                        | Section::Subscriptions
+                        | Section::Podcasts
+                )
         ))
     }
 }

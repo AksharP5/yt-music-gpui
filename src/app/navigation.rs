@@ -1,6 +1,7 @@
 //! Routes, catalog workers, request generations, navigation history, and page loading.
 
 use super::*;
+use crate::catalog::{BrowseChoice, LibraryFilters};
 
 #[derive(Clone, PartialEq)]
 pub(in crate::app) struct Search {
@@ -21,6 +22,24 @@ pub(in crate::app) enum Route {
     Library(Section),
 }
 impl Route {
+    /// The account library page behind a library route.
+    pub(in crate::app) fn library_section(&self) -> Option<Section> {
+        match self {
+            Self::Liked => Some(Section::Liked),
+            Self::Recent => Some(Section::History),
+            Self::Saved => Some(Section::Landing),
+            Self::Library(section) => Some(*section),
+            _ => None,
+        }
+    }
+    /// Where a library chip leads.
+    pub(in crate::app) fn library_chip(link: BrowseLink) -> Self {
+        match Section::from_browse_id(&link.id) {
+            Some(Section::Landing) => Self::Saved,
+            Some(section) => Self::Library(section),
+            None => Self::Browse(link),
+        }
+    }
     pub(in crate::app) fn is_artist(&self) -> bool {
         matches!(self, Self::Browse(link) if link.id.starts_with("UC"))
     }
@@ -44,6 +63,8 @@ pub(in crate::app) enum Query {
     SidebarPlaylists,
     PlaylistChoicesMore(Continuation),
     SidebarMore(Continuation),
+    /// The current page again in another order, replacing it.
+    Reload(Continuation),
     Revalidate(Box<Query>),
 }
 impl Query {
@@ -189,6 +210,11 @@ impl Music {
     }
 
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        // A guest's Liked Music is the local list of liked songs.
+        let route = match route {
+            Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
+            route => route,
+        };
         self.focus_after_navigation(cx);
         self.artwork.cancel_pending();
         self.player_open = false;
@@ -230,6 +256,8 @@ impl Music {
         self.page.privacy = None;
         self.page.chips.clear();
         self.page.countries.clear();
+        self.page.library = None;
+        self.sort_menu = false;
         self.rows.clear();
         self.list_rows.clear();
         if !matches!(route, Route::Search(_)) {
@@ -256,16 +284,10 @@ impl Music {
                 self.page.title = link.title.clone();
                 self.request(Query::Browse(link), cx);
             }
-            Route::Library(section) => {
-                self.page.title = section.title().into();
-                self.request(Query::Library(section), cx);
-            }
-            Route::Liked | Route::Saved | Route::Recent if self.account.is_some() => {
-                let section = match route {
-                    Route::Liked => Section::Liked,
-                    Route::Recent => Section::History,
-                    _ => Section::Songs,
-                };
+            Route::Liked | Route::Saved | Route::Recent | Route::Library(_)
+                if self.account.is_some() =>
+            {
+                let section = route.library_section().expect("library route");
                 self.page.title = section.title().into();
                 self.request(Query::Library(section), cx);
             }
@@ -351,7 +373,7 @@ impl Music {
     }
 
     pub(in crate::app) fn refresh_local(&mut self) {
-        let (title, rows) = match self.route {
+        let (title, rows, library) = match self.route {
             Route::Liked => (
                 "Liked songs",
                 self.library
@@ -360,6 +382,7 @@ impl Music {
                     .cloned()
                     .map(Item::Track)
                     .collect(),
+                None,
             ),
             Route::Recent => (
                 "Recently played",
@@ -369,15 +392,31 @@ impl Music {
                     .cloned()
                     .map(Item::Track)
                     .collect(),
+                None,
             ),
             Route::Saved => (
-                "Saved collections",
+                "Library",
+                std::iter::once(Item::Collection(Collection {
+                    id: "VLLM".into(),
+                    title: "Liked Music".into(),
+                    subtitle: "Auto playlist".into(),
+                    thumbnail: Some(LIKED_MUSIC_ART.into()),
+                    details: Default::default(),
+                }))
+                .chain(self.library.saved.iter().cloned().map(Item::Collection))
+                .collect(),
+                Some(local_library_filters(None)),
+            ),
+            Route::Library(section) => (
+                section.title(),
                 self.library
                     .saved
                     .iter()
+                    .filter(|collection| local_section(&collection.id) == section)
                     .cloned()
                     .map(Item::Collection)
                     .collect(),
+                Some(local_library_filters(Some(section))),
             ),
             _ => return,
         };
@@ -397,6 +436,7 @@ impl Music {
             chips: Vec::new(),
             countries: Vec::new(),
             search_filters: Vec::new(),
+            library,
         };
         self.rebuild_rows();
     }
@@ -641,7 +681,8 @@ impl CatalogRequests {
                                         catalog.library(Section::Playlists)
                                     }
                                     Query::PlaylistChoicesMore(token)
-                                    | Query::SidebarMore(token) => catalog.more(token),
+                                    | Query::SidebarMore(token)
+                                    | Query::Reload(token) => catalog.more(token),
                                     Query::Revalidate(_) => {
                                         unreachable!("revalidation unwrapped above")
                                     }
@@ -700,5 +741,86 @@ impl CatalogRequests {
         })
         .detach();
         catalog_requests
+    }
+}
+
+/// The art the web shows for Liked Music, which guests keep locally.
+const LIKED_MUSIC_ART: &str =
+    "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-songs-delhi-192.png";
+
+/// The library chips a guest can fill from saved collections.
+const LOCAL_SECTIONS: [Section; 4] = [
+    Section::Playlists,
+    Section::Albums,
+    Section::Artists,
+    Section::Podcasts,
+];
+
+fn local_section(id: &str) -> Section {
+    if id.starts_with("MPRE") {
+        Section::Albums
+    } else if id.starts_with("UC") {
+        Section::Artists
+    } else if id.starts_with("MPSP") {
+        Section::Podcasts
+    } else {
+        Section::Playlists
+    }
+}
+
+/// The guest library's chips, shaped like the web's: every section on the
+/// landing page, or only the selected one beside a clear chip.
+fn local_library_filters(selected: Option<Section>) -> LibraryFilters {
+    let landing = Section::Landing.link();
+    let chip = |section: Section| BrowseChoice {
+        label: section.title().into(),
+        selected: Some(section) == selected,
+        target: if Some(section) == selected {
+            landing.clone()
+        } else {
+            section.link()
+        },
+    };
+    match selected {
+        Some(section) => LibraryFilters {
+            clear: Some(landing.clone()),
+            chips: vec![chip(section)],
+            sort: Vec::new(),
+            empty: Some((
+                format!("No {} yet", section.title().to_lowercase()),
+                format!("{} you save will show here", section.title()),
+            )),
+        },
+        None => LibraryFilters {
+            chips: LOCAL_SECTIONS.into_iter().map(chip).collect(),
+            ..LibraryFilters::default()
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOCAL_SECTIONS, Route, Section, local_library_filters, local_section};
+
+    #[test]
+    fn guest_library_chips_stay_on_local_routes() {
+        let landing = local_library_filters(None);
+        assert!(landing.clear.is_none());
+        assert_eq!(landing.chips.len(), LOCAL_SECTIONS.len());
+        for (chip, section) in landing.chips.into_iter().zip(LOCAL_SECTIONS) {
+            assert!(Route::library_chip(chip.target) == Route::Library(section));
+        }
+        let albums = local_library_filters(Some(Section::Albums));
+        assert!(Route::library_chip(albums.clear.unwrap()) == Route::Saved);
+        assert!(albums.chips[0].selected);
+        assert!(Route::library_chip(albums.chips[0].target.clone()) == Route::Saved);
+        for (id, section) in [
+            ("MPREb_album", Section::Albums),
+            ("UCartist", Section::Artists),
+            ("MPSPPLshow", Section::Podcasts),
+            ("VLPLplaylist", Section::Playlists),
+        ] {
+            assert_eq!(local_section(id), section);
+        }
     }
 }

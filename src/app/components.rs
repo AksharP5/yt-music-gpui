@@ -229,6 +229,7 @@ pub(in crate::app) fn tinted_button(
         "help" => "Keyboard shortcuts",
         "settings" => "Settings",
         "close" => "Close or remove",
+        "history" => "History",
         _ => "Open",
     };
     icon_button(id, name, color, theme)

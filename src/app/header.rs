@@ -124,6 +124,18 @@ impl Music {
                     .gap(px(24.))
                     .child(self.search.clone())
                     .child(div().flex_1())
+                    // Signed in, the web keeps History here rather than in the library.
+                    .when(
+                        avatar.is_some() && !matches!(self.route, Route::Search(_)),
+                        |header| {
+                            header.child(button("history-nav", "history", self.theme).on_click(
+                                cx.listener(|view, _, window, cx| {
+                                    window.focus(&view.focus, cx);
+                                    view.navigate(Route::Recent, cx);
+                                }),
+                            ))
+                        },
+                    )
                     .when_some(avatar, |header, avatar| {
                         header.child(
                             div()

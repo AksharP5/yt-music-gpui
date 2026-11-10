@@ -173,7 +173,7 @@ impl SyncState {
 pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     let playlist = |id: &str| matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"));
     let liked = matches!(route, Route::Liked | Route::Library(Section::Liked));
-    let songs = matches!(route, Route::Saved | Route::Library(Section::Songs));
+    let songs = matches!(route, Route::Library(Section::Songs));
     for shelf in &mut page.shelves {
         shelf.items.retain(|item| match (item, mutation) {
             (Item::Track(current), Mutation::RateSong { track, rating }) => {
@@ -199,12 +199,13 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
                 },
             ) if matches!(
                 route,
-                Route::Library(
-                    Section::Albums
-                        | Section::Playlists
-                        | Section::Subscriptions
-                        | Section::Podcasts
-                )
+                Route::Saved
+                    | Route::Library(
+                        Section::Albums
+                            | Section::Playlists
+                            | Section::Subscriptions
+                            | Section::Podcasts
+                    )
             ) =>
             {
                 current.id != collection.id
@@ -477,9 +478,7 @@ impl Music {
     }
 
     pub(in crate::app) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
-        if self.account.is_none()
-            && matches!(self.route, Route::Liked | Route::Saved | Route::Recent)
-        {
+        if self.account.is_none() && self.route.library_section().is_some() {
             let anchor = self.page_anchor();
             self.refresh_local();
             self.restore_page_anchor(&anchor);
@@ -598,10 +597,9 @@ impl Music {
             Route::Explore => Query::Explore,
             Route::Search(search) => Query::Search(search.clone()),
             Route::Browse(link) => Query::Browse(link.clone()),
-            Route::Liked => Query::Library(Section::Liked),
-            Route::Recent => Query::Library(Section::History),
-            Route::Saved => Query::Library(Section::Songs),
-            Route::Library(section) => Query::Library(*section),
+            Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => {
+                Query::Library(self.route.library_section().expect("library route"))
+            }
         };
         self.request(Query::Revalidate(Box::new(query)), cx);
     }

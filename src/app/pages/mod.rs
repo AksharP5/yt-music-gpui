@@ -166,6 +166,24 @@ impl PageLayout {
         .min(self.column + 2. * self.inset - 32.)
     }
 
+    /// The library's small-card grid: columns, gap, card edge, and the
+    /// layout its cards use. The web keeps these cards' text at 14px.
+    pub(in crate::app) fn small_grid(self) -> (usize, f32, f32, Self) {
+        let (columns, gap) = match self.tier {
+            Tier::Narrow | Tier::Medium => (5, 16.),
+            Tier::Wide => (6, 16.),
+            Tier::Large => (7, 24.),
+            Tier::Huge if self.window < 1792. => (8, 24.),
+            Tier::Huge => (9, 24.),
+        };
+        let width = (self.column - (columns - 1) as f32 * gap) / columns as f32;
+        let cards = Self {
+            tier: self.tier.min(Tier::Wide),
+            ..self
+        };
+        (columns, gap, width, cards)
+    }
+
     /// Card title and subtitle each reserve two lines, like the web's line clamp.
     pub(in crate::app) fn card_text_height(self) -> f32 {
         16. + 3. + 4. * self.text_size() * 1.2
@@ -267,8 +285,10 @@ impl Music {
         let collection = !home && self.page.header.is_some();
         let artist = collection && self.route.is_artist();
         let stacked = collection && !artist && available >= 980.;
+        // Library pages open on their chips, without a back button or heading.
+        let library = !collection && matches!(self.route, Route::Saved | Route::Library(_));
         let mut content = div().flex_1().min_w_0().min_h_0().flex().flex_col();
-        if !home && !artist && !search {
+        if !home && !artist && !search && !library {
             content = content.child(
                 div()
                     .h(px(if collection { 24. } else { 48. }))
@@ -284,7 +304,7 @@ impl Music {
                     }),
             );
         }
-        if !home && !search && !collection {
+        if !home && !search && !collection && !library {
             let heading = self.page_heading(false, 128., cx);
             content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
         }
@@ -350,6 +370,12 @@ impl Music {
         }
         let heading = (collection && stacked)
             .then(|| self.page_heading(true, if available < 1200. { 240. } else { 264. }, cx));
+        if self.rows.is_empty()
+            && !collection
+            && let Some(empty) = self.library_empty()
+        {
+            return content.child(empty).into_any_element();
+        }
         if self.rows.is_empty() && !collection {
             let message = match self.route {
                 Route::Liked => "Music you like will appear here.",
@@ -450,9 +476,14 @@ impl Music {
                 .min_h_0()
                 .into_any_element()
             } else if grid {
-                let gap = layout.card_gap();
-                let card_width = layout.card_width();
-                let columns = ((layout.column + gap) / (card_width + gap)).floor().max(1.) as usize;
+                let (columns, gap, card_width, layout) = if library {
+                    layout.small_grid()
+                } else {
+                    let gap = layout.card_gap();
+                    let width = layout.card_width();
+                    let columns = ((layout.column + gap) / (width + gap)).floor().max(1.) as usize;
+                    (columns, gap, width, layout)
+                };
                 let row_height = card_width + layout.card_text_height() + 24.;
                 uniform_list(
                     ("collection-grid", self.list_id),

@@ -56,3 +56,7 @@ assets/icons/thumb-down-filled.svg is adapted from Google Material Icons
 ("thumb_up", rotated), Copyright Google LLC, Apache License 2.0.
 The menu-* icons in assets/icons were drawn for this project and are covered
 by its MIT license (LICENSE).
+
+assets/icons/check.svg and expand-more.svg are unmodified Google Material Icons
+("check" and "expand_more"), Copyright Google LLC, Apache License 2.0.
+Source: https://github.com/google/material-design-icons/tree/master/src/navigation
