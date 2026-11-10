@@ -1,4 +1,4 @@
-//! Up next: the playing-from header, autoplay switch, and the reorderable queue.
+//! Up next: the playing-from header, reorderable queue, and autoplay switch.
 
 use super::*;
 
@@ -83,7 +83,6 @@ impl Music {
                             .gap(px(8.))
                             .rounded_full()
                             .bg(theme.text)
-                            .focus_visible(|pill| pill.border_color(rgb(0x3ea6ff)))
                             .text_color(rgb(0x030303))
                             .text_size(px(14.))
                             .font_weight(FontWeight::MEDIUM)
@@ -102,11 +101,11 @@ impl Music {
                             })),
                     ),
             )
-            .child(self.autoplay_switch(cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
+                    .ml(px(-24.))
                     .relative()
                     .child(
                         canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
@@ -153,6 +152,7 @@ impl Music {
                         .size_full(),
                     ),
             )
+            .child(self.autoplay_switch(cx))
             .into_any_element()
     }
 
@@ -171,9 +171,9 @@ impl Music {
         div()
             .id("autoplay-toggle")
             .keyboard_control(self.theme)
-            .mt(px(8.))
+            .h(px(40.))
+            .flex_shrink_0()
             .px(px(8.))
-            .py(px(8.))
             .flex()
             .items_center()
             .gap(px(16.))
@@ -190,13 +190,6 @@ impl Music {
                             .text_size(px(14.))
                             .font_weight(FontWeight::MEDIUM)
                             .child("Autoplay"),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(12.))
-                            .text_color(self.theme.muted)
-                            .child("Add similar content to the end of the queue"),
                     ),
             )
             .child(
@@ -238,14 +231,14 @@ impl Music {
                 .and_then(|watch| watch.current.as_ref()?.duration);
         }
         let playing = active && self.playback != Playback::Stopped && !self.playback.is_paused();
-        // Showing the handle shifts the row, as on the web. GPUI evaluates `display` in both
-        // prepaint and paint, so it follows stored hover state rather than `group_hover`.
+        // Overlay the handle in the gutter so hover never shifts the song or thumbnail.
         let show_handle = dragged || self.player_page.hovered_row == Some(index);
         let handle = show_handle.then(|| {
             div()
                 .id(("queue-handle", index))
+                .absolute()
+                .left_0()
                 .size(px(24.))
-                .mr(px(8.))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
@@ -397,7 +390,8 @@ impl Music {
             .relative()
             .w_full()
             .h(px(ROW_HEIGHT))
-            .px(px(8.))
+            .pl(px(32.))
+            .pr(px(8.))
             .flex()
             .items_center()
             .text_size(px(text))
@@ -424,7 +418,7 @@ impl Music {
                     .when(active, |thumb| {
                         thumb
                             .child(
-                                overlay("volume")
+                                overlay(if playing { "volume" } else { "play" })
                                     .group_hover("up-next-row", |overlay| overlay.invisible()),
                             )
                             .child(
