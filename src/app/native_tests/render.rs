@@ -668,6 +668,7 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                     track.artist = "First artist & Second artist".into();
                     track.album = Some("Album".into());
                     track.details.links = links.to_vec();
+                    track.duration = Some(719);
                 }
                 music.error = None;
                 music.notice = None;
@@ -680,10 +681,62 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                 (music.library.queue.current().unwrap().id.clone(), music.active_id)
             }).unwrap();
             wait_for_presented_frame(window, cx).await;
+            let idle = (!reverse && index == 0).then(|| {
+                window
+                    .update(cx, |_, window, _| capture(window, "track-controls-idle"))
+                    .unwrap()
+            });
+            if idle.is_some() {
+                for (name, position) in [
+                    ("track-controls-hover", point(px(500.), px(330.))),
+                    ("track-controls-away", point(px(1.), px(70.))),
+                ] {
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                position,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    })
+                    .unwrap();
+                    wait_for_presented_frame(window, cx).await;
+                    window
+                        .update(cx, |_, window, _| capture(window, name))
+                        .unwrap();
+                }
+            }
             // Four header controls, three sidebar controls, three playlist
             // actions, then the row, its two artists, its album and row actions.
-            for _ in 0..if reverse { 14 } else { 12 + index } {
+            for step in 0..if reverse { 14 } else { 12 + index } {
                 key(window, cx, "tab").await;
+                if idle.is_some() && step == 3 {
+                    window
+                        .update(cx, |_, window, _| capture(window, "focus-white-button"))
+                        .unwrap();
+                }
+                if let Some(idle) = &idle
+                    && step == 10
+                {
+                    let focused = window
+                        .update(cx, |_, window, _| capture(window, "track-controls-focused"))
+                        .unwrap();
+                    let title = |image: &image::RgbaImage| {
+                        image::imageops::crop_imm(image, 210, 308, 400, 20).to_image()
+                    };
+                    let actions = |image: &image::RgbaImage| {
+                        image::imageops::crop_imm(image, 675, 310, 110, 40).to_image()
+                    };
+                    assert!(
+                        title(idle) == title(&focused),
+                        "Revealing row controls must not move the title"
+                    );
+                    assert!(
+                        actions(idle) != actions(&focused),
+                        "Keyboard row focus must reveal the action overlay"
+                    );
+                }
             }
             if reverse {
                 for _ in index..2 {
@@ -696,6 +749,25 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                         capture(window, &format!("inline-link-{index}"));
                     })
                     .unwrap();
+            }
+            if !reverse && index == 0 {
+                for _ in 0..5 {
+                    key(window, cx, "tab").await;
+                }
+                key(window, cx, "enter").await;
+                window
+                    .update(cx, |music, window, _| {
+                        assert!(
+                            matches!(music.overlay, Some(crate::app::Overlay::Track { .. })),
+                            "The overlay menu must remain keyboard reachable"
+                        );
+                        capture(window, "track-controls-menu");
+                    })
+                    .unwrap();
+                key(window, cx, "escape").await;
+                for _ in 0..5 {
+                    key(window, cx, "shift-tab").await;
+                }
             }
             key(window, cx, "enter").await;
             window.update(cx, |music, _, _| {

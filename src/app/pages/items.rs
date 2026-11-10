@@ -445,7 +445,7 @@ impl Music {
         &mut self,
         index: usize,
         inset: f32,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item = self.rows[index].clone();
@@ -565,8 +565,15 @@ impl Music {
             _ => item.subtitle().to_owned(),
         };
         let menu_index = index;
+        let focus = window.use_keyed_state(("song-focus", index), cx, |_, cx| {
+            cx.focus_handle().tab_index(0).tab_stop(true)
+        });
+        let focus = focus.read(cx);
+        let keyboard_controls =
+            window.last_input_was_keyboard() && focus.contains_focused(window, cx);
         let mut row = div()
             .id(("song", index))
+            .track_focus(focus)
             .keyboard_control(self.theme)
             .group("music-row")
             .relative()
@@ -703,27 +710,33 @@ impl Music {
                     .map(|episode| episode.duration_text.clone())
                     .unwrap_or_default()
             });
-            // Like, dislike and menu replace the duration on hover. GPUI hover
-            // styles cannot move layout, so the row keeps their room clear.
+            // The hover controls cover this slot and the end of long text,
+            // without taking space from the title while the row is idle.
             row = row.child(
                 div()
-                    .w(px(104.))
+                    .w(px(54.))
                     .flex_shrink_0()
                     .flex()
                     .justify_end()
                     .text_size(px(text_size))
                     .text_color(self.theme.muted)
-                    .group_hover("music-row", |style| style.invisible())
                     .child(duration),
             );
         }
         let artist_table = style == RowStyle::ArtistTable;
-        // Three 36px buttons, 2px apart, fill the 104px zone plus the row's padding.
         let controls = div()
+            .id(("track-controls", index))
             .flex()
             .items_center()
             .gap(px(2.))
             .pr(px(8.))
+            .bg(if active {
+                self.theme.selection
+            } else {
+                self.theme.bg
+            })
+            .opacity(if keyboard_controls { 1. } else { 0. })
+            .group_hover("music-row", |style| style.opacity(1.))
             .child(
                 button(
                     ("like", index),
@@ -731,11 +744,6 @@ impl Music {
                     self.theme,
                 )
                 .size(px(36.))
-                .when(!liked, |d| {
-                    d.opacity(0.)
-                        .group_hover("music-row", |d| d.opacity(1.))
-                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
-                })
                 .on_click(cx.listener(move |view, _, _, cx| {
                     cx.stop_propagation();
                     view.toggle_like(&like_track, cx);
@@ -745,9 +753,6 @@ impl Music {
                 d.child(
                     button(("dislike", index), "thumb-down", self.theme)
                         .size(px(36.))
-                        .opacity(0.)
-                        .group_hover("music-row", |d| d.opacity(1.))
-                        .focus_visible(|style| style.opacity(1.).border_color(self.theme.text))
                         .on_click(cx.listener(move |view, _, window, cx| {
                             cx.stop_propagation();
                             if view.account.is_none() {
@@ -778,10 +783,7 @@ impl Music {
                 self.menu_button(("track-menu", index), cx, move |view, window, cx| {
                     view.open_track_menu(menu_track.clone(), Some(index), window, cx);
                 })
-                .size(px(36.))
-                .opacity(0.)
-                .group_hover("music-row", |d| d.opacity(1.))
-                .focus_visible(|style| style.opacity(1.).border_color(self.theme.text)),
+                .size(px(36.)),
             );
         row = row.child(controls.absolute().right_0().top_0().h_full());
         wrap_row(row)
