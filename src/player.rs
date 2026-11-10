@@ -13,20 +13,19 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     ptr::NonNull,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicI64, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(test)]
-use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
@@ -245,6 +244,10 @@ pub enum PlayerEvent {
     },
     #[allow(dead_code)] // Consumed by the app integration after its module split.
     Notice(String),
+    #[cfg(test)]
+    Prepared {
+        video_id: String,
+    },
     VideoChanged,
     VideoError {
         message: String,
@@ -254,6 +257,7 @@ pub enum PlayerEvent {
 }
 
 enum PlayerCommand {
+    Prepare(Option<PreparedTarget>),
     Play {
         track_id: u64,
         url: String,
@@ -371,6 +375,7 @@ pub struct Player {
     commands: CommandSender,
     events: async_channel::Receiver<PlayerEvent>,
     next_id: AtomicU64,
+    next: Mutex<Option<PreparedTarget>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -393,6 +398,7 @@ impl Player {
             commands,
             events: event_receiver,
             next_id: AtomicU64::new(1),
+            next: Mutex::new(None),
             worker: Some(worker),
         })
     }
@@ -412,12 +418,65 @@ impl Player {
         )
     }
 
+    /// Resolve only the next candidate. Replacing/clearing it cancels old work.
+    /// Pass the natural successor, respecting repeat/autoplay. Call after queue edits
+    /// and quality changes. mpv can transition to it at EOF without reopening its stream.
+    #[allow(dead_code)] // Wired by the app integration after its module split.
+    pub fn prepare_next(&self, video_id: Option<&str>, options: PlayOptions) -> Result<()> {
+        if let Some(id) = video_id {
+            ensure!(
+                crate::catalog::valid_video_id(id),
+                "Invalid next YouTube video ID"
+            );
+        }
+        let mut next = self.next.lock().unwrap();
+        let unchanged = match (next.as_ref(), video_id) {
+            (None, None) => true,
+            (Some(next), Some(id)) => {
+                next.key
+                    .url
+                    .strip_prefix("https://music.youtube.com/watch?v=")
+                    == Some(id)
+                    && next.key.quality == options.quality
+                    && next.key.video == options.video
+            }
+            _ => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+        let key = video_id.map(|id| StreamKey {
+            url: format!("https://music.youtube.com/watch?v={id}"),
+            quality: options.quality,
+            video: options.video,
+        });
+        *next = key.map(|key| PreparedTarget {
+            key,
+            track_id: self.next_id.fetch_add(1, Ordering::Relaxed),
+        });
+        self.send(PlayerCommand::Prepare(next.clone()))
+    }
+
     fn play_url(&self, url: String, title: &str, options: PlayOptions) -> Result<u64> {
         ensure!(
             options.start.is_finite() && options.start >= 0.,
             "Invalid playback start position."
         );
-        let track_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let next = self.next.lock().unwrap().take();
+        let track_id = next
+            .filter(|next| {
+                options.start == 0.
+                    && next.key
+                        == StreamKey {
+                            url: url.clone(),
+                            quality: options.quality,
+                            video: options.video,
+                        }
+            })
+            .map_or_else(
+                || self.next_id.fetch_add(1, Ordering::Relaxed),
+                |next| next.track_id,
+            );
         self.send(PlayerCommand::Play {
             track_id,
             url,
@@ -432,6 +491,7 @@ impl Player {
         &self,
         credentials: PlaybackCredentials,
     ) -> Result<async_channel::Receiver<Result<(), String>>> {
+        self.next.lock().unwrap().take();
         let (reply, response) = async_channel::bounded(1);
         self.send(PlayerCommand::Credentials {
             next: Some(credentials),
@@ -442,6 +502,7 @@ impl Player {
     /// A successful response confirms extractor termination, option reset, and credential revocation.
     /// A closed response channel means the player exited without confirming cleanup.
     pub fn clear_credentials(&self) -> Result<async_channel::Receiver<Result<(), String>>> {
+        self.next.lock().unwrap().take();
         let (reply, response) = async_channel::bounded(1);
         self.send(PlayerCommand::Credentials { next: None, reply })?;
         Ok(response)
@@ -450,6 +511,7 @@ impl Player {
         self.send(PlayerCommand::Pause(paused))
     }
     pub fn stop(&self) -> Result<()> {
+        self.next.lock().unwrap().take();
         self.send(PlayerCommand::Stop)
     }
     pub fn seek(&self, track_id: u64, seconds: f64) -> Result<u64> {
@@ -740,6 +802,8 @@ impl MpvCore {
             (c"input-vo-keyboard", "no"),
             (c"network-timeout", "20"),
             (c"cache", "yes"),
+            (c"gapless-audio", "yes"),
+            (c"prefetch-playlist", "yes"),
             (c"demuxer-max-bytes", "32MiB"),
             (c"demuxer-max-back-bytes", "8MiB"),
             (c"audio-client-name", "YouTube Music"),
@@ -1013,7 +1077,7 @@ fn replace_playback_credentials(
 const REVIEWED_YTDLP: &str = "2026.08.19";
 
 fn account_playback_supported(ytdlp: &Path) -> bool {
-    std::process::Command::new(ytdlp)
+    Command::new(ytdlp)
         .args(["--ignore-config", "--no-plugin-dirs", "--version"])
         .output()
         .is_ok_and(|output| {
@@ -1040,6 +1104,169 @@ fn account_credentials(
     None
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct StreamKey {
+    url: String,
+    quality: AudioQuality,
+    video: Option<VideoQuality>,
+}
+
+#[derive(Clone)]
+struct PreparedTarget {
+    key: StreamKey,
+    track_id: u64,
+}
+
+struct ResolvedStream {
+    key: StreamKey,
+    url: String,
+    expires: SystemTime,
+}
+
+impl ResolvedStream {
+    fn parse(key: StreamKey, bytes: &[u8], now: SystemTime) -> Result<Self> {
+        let text = std::str::from_utf8(bytes)?;
+        let urls = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        ensure!(
+            !urls.is_empty() && urls.len() <= 2,
+            "Invalid prepared stream"
+        );
+        let mut expires = now + Duration::from_secs(5 * 60);
+        for url in &urls {
+            let parsed = reqwest::Url::parse(url)?;
+            ensure!(
+                parsed.scheme() == "https"
+                    && parsed
+                        .host_str()
+                        .is_some_and(|host| host.ends_with(".googlevideo.com")),
+                "Unsupported prepared stream host"
+            );
+            if let Some(expiry) = parsed.query_pairs().find_map(|(name, value)| {
+                (name == "expire")
+                    .then(|| value.parse::<u64>().ok())
+                    .flatten()
+            }) {
+                expires = expires.min(UNIX_EPOCH + Duration::from_secs(expiry.saturating_sub(60)));
+            }
+        }
+        ensure!(expires > now, "Prepared stream expired");
+        let url = if urls.len() == 1 {
+            urls[0].to_owned()
+        } else {
+            format!(
+                "edl://%{}%{};!new_stream;%{}%{}",
+                urls[0].len(),
+                urls[0],
+                urls[1].len(),
+                urls[1]
+            )
+        };
+        Ok(Self { key, url, expires })
+    }
+
+    fn matches(&self, key: &StreamKey) -> bool {
+        self.key == *key && SystemTime::now() < self.expires
+    }
+}
+
+struct StreamPreparation {
+    target: PreparedTarget,
+    child: Child,
+    output: File,
+    started: Instant,
+    _cookies: Option<File>,
+}
+
+impl StreamPreparation {
+    fn start(
+        target: PreparedTarget,
+        ytdlp: &Path,
+        credentials: Option<&ExtractorCredentials>,
+    ) -> Result<Self> {
+        // Keep signed URLs and any extractor output in anonymous RAM, never disk.
+        let output = writable_playback_cookies(sealed_file(b"")?)?;
+        let key = &target.key;
+        let selector = key
+            .video
+            .map(|video| video.selector(key.quality))
+            .unwrap_or_else(|| key.quality.selector().to_owned());
+        let mut command = Command::new(ytdlp);
+        command
+            .args([
+                "--ignore-config",
+                "--no-playlist",
+                "--no-warnings",
+                "--quiet",
+                "--get-url",
+                "--format",
+                &selector,
+            ])
+            .stdin(Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(Stdio::null());
+        let cookies = credentials
+            .map(|credentials| {
+                credentials
+                    .cookies
+                    .try_clone()
+                    .and_then(|file| writable_playback_cookies(file).map_err(io::Error::other))
+            })
+            .transpose()?;
+        if let Some(credentials) = credentials {
+            command
+                .arg("--cookies")
+                .arg(format!(
+                    "/proc/{}/fd/{}",
+                    std::process::id(),
+                    cookies.as_ref().unwrap().as_raw_fd()
+                ))
+                .arg("--config-locations")
+                .arg(format!(
+                    "/proc/{}/fd/{}",
+                    std::process::id(),
+                    credentials.config.as_raw_fd()
+                ));
+        } else {
+            command.arg("--no-plugin-dirs");
+        }
+        let child = command.process_group(0).arg(&key.url).spawn()?;
+        Ok(Self {
+            target,
+            child,
+            output,
+            started: Instant::now(),
+            _cookies: cookies,
+        })
+    }
+
+    fn finish(&mut self) -> Result<Option<ResolvedStream>> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        ensure!(status.success(), "Could not prepare the next stream");
+        self.output.rewind()?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut self.output)
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 16 * 1024, "Oversized prepared stream");
+        ResolvedStream::parse(self.target.key.clone(), &bytes, SystemTime::now()).map(Some)
+    }
+}
+
+impl Drop for StreamPreparation {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            // yt-dlp can start a JS runtime. Cancel its process group as well.
+            unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        }
+        let _ = self.child.wait();
+    }
+}
+
 fn run(
     options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
@@ -1063,6 +1290,9 @@ fn run(
     let mut credentials = None;
     // Destroy the core before dropping the RAM credentials or private runtime.
     let core = MpvCore::new(&options, &ytdlp, &socket_path)?;
+    // Cancel/reap ahead-of-time extraction before credentials or the core can drop.
+    let mut preparation: Option<StreamPreparation> = None;
+    let mut prepared: Option<(PreparedTarget, ResolvedStream)> = None;
     // Every actor exit frees the renderer before destroying the core.
     let mut video: Option<AttachedVideo> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1117,23 +1347,74 @@ fn run(
     loop {
         loop {
             match commands.try_recv() {
+                Ok(PlayerCommand::Prepare(target)) => {
+                    if target.as_ref().is_some_and(|target| {
+                        preparation
+                            .as_ref()
+                            .is_some_and(|job| job.target.track_id == target.track_id)
+                            || prepared.as_ref().is_some_and(|(current, stream)| {
+                                current.track_id == target.track_id && stream.matches(&target.key)
+                            })
+                    }) {
+                        continue;
+                    }
+                    preparation.take();
+                    prepared = None;
+                    state.upcoming = None;
+                    state.entries.retain(|_, id| Some(*id) == state.current);
+                    write_command(&mut socket, json!(["playlist-clear"]), None)?;
+                    if let Some(target) = target {
+                        preparation =
+                            StreamPreparation::start(target, &ytdlp, credentials.as_ref()).ok();
+                    }
+                }
                 Ok(PlayerCommand::Play {
                     track_id,
                     url,
                     title,
                     options,
                 }) => {
+                    let key = StreamKey {
+                        url: url.clone(),
+                        quality: options.quality,
+                        video: options.video,
+                    };
+                    let prefetched = prepared.take().is_some_and(|(target, stream)| {
+                        target.track_id == track_id
+                            && stream.matches(&key)
+                            && state.entries.values().any(|entry| *entry == track_id)
+                    });
+                    preparation.take();
+                    let already_restarted = state.restarted && state.current == Some(track_id);
                     state.invalidate_seeks();
+                    state.restarted = already_restarted;
                     state.desired = Some(track_id);
-                    state.loaded = false;
                     state.paused = options.paused;
                     state.pause_target = Some(options.paused);
-                    state.pause_after_load = true;
-                    write_command(
-                        &mut socket,
-                        load_command(&url, &title, options),
-                        Some(json!(track_id)),
-                    )?;
+                    state.upcoming = None;
+                    if prefetched {
+                        if state.current != Some(track_id) {
+                            state.loaded = false;
+                            state.pause_after_load = true;
+                            write_command(&mut socket, json!(["playlist-next", "force"]), None)?;
+                        } else if state.loaded {
+                            // EOF may have transitioned before the UI consumed Ended.
+                            let _ = events.send_blocking(PlayerEvent::Started {
+                                track_id,
+                                paused: options.paused,
+                            });
+                        }
+                        state.pause_revision += 1;
+                        write_pause(&mut socket, options.paused, state.pause_revision)?;
+                    } else {
+                        state.loaded = false;
+                        state.pause_after_load = true;
+                        write_command(
+                            &mut socket,
+                            load_command(&url, &title, options),
+                            Some(json!(track_id)),
+                        )?;
+                    }
                 }
                 Ok(PlayerCommand::Pause(paused)) => {
                     state.pause_revision += 1;
@@ -1145,6 +1426,9 @@ fn run(
                 Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Credentials { next, reply }) => {
+                    preparation.take();
+                    prepared = None;
+                    state.upcoming = None;
                     let next =
                         account_credentials(next, account_supported, &mut account_warned, events);
                     state.invalidate_seeks();
@@ -1216,17 +1500,67 @@ fn run(
                     let _ = reply.send_blocking(());
                 }
                 Ok(PlayerCommand::Stop) => {
+                    preparation.take();
+                    prepared = None;
+                    state.upcoming = None;
                     state.invalidate_seeks();
                     state.desired = None;
                     state.loaded = false;
                     write_command(&mut socket, json!(["stop"]), None)?;
                 }
                 Ok(PlayerCommand::Quit) | Err(mpsc::TryRecvError::Disconnected) => {
+                    preparation.take();
                     let _ = write_command(&mut socket, json!(["quit"]), None);
                     return Ok(());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
+        }
+        if let Some(job) = &mut preparation {
+            match job.finish() {
+                Ok(Some(stream)) => {
+                    let target = job.target.clone();
+                    let mut command = load_command(
+                        &stream.url,
+                        "",
+                        PlayOptions {
+                            quality: target.key.quality,
+                            video: target.key.video,
+                            ..Default::default()
+                        },
+                    );
+                    command[2] = json!("append");
+                    command[4]["ytdl"] = json!("no");
+                    state.upcoming = Some(target.track_id);
+                    write_command(
+                        &mut socket,
+                        command,
+                        Some(json!(format!("prepare:{}", target.track_id))),
+                    )?;
+                    #[cfg(test)]
+                    let _ = events.send_blocking(PlayerEvent::Prepared {
+                        video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
+                    });
+                    prepared = Some((target, stream));
+                    preparation.take();
+                }
+                Err(_) => {
+                    preparation.take();
+                }
+                Ok(None) if job.started.elapsed() > Duration::from_secs(30) => {
+                    preparation.take();
+                }
+                Ok(None) => {}
+            }
+        }
+        if prepared.as_ref().is_some_and(|(target, stream)| {
+            state.current != Some(target.track_id) && SystemTime::now() >= stream.expires
+        }) {
+            let (target, _) = prepared.take().unwrap();
+            state.upcoming = None;
+            state.entries.retain(|_, id| Some(*id) == state.current);
+            write_command(&mut socket, json!(["playlist-clear"]), None)?;
+            preparation = StreamPreparation::start(target, &ytdlp, credentials.as_ref()).ok();
         }
         if let Some(attached) = &mut video {
             match attached.video.ready() {
@@ -1286,6 +1620,7 @@ struct ActiveSeek {
 struct PlaybackState {
     file_active: bool,
     desired: Option<u64>,
+    upcoming: Option<u64>,
     current: Option<u64>,
     entries: HashMap<u64, u64>,
     loaded: bool,
@@ -1444,6 +1779,20 @@ impl PlaybackState {
     fn message(&mut self, value: Value, events: &async_channel::Sender<PlayerEvent>) {
         if let Some(track_id) = value["request_id"]
             .as_str()
+            .and_then(|id| id.strip_prefix("prepare:"))
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            if self.upcoming == Some(track_id)
+                && let Some(entry) = value
+                    .pointer("/data/playlist_entry_id")
+                    .and_then(Value::as_u64)
+            {
+                self.entries.insert(entry, track_id);
+            }
+            return;
+        }
+        if let Some(track_id) = value["request_id"]
+            .as_str()
             .and_then(|id| id.strip_prefix("loaded-seekable:"))
             .and_then(|id| id.parse::<u64>().ok())
         {
@@ -1569,6 +1918,15 @@ impl PlaybackState {
                 self.current = value["playlist_entry_id"]
                     .as_u64()
                     .and_then(|id| self.entries.get(&id).copied());
+                if self.current.is_some() && self.current == self.upcoming {
+                    self.desired = self.current;
+                    self.upcoming = None;
+                    self.loaded = false;
+                    self.paused = false;
+                    self.pause_target = Some(false);
+                    self.pause_after_load = true;
+                    self.invalidate_seeks();
+                }
             }
             Some("file-loaded") if self.current.is_some() && self.current == self.desired => {
                 self.loaded = true;
@@ -1739,6 +2097,298 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn cancelling_preparation_reaps_the_extractor_and_revokes_its_cookie_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let extractor = directory.path().join("extractor");
+        fs::write(
+            &extractor,
+            "#!/usr/bin/python3\nimport time\ntime.sleep(30)\n",
+        )
+        .unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let credentials =
+            prepare_credentials(synthetic_credentials("INVENTED"), directory.path()).unwrap();
+        let target = PreparedTarget {
+            key: StreamKey {
+                url: "https://music.youtube.com/watch?v=abcdefghijk".into(),
+                quality: AudioQuality::Normal,
+                video: None,
+            },
+            track_id: 1,
+        };
+        let job = StreamPreparation::start(target, &extractor, Some(&credentials)).unwrap();
+        let pid = job.child.id();
+        let copy = format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            job._cookies.as_ref().unwrap().as_raw_fd()
+        );
+        let original = format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            credentials.cookies.as_raw_fd()
+        );
+        assert_ne!(file_identity(&copy), file_identity(&original));
+        assert!(fs::read_to_string(&copy).unwrap().contains("INVENTED"));
+        drop(job);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!Path::new(&copy).exists());
+        assert!(Path::new(&original).exists());
+    }
+
+    #[test]
+    fn prepared_occurrences_keep_their_reserved_identity_only_for_matching_plays() {
+        let (commands, received) = command_channel().unwrap();
+        let (_, events) = async_channel::unbounded();
+        let player = Player {
+            commands,
+            events,
+            next_id: AtomicU64::new(1),
+            next: Mutex::new(None),
+            worker: None,
+        };
+        player
+            .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+            .unwrap();
+        let PlayerCommand::Prepare(Some(target)) = received.try_recv().unwrap() else {
+            panic!("missing preparation")
+        };
+        assert_eq!(
+            player
+                .play("abcdefghijk", "Next", PlayOptions::default())
+                .unwrap(),
+            target.track_id
+        );
+        assert_eq!(
+            player
+                .play("abcdefghijk", "Replay", PlayOptions::default())
+                .unwrap(),
+            target.track_id + 1
+        );
+        received.try_recv().unwrap();
+        received.try_recv().unwrap();
+        player
+            .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+            .unwrap();
+        let PlayerCommand::Prepare(Some(target)) = received.try_recv().unwrap() else {
+            panic!("missing preparation")
+        };
+        assert_ne!(
+            player
+                .play(
+                    "abcdefghijk",
+                    "New quality",
+                    PlayOptions {
+                        quality: AudioQuality::High,
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
+            target.track_id
+        );
+    }
+
+    #[test]
+    fn natural_prefetched_transition_reports_the_old_end_and_new_start_in_order() {
+        let (events, received) = async_channel::unbounded();
+        let mut state = PlaybackState {
+            desired: Some(1),
+            current: Some(1),
+            loaded: true,
+            upcoming: Some(2),
+            entries: HashMap::from([(10, 1)]),
+            ..Default::default()
+        };
+        state.message(
+            json!({"request_id":"prepare:2","error":"success","data":{"playlist_entry_id":11}}),
+            &events,
+        );
+        state.message(
+            json!({"event":"end-file","playlist_entry_id":10,"reason":"eof"}),
+            &events,
+        );
+        state.message(
+            json!({"event":"start-file","playlist_entry_id":11}),
+            &events,
+        );
+        state.message(json!({"event":"file-loaded"}), &events);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            PlayerEvent::Ended { track_id: 1 }
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            PlayerEvent::Started { track_id: 2, .. }
+        ));
+        assert_eq!(state.desired, Some(2));
+        assert!(state.loaded);
+        // A replaced preparation cannot reinsert a removed playlist entry.
+        state.message(
+            json!({"request_id":"prepare:3","error":"success","data":{"playlist_entry_id":12}}),
+            &events,
+        );
+        assert!(!state.entries.contains_key(&12));
+    }
+
+    #[test]
+    fn prepared_streams_expire_and_are_bound_to_the_recording_and_quality() {
+        let key = StreamKey {
+            url: "https://music.youtube.com/watch?v=abcdefghijk".into(),
+            quality: AudioQuality::Normal,
+            video: None,
+        };
+        let now = SystemTime::now();
+        let expiry = now.duration_since(UNIX_EPOCH).unwrap().as_secs() + 120;
+        let stream = ResolvedStream::parse(
+            key.clone(),
+            format!("https://rr1.googlevideo.com/videoplayback?expire={expiry}&id=x\n").as_bytes(),
+            now,
+        )
+        .unwrap();
+        assert!(stream.matches(&key));
+        assert!(!stream.matches(&StreamKey {
+            quality: AudioQuality::High,
+            ..key.clone()
+        }));
+        assert!(!stream.matches(&StreamKey {
+            url: "other".into(),
+            ..key.clone()
+        }));
+        assert!(
+            ResolvedStream::parse(
+                key.clone(),
+                b"https://rr1.googlevideo.com/videoplayback?expire=1",
+                now
+            )
+            .is_err()
+        );
+        for url in [
+            "http://rr1.googlevideo.com/x",
+            "https://example.com/x",
+            "file:///tmp/private",
+        ] {
+            assert!(ResolvedStream::parse(key.clone(), url.as_bytes(), now).is_err());
+        }
+        let video = ResolvedStream::parse(
+            key,
+            b"https://rr1.googlevideo.com/video\nhttps://rr1.googlevideo.com/audio\n",
+            now,
+        )
+        .unwrap();
+        assert!(video.url.contains(";!new_stream;"));
+    }
+
+    #[test]
+    #[ignore = "requires libmpv, yt-dlp and network; uses null audio and no account"]
+    fn live_prepared_next_latency() {
+        fn event(player: &Player, deadline: Instant) -> PlayerEvent {
+            loop {
+                if let Some(event) = player.try_recv() {
+                    return event;
+                }
+                assert!(Instant::now() < deadline, "player stopped producing events");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn wait_for_audio(player: &Player, id: u64, start: Instant) -> Duration {
+            while start.elapsed() < Duration::from_secs(55) {
+                match event(player, start + Duration::from_secs(55)) {
+                    PlayerEvent::Position { track_id, seconds }
+                        if track_id == id && seconds > 0. =>
+                    {
+                        return start.elapsed();
+                    }
+                    PlayerEvent::Error { track_id, message } => {
+                        panic!("track {track_id:?}: {message}")
+                    }
+                    _ => {}
+                }
+            }
+            panic!("audio did not start")
+        }
+        let player = Player::new(PlayerOptions {
+            volume: 0.,
+            audio_output: Some("null".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let start = Instant::now();
+        let initial = player
+            .play("csILUDfmtqM", "Initial", PlayOptions::default())
+            .unwrap();
+        wait_for_audio(&player, initial, start);
+        let start = Instant::now();
+        let id = player
+            .play("csILUDfmtqM", "Baseline", PlayOptions::default())
+            .unwrap();
+        let cold = wait_for_audio(&player, id, start);
+        player
+            .prepare_next(Some("csILUDfmtqM"), PlayOptions::default())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(55);
+        loop {
+            assert!(Instant::now() < deadline, "next stream did not prepare");
+            match event(&player, deadline) {
+                PlayerEvent::Prepared { video_id } if video_id == "csILUDfmtqM" => break,
+                PlayerEvent::Error { track_id, message } => panic!("track {track_id:?}: {message}"),
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+        while player.events.try_recv().is_ok() {}
+        let start = Instant::now();
+        let id = player
+            .play("csILUDfmtqM", "Prepared", PlayOptions::default())
+            .unwrap();
+        let warm = wait_for_audio(&player, id, start);
+        println!(
+            "cold_next_ms={:.1} prepared_next_ms={:.1}",
+            cold.as_secs_f64() * 1000.,
+            warm.as_secs_f64() * 1000.
+        );
+        player
+            .prepare_next(Some("csILUDfmtqM"), PlayOptions::default())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(55);
+        loop {
+            if matches!(event(&player, deadline), PlayerEvent::Prepared { .. }) {
+                break;
+            }
+        }
+        // Exercise the real EOF handoff quickly, after the queued URL can prebuffer.
+        thread::sleep(Duration::from_secs(1));
+        player.seek(id, 225.).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut ended = None;
+        let mut next_id = None;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "natural transition did not finish"
+            );
+            match event(&player, deadline) {
+                PlayerEvent::Ended { track_id } if track_id == id => {
+                    ended = Some(Instant::now());
+                    next_id = Some(
+                        player
+                            .play("csILUDfmtqM", "Natural", PlayOptions::default())
+                            .unwrap(),
+                    );
+                }
+                PlayerEvent::Started { track_id, .. } if Some(track_id) == next_id => {
+                    println!(
+                        "natural_eof_to_started_ms={:.3}",
+                        ended.unwrap().elapsed().as_secs_f64() * 1000.
+                    );
+                    break;
+                }
+                PlayerEvent::Error { track_id, message } => panic!("track {track_id:?}: {message}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -1926,6 +2576,7 @@ mod tests {
             commands,
             events,
             next_id: AtomicU64::new(2),
+            next: Mutex::new(None),
             worker: None,
         };
         for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -2301,6 +2952,7 @@ mod tests {
             commands,
             events,
             next_id: AtomicU64::new(1),
+            next: Mutex::new(None),
             worker: None,
         };
         for start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.] {
@@ -3023,6 +3675,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             commands,
             events,
             next_id: AtomicU64::new(1),
+            next: Mutex::new(None),
             worker: None,
         };
         let cleared = player.clear_credentials().unwrap();
