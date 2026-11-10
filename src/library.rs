@@ -271,22 +271,91 @@ impl Store {
     }
 }
 
+enum SaveRequest {
+    Snapshot(Box<Library>),
+    Preferences(Preferences),
+}
+
+#[derive(Clone, Copy)]
+struct Preferences {
+    repeat: Repeat,
+    autoplay: bool,
+    volume: f64,
+    speed: PlaybackSpeed,
+    quality: AudioQuality,
+    video: bool,
+    video_quality: VideoQuality,
+}
+
+impl From<&Library> for Preferences {
+    fn from(library: &Library) -> Self {
+        Self {
+            repeat: library.repeat,
+            autoplay: library.autoplay,
+            volume: library.volume,
+            speed: library.speed,
+            quality: library.quality,
+            video: library.video,
+            video_quality: library.video_quality,
+        }
+    }
+}
+
+impl Preferences {
+    fn apply(self, library: &mut Library) {
+        library.repeat = self.repeat;
+        library.autoplay = self.autoplay;
+        library.volume = self.volume;
+        library.speed = self.speed;
+        library.quality = self.quality;
+        library.video = self.video;
+        library.video_quality = self.video_quality;
+    }
+}
+
 pub struct LibraryWriter {
-    requests: async_channel::Sender<Library>,
-    pending: async_channel::Receiver<Library>,
+    requests: async_channel::Sender<SaveRequest>,
+    pending: async_channel::Receiver<SaveRequest>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LibraryWriter {
     pub fn new(store: Store) -> (Self, async_channel::Receiver<String>) {
-        let (requests, pending) = async_channel::bounded::<Library>(1);
+        let (requests, pending) = async_channel::bounded::<SaveRequest>(1);
         let receiver = pending.clone();
         let (errors, failed) = async_channel::unbounded();
         let worker = std::thread::Builder::new()
             .name("library-writer".into())
             .spawn(move || {
-                while let Ok(library) = receiver.recv_blocking() {
-                    if let Err(error) = store.save(&library) {
+                let mut current = None;
+                while let Ok(request) = receiver.recv_blocking() {
+                    match request {
+                        SaveRequest::Snapshot(library) => current = Some(*library),
+                        SaveRequest::Preferences(preferences) => {
+                            if current.is_none() {
+                                let restored = match fs::read(&store.path) {
+                                    Ok(bytes) => serde_json::from_slice::<Library>(&bytes)
+                                        .map_err(anyhow::Error::from),
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                        Ok(Library::new())
+                                    }
+                                    Err(error) => Err(error.into()),
+                                };
+                                match restored {
+                                    Ok(library) => current = Some(library),
+                                    Err(error) => {
+                                        let _ = errors.send_blocking(format!(
+                                            "Could not read your saved music: {error}"
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                            let library = current.as_mut().unwrap();
+                            preferences.apply(library);
+                        }
+                    }
+                    if let Err(error) = store.save(current.as_ref().unwrap()) {
                         let _ = errors.send_blocking(format!("{error:#}"));
                     }
                 }
@@ -305,7 +374,23 @@ impl LibraryWriter {
     pub fn save(&self, library: &Library) {
         // Keep only the newest snapshot while a previous atomic write is in flight.
         let _ = self.pending.try_recv();
-        let _ = self.requests.try_send(library.clone());
+        let _ = self
+            .requests
+            .try_send(SaveRequest::Snapshot(Box::new(library.clone())));
+    }
+
+    /// Save settings without cloning queue or library collections on the UI thread.
+    #[allow(dead_code)] // The app integration can use this independently of full snapshots.
+    pub fn save_preferences(&self, library: &Library) {
+        let preferences = Preferences::from(library);
+        let request = match self.pending.try_recv() {
+            Ok(SaveRequest::Snapshot(mut snapshot)) => {
+                preferences.apply(&mut snapshot);
+                SaveRequest::Snapshot(snapshot)
+            }
+            _ => SaveRequest::Preferences(preferences),
+        };
+        let _ = self.requests.try_send(request);
     }
 }
 
@@ -366,6 +451,68 @@ mod tests {
             thumbnail: None,
             details: Default::default(),
         }
+    }
+
+    #[test]
+    fn preferences_keep_the_latest_queue_snapshot_and_existing_disk_library() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.json");
+        let mut library = Library::new();
+        library
+            .queue
+            .replace(vec![track("first"), track("second")], 1);
+        let store = Store { path: path.clone() };
+        store.save(&library).unwrap();
+        let (writer, errors) = LibraryWriter::new(store);
+        library.volume = 17.;
+        writer.save_preferences(&library);
+        drop(writer);
+        assert!(errors.is_empty());
+        let saved: Library = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.volume, 17.);
+        assert_eq!(saved.queue.tracks, library.queue.tracks);
+        let (writer, errors) = LibraryWriter::new(Store { path: path.clone() });
+        library.queue.tracks.push(track("new-tail"));
+        writer.save(&library);
+        for n in 0..100 {
+            library.volume = n as f64;
+            writer.save_preferences(&library);
+        }
+        drop(writer);
+        assert!(errors.is_empty());
+        let saved: Library = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.volume, 99.);
+        assert_eq!(saved.queue.tracks, library.queue.tracks);
+    }
+
+    #[test]
+    #[ignore = "measures caller-thread save cost with a 10,000-song queue"]
+    fn large_queue_preference_save_latency() {
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, errors) = LibraryWriter::new(Store {
+            path: directory.path().join("library.json"),
+        });
+        let mut library = Library::new();
+        library.queue.replace(
+            (0..10_000).map(|i| track(&format!("song-{i}"))).collect(),
+            0,
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            writer.save(&library);
+        }
+        let full = start.elapsed().as_secs_f64() * 1000. / 20.;
+        let start = std::time::Instant::now();
+        for n in 0..20 {
+            library.volume = n as f64;
+            writer.save_preferences(&library);
+        }
+        let preferences = start.elapsed().as_secs_f64() * 1000. / 20.;
+        drop(writer);
+        assert!(errors.is_empty());
+        println!(
+            "queue_tracks=10000 snapshot_save_ms={full:.4} preference_save_ms={preferences:.4}"
+        );
     }
 
     #[test]
