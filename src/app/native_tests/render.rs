@@ -29,7 +29,12 @@ async fn wait_for_presented_frame(window: WindowHandle<Music>, cx: &mut AsyncApp
 
 async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
     cx.update_window(window.into(), |_, window, cx| {
-        window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        let keystroke = gpui::Keystroke::parse(key).unwrap();
+        window.dispatch_keystroke(keystroke.clone(), cx);
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }),
+            cx,
+        );
     })
     .unwrap();
     wait_for_presented_frame(window, cx).await;
@@ -176,6 +181,9 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
         }
         key(window, cx, "tab").await;
     }
+    let restores_before_queue = window
+        .update(cx, |music, _, _| music.focus_restores)
+        .unwrap();
     for slot in 0..66 {
         window
             .update(cx, |music, window, _| {
@@ -188,7 +196,29 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
                 );
             })
             .unwrap();
-        if slot < 65 {
+        if slot == 49 {
+            // Force a frame between focusing an undrawn row and revealing it. This
+            // reproduced the app's focus-lost fallback stealing the queue target.
+            window
+                .update(cx, |music, window, cx| {
+                    music.queue_focus.focus(50, window, cx);
+                    cx.notify();
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            window
+                .update(cx, |music, window, cx| {
+                    assert_eq!(music.queue_focus.focused(window), Some(50));
+                    assert_eq!(music.focus_restores, restores_before_queue);
+                    music
+                        .player_page
+                        .queue_scroll
+                        .scroll_to_item(25, gpui::ScrollStrategy::Nearest);
+                    cx.notify();
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        } else if slot < 65 {
             key(window, cx, "tab").await;
         }
     }
@@ -203,7 +233,7 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
             assert_eq!(
                 music.queue_focus.focused(window),
                 None,
-                "The final queue menu exits to the player bar"
+                "The final queue menu exits to the autoplay control"
             )
         })
         .unwrap();
@@ -234,6 +264,15 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
             key(window, cx, "shift-tab").await;
         }
     }
+    window
+        .update(cx, |music, _, _| {
+            assert_eq!(
+                music.focus_restores, restores_before_queue,
+                "Queue traversal must never restore root focus"
+            );
+            println!("QUEUE_FOCUS_RESTORES forward_reverse=0 forced_undrawn_target=passed");
+        })
+        .unwrap();
     // Scrolling a focused virtual row away must recover the same root shortcuts.
     window
         .update(cx, |music, _, cx| {
@@ -317,6 +356,234 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
     println!("KEYBOARD_RECOVERY card=passed virtual_row=passed queue_slots=66 sidebar_rows=30");
 }
 
+async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::{CatalogRequests, Query, Route};
+    use serde_json::json;
+    let option = |label: &str, token: &str| {
+        json!({"musicMultiSelectMenuItemRenderer":{
+            "title":{"runs":[{"text":label}]},
+            "selectedCommand":{"commandExecutorCommand":{"commands":[{"browseSectionListReloadEndpoint":{"continuation":{"reloadContinuationData":{"continuation":token}}}}]}}
+        }})
+    };
+    let response = json!({"contents":{"singleColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{
+        "header":{"musicSideAlignedItemRenderer":{
+            "startItems":[{"chipCloudRenderer":{"chips":[]}}],
+            "endItems":[{"musicSortFilterButtonRenderer":{
+            "title":{"runs":[{"text":"Recent activity"}]},
+            "menu":{"musicMultiSelectMenuRenderer":{"options":[option("Recent activity","activity"),option("Recently saved","saved")]}}
+        }}]}},
+        "contents":[{"gridRenderer":{"items":(0..10).map(|index| json!({"musicTwoRowItemRenderer":{
+            "title":{"runs":[{"text":format!("Playlist {}",index+1)}]},
+            "subtitle":{"runs":[{"text":"Synthetic playlist"}]},
+            "navigationEndpoint":{"browseEndpoint":{"browseId":format!("VLsynthetic-{index}")}}
+        }})).collect::<Vec<_>>(),"itemSize":"COLLECTION_STYLE_ITEM_SIZE_SMALL"}}]
+    }}}}]}}});
+    window
+        .update(cx, |music, window, cx| {
+            music.player_open = false;
+            music.account = Some(super::account::connection(super::account::session(
+                "keyboard-test",
+            )));
+            music.library.saved.clear();
+            music.catalog_requests = CatalogRequests::new();
+            music.route = Route::Saved;
+            music.page = crate::catalog::parse_page(&response, "Library").unwrap();
+            assert_eq!(music.page.library.as_ref().unwrap().sort.len(), 2);
+            music.rebuild_rows();
+            music
+                .list_scroll
+                .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+            music.library.volume = 0.;
+            music.error = None;
+            window.resize(size(px(850.), px(560.)));
+            window.focus(&music.focus, cx);
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, window, cx| window.focus(&music.sort_focus, cx))
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    key(window, cx, "enter").await;
+    let first = window
+        .update(cx, |music, window, cx| {
+            assert!(music.sort_menu);
+            assert!(music.overlay_focus.contains_focused(window, cx));
+            window.focused(cx).unwrap()
+        })
+        .unwrap();
+    key(window, cx, "down").await;
+    let second = window
+        .update(cx, |music, window, cx| {
+            assert_eq!(music.library.volume, 0.);
+            let focused = window.focused(cx).unwrap();
+            assert_ne!(focused, first);
+            assert!(music.overlay_focus.contains_focused(window, cx));
+            focused
+        })
+        .unwrap();
+    key(window, cx, "up").await;
+    window
+        .update(cx, |music, window, cx| {
+            assert_eq!(
+                music.library.volume, 0.,
+                "Sort arrows must never change volume"
+            );
+            assert_eq!(window.focused(cx), Some(first.clone()));
+            capture(window, "library-sort-focused");
+        })
+        .unwrap();
+    for (key_name, expected) in [
+        ("end", second.clone()),
+        ("home", first.clone()),
+        ("shift-tab", second.clone()),
+        ("tab", first),
+    ] {
+        key(window, cx, key_name).await;
+        window
+            .update(cx, |_, window, cx| {
+                assert_eq!(window.focused(cx), Some(expected))
+            })
+            .unwrap();
+    }
+    key(window, cx, "escape").await;
+    window
+        .update(cx, |music, window, _| {
+            assert!(!music.sort_menu);
+            assert!(music.sort_focus.is_focused(window));
+        })
+        .unwrap();
+    key(window, cx, "enter").await;
+    key(window, cx, "down").await;
+    key(window, cx, "enter").await;
+    window.update(cx,|music,window,_| {
+        assert!(!music.sort_menu);
+        assert!(music.sort_focus.is_focused(window));
+        assert!(matches!(music.catalog_requests.pending.try_recv().unwrap().query,Query::Reload(ref reload) if reload.token()=="saved"));
+    }).unwrap();
+    for width in [850., 1000.] {
+        window
+            .update(cx, |music, window, cx| {
+                window.resize(size(px(width), px(560.)));
+                music.catalog_requests = CatalogRequests::new();
+                music
+                    .list_scroll
+                    .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+                window.focus(&music.sort_focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        key(window, cx, "tab").await;
+        window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("library-card-{width}"));
+            })
+            .unwrap();
+        window
+            .update(cx, |music, window, cx| {
+                music.account = None;
+                music.autoplay_tracks = crate::app::sync::tests::page(3, false).tracks().into();
+                music.player_open = true;
+                music.library.queue.playing_from = Some("Synthetic playlist".into());
+                music.select_player_tab(PlayerTab::UpNext, cx);
+                music
+                    .player_page
+                    .queue_scroll
+                    .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+                music.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                music.player_page.hovered_row = None;
+                window.focus(&music.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |music, window, cx| {
+                capture(window, &format!("queue-paused-{width}"));
+                music.player_page.hovered_row = Some(0);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("queue-hover-{width}"));
+            })
+            .unwrap();
+        // Reach the filled Save pill with actual Tab input and capture its ring.
+        for _ in 0..30 {
+            key(window, cx, "tab").await;
+            if window
+                .update(cx, |music, window, _| {
+                    music.queue_focus.focused(window) == Some(0)
+                })
+                .unwrap()
+            {
+                break;
+            }
+        }
+        window
+            .update(cx, |music, window, _| {
+                assert_eq!(music.queue_focus.focused(window), Some(0))
+            })
+            .unwrap();
+        key(window, cx, "shift-tab").await;
+        window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("queue-save-focused-{width}"));
+            })
+            .unwrap();
+        key(window, cx, "tab").await;
+        for slot in 0..66 {
+            window
+                .update(cx, |music, window, cx| {
+                    assert_eq!(music.queue_focus.focused(window), Some(slot), "width={width} queued={} autoplay={} root={} restores={} raw={:?} scroll={:?}",music.library.queue.tracks.len(),music.autoplay_tracks.len(),music.focus.is_focused(window),music.focus_restores,window.focused(cx),music.player_page.queue_scroll.0.borrow().base_handle.offset());
+                    let row = slot / 2;
+                    assert_row_visible(
+                        &music.player_page.queue_scroll,
+                        row + usize::from(row >= 30),
+                        34,
+                    );
+                })
+                .unwrap();
+            if slot < 65 {
+                key(window, cx, "tab").await;
+            }
+        }
+        window
+            .update(cx, |_, window, _| {
+                capture(window, &format!("queue-tail-{width}"));
+            })
+            .unwrap();
+        key(window, cx, "tab").await;
+        window
+            .update(cx, |music, window, _| {
+                assert_eq!(music.queue_focus.focused(window), None)
+            })
+            .unwrap();
+        key(window, cx, "space").await;
+        window
+            .update(cx, |music, _, cx| {
+                assert!(
+                    !music.library.autoplay,
+                    "The autoplay control must remain reachable at compact widths"
+                );
+                music.library.autoplay = true;
+                music.player_open = false;
+                cx.notify();
+            })
+            .unwrap();
+    }
+    println!(
+        "LIBRARY_SORT arrows=passed volume_unchanged=passed enter_reload=passed escape_restore=passed tab_trap=passed compact_widths=850,1000"
+    );
+}
+
 pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
     let id = match HasWindowHandle::window_handle(window).unwrap().as_raw() {
         RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
@@ -335,7 +602,15 @@ pub(super) fn capture(window: &gpui::Window, name: &str) -> image::RgbaImage {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    image::open(path).unwrap().to_rgba8()
+    let image = image::open(&path).unwrap().to_rgba8();
+    // Comparison loops use the pixels immediately. Keep representative states,
+    // rather than dozens of nearly identical PNGs in a quota-limited runtime.
+    if (name.starts_with("Lyrics-") || name.starts_with("Related-"))
+        && (name.contains("-tab-") || name.contains("-focus-"))
+    {
+        std::fs::remove_file(path).unwrap();
+    }
+    image
 }
 
 fn assert_page_retained(baseline: &image::RgbaImage, image: &image::RgbaImage) {
@@ -439,6 +714,13 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                             );
                             println!("STARTED_WITHOUT_RENDER prepared=fJ9rUzIMcZQ");
                             music.catalog_requests = crate::app::CatalogRequests::new();
+                            // These startup workers are replaced by synthetic state below.
+                            // Close their subscriptions so late startup events cannot redraw
+                            // the body during the position-only measurement.
+                            music.player.as_ref().unwrap().events().close();
+                            if let Some(service) = &music.mpris {
+                                service.events().close();
+                            }
                             music.player = None;
                             music.mpris = None;
                             music.video = None;
@@ -746,6 +1028,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     })
                     .unwrap();
                 keyboard_survives_replacement_and_scrolls_lists(window, cx).await;
+                library_sort_and_compact_layouts(window, cx).await;
                 result.store(true, Ordering::SeqCst);
                 cx.update(|cx| cx.quit());
             })

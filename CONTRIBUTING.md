@@ -34,7 +34,7 @@ bin/test -- --ignored --exact player::tests::embedded_extractor_binds_the_select
 - **`live_*` tests** call public YouTube Music endpoints without an account. Some player tests named `live_*` use only a synthetic local extractor, as their ignore reason says.
 - **Keyring and browser tests** (`live_keyring_removal_is_idempotent`, `live_default_browser_profile_resolves_omarchy_launcher`) use your desktop session. They create only a synthetic keyring entry and read only browser profile metadata.
 
-The four native window tests live in `src/app/native_tests/`. They share `YT_MUSIC_NATIVE_TESTS=1` and refuse execution unless the runtime is an owned 0700 directory directly under `/tmp`, with separate data and artwork cache directories inside it and a private D-Bus session. Account and sync checks use synthetic accounts and intercepted commands. The playback check uses public streams and a paginated public playlist. The render check uses X11 and ImageMagick's `import` to compare actual window pixels after keyboard focus changes and playback ticks.
+The four native window tests live in `src/app/native_tests/`. They share `YT_MUSIC_NATIVE_TESTS=1` and refuse execution unless the runtime is an owned 0700 directory directly under `/tmp`, with separate data and artwork cache directories inside it and a private D-Bus session. Account and sync checks use synthetic accounts and intercepted commands. The playback check uses public streams and a paginated public playlist. The render check uses X11 and ImageMagick's `import` to compare actual window pixels after keyboard focus changes and playback ticks. It also exercises library sorting with a synthetic response, forces a frame before a virtual queue row is revealed, and captures the library and queue at widths of 850 and 1000 pixels.
 
 Run each test in a separate process and fresh environment. GPUI's native application loop cannot be restarted within one test process. This recipe also gives the playback check a synthetic yt-dlp version mismatch, to exercise the guest fallback notice without an account:
 
@@ -60,7 +60,7 @@ EOF
     XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" XDG_CACHE_HOME="$runtime/cache" \
     PATH="$runtime/bin:$PATH" YT_MUSIC_NATIVE_TESTS=1 \
     dbus-run-session -- bin/test -- --ignored --exact "$test" --nocapture || break
-  # Screenshots from the render check stay in $runtime for inspection.
+  # Representative screenshots from the render check stay in $runtime for inspection.
   echo "Native test files: $runtime"
 done
 ```

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-fn session(value: &str) -> Arc<Session> {
+pub(super) fn session(value: &str) -> Arc<Session> {
     let fields = json!({
         "cookie":format!("SAPISID={value}"),
         "playback_cookie":"# Netscape HTTP Cookie File\n",
@@ -35,7 +35,7 @@ fn session(value: &str) -> Arc<Session> {
     Arc::new(serde_json::from_value(fields).unwrap())
 }
 
-fn connection(session: Arc<Session>) -> Connection {
+pub(super) fn connection(session: Arc<Session>) -> Connection {
     Connection {
         session,
         account: Account {

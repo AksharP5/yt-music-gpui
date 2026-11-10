@@ -41,7 +41,8 @@ fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> R
             music.library.autoplay = false;
             music.library.video = false;
             music.library.volume = 0.;
-            music.player.as_ref().unwrap().set_volume(0.).unwrap();
+            let player = music.player.as_ref().unwrap();
+            player.set_volume(0.).unwrap_or_else(|error| panic!("{error:#}; startup events: {:?}", std::iter::from_fn(|| player.try_recv()).collect::<Vec<_>>()));
             music.player_open = true;
             music
         })).unwrap();
