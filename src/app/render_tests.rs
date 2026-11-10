@@ -71,6 +71,8 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                                 buffering: false,
                             };
                             music.duration = 120.;
+                            // Playback opens the player page, so measure with it showing.
+                            music.player_open = true;
                             music
                         })
                     },

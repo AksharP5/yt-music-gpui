@@ -75,6 +75,13 @@ impl AssetSource for Assets {
             "switch-account" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/switch-account.svg"
             ))),
+            "drag-handle" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/drag-handle.svg"
+            ))),
+            "expand" => Some(Cow::Borrowed(include_bytes!("../assets/icons/expand.svg"))),
+            "collapse" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/collapse.svg"
+            ))),
             _ => None,
         })
     }

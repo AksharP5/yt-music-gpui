@@ -20,6 +20,8 @@ pub(in crate::app) enum Overlay {
     Track {
         track: Track,
         index: Option<usize>,
+        /// Set when opened from Up next, so the menu can remove that queue entry.
+        queue_index: Option<usize>,
     },
     PlaylistPicker {
         track: Track,
@@ -165,7 +167,11 @@ impl Music {
     ) {
         window.focus(&self.focus, cx);
         self.overlay_anchor = Some(window.mouse_position());
-        self.overlay = Some(Overlay::Track { track, index });
+        self.overlay = Some(Overlay::Track {
+            track,
+            index,
+            queue_index: None,
+        });
         cx.notify();
     }
 
@@ -192,6 +198,7 @@ impl Music {
         let label = match &query {
             TextQuery::Lyrics(_) => "Lyrics",
             TextQuery::Credits(_) => "Credits",
+            TextQuery::Related(_) => "Related",
         };
         let title = format!("{label} · {title}");
         let session = self.account.as_ref().map(|account| account.session.clone());
@@ -228,7 +235,7 @@ impl Music {
                 "menu-like" => Some("thumb-up"),
                 "menu-dislike" => Some("thumb-down"),
                 "menu-history" => Some("history"),
-                "menu-remove-occurrence" => Some("close"),
+                "menu-remove-occurrence" | "menu-remove-queue" => Some("close"),
                 "menu-share" => Some("link"),
                 "menu-credits" | "menu-lyrics" | "menu-episode" | "menu-chapters" => {
                     Some("description")
@@ -359,7 +366,7 @@ impl Music {
                 ("→ / ←", "Seek 5 seconds"),
                 ("↑ / ↓", "Adjust volume"),
                 ("L", "Like the current song"),
-                ("Q", "Show the queue"),
+                ("Q", "Open or close the player page"),
                 ("F", "Toggle video fullscreen"),
                 ("?", "Keyboard shortcuts"),
                 ("Ctrl Q", "Quit"),
@@ -421,7 +428,12 @@ impl Music {
                     );
                 }
             }
-        } else if let Overlay::Track { track, index } = kind {
+        } else if let Overlay::Track {
+            track,
+            index,
+            queue_index,
+        } = kind
+        {
             let mut track = track.clone();
             if self.account.is_some()
                 && let Some(current) = self
@@ -505,31 +517,20 @@ impl Music {
                     .as_ref()
                     .is_some_and(|current| current.id == track.id)
             {
-                if let Some(id) = &watch.lyrics {
-                    let id = id.clone();
-                    let title = track.title.clone();
+                if watch.lyrics.is_some() {
                     body = body.child(self.menu_action(
                         "menu-lyrics",
                         "Lyrics",
                         cx,
-                        move |view, _, cx| {
-                            view.show_song_text(TextQuery::Lyrics(id.clone()), &title, cx);
-                        },
+                        |view, _, cx| view.show_player_tab(PlayerTab::Lyrics, cx),
                     ));
                 }
-                if let Some(id) = &watch.related {
-                    let id = id.clone();
+                if watch.related.is_some() {
                     body = body.child(self.menu_action(
                         "menu-related",
                         "Related music",
                         cx,
-                        move |view, _, cx| {
-                            view.overlay = None;
-                            view.navigate(
-                                Route::Browse(BrowseLink::new(id.clone(), "Related music")),
-                                cx,
-                            );
-                        },
+                        |view, _, cx| view.show_player_tab(PlayerTab::Related, cx),
                     ));
                 }
             }
@@ -580,6 +581,23 @@ impl Music {
                     view.enqueue(song.clone(), cx);
                 },
             ));
+            if let Some(queued) = queue_index.filter(|&queued| {
+                self.library
+                    .queue
+                    .tracks
+                    .get(queued)
+                    .is_some_and(|entry| entry.id == track.id)
+            }) {
+                body = body.child(self.menu_action(
+                    "menu-remove-queue",
+                    "Remove from queue",
+                    cx,
+                    move |view, _, cx| {
+                        view.overlay = None;
+                        view.remove_queue_track(queued, cx);
+                    },
+                ));
+            }
             if self.account.is_some() {
                 let song = track.clone();
                 let disliked = self
@@ -776,9 +794,10 @@ impl Music {
                 Some(Err(error)) => {
                     body = body.child(div().text_color(self.theme.muted).child(error.clone()))
                 }
-                Some(Ok(SongText::Lyrics(text))) => {
-                    body = body.child(div().text_size(px(17.)).child(text.clone()))
+                Some(Ok(SongText::Lyrics(lyrics))) => {
+                    body = body.child(div().text_size(px(17.)).child(lyrics.text.clone()))
                 }
+                Some(Ok(SongText::Related(_))) => {}
                 Some(Ok(SongText::Credits(credits))) => {
                     for section in credits {
                         body = body.child(

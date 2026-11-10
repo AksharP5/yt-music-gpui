@@ -56,7 +56,7 @@ impl Music {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .when(!self.route.is_artist() || self.video_open, |d| {
+            .when(!self.route.is_artist() || self.player_open, |d| {
                 d.bg(self.theme.bg)
             })
             .child(

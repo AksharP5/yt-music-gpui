@@ -37,27 +37,24 @@ impl Render for MusicContent {
 
 impl Music {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let fullscreen = self.video_open && window.is_fullscreen();
-        let width: f32 = window.viewport_size().width.into();
-        let compact = self.sidebar_collapsed || width < 1150. || (self.show_queue && width < 1440.);
-        let queue_compact = width < 1200.;
-        let available = width
-            - if compact { 72. } else { 240. }
-            - if self.show_queue && !fullscreen {
-                if queue_compact { 320. } else { 400. }
-            } else {
-                0.
-            };
+        let player_page = self.player_open && self.library.queue.current().is_some();
+        let fullscreen = player_page && self.library.video && window.is_fullscreen();
+        let viewport = window.viewport_size();
+        let width: f32 = viewport.width.into();
+        let height: f32 = viewport.height.into();
+        let compact = self.sidebar_collapsed || width < 1150.;
+        let sidebar_width = if compact { 72. } else { 240. };
+        let available = width - sidebar_width;
         let inset = if available >= 1000. { 100. } else { 32. };
         let artist_background = self.artist_background(compact);
         let header = (!fullscreen).then(|| self.header(inset, compact, width, cx));
         let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
-        let content = if self.video_open {
-            self.video_content(window, cx)
+        let content = if player_page {
+            let body = height - player_bar_height(width) - if fullscreen { 0. } else { 64. };
+            self.player_page(width, sidebar_width, body, window, cx)
         } else {
             self.content(inset, available, cx)
         };
-        let queue = (self.show_queue && !fullscreen).then(|| self.queue(queue_compact, cx));
         div()
             .size_full()
             .relative()
@@ -71,17 +68,20 @@ impl Music {
                     .min_h_0()
                     .flex()
                     .children(sidebar)
-                    .child(content)
-                    .children(queue),
+                    .child(content),
             )
             .into_any_element()
     }
 }
 
+fn player_bar_height(width: f32) -> f32 {
+    if width < 936. { 64. } else { 72. }
+}
+
 impl Render for Music {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.publish_desktop();
-        if self.video_fullscreen && !self.video_open {
+        if self.video_fullscreen && !(self.player_open && self.library.video) {
             if window.is_fullscreen() {
                 window.toggle_fullscreen();
             }
@@ -95,7 +95,8 @@ impl Render for Music {
         {
             self.video_error = Some("Video is unavailable. Try again or switch to audio.".into());
         }
-        let native_video = self.video_open
+        let native_video = self.player_open
+            && self.library.video
             && self.overlay.is_none()
             && self.active_id.is_some()
             && self.playback != Playback::Stopped
@@ -115,7 +116,7 @@ impl Render for Music {
         let height: f32 = window.viewport_size().height.into();
         let has_player = self.library.queue.current().is_some();
         let player_height = if has_player {
-            if width < 936. { 64. } else { 72. }
+            player_bar_height(width)
         } else {
             0.
         };

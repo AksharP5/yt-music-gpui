@@ -1,18 +1,16 @@
-//! Video view, media mode controls, and fullscreen presentation.
+//! Native video viewport for the player page and fullscreen presentation.
 
 use super::*;
 
 impl Music {
-    pub(in crate::app) fn video_content(
+    /// The video surface. libmpv draws into its bounds through the transparent window.
+    pub(in crate::app) fn video_viewport(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Stateful<Div> {
         let fullscreen = window.is_fullscreen();
         let current = self.library.queue.current();
-        let title = current
-            .map_or("Now playing", |track| track.title.as_str())
-            .to_owned();
         let native = self.overlay.is_none()
             && self.active_id.is_some()
             && self.playback != Playback::Stopped
@@ -24,15 +22,16 @@ impl Music {
                 .as_ref()
                 .is_some_and(|video| video.status() == VideoStatus::Ready);
         let view = cx.entity().downgrade();
+        let hole = self.player_page.video_bounds.clone();
         let mut viewport = div()
             .id("video-viewport")
+            .group("video-viewport")
             .relative()
-            .flex_1()
-            .min_h_0()
             .when(!ready, |viewport| viewport.bg(gpui::black()))
             .child(
                 canvas(
                     move |bounds, window, cx| {
+                        hole.set(Some(bounds));
                         view.update(cx, |view, cx| {
                             if !native {
                                 return false;
@@ -76,7 +75,7 @@ impl Music {
                         .timer(Duration::from_millis(400))
                         .await;
                     let _ = view.update(cx, |view, cx| {
-                        if view.video_open
+                        if view.player_open
                             && view.overlay.is_none()
                             && view.active_id == active
                             && view.playback == playback
@@ -93,6 +92,29 @@ impl Music {
                         view.video_click = None;
                     }
                 }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(12.))
+                    .right(px(12.))
+                    .invisible()
+                    .group_hover("video-viewport", |button| button.visible())
+                    .child(
+                        button(
+                            "video-fullscreen",
+                            if fullscreen {
+                                "exit-fullscreen"
+                            } else {
+                                "fullscreen"
+                            },
+                            self.theme,
+                        )
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            cx.stop_propagation();
+                            view.toggle_video_fullscreen(window, cx)
+                        })),
+                    ),
             );
         if !native {
             let message = self.video_error.clone().unwrap_or_else(|| {
@@ -135,81 +157,6 @@ impl Music {
                     }),
             );
         }
-        let content = div().flex_1().min_w_0().flex().flex_col();
-        content
-            .child(
-                div()
-                    .h(px(64.))
-                    .flex_shrink_0()
-                    .px(px(24.))
-                    .bg(self.theme.bg)
-                    .flex()
-                    .items_center()
-                    .gap(px(14.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .id("audio-mode")
-                            .px(px(10.))
-                            .py(px(12.))
-                            .text_color(self.theme.muted)
-                            .cursor_pointer()
-                            .child("Audio")
-                            .on_click(cx.listener(|view, _, _, cx| view.set_video_mode(false, cx))),
-                    )
-                    .child(div().text_color(self.theme.accent).child("Video"))
-                    .child(
-                        div()
-                            .id("video-quality-picker")
-                            .px(px(10.))
-                            .py(px(12.))
-                            .cursor_pointer()
-                            .child(self.library.video_quality.label())
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                window.focus(&view.focus, cx);
-                                view.settings_section = SettingsSection::Playback;
-                                view.overlay = Some(Overlay::Settings);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        button(
-                            "video-fullscreen",
-                            if fullscreen {
-                                "exit-fullscreen"
-                            } else {
-                                "fullscreen"
-                            },
-                            self.theme,
-                        )
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.toggle_video_fullscreen(window, cx)
-                        })),
-                    ),
-            )
-            .when_some(
-                self.error
-                    .as_ref()
-                    .filter(|_| !matches!(self.overlay, Some(Overlay::SignIn))),
-                |content, error| {
-                    content.child(
-                        div()
-                            .px(px(24.))
-                            .py(px(12.))
-                            .bg(self.theme.panel)
-                            .text_color(rgb(0xf1a6ae))
-                            .child(error.clone()),
-                    )
-                },
-            )
-            .child(viewport)
-            .into_any_element()
+        viewport
     }
 }

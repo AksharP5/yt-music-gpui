@@ -6,6 +6,8 @@ use super::*;
 pub(in crate::app) enum Drag {
     Seek,
     Volume,
+    /// Reordering Up next; the rows track the pointer in `PlayerPage`.
+    Queue,
 }
 
 impl Music {
@@ -17,7 +19,7 @@ impl Music {
                     ((position.x - bounds.left()) / bounds.size.width).clamp(0., 1.) as f64
                         * self.duration,
                 );
-                cx.notify();
+                self.player_bar.update(cx, |_, cx| cx.notify());
             }
             Some(Drag::Volume) => {
                 let bounds = self.volume_bounds.get();
@@ -26,6 +28,7 @@ impl Music {
                     cx,
                 );
             }
+            Some(Drag::Queue) => self.drag_queue_row(position, cx),
             _ => {}
         }
     }
@@ -38,6 +41,7 @@ impl Music {
                 }
             }
             Some(Drag::Volume) => self.save(),
+            Some(Drag::Queue) => self.drop_queue_row(cx),
             None => return,
         }
         cx.notify();
@@ -64,7 +68,7 @@ impl Music {
             return;
         }
         if control && key == "k" {
-            if self.video_open && window.is_fullscreen() {
+            if self.player_open && window.is_fullscreen() {
                 self.toggle_video_fullscreen(window, cx);
             }
             window.focus(&self.search.focus_handle(cx), cx);
@@ -109,7 +113,7 @@ impl Music {
         }
         match key {
             "space" => self.toggle_play(cx),
-            "f" if self.video_open => self.toggle_video_fullscreen(window, cx),
+            "f" => self.toggle_video_fullscreen(window, cx),
             "right" => {
                 let seconds = (self.playback_position() + 5.).min(self.duration);
                 self.seek_current(seconds, cx);
@@ -133,10 +137,7 @@ impl Music {
                     self.toggle_like(&track, cx);
                 }
             }
-            "q" => {
-                self.show_queue = !self.show_queue;
-                cx.notify();
-            }
+            "q" => self.toggle_player_page(cx),
             "escape" => {
                 if self.settings_menu.take().is_some() {
                     cx.notify();
@@ -146,12 +147,14 @@ impl Music {
                     self.close_overlay(window, cx);
                     return;
                 }
-                if self.video_open && window.is_fullscreen() {
+                if self.player_open && window.is_fullscreen() {
                     self.toggle_video_fullscreen(window, cx);
                     return;
                 }
-                self.show_queue = false;
-                cx.notify();
+                if self.player_open {
+                    self.player_open = false;
+                    cx.notify();
+                }
             }
             "?" => {
                 self.overlay = Some(Overlay::Help);

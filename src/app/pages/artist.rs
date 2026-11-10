@@ -152,7 +152,7 @@ impl Music {
 impl Music {
     pub(in crate::app) fn artist_background(&mut self, compact: bool) -> Option<Div> {
         let artist_top = self.detail_list.state.logical_scroll_top();
-        let artist_art = if self.route.is_artist() && !self.video_open && artist_top.item_ix == 0 {
+        let artist_art = if self.route.is_artist() && !self.player_open && artist_top.item_ix == 0 {
             let url = self
                 .page
                 .header

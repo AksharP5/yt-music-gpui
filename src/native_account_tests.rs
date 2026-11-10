@@ -67,7 +67,7 @@ fn prepare(view: &mut Music, current: Arc<Session>) {
     };
     view.position = 17.;
     view.library.video = false;
-    view.video_open = false;
+    view.player_open = false;
     view.media_pair = None;
     view.error = None;
 }
@@ -457,7 +457,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                         assert!(view.pending_playback_jobs.is_empty());
                     }
                     else if case == "video" {
-                        assert!(view.library.video && view.video_open);
+                        assert!(view.library.video && view.player_open);
                         assert_eq!(view.library.queue.current().unwrap().id, "invalid-video");
                         assert_eq!(view.position, 17.);
                         assert!(view.error.as_deref().is_some_and(|error| error.contains("invalid YouTube video ID")));

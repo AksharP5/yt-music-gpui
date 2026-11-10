@@ -4,6 +4,7 @@ use super::super::*;
 
 impl Music {
     pub(in crate::app) fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
+        self.player_open = true;
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -300,7 +301,7 @@ impl Music {
                                     .is_some_and(|target| target.id != current.id)
                             });
                         self.now_playing = Some(watch);
-                        let video_open = self.video_open;
+                        let player_open = self.player_open;
                         if let Some(intent) = advance {
                             self.advance_queue(intent, cx);
                         } else if update == QueueUpdate::Replace {
@@ -319,7 +320,7 @@ impl Music {
                                 self.save();
                             }
                         }
-                        self.video_open = video_open;
+                        self.player_open = player_open;
                     }
                     Err(error)
                         if update != QueueUpdate::Preserve
@@ -381,7 +382,7 @@ impl Music {
     }
 
     pub(in crate::app) fn replace_page_queue(&mut self, selected: usize, cx: &mut Context<Self>) {
-        self.video_open = self.library.video;
+        self.player_open = true;
         self.queue_waiting = None;
         self.reset_radio();
         self.now_playing = None;
@@ -532,25 +533,30 @@ impl Music {
                     }
                     return;
                 }
-                let mode = if track
-                    .details
-                    .watch
-                    .as_ref()
-                    .is_some_and(|target| !target.is_single_video())
-                {
-                    WatchMode::Issued
-                } else {
-                    WatchMode::Details
-                };
-                self.reset_radio();
-                self.queue_source.cancel();
-                self.queue_waiting = None;
-                self.now_playing = None;
-                self.library.queue.replace(vec![track], 0);
-                self.video_open = self.library.video;
-                self.play_current_resuming(false, mode, cx);
+                self.play_track(track, cx);
             }
         }
+    }
+
+    /// Play one track as a new queue, keeping its issued playlist when it has one.
+    pub(in crate::app) fn play_track(&mut self, track: Track, cx: &mut Context<Self>) {
+        let mode = if track
+            .details
+            .watch
+            .as_ref()
+            .is_some_and(|target| !target.is_single_video())
+        {
+            WatchMode::Issued
+        } else {
+            WatchMode::Details
+        };
+        self.reset_radio();
+        self.queue_source.cancel();
+        self.queue_waiting = None;
+        self.now_playing = None;
+        self.library.queue.replace(vec![track], 0);
+        self.player_open = true;
+        self.play_current_resuming(false, mode, cx);
     }
 
     pub(in crate::app) fn waiting_for_watch(&self) -> bool {

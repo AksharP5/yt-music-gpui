@@ -182,7 +182,7 @@ impl Music {
 
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         self.artwork.cancel_pending();
-        self.video_open = false;
+        self.player_open = false;
         if self.route != route {
             let cached = ((!self.rows.is_empty()
                 || !self.catalog_requests.is_loading(CatalogTarget::Page))
@@ -262,7 +262,7 @@ impl Music {
         self.rows.clear();
         self.list_rows.clear();
         self.append_rows(0);
-        if let Some(Overlay::Track { track, index }) = &mut self.overlay {
+        if let Some(Overlay::Track { track, index, .. }) = &mut self.overlay {
             *index = self.rows.iter().position(|item| matches!(item, Item::Track(current) if current.id == track.id && current.details.set_video_id == track.details.set_video_id));
         }
         if self.page.header.is_some()
@@ -352,8 +352,8 @@ impl Music {
     }
 
     pub(in crate::app) fn go_back(&mut self, cx: &mut Context<Self>) {
-        if self.video_open {
-            self.video_open = false;
+        if self.player_open {
+            self.player_open = false;
             cx.notify();
             return;
         }

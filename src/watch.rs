@@ -129,19 +129,6 @@ impl Catalog {
         let response = self.request("next", continuation.request.clone())?;
         parse_watch_more(&response, continuation)
     }
-
-    pub fn lyrics(&self, browse_id: &str) -> Result<String> {
-        ensure!(
-            browse_id.starts_with("MPLY")
-                && browse_id.len() <= 256
-                && browse_id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
-            "This song has no valid lyrics ID"
-        );
-        let response = self.request("browse", json!({"browseId": browse_id}))?;
-        parse_lyrics(&response)
-    }
 }
 
 fn playlist_panel(response: &Value) -> Result<&Value> {
@@ -529,21 +516,6 @@ fn parse_track(row: &Value, current_id: &str) -> Option<Track> {
         thumbnail: thumbnail(&row["thumbnail"]),
         details,
     })
-}
-
-fn parse_lyrics(response: &Value) -> Result<String> {
-    let lyrics = response
-        .pointer("/contents/sectionListRenderer/contents")
-        .and_then(Value::as_array)
-        .and_then(|sections| {
-            sections
-                .iter()
-                .find_map(|section| section.pointer("/musicDescriptionShelfRenderer/description"))
-        })
-        .map(text)
-        .filter(|lyrics| !lyrics.trim().is_empty())
-        .context("Lyrics are not available for this song")?;
-    Ok(lyrics)
 }
 
 #[cfg(test)]
@@ -1235,18 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn lyric_runs_keep_line_breaks_and_missing_lyrics_are_reported() {
-        let response = json!({"contents":{"sectionListRenderer":{"contents":[{
-            "musicDescriptionShelfRenderer":{
-                "description":{"runs":[{"text":"First line\n"},{"text":"Second line\n"}]},
-                "footer":{"runs":[{"text":"Lyrics provider"}]}
-            }
-        }]}}});
-        assert_eq!(
-            parse_lyrics(&response).unwrap(),
-            "First line\nSecond line\n"
-        );
-        assert!(parse_lyrics(&json!({"contents":{}})).is_err());
+    fn empty_watch_responses_are_reported() {
         assert!(
             parse_watch(
                 &json!({}),
@@ -1272,7 +1233,7 @@ mod tests {
         );
         assert!(!watch.queue.is_empty());
         if let Some(id) = watch.lyrics {
-            assert!(!catalog.lyrics(&id).unwrap().trim().is_empty());
+            assert!(!catalog.lyrics(&id).unwrap().text.trim().is_empty());
         }
     }
 

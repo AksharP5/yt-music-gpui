@@ -77,7 +77,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             window.update(cx,|view,_,cx| {
                 view.list_scroll.scroll_to_item(450,ScrollStrategy::Top);
                 let track = view.page.tracks()[450].clone();
-                view.overlay = Some(Overlay::Track { track,index:Some(450) });
+                view.overlay = Some(Overlay::Track { track, index: Some(450), queue_index: None });
                 cx.notify();
             }).unwrap();
             cx.background_executor().timer(Duration::from_millis(600)).await;

@@ -395,7 +395,7 @@ impl Music {
     }
 
     pub(in crate::app) fn set_video_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.video_open = enabled;
+        self.player_open |= enabled;
         self.video_error = None;
         let changed = self.library.video != enabled;
         let position = self.playback_position();
@@ -479,7 +479,7 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.video_open {
+        if !(self.player_open && self.library.video) {
             return;
         }
         self.video_fullscreen = !window.is_fullscreen();
@@ -601,7 +601,7 @@ impl Music {
             if self.library.queue.index.is_none() {
                 self.library.queue.select(0);
             }
-            self.video_open = self.library.video;
+            self.player_open |= self.library.video;
             self.play_current(cx);
         }
     }

@@ -169,8 +169,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item = self.rows[index].clone();
-        let artist =
-            self.route.is_artist() && window.viewport_size().width >= px(1200.) && !self.show_queue;
+        let artist = self.route.is_artist() && window.viewport_size().width >= px(1200.);
         let active = self.library.queue.current().is_some_and(|current| {
             current.id == item.id()
                 && match &item {

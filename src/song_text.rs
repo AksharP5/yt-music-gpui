@@ -1,6 +1,8 @@
+//! Song details loaded on demand: lyrics, credits and related music.
+
 use crate::{
     auth::{self, Session},
-    catalog::{Catalog, text},
+    catalog::{BrowseLink, Catalog, Page, text},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -15,6 +17,14 @@ use std::{
 pub enum Query {
     Lyrics(String),
     Credits(String),
+    Related(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lyrics {
+    pub text: String,
+    /// The provider line YouTube Music shows under the lyrics, such as "Source: Musixmatch".
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,8 +35,9 @@ pub struct CreditSection {
 
 #[derive(Clone)]
 pub enum Content {
-    Lyrics(String),
+    Lyrics(Lyrics),
     Credits(Vec<CreditSection>),
+    Related(Box<Page>),
 }
 
 struct Request {
@@ -59,6 +70,9 @@ impl Worker {
             match &request.query {
                 Query::Lyrics(id) => catalog.lyrics(id).map(Content::Lyrics),
                 Query::Credits(id) => catalog.credits(id).map(Content::Credits),
+                Query::Related(id) => catalog
+                    .browse(&BrowseLink::new(id.clone(), "Related"))
+                    .map(|page| Content::Related(Box::new(page))),
             }
         })
     }
@@ -131,6 +145,19 @@ impl Drop for Worker {
 }
 
 impl Catalog {
+    pub fn lyrics(&self, browse_id: &str) -> Result<Lyrics> {
+        ensure!(
+            browse_id.starts_with("MPLY")
+                && browse_id.len() <= 256
+                && browse_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
+            "This song has no valid lyrics ID"
+        );
+        let response = self.request("browse", json!({"browseId": browse_id}))?;
+        parse_lyrics(&response)
+    }
+
     pub fn credits(&self, browse_id: &str) -> Result<Vec<CreditSection>> {
         ensure!(
             browse_id.starts_with("MPTC")
@@ -144,6 +171,28 @@ impl Catalog {
         let response = self.request("browse", json!({"browseId": browse_id}))?;
         parse_credits(&response)
     }
+}
+
+fn parse_lyrics(response: &Value) -> Result<Lyrics> {
+    let shelf = response
+        .pointer("/contents/sectionListRenderer/contents")
+        .and_then(Value::as_array)
+        .and_then(|sections| {
+            sections
+                .iter()
+                .find_map(|section| section.get("musicDescriptionShelfRenderer"))
+        })
+        .context("Lyrics are not available for this song")?;
+    let lyrics = text(&shelf["description"]);
+    ensure!(
+        !lyrics.trim().is_empty(),
+        "Lyrics are not available for this song"
+    );
+    let source = Some(text(&shelf["footer"])).filter(|line| !line.trim().is_empty());
+    Ok(Lyrics {
+        text: lyrics,
+        source,
+    })
 }
 
 fn parse_credits(response: &Value) -> Result<Vec<CreditSection>> {
@@ -217,6 +266,24 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_keep_line_breaks_and_their_source_line() {
+        let response = json!({"contents":{"sectionListRenderer":{"contents":[{
+            "musicDescriptionShelfRenderer":{
+                "description":{"runs":[{"text":"First line\n"},{"text":"Second line\n"}]},
+                "footer":{"runs":[{"text":"Source: Musixmatch"}]}
+            }
+        }]}}});
+        assert_eq!(
+            parse_lyrics(&response).unwrap(),
+            Lyrics {
+                text: "First line\nSecond line\n".into(),
+                source: Some("Source: Musixmatch".into()),
+            }
+        );
+        assert!(parse_lyrics(&json!({"contents":{}})).is_err());
+    }
+
+    #[test]
     fn cancelled_and_superseded_text_never_replace_the_latest_request() {
         let (started, began) = mpsc::channel();
         let (release, resume) = mpsc::channel();
@@ -228,7 +295,10 @@ mod tests {
             if id == "blocked" {
                 resume.recv().unwrap();
             }
-            Ok(Content::Lyrics(id.clone()))
+            Ok(Content::Lyrics(Lyrics {
+                text: id.clone(),
+                source: None,
+            }))
         });
         worker.load(Query::Lyrics("blocked".into()), None).unwrap();
         assert_eq!(
@@ -247,7 +317,7 @@ mod tests {
         );
         let event = completed.recv_blocking().unwrap();
         assert_eq!(event.id, latest);
-        assert!(matches!(event.result, Ok(Content::Lyrics(value)) if value == "latest"));
+        assert!(matches!(event.result, Ok(Content::Lyrics(value)) if value.text == "latest"));
         assert!(completed.try_recv().is_err());
     }
 

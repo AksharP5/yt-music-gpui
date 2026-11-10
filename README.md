@@ -3,7 +3,7 @@
 A native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv and yt-dlp. It runs on Wayland and X11 with YouTube Music's dark interface.
 
 - Browse Home, Explore, charts, artists, albums and playlists, with search suggestions and category filters.
-- Play audio and video with a persistent queue, shuffle, repeat, radio and autoplay.
+- Play audio and video with a persistent, drag-to-reorder queue, shuffle, repeat, radio and autoplay. Click the player bar to open the player page with Up next, lyrics and related music.
 - Read lyrics and credits, and browse podcasts with episode descriptions and chapters.
 - Connect your account to access your library, edit playlists and record playback history.
 - Control playback with keyboard shortcuts, media keys and MPRIS desktop controls.
@@ -57,9 +57,9 @@ Podcast episodes and videos with resume information keep a local listening posit
 | Right / Left | Seek 5 seconds |
 | Up / Down | Adjust volume |
 | L | Like the current song |
-| Q | Toggle queue |
+| Q | Open or close the player page |
 | F | Toggle video fullscreen |
-| Escape | Dismiss a dialog or leave fullscreen, queue or search |
+| Escape | Dismiss a dialog or leave fullscreen, the player page or search |
 | ? | Keyboard help |
 | Ctrl Q | Quit |
 

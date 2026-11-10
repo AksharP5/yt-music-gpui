@@ -48,6 +48,7 @@ mod navigation;
 mod pages;
 mod playback;
 mod player_bar;
+mod player_page;
 mod queue_panel;
 mod sidebar;
 mod sync;
@@ -67,6 +68,7 @@ use pages::{DetailList, ListRow};
 use playback::queue::adopt_watch_queue;
 use playback::*;
 use player_bar::PlayerBar;
+use player_page::{PlayerPage, PlayerTab};
 use window::MusicContent;
 
 const CARD_WIDTH: f32 = 180.;
@@ -136,7 +138,8 @@ pub struct Music {
     mpris: Option<mpris::Mpris>,
     seekable: bool,
     video: Option<VideoAttachment>,
-    video_open: bool,
+    /// The full-window player page, showing artwork or video beside its tabs.
+    player_open: bool,
     video_fullscreen: bool,
     video_transparent: bool,
     video_error: Option<String>,
@@ -148,7 +151,7 @@ pub struct Music {
     position: f64,
     pending_seek: Option<SeekIntent>,
     duration: f64,
-    show_queue: bool,
+    player_page: PlayerPage,
     overlay: Option<Overlay>,
     settings_section: SettingsSection,
     settings_menu: Option<SettingMenu>,
