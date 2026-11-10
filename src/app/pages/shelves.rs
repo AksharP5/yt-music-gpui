@@ -49,8 +49,13 @@ impl Music {
             .all(|item| matches!(item, Item::Navigation(_)));
         let page = self.page_layout(window);
         let available = page.column;
-        let gap = page.card_gap();
-        let width = page.shelf_width(layout);
+        let album = matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"));
+        // Album pages list their carousels beside the art at a fixed card size.
+        let (width, gap) = if album && layout == ShelfLayout::Cards {
+            (160., if page.tier >= Tier::Large { 24. } else { 16. })
+        } else {
+            (page.shelf_width(layout), page.card_gap())
+        };
         let content_height = if navigation {
             4. * 48. + 3. * 16.
         } else {
@@ -81,7 +86,7 @@ impl Music {
                     20.
                 }
             }
-            Route::Browse(link) if self.page.header.is_some() && !link.id.starts_with("MPRE") => {
+            Route::Browse(_) if self.page.header.is_some() && !album => {
                 page.heading_size().min(28.)
             }
             _ => page.heading_size(),
@@ -182,7 +187,7 @@ impl Music {
                                     .px(px(16.))
                                     .rounded_full()
                                     .border_1()
-                                    .border_color(self.theme.border)
+                                    .border_color(rgb(0x353535))
                                     .flex()
                                     .items_center()
                                     .cursor_pointer()

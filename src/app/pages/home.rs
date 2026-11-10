@@ -89,7 +89,11 @@ impl Music {
                             .flex_grow(1.)
                             .flex_basis(px(0.))
                             .min_w_0()
-                            .h(px(110.))
+                            .h(px(if layout.tier >= Tier::Large {
+                                132.
+                            } else {
+                                110.
+                            }))
                             .p(px(20.))
                             .rounded(px(16.))
                             .bg(gpui::white().opacity(0.15))
