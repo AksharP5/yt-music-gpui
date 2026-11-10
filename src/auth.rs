@@ -558,13 +558,19 @@ fn timestamp() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn private_runtime() -> Result<PathBuf> {
+pub(crate) fn private_runtime() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("A private desktop runtime directory is required for account connection")?;
-    let metadata = fs::symlink_metadata(&runtime)?;
+    validate_private_runtime(&runtime)?;
+    Ok(runtime)
+}
+
+fn validate_private_runtime(runtime: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(runtime)?;
     ensure!(
-        metadata.is_dir()
+        runtime.is_absolute()
+            && metadata.is_dir()
             && metadata.uid() == unsafe { libc::geteuid() }
             && metadata.mode() & 0o077 == 0,
         "The desktop runtime directory must be private to your user"
@@ -579,7 +585,7 @@ fn private_runtime() -> Result<PathBuf> {
         unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC,
         "Sign-in requires a RAM-backed private runtime directory"
     );
-    Ok(runtime)
+    Ok(())
 }
 
 pub fn lock_instance() -> Result<File> {
@@ -888,6 +894,25 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_runtime_rejects_shared_directories_and_symlinks() {
+        let parent = tempfile::tempdir().unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_private_runtime(parent.path())
+                .unwrap_err()
+                .to_string(),
+            "The desktop runtime directory must be private to your user"
+        );
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(parent.path(), &link).unwrap();
+        assert_eq!(
+            validate_private_runtime(&link).unwrap_err().to_string(),
+            "The desktop runtime directory must be private to your user"
+        );
+    }
 
     #[test]
     #[ignore = "requires the configured desktop browser and Omarchy resolver; reads profile metadata only"]
