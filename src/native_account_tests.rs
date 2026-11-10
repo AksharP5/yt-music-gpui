@@ -198,6 +198,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 let (store, _) = Store::load().unwrap();
                 let (writer, errors) = LibraryWriter::new(store);
                 view.store = Some(writer);
+                view.save();
                 assert!(view.set_volume(40., cx));
                 view.drag = Some(Drag::Volume);
                 view.end_drag(cx);

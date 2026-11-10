@@ -1181,7 +1181,10 @@ mod tests {
         let saved = serde_json::to_value(&queue).unwrap();
         let mut keys = saved.as_object().unwrap().keys().collect::<Vec<_>>();
         keys.sort();
-        assert_eq!(keys, ["incomplete", "index", "playing_from", "shuffled", "tracks"]);
+        assert_eq!(
+            keys,
+            ["incomplete", "index", "playing_from", "shuffled", "tracks"]
+        );
         let mut restored: Queue = serde_json::from_value(saved).unwrap();
         assert!(restored.incomplete);
         assert!(restored.source_id.is_none());
