@@ -198,7 +198,12 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
             view.navigate(Route::Explore, cx);
             super::navigation::reply(view, crate::app::sync::tests::page(1, false), cx);
             view.go_back(cx);
-            assert!(view.rows.is_empty(), "An active page merged across renewal must not be cached with an old-session tail");
+            assert_eq!(view.rows.len(), 150, "Back must immediately restore the page invalidated by renewal");
+            assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), crate::app::Query::Revalidate(_)));
+            assert_eq!(view.page.continuation.as_ref().unwrap().token(), "old-loaded-tail");
+            view.navigate(Route::Explore, cx);
+            view.navigate(Route::Browse(BrowseLink::new("VLrenewed", "Renewed playlist")), cx);
+            assert!(view.rows.is_empty(), "Forward must not serve an active page merged across renewal with an old-session tail");
             assert!(matches!(super::navigation::reply(view, fresh, cx), crate::app::Query::Browse(_)));
             view.prefetch_page(100, 100, 0, cx);
             let job = view.catalog_requests.pending.try_recv().unwrap();

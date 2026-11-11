@@ -188,7 +188,7 @@ impl CatalogRequests {
 }
 const PAGE_CACHE_LIMIT: usize = 12;
 
-// Only inactive pages live here. Navigation moves them instead of cloning their tracks.
+// Inactive pages move here, including invalidated pages retained for Back restoration.
 pub(in crate::app) struct CachedPage {
     pub(in crate::app) route: Route,
     pub(in crate::app) account_revision: u64,
@@ -307,11 +307,6 @@ impl Music {
         let page = std::mem::take(&mut self.page);
         if let Some(fetched_at) = self.sync.page_fetched_at.take()
             && self.sync.page_error.is_none()
-            && self.page_is_current(
-                self.sync.page_account_generation,
-                self.sync.page_history_generation,
-                &self.route,
-            )
         {
             self.page_cache
                 .retain(|entry| !entry.route.same_page(&self.route));
@@ -331,7 +326,6 @@ impl Music {
         self.detail_list = DetailList::new();
         self.shelf_scroll.clear();
         self.route = route.clone();
-        self.sync.page_scroll = None;
         self.sync.page_reload = None;
         self.sync.page_sort = sort;
         self.sync.page_changes.clear();
@@ -360,7 +354,8 @@ impl Music {
             self.page_cache.pop_front();
         }
         if let Some(entry) = cached.filter(|entry| {
-            self.page_is_current(entry.account_generation, entry.history_generation, &route)
+            (restore_scroll
+                || self.page_is_current(entry.account_generation, entry.history_generation, &route))
                 && (!restore_scroll
                     || entry.sort.as_ref().map(Continuation::token)
                         == self.sync.page_sort.as_ref().map(Continuation::token))
@@ -373,7 +368,9 @@ impl Music {
             self.sync.page_sort = entry.sort;
             self.rebuild_rows();
             self.overlay_ratings();
-            if sync::needs_refresh(self.sync.page_fetched_at, Instant::now()) {
+            if !self.page_is_current(entry.account_generation, entry.history_generation, &route)
+                || sync::needs_refresh(self.sync.page_fetched_at, Instant::now())
+            {
                 if restore_scroll {
                     self.revalidate_page(cx);
                 } else {
@@ -566,14 +563,7 @@ impl Music {
         }
         let Some(state) = self.back.pop() else { return };
         self.open_route(state.route.clone(), state.sort.clone(), true, cx);
-        if self.sync.page_fetched_at.is_none()
-            && self.catalog_requests.is_loading(CatalogTarget::Page)
-        {
-            // The loading frame must not clamp the saved lists against zero rows.
-            self.sync.page_scroll = Some(state);
-        } else {
-            self.restore_navigation_scroll(state);
-        }
+        self.restore_navigation_scroll(state);
         cx.notify();
     }
 
@@ -718,9 +708,6 @@ impl Music {
                 if self.sync.page_reload.is_some() {
                     self.rebuild_rows();
                     self.continue_page_reload(cx);
-                }
-                if let Some(state) = self.sync.page_scroll.take() {
-                    self.restore_navigation_scroll(state);
                 }
             }
             Err(error) => {

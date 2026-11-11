@@ -16,7 +16,6 @@ pub(in crate::app) struct SyncState {
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
     pub page_sort: Option<Continuation>,
-    pub page_scroll: Option<NavigationState>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -598,6 +597,11 @@ impl Music {
         }
         append_added(&mut self.page, &self.route, id, &sources);
         self.rebuild_rows();
+        if sources.len() < additions.len()
+            && matches!(&self.route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
+        {
+            self.revalidate_page(cx);
+        }
         cx.notify();
     }
 
