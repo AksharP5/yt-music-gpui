@@ -406,7 +406,7 @@ impl Music {
         let body = match self.player_page.tab {
             PlayerTab::UpNext => self.up_next(cx),
             PlayerTab::Lyrics => self.lyrics_tab(),
-            PlayerTab::Comments => self.comments_tab(cx),
+            PlayerTab::Comments => self.comments_tab(side, window, cx),
             PlayerTab::Related => self.related_tab(width, side, cx),
         };
         let side_panel = div()
