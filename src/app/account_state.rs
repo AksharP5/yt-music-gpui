@@ -801,6 +801,7 @@ impl Music {
                                         let label = format!("Connected as {}", connection.account.name);
                                         view.account = Some(connection);
                                         if renewing {
+                                            view.account_generation = view.account_generation.wrapping_add(1);
                                             // Read continuations belong to the exact session snapshot.
                                             view.page_cache.clear();
                                             for state in &mut view.back { state.sort = None; }

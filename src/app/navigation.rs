@@ -210,7 +210,7 @@ pub(in crate::app) struct NavigationState {
 }
 
 impl Music {
-    fn page_is_current(
+    pub(super) fn page_is_current(
         &self,
         account_generation: u64,
         history_generation: u64,
@@ -331,6 +331,7 @@ impl Music {
         self.detail_list = DetailList::new();
         self.shelf_scroll.clear();
         self.route = route.clone();
+        self.sync.page_scroll = None;
         self.sync.page_reload = None;
         self.sync.page_sort = sort;
         self.sync.page_changes.clear();
@@ -564,14 +565,30 @@ impl Music {
             return;
         }
         let Some(state) = self.back.pop() else { return };
-        self.open_route(state.route, state.sort, true, cx);
-        self.list_scroll = state.list_scroll;
-        self.detail_list = state.detail_list;
-        self.shelf_scroll = state.shelf_scroll;
-        if self.grouped_rows() {
-            self.detail_list.reset_rows(self.list_rows.len());
+        self.open_route(state.route.clone(), state.sort.clone(), true, cx);
+        if self.sync.page_fetched_at.is_none()
+            && self.catalog_requests.is_loading(CatalogTarget::Page)
+        {
+            // The loading frame must not clamp the saved lists against zero rows.
+            self.sync.page_scroll = Some(state);
+        } else {
+            self.restore_navigation_scroll(state);
         }
         cx.notify();
+    }
+
+    fn restore_navigation_scroll(&mut self, state: NavigationState) {
+        self.list_scroll = state.list_scroll;
+        let top = state.detail_list.state.logical_scroll_top();
+        self.detail_list
+            .set_inline_header(state.detail_list.inline_header);
+        self.shelf_scroll = state.shelf_scroll;
+        if self.route.is_home() || matches!(self.route, Route::Explore) {
+            self.detail_list.state.reset(self.page.shelves.len() + 1);
+        } else if self.grouped_rows() {
+            self.detail_list.reset_rows(self.list_rows.len());
+        }
+        self.detail_list.state.scroll_to(top);
     }
 
     pub(in crate::app) fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
@@ -701,6 +718,9 @@ impl Music {
                 if self.sync.page_reload.is_some() {
                     self.rebuild_rows();
                     self.continue_page_reload(cx);
+                }
+                if let Some(state) = self.sync.page_scroll.take() {
+                    self.restore_navigation_scroll(state);
                 }
             }
             Err(error) => {

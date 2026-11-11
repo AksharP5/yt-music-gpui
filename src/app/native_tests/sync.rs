@@ -152,10 +152,10 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 view.navigate(Route::Browse(BrowseLink::new("VLtarget","Target playlist")),cx);
                 let job = view.catalog_requests.pending.try_recv().unwrap();
                 view.page = page(0,false);
-                view.library.queue = Default::default();
+                view.library.queue.replace(vec![track.clone()],0);
                 let session = view.account.as_ref().unwrap().session.clone();
                 view.account_event(account::Event::Applied { session,mutation:Box::new(Mutation::AddToPlaylist { id:"target".into(),video_ids:vec![track.id.clone()],duplicates:false }),result:Ok(Effect::PlaylistAdded { additions:vec![(track.id.clone(),"new-occurrence".into())] }),session_rejected:false },window,cx);
-                assert_eq!(view.rows.len(),1,"An addition can resolve metadata from the page left behind");
+                assert_eq!(view.rows.len(),1,"An addition can resolve metadata from the current queue");
                 assert_eq!(view.page.tracks()[0].details.set_video_id.as_deref(),Some("new-occurrence"));
                 view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,account_generation:job.account_generation,history_generation:job.history_generation,append:false,revalidate:false,result:Ok(page(0,false)),session_rejected:false,target:CatalogTarget::Page },cx);
                 assert_eq!(view.rows.len(),1,"An older page reply must preserve the acknowledged addition");

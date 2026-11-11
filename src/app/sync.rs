@@ -16,6 +16,7 @@ pub(in crate::app) struct SyncState {
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
     pub page_sort: Option<Continuation>,
+    pub page_scroll: Option<NavigationState>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -568,6 +569,14 @@ impl Music {
                     .chain(
                         self.page_cache
                             .iter()
+                            .filter(|entry| {
+                                entry.account_revision == self.account_revision
+                                    && self.page_is_current(
+                                        entry.account_generation,
+                                        entry.history_generation,
+                                        &entry.route,
+                                    )
+                            })
                             .flat_map(|entry| &entry.page.shelves)
                             .flat_map(|shelf| &shelf.items)
                             .filter_map(|item| match item {

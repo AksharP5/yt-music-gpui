@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn reply(view: &mut Music, page: Page, cx: &mut Context<Music>) -> Query {
+pub(super) fn reply(view: &mut Music, page: Page, cx: &mut Context<Music>) -> Query {
     let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
         .find(|job| job.query.target() == CatalogTarget::Page)
         .expect("Expected a page request");
@@ -66,6 +66,14 @@ fn page(title: &str, token: &str) -> Page {
 }
 
 fn check_cache(check: fn(&mut Music, &mut Window, &mut Context<Music>)) -> Result<()> {
+    check_cache_window(async move |window, cx| {
+        window.update(cx, check).unwrap();
+    })
+}
+
+pub(super) fn check_cache_window(
+    check: impl AsyncFnOnce(gpui::WindowHandle<Music>, &mut gpui::AsyncApp) + 'static,
+) -> Result<()> {
     super::isolate()?;
     let passed = Arc::new(AtomicBool::new(false));
     let result = passed.clone();
@@ -119,7 +127,7 @@ fn check_cache(check: fn(&mut Music, &mut Window, &mut Context<Music>)) -> Resul
             cx.activate(true);
             cx.spawn(async move |cx| {
                 wait_for_presented_frame(window, cx).await;
-                window.update(cx, check).unwrap();
+                check(window, cx).await;
                 wait_for_presented_frame(window, cx).await;
                 result.store(true, Ordering::Relaxed);
                 cx.update(|cx| cx.quit());
@@ -131,6 +139,261 @@ fn check_cache(check: fn(&mut Music, &mut Window, &mut Context<Music>)) -> Resul
         "Cache regression check did not complete"
     );
     Ok(())
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<()> {
+    check_cache(|view, window, cx| {
+        view.navigate(
+            Route::Search(Search {
+                query: "song to save".into(),
+                filter: SearchFilter::Songs,
+                scope: SearchScope::Catalog,
+            }),
+            cx,
+        );
+        let mut unsaved = page("Unsaved song", "search-tail");
+        let crate::catalog::Item::Track(track) = &mut unsaved.shelves[0].items[0] else {
+            unreachable!()
+        };
+        track.details.in_library = Some(false);
+        let track = track.clone();
+        reply(view, unsaved, cx);
+        view.navigate(
+            Route::Browse(BrowseLink::new("VLdestination", "Destination")),
+            cx,
+        );
+        reply(
+            view,
+            crate::app::sync::tests::response(&[("Songs", (100..200).collect())], None, true),
+            cx,
+        );
+        confirm(
+            view,
+            window,
+            Mutation::SongLibrary {
+                track: track.clone(),
+                save: true,
+            },
+            cx,
+        );
+        view.account_event(
+            account::Event::Applied {
+                session: view.account.as_ref().unwrap().session.clone(),
+                mutation: Box::new(Mutation::AddToPlaylist {
+                    id: "destination".into(),
+                    video_ids: vec![track.id.clone()],
+                    duplicates: false,
+                }),
+                result: Ok(Effect::PlaylistAdded {
+                    additions: vec![(track.id.clone(), "added-occurrence".into())],
+                }),
+                session_rejected: false,
+            },
+            window,
+            cx,
+        );
+        assert!(
+            view.page
+                .tracks()
+                .iter()
+                .all(|item| item.id != track.id || item.details.in_library == Some(true)),
+            "Adding a song must not resurrect the cached pre-save library state"
+        );
+        view.revalidate_page(cx);
+        let mut fresh = page("Authoritative playlist", "fresh-tail");
+        let crate::catalog::Item::Track(saved) = &mut fresh.shelves[0].items[0] else {
+            unreachable!()
+        };
+        saved.details.in_library = Some(true);
+        reply(view, fresh, cx);
+        assert_eq!(view.page.tracks()[0].details.in_library, Some(true));
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn back_after_invalidation_restores_scroll_after_the_first_response() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        for route in [
+            Route::Search(Search {
+                query: "scroll".into(),
+                filter: SearchFilter::Songs,
+                scope: SearchScope::Catalog,
+            }),
+            Route::Search(Search {
+                query: "scroll".into(),
+                filter: SearchFilter::All,
+                scope: SearchScope::Catalog,
+            }),
+            Route::Recent,
+            Route::Library(Section::History),
+            Route::Browse(BrowseLink::new("VLscroll", "Playlist")),
+            Route::Saved,
+            Route::Home,
+        ] {
+            let grid = route == Route::Saved;
+            for shorter in [false, true] {
+                let fixture = |count| {
+                    let mut response = crate::app::sync::tests::response(
+                        &[("Songs", (0..count).collect())],
+                        None,
+                        true,
+                    );
+                    if route.is_home() {
+                        let template = response.shelves[0].clone();
+                        response.shelves = template
+                            .items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                let mut shelf = template.clone();
+                                shelf.title = format!("Shelf {index}");
+                                shelf.items = vec![item.clone()];
+                                shelf
+                            })
+                            .collect();
+                    }
+                    if matches!(route, Route::Browse(_)) {
+                        response.header = crate::catalog::parse_page(&serde_json::json!({
+                            "header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Playlist"}}}, "contents":[]
+                        }), "Playlist").unwrap().header;
+                        assert!(response.header.is_some());
+                    }
+                    if route == Route::Saved {
+                        response.shelves[0].items = (0..count).map(|index| crate::catalog::Item::Collection(
+                            serde_json::from_value(serde_json::json!({"id":format!("VL{index}"),"title":format!("Playlist {index}"),"subtitle":"Playlist"})).unwrap()
+                        )).collect();
+                    }
+                    response
+                };
+                window
+                    .update(cx, |view, _, cx| {
+                        view.navigate(route.clone(), cx);
+                        reply(view, fixture(100), cx);
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                window
+                    .update(cx, |view, _, cx| {
+                        if !grid {
+                            view.detail_list.state.scroll_to(ListOffset {
+                                item_ix: 60,
+                                offset_in_item: px(7.),
+                            });
+                        } else {
+                            view.list_scroll
+                                .scroll_to_item_strict(15, ScrollStrategy::Top);
+                        }
+                        cx.notify();
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                let (top, offset, baseline) = window
+                    .update(cx, |view, window, cx| {
+                        let top = view.detail_list.state.logical_scroll_top();
+                        let offset = view.list_scroll.0.borrow().base_handle.offset();
+                        assert!(
+                            if !grid {
+                                top.item_ix > 40
+                            } else {
+                                offset.y < px(-1000.)
+                            },
+                            "The page must actually be scrolled"
+                        );
+                        let baseline = if !shorter && grid {
+                            Some(super::render::capture(window, "back-grid-before"))
+                        } else if !shorter && matches!(&route, Route::Search(search) if search.filter == SearchFilter::Songs) {
+                            Some(super::render::capture(window, "back-search-before"))
+                        } else {
+                            None
+                        };
+                        view.navigate(Route::Explore, cx);
+                        if view.catalog_requests.is_loading(CatalogTarget::Page) {
+                            reply(view, page("Explore", "explore-tail"), cx);
+                        }
+                        let track = view.page.tracks()[0].clone();
+                        confirm(
+                            view,
+                            window,
+                            Mutation::SongLibrary { track, save: true },
+                            cx,
+                        );
+                        view.go_back(cx);
+                        assert!(view.rows.is_empty(), "Invalidated Back must refetch");
+                        (top, offset, baseline)
+                    })
+                    .unwrap();
+                // Render the empty loading page before delivering the response.
+                wait_for_presented_frame(window, cx).await;
+                window
+                    .update(cx, |view, _, cx| {
+                        reply(view, fixture(if shorter { 30 } else { 100 }), cx);
+                        if !grid {
+                            let restored = view.detail_list.state.logical_scroll_top();
+                            if shorter {
+                                assert!(
+                                    restored.item_ix >= 29
+                                        && restored.item_ix <= view.detail_list.state.item_count(),
+                                    "A shorter response must clamp near its final row: {restored:?}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    (restored.item_ix, restored.offset_in_item),
+                                    (top.item_ix, top.offset_in_item),
+                                    "Back must restore the saved row and offset after refetch"
+                                );
+                            }
+                        }
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                window
+                    .update(cx, |view, window, _| {
+                        if let Some(before) = &baseline {
+                            let after = super::render::capture(window, if grid { "back-grid-after" } else { "back-search-after" });
+                            let visible: Vec<_> = before.enumerate_pixels().filter(|(x, y, pixel)| {
+                                *x >= 330 && *y >= 120 && *y < 700 && pixel.0[..3].iter().any(|channel| *channel >= 100)
+                            }).collect();
+                            assert!(visible.len() > 100, "The baseline must show scrolled row content");
+                            let missing = visible.iter().filter(|(x, y, _)| after.get_pixel(*x, *y).0[..3].iter().all(|channel| *channel < 50)).count();
+                            assert!(missing * 100 < visible.len() * 2, "The first response frame must paint the restored rows: {missing}/{} visible pixels missing", visible.len());
+                        }
+                        if !grid {
+                            assert!(
+                                view.detail_list.state.logical_scroll_top().item_ix
+                                    > if shorter { 10 } else { 40 },
+                                "The presented list must stay scrolled"
+                            );
+                        } else {
+                            let restored = view.list_scroll.0.borrow().base_handle.offset();
+                            if shorter {
+                                assert!(
+                                    restored.y < px(-100.),
+                                    "A shorter grid must clamp above the top"
+                                );
+                            } else {
+                                assert_eq!(
+                                    restored, offset,
+                                    "The presented grid must restore its offset"
+                                );
+                            }
+                        }
+                    })
+                    .unwrap();
+                window
+                    .update(cx, |view, _, cx| {
+                        view.navigate(Route::Explore, cx);
+                        if view.catalog_requests.is_loading(CatalogTarget::Page) {
+                            reply(view, page("Explore", "explore-tail"), cx);
+                        }
+                        view.page_cache.clear();
+                    })
+                    .unwrap();
+            }
+        }
+    })
 }
 
 #[test]
