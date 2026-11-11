@@ -1237,6 +1237,24 @@ fn python_interpreter(ytdlp: &Path) -> Result<Command> {
     Ok(command)
 }
 
+/// An extractor holds account cookies in memory. Its own process group keeps it
+/// out of terminal signals, so ask the kernel to kill it if the player thread dies
+/// without running its destructors (for example when the app is killed).
+fn exit_with_parent(command: &mut Command) {
+    let parent = std::process::id() as libc::pid_t;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent
+            {
+                return Err(io::Error::other(
+                    "The player exited before its extractor started",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ResolverResponse {
@@ -1261,12 +1279,13 @@ impl WarmResolver {
             .args(["-I", "-B", "-u", "-c", include_str!("ytdlp_resolver.py")])
             .arg(ytdlp);
         let cookies = extractor_arguments(&mut command, credentials)?;
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
+        exit_with_parent(&mut command);
+        let mut child = command.spawn()?;
         let resolver = Self {
             input: child.stdin.take().unwrap(),
             output: child.stdout.take().unwrap(),
@@ -1388,8 +1407,8 @@ impl StreamResolver {
             if warm.send(&self.target.as_ref().unwrap().key).is_ok() {
                 return Ok(());
             }
+            self.warm_enabled = warm.ready;
             self.warm.take();
-            self.warm_enabled = false;
         }
         match StreamPreparation::start(
             self.target.as_ref().unwrap().clone(),
@@ -1431,10 +1450,11 @@ impl StreamResolver {
                     }
                 }
                 Err(_) => {
-                    // Unsupported installs and failed servers retain the CLI path,
-                    // with the very same account/plugin/cookie arguments.
+                    // Unsupported installs and servers that never start keep the CLI
+                    // path, with the very same account/plugin/cookie arguments. A
+                    // server that crashed after starting is respawned on the next request.
+                    self.warm_enabled = warm.ready;
                     self.warm.take();
-                    self.warm_enabled = false;
                     if let Some(target) = &self.target {
                         match StreamPreparation::start(target.clone(), &self.ytdlp, credentials) {
                             Ok(job) => {
@@ -1498,7 +1518,9 @@ impl StreamPreparation {
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(Stdio::null());
-        let child = command.process_group(0).arg(&target.key.url).spawn()?;
+        command.process_group(0).arg(&target.key.url);
+        exit_with_parent(&mut command);
+        let child = command.spawn()?;
         Ok(Self {
             target,
             child,
@@ -2636,8 +2658,29 @@ YtMusicAccountIE._real_extract = extract
                 .contains("call=2")
         );
         assert_eq!(resolver.warm.as_ref().unwrap().child.id(), new_pid);
+        // A crash after startup falls back once, then the next request is warm again.
+        unsafe { libc::kill(new_pid as i32, libc::SIGKILL) };
+        resolver
+            .start(resolver_target("abcdefghijk", 5), Some(&credentials))
+            .unwrap();
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("call=1")
+        );
+        resolver
+            .start(resolver_target("dQw4w9WgXcQ", 6), Some(&credentials))
+            .unwrap();
+        let respawned = resolver
+            .warm
+            .as_ref()
+            .expect("warm resolver respawned")
+            .child
+            .id();
+        assert_ne!(respawned, new_pid);
+        resolved(&mut resolver, Some(&credentials));
         drop(resolver);
-        assert!(!Path::new(&format!("/proc/{new_pid}")).exists());
+        assert!(!Path::new(&format!("/proc/{respawned}")).exists());
     }
 
     #[test]
