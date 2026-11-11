@@ -487,7 +487,6 @@ impl Music {
         }
         if let Some(active) = &mut self.forward_page {
             active.fetched_at = None;
-            active.sort = None;
         }
         if self.account.is_some() {
             self.refresh_remote(cx);
@@ -566,24 +565,6 @@ impl Music {
                             .iter()
                             .filter_map(|state| state.page.as_ref())
                             .flat_map(|page| &page.shelves)
-                            .flat_map(|shelf| &shelf.items)
-                            .filter_map(|item| match item {
-                                Item::Track(track) => Some(track),
-                                _ => None,
-                            }),
-                    )
-                    .chain(
-                        self.page_cache
-                            .iter()
-                            .filter(|entry| {
-                                entry.account_revision == self.account_revision
-                                    && self.page_is_current(
-                                        entry.account_generation,
-                                        entry.history_generation,
-                                        &entry.route,
-                                    )
-                            })
-                            .flat_map(|entry| &entry.page.shelves)
                             .flat_map(|shelf| &shelf.items)
                             .filter_map(|item| match item {
                                 Item::Track(track) => Some(track),

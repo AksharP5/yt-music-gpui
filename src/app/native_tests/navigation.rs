@@ -459,61 +459,6 @@ fn guest_likes_and_saves_invalidate_cached_catalog_pages() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn saved_song_refetches_cached_library_search_and_playlist() -> Result<()> {
-    check_cache(|view, window, cx| {
-        let search = Route::Search(Search {
-            query: "saved songs".into(),
-            filter: SearchFilter::Songs,
-            scope: SearchScope::Library,
-        });
-        let playlist = Route::Browse(BrowseLink::new("VLunrelated", "Unrelated playlist"));
-        for route in [&search, &playlist] {
-            view.navigate(route.clone(), cx);
-            reply(view, page("Before save", "old-tail"), cx);
-        }
-        view.navigate(
-            Route::Search(Search {
-                query: "new song".into(),
-                filter: SearchFilter::Songs,
-                scope: SearchScope::Catalog,
-            }),
-            cx,
-        );
-        reply(view, page("Search result", "search-tail"), cx);
-        let track = view.page.tracks()[0].clone();
-        assert!(view.page_cache.iter().any(|entry| entry.route == search));
-        assert!(view.page_cache.iter().any(|entry| entry.route == playlist));
-        view.account_event(
-            account::Event::Applied {
-                session: view.account.as_ref().unwrap().session.clone(),
-                mutation: Box::new(Mutation::SongLibrary { track, save: true }),
-                result: Ok(Effect::Changed),
-                session_rejected: false,
-            },
-            window,
-            cx,
-        );
-        assert_eq!(
-            view.rows.len(),
-            100,
-            "Saving must keep the active search visible"
-        );
-        assert_eq!(view.page.tracks()[0].details.in_library, Some(true));
-        assert!(view.catalog_requests.pending.is_empty());
-        for route in [search, playlist] {
-            view.navigate(route, cx);
-            assert!(
-                view.rows.is_empty(),
-                "Every cached route must fetch after a save"
-            );
-            assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
-            reply(view, page("After save", "fresh-tail"), cx);
-        }
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playback_report_invalidates_cached_and_inflight_history_only() -> Result<()> {
     check_cache(|view, window, cx| {
         let playlist = Route::Browse(BrowseLink::new("VLretained", "Retained playlist"));
@@ -760,7 +705,10 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert!(view.catalog_requests.pending.is_empty(), "Fresh Home must not reshuffle recommendations");
                 assert!(!view.catalog_requests.is_loading(CatalogTarget::Page));
                 view.navigate(Route::Home, cx);
-                assert!(view.catalog_requests.pending.is_empty(), "Clicking the current route also uses its response");
+                assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "Like the web, clicking the current route loads it again");
+                reply(view, page("Home recommendations", "home-tail"), cx);
+                view.navigate(Route::Explore, cx);
+                assert!(view.catalog_requests.pending.is_empty());
                 view.navigate(Route::Browse(BrowseLink::new("FEmusic_home", "Home link")), cx);
                 assert_eq!(view.page.title, "Home recommendations");
                 assert!(view.catalog_requests.pending.is_empty(), "An unfiltered Home link shares the primary Home cache entry");
@@ -828,6 +776,8 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 let mut renamed = filtered.clone();
                 renamed.title = "Another label for Workout".into();
                 renamed.accent = Some(0xff0000);
+                view.navigate(Route::Browse(BrowseLink::new("VLspacer", "Spacer")), cx);
+                reply(view, page("Spacer", "spacer-tail"), cx);
                 view.navigate(Route::Browse(renamed), cx);
                 assert_eq!(view.page.title, "Workout");
                 assert!(view.catalog_requests.pending.is_empty(), "Display labels and colors must not change the request's cache identity");

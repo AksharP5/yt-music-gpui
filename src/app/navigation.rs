@@ -260,16 +260,10 @@ impl Music {
             {
                 // Remember the order the next response will show, so a stale
                 // revisit refreshes in that order.
-                let fresh = match &query {
-                    Query::Revalidate(query) => query,
-                    query => query,
-                };
-                match fresh {
+                match &query {
                     Query::Reload(token) => {
                         page.sort = Some(token.clone());
-                        if matches!(query, Query::Reload(_)) {
-                            page.fetched_at = None;
-                        }
+                        page.fetched_at = None;
                     }
                     Query::More { .. } => {}
                     _ => page.sort = None,
@@ -314,6 +308,8 @@ impl Music {
             Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
             route => route,
         };
+        // Like the web, clicking the page you're on loads it again.
+        let reopening = self.route.same_page(&route);
         if let Some(active) = &self.forward_page
             && active.list_id == self.list_id
             && let Some(fetched_at) = active.fetched_at
@@ -365,7 +361,12 @@ impl Music {
             })
             .and_then(|index| self.page_cache.remove(index))
             .filter(|entry| {
-                self.page_is_current(entry.account_generation, entry.history_generation, &route)
+                !reopening
+                    && self.page_is_current(
+                        entry.account_generation,
+                        entry.history_generation,
+                        &route,
+                    )
             });
         if self.page_cache.len() > PAGE_CACHE_LIMIT {
             self.page_cache.pop_front();
