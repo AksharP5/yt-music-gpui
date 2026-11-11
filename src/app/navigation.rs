@@ -301,6 +301,11 @@ impl Music {
             Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
             route => route,
         };
+        // Whatever the user last saw for this route supersedes an older entry,
+        // including a page refreshed after Back or Ctrl R that can't be cached.
+        self.page_cache.retain(|entry| {
+            entry.account_revision != self.account_revision || !entry.route.same_page(&self.route)
+        });
         if let Some(active) = &self.forward_page
             && active.list_id == self.list_id
             && let Some(fetched_at) = active.fetched_at
@@ -311,10 +316,6 @@ impl Music {
                 &self.route,
             )
         {
-            self.page_cache.retain(|entry| {
-                entry.account_revision != self.account_revision
-                    || !entry.route.same_page(&self.route)
-            });
             self.page_cache.push_back(CachedPage {
                 route: self.route.clone(),
                 account_revision: self.account_revision,

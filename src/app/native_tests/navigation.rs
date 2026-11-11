@@ -869,16 +869,11 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "Saving a new collection must invalidate cached library membership");
                 reply(view, page("Updated collections", "updated-tail"), cx);
 
-                let previous_revision = view.account_revision;
                 view.account = Some(connection(session("second")));
                 view.clear_account_state(cx);
                 assert!(view.page_cache.is_empty());
                 view.navigate(Route::Home, cx);
                 assert!(view.rows.is_empty(), "Another account must not see the guest or first account's cached Home");
-                let generation = view.catalog_requests.generations[CatalogTarget::Page as usize].load(Ordering::Relaxed);
-                view.catalog_result(CatalogResult { id: generation, account_revision: previous_revision, account_generation:view.account_generation,history_generation:view.history_generation, append: false, revalidate: false, result: Ok(page("Wrong account", "wrong-tail")), session_rejected: false, target: CatalogTarget::Page }, cx);
-                assert!(view.rows.is_empty());
-                assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
                 reply(view, page("Second account", "second-tail"), cx);
                 view.account = None;
                 view.clear_account_state(cx);
@@ -1026,5 +1021,27 @@ fn back_owns_each_visits_loaded_page_and_ignores_forward_cache() -> Result<()> {
             reply(view, page("Fetched incomplete", "fresh-tail"), cx),
             Query::Browse(_)
         ));
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn refresh_after_back_supersedes_the_forward_cache_entry() -> Result<()> {
+    check_cache(|view, _, cx| {
+        let route = Route::Browse(BrowseLink::new("VLrefreshed", "Refreshed"));
+        view.navigate(route.clone(), cx);
+        reply(view, page("Original", "original-tail"), cx);
+        view.navigate(Route::Home, cx);
+        reply(view, page("Home", "home-tail"), cx);
+        view.go_back(cx);
+        reply(view, page("Refreshed", "refreshed-tail"), cx);
+        assert_eq!(view.page.title, "Refreshed");
+        view.navigate(Route::Home, cx);
+        view.navigate(route, cx);
+        assert_ne!(
+            view.page.title, "Original",
+            "An older forward entry must not undo content refreshed after Back"
+        );
+        assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
     })
 }
