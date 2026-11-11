@@ -812,6 +812,15 @@ impl MpvCore {
             (c"terminal", "no"),
             (c"config", "no"),
             (c"load-scripts", "no"),
+            // mpv also starts a Lua VM for each built-in script. This player is
+            // controlled only over IPC, so none of them has any use.
+            (c"load-auto-profiles", "no"),
+            (c"load-commands", "no"),
+            (c"load-console", "no"),
+            (c"load-context-menu", "no"),
+            (c"load-positioning", "no"),
+            (c"load-select", "no"),
+            (c"load-stats-overlay", "no"),
             (c"idle", "yes"),
             (c"vid", "no"),
             (c"vo", "libmpv"),
