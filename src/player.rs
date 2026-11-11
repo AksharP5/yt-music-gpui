@@ -328,6 +328,7 @@ fn wait_for_player_input(
     socket: &UnixStream,
     wake: &OwnedFd,
     resolver_fd: Option<c_int>,
+    deadline: Option<Instant>,
 ) -> Result<bool> {
     let mut descriptors = [
         libc::pollfd {
@@ -347,7 +348,21 @@ fn wait_for_player_input(
         },
     ];
     loop {
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 80) };
+        let timeout = deadline.map(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            libc::timespec {
+                tv_sec: remaining.as_secs() as _,
+                tv_nsec: remaining.subsec_nanos() as _,
+            }
+        });
+        let result = unsafe {
+            libc::ppoll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                timeout.as_ref().map_or(std::ptr::null(), |timeout| timeout),
+                std::ptr::null(),
+            )
+        };
         if result >= 0 {
             break;
         }
@@ -960,12 +975,16 @@ fn read_message(
     deadline: Instant,
 ) -> Result<Value> {
     loop {
-        ensure!(Instant::now() < deadline, "mpv stopped responding");
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|timeout| !timeout.is_zero())
+            .context("mpv stopped responding")?;
         if let Some(end) = pending.iter().position(|c| *c == b'\n') {
             let line: Vec<_> = pending.drain(..=end).collect();
             return serde_json::from_slice(&line).context("Invalid mpv response");
         }
         let mut bytes = [0; 16384];
+        socket.set_read_timeout(Some(timeout))?;
         match socket.read(&mut bytes) {
             Ok(0) => bail!("mpv closed its connection"),
             Ok(size) => {
@@ -1271,6 +1290,8 @@ enum ResolverResponse {
     Stream { urls: Option<Vec<String>> },
 }
 
+const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct WarmResolver {
     child: Child,
     input: ChildStdin,
@@ -1377,7 +1398,23 @@ impl StreamResolver {
     }
 
     fn fd(&self) -> Option<c_int> {
-        self.warm.as_ref().map(|warm| warm.output.as_raw_fd())
+        self.warm
+            .as_ref()
+            .map(|warm| warm.output.as_raw_fd())
+            .or_else(|| self.one_shot.as_ref().map(|job| job.exited.as_raw_fd()))
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        let startup = self
+            .warm
+            .as_ref()
+            .filter(|warm| !warm.ready)
+            .map(|warm| warm.started + RESOLVER_TIMEOUT);
+        let request = self
+            .target
+            .as_ref()
+            .map(|_| self.started + RESOLVER_TIMEOUT);
+        startup.into_iter().chain(request).min()
     }
 
     fn stop(&mut self) {
@@ -1439,7 +1476,7 @@ impl StreamResolver {
     ) -> Option<(PreparedTarget, Result<ResolvedStream>)> {
         let mut result = None;
         if let Some(warm) = &mut self.warm {
-            let response = if !warm.ready && warm.started.elapsed() > Duration::from_secs(30) {
+            let response = if !warm.ready && warm.started.elapsed() >= RESOLVER_TIMEOUT {
                 Err(anyhow::anyhow!("Resolver did not start"))
             } else {
                 warm.read()
@@ -1486,10 +1523,7 @@ impl StreamResolver {
                 Ok(None) => {}
             }
         }
-        if result.is_none()
-            && self.target.is_some()
-            && self.started.elapsed() > Duration::from_secs(30)
-        {
+        if result.is_none() && self.target.is_some() && self.started.elapsed() >= RESOLVER_TIMEOUT {
             self.warm.take();
             result = Some(Err(anyhow::anyhow!("Stream resolution timed out")));
         }
@@ -1508,6 +1542,7 @@ struct StreamPreparation {
     target: PreparedTarget,
     child: Child,
     output: File,
+    exited: OwnedFd,
     _cookies: Option<File>,
 }
 
@@ -1529,11 +1564,20 @@ impl StreamPreparation {
             .stderr(Stdio::null());
         command.process_group(0).arg(&target.key.url);
         exit_with_parent(&mut command);
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
+        // stdout is a memfd, so watch process exit instead of polling try_wait.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            return Err(error).context("Could not watch the stream extractor");
+        }
         Ok(Self {
             target,
             child,
             output,
+            exited: unsafe { OwnedFd::from_raw_fd(fd as _) },
             _cookies: cookies,
         })
     }
@@ -1620,7 +1664,6 @@ fn run(
             Err(error) => return Err(error).context("mpv did not open its control socket"),
         }
     };
-    socket.set_read_timeout(Some(Duration::from_millis(80)))?;
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut state = PlaybackState::default();
     let mut pending = Vec::new();
@@ -1795,7 +1838,7 @@ fn run(
                 Ok(PlayerCommand::AttachVideo { video: next }) => {
                     let result = (|| {
                         ensure!(video.is_none(), "A video surface is already attached");
-                        next.start(core.0.as_ptr())?;
+                        next.start(core.0.as_ptr(), wake)?;
                         let attached = AttachedVideo {
                             video: next,
                             ready: false,
@@ -1914,7 +1957,7 @@ fn run(
             let _ = resolver.start(target, credentials.as_ref());
         }
         if let Some(attached) = &mut video {
-            match attached.video.ready() {
+            match attached.video.ready_for_player() {
                 Ok(true) if !attached.ready => {
                     attached.ready = true;
                     let _ = events.send_blocking(PlayerEvent::VideoChanged);
@@ -1935,10 +1978,6 @@ fn run(
                 }
             }
         }
-        state.write_seek(&mut socket)?;
-        if pending.contains(&b'\n') || wait_for_player_input(&socket, wake, resolver.fd())? {
-            state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
-        }
         if state.loaded
             && state.current == state.desired
             && let Some(message) = account_notice.take()
@@ -1949,7 +1988,28 @@ fn run(
             let _ = events.send_blocking(PlayerEvent::Notice(message));
         }
         let _ = &credentials;
+        state.write_seek(&mut socket)?;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
+        // Only queued streams need refreshing; the current stream is already open.
+        // Expiry is wall-clock time, which a monotonic wait doesn't follow across
+        // clock changes or suspend, so recheck it at least once a minute.
+        let expiry = prepared
+            .as_ref()
+            .filter(|(target, _)| state.current != Some(target.track_id))
+            .map(|(_, stream)| {
+                Instant::now()
+                    + stream
+                        .expires
+                        .duration_since(SystemTime::now())
+                        .unwrap_or_default()
+                        .min(Duration::from_secs(60))
+            });
+        let deadline = resolver.deadline().into_iter().chain(expiry).min();
+        if pending.contains(&b'\n')
+            || wait_for_player_input(&socket, wake, resolver.fd(), deadline)?
+        {
+            state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
+        }
     }
 }
 
@@ -2752,12 +2812,93 @@ YtMusicAccountIE._real_extract = extract
         output.write_all(b"{\"ready\":true}\n").unwrap();
         let start = Instant::now();
         assert!(
-            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_raw_fd())).unwrap()
+            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_raw_fd()), None)
+                .unwrap()
         );
         assert!(
             start.elapsed() < Duration::from_millis(60),
             "resolver output waited for the actor's timer"
         );
+    }
+
+    #[test]
+    fn one_shot_exit_wakes_the_actor_without_mpv_or_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let extractor = directory.path().join("extractor");
+        fs::write(
+            &extractor,
+            "#!/bin/sh\nsleep 0.15\nprintf '%s\\n' 'https://rr1.googlevideo.com/audio'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut resolver = StreamResolver::new(&extractor, None);
+        resolver
+            .start(resolver_target("abcdefghijk", 1), None)
+            .unwrap();
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (commands, _received) = command_channel().unwrap();
+        let start = Instant::now();
+        assert!(
+            !wait_for_player_input(
+                &socket,
+                &commands.wake,
+                resolver.fd(),
+                Some(start + Duration::from_secs(2))
+            )
+            .unwrap()
+        );
+        let (_, stream) = resolver
+            .finish(None)
+            .expect("child exit must wake the actor");
+        assert!(stream.is_ok());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(resolver.fd().is_none() && resolver.deadline().is_none());
+    }
+
+    #[test]
+    fn resolver_startup_and_request_deadlines_wake_without_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let interpreter = directory.path().join("python3");
+        fs::write(&interpreter, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (commands, _received) = command_channel().unwrap();
+        for ready in [false, true] {
+            let mut resolver = StreamResolver::new(&extractor, None);
+            assert!(resolver.warm.is_some());
+            let started = Instant::now() - Duration::from_secs(30);
+            let warm = resolver.warm.as_mut().unwrap();
+            warm.ready = ready;
+            warm.started = started;
+            if ready {
+                resolver.started = started;
+                resolver.target = Some(resolver_target("abcdefghijk", 1));
+            }
+            let deadline = resolver.deadline().unwrap();
+            assert!(deadline <= Instant::now());
+            assert!(
+                !wait_for_player_input(&socket, &commands.wake, resolver.fd(), Some(deadline))
+                    .unwrap()
+            );
+            let result = resolver.finish(None);
+            if ready {
+                assert!(
+                    result
+                        .unwrap()
+                        .1
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("timed out")
+                );
+            } else {
+                assert!(result.is_none());
+            }
+            assert!(resolver.warm.is_none());
+            assert!(resolver.deadline().is_none());
+        }
     }
 
     #[test]
@@ -3159,12 +3300,70 @@ YtMusicAccountIE._real_extract = extract
     }
 
     #[test]
+    fn idle_wait_blocks_until_a_command_and_deadline_wait_expires() {
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (commands, _received) = command_channel().unwrap();
+        thread::scope(|scope| {
+            let (completed, result) = mpsc::channel();
+            let wake = &commands.wake;
+            let socket = &socket;
+            scope.spawn(move || {
+                completed
+                    .send(wait_for_player_input(socket, wake, None, None))
+                    .unwrap();
+            });
+            let premature = result.recv_timeout(Duration::from_millis(200));
+            commands.send(PlayerCommand::Stop).unwrap();
+            assert!(premature.is_err(), "an idle actor must not wake on a timer");
+            assert!(
+                !result
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+            );
+        });
+        let start = Instant::now();
+        assert!(
+            !wait_for_player_input(
+                &socket,
+                &commands.wake,
+                None,
+                Some(start + Duration::from_millis(25))
+            )
+            .unwrap()
+        );
+        assert!(start.elapsed() >= Duration::from_millis(25));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn synchronous_reads_use_the_remaining_deadline() {
+        let (mut socket, _mpv) = UnixStream::pair().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let start = Instant::now();
+        let result = read_message(
+            &mut socket,
+            &mut Vec::new(),
+            start + Duration::from_millis(25),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("stopped responding")
+        );
+        assert!(start.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
     fn command_wakeups_coalesce_without_losing_commands_or_socket_readiness() {
         let (commands, received) = command_channel().unwrap();
         let (mut mpv, socket) = UnixStream::pair().unwrap();
         commands.send(PlayerCommand::Stop).unwrap();
         commands.clone().send(PlayerCommand::Pause(true)).unwrap();
-        assert!(!wait_for_player_input(&socket, &commands.wake, None).unwrap());
+        assert!(!wait_for_player_input(&socket, &commands.wake, None, None).unwrap());
         assert!(matches!(received.try_recv(), Ok(PlayerCommand::Stop)));
         assert!(matches!(
             received.try_recv(),
@@ -3183,7 +3382,7 @@ YtMusicAccountIE._real_extract = extract
 
         mpv.write_all(b"mpv reply\n").unwrap();
         commands.send(PlayerCommand::Quit).unwrap();
-        assert!(wait_for_player_input(&socket, &commands.wake, None).unwrap());
+        assert!(wait_for_player_input(&socket, &commands.wake, None, None).unwrap());
         let mut reply = [0; 10];
         (&socket).read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"mpv reply\n");
@@ -4865,10 +5064,111 @@ PYTHON
     }
 
     #[test]
-    #[ignore = "requires installed mpv and yt-dlp; uses only private synthetic local audio"]
-    fn local_seek_completion_handles_rapid_no_op_and_end_of_file() {
+    #[ignore = "measures /proc actor wakeups and latency with libmpv, null audio and synthetic silence"]
+    fn local_actor_wakeups_and_latency() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("silence.wav");
+        let path = silent_audio(directory.path());
+        let player = Player::new(PlayerOptions {
+            volume: 0.,
+            audio_output: Some("null".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let wait_for = |predicate: &dyn Fn(&PlayerEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "player did not produce the expected event"
+                );
+                match player.try_recv() {
+                    Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                    Some(event) if predicate(&event) => break,
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        };
+        wait_for(&|event| matches!(event, PlayerEvent::Speed(_)));
+        let status = fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                fs::read_to_string(path.join("comm"))
+                    .is_ok_and(|name| name.trim() == "music-player")
+            })
+            .unwrap()
+            .join("status");
+        let switches = || -> u64 {
+            fs::read_to_string(&status)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("voluntary_ctxt_switches:")
+                        .map(|n| n.trim().parse().unwrap())
+                })
+                .unwrap()
+        };
+        let measure = |mode: &str| {
+            thread::sleep(Duration::from_secs(2));
+            for sample in 1..=3 {
+                let before = switches();
+                let start = Instant::now();
+                thread::sleep(Duration::from_secs(5));
+                println!(
+                    "mode={mode} sample={sample} wakeups_per_s={:.2}",
+                    (switches() - before) as f64 / start.elapsed().as_secs_f64()
+                );
+            }
+        };
+        measure("idle");
+        for trial in 1..=3 {
+            while player.try_recv().is_some() {}
+            let start = Instant::now();
+            let id = player
+                .play_url(
+                    path.to_string_lossy().into_owned(),
+                    "Synthetic silence",
+                    PlayOptions::default(),
+                )
+                .unwrap();
+            wait_for(
+                &|event| matches!(event, PlayerEvent::Position { track_id, seconds } if *track_id == id && *seconds > 0.),
+            );
+            println!(
+                "trial={trial} play_to_audio_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.
+            );
+            player.pause(true).unwrap();
+            wait_for(
+                &|event| matches!(event, PlayerEvent::Paused { track_id, paused: true } if *track_id == id),
+            );
+            if trial == 1 {
+                measure("paused");
+            }
+            for seconds in [10., 30., 50.] {
+                let start = Instant::now();
+                let revision = player.seek(id, seconds).unwrap();
+                wait_for(
+                    &|event| matches!(event, PlayerEvent::SeekFinished { revision: current, result: Ok(actual), .. } if *current == revision && (*actual - seconds).abs() < 0.5),
+                );
+                println!(
+                    "trial={trial} seek_to={seconds} seek_ms={:.3}",
+                    start.elapsed().as_secs_f64() * 1000.
+                );
+            }
+            player.pause(false).unwrap();
+            wait_for(
+                &|event| matches!(event, PlayerEvent::Paused { track_id, paused: false } if *track_id == id),
+            );
+            if trial == 1 {
+                measure("playing");
+            }
+        }
+    }
+
+    fn silent_audio(directory: &Path) -> PathBuf {
+        let path = directory.join("silence.wav");
         let sample_bytes = 120_u32 * 8000 * 2;
         let mut file = File::create(&path).unwrap();
         file.write_all(b"RIFF").unwrap();
@@ -4885,6 +5185,83 @@ PYTHON
         file.write_all(&sample_bytes.to_le_bytes()).unwrap();
         file.write_all(&vec![0; sample_bytes as usize]).unwrap();
         drop(file);
+        path
+    }
+
+    #[test]
+    #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
+    fn paused_actor_refreshes_expired_preparation_and_writes_pending_seek() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = silent_audio(directory.path());
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let player = Player::with_extractor(
+            PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            extractor,
+        )
+        .unwrap();
+        player
+            .command(json!(["set_property", "prefetch-playlist", false]))
+            .unwrap();
+        let track_id = player
+            .play_url(
+                path.to_string_lossy().into_owned(),
+                "Synthetic silence",
+                PlayOptions {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let wait_for = |predicate: &dyn Fn(&PlayerEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "paused actor did not finish pending work"
+                );
+                match player.try_recv() {
+                    Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                    Some(event) if predicate(&event) => break,
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        };
+        wait_for(
+            &|event| matches!(event, PlayerEvent::Started { track_id: id, paused: true } if *id == track_id),
+        );
+        player
+            .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+            .unwrap();
+        wait_for(&|event| matches!(event, PlayerEvent::Prepared { .. }));
+        let start = Instant::now();
+        wait_for(&|event| matches!(event, PlayerEvent::Prepared { .. }));
+        assert!(
+            start.elapsed() > Duration::from_millis(800),
+            "unexpired streams must stay prepared"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "expiry must trigger re-preparation"
+        );
+        let revision = player.seek(track_id, 30.).unwrap();
+        wait_for(&|event| {
+            matches!(event, PlayerEvent::SeekFinished { revision: current, result: Ok(seconds), .. }
+            if *current == revision && (29.9..30.1).contains(seconds))
+        });
+    }
+
+    #[test]
+    #[ignore = "requires installed mpv and yt-dlp; uses only private synthetic local audio"]
+    fn local_seek_completion_handles_rapid_no_op_and_end_of_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = silent_audio(directory.path());
         let player = Player::new(PlayerOptions {
             audio_output: Some("null".into()),
             ..Default::default()

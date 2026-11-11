@@ -3,6 +3,7 @@ use gpui::{Bounds, Pixels, Window};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use std::{
     ffi::{c_ulong, c_void},
+    os::fd::{AsRawFd, OwnedFd},
     ptr::NonNull,
     sync::{Mutex, TryLockError},
 };
@@ -11,7 +12,7 @@ unsafe extern "C" {
     fn video_initialize() -> i32;
     fn video_create(display: *mut c_void, parent: *mut c_void) -> *mut c_void;
     fn video_create_x11(parent: c_ulong) -> *mut c_void;
-    fn video_start(video: *mut c_void, core: *mut c_void) -> i32;
+    fn video_start(video: *mut c_void, core: *mut c_void, wake: i32) -> i32;
     fn video_resize(
         video: *mut c_void,
         x: i32,
@@ -130,11 +131,11 @@ impl NativeVideo {
         Ok(video)
     }
 
-    pub(crate) fn start(&self, core: *mut c_void) -> Result<()> {
+    pub(crate) fn start(&self, core: *mut c_void, wake: &OwnedFd) -> Result<()> {
         let handle = self.handle.lock().unwrap();
         let handle = handle.context("The video surface was detached")?;
         ensure!(
-            unsafe { video_start(handle.as_ptr(), core) } != 0,
+            unsafe { video_start(handle.as_ptr(), core, wake.as_raw_fd()) } != 0,
             "Could not attach the video renderer"
         );
         Ok(())
@@ -146,6 +147,19 @@ impl NativeVideo {
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(_)) => anyhow::bail!("The video renderer stopped"),
         };
+        Self::read_status(*handle)
+    }
+
+    pub(crate) fn ready_for_player(&self) -> Result<bool> {
+        // The actor must observe the last status notification even during a resize.
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The video renderer stopped"))?;
+        Self::read_status(*handle)
+    }
+
+    fn read_status(handle: Option<NonNull<c_void>>) -> Result<bool> {
         let handle = handle.context("The video surface was detached")?;
         match unsafe { video_status(handle.as_ptr()) } {
             0 | 1 => Ok(false),

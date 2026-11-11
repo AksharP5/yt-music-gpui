@@ -10,6 +10,8 @@
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
 #include <pthread.h>
+#include <errno.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include "viewporter-client-protocol.h"
@@ -39,7 +41,7 @@ struct video {
     pthread_mutex_t mutex;
     pthread_cond_t condition;
     pthread_t worker;
-    int started, stop, status, wake, geometry_dirty, x11;
+    int started, stop, status, wake, geometry_dirty, x11, notify_fd;
     int x, y, width, height, pixel_width, pixel_height;
     mpv_handle *core;
 };
@@ -245,6 +247,19 @@ static int initialize_egl(struct video *v) {
     return v->context != EGL_NO_CONTEXT && v->egl_surface != EGL_NO_SURFACE;
 }
 
+/* The actor owns notify_fd until video_stop joins this worker. Wake only on
+   status changes, never once per frame. The nonblocking eventfd coalesces them. */
+static void set_status(struct video *v, int status) {
+    pthread_mutex_lock(&v->mutex);
+    int changed = v->status != status;
+    v->status = status;
+    pthread_mutex_unlock(&v->mutex);
+    if (changed) {
+        uint64_t one = 1;
+        while (write(v->notify_fd, &one, sizeof(one)) < 0 && errno == EINTR) {}
+    }
+}
+
 static void *render_worker(void *data) {
     struct video *v = data;
     mpv_render_context *render = NULL;
@@ -268,10 +283,7 @@ static void *render_worker(void *data) {
         goto done;
     }
     mpv_render_context_set_update_callback(render, wake_worker, v);
-    pthread_mutex_lock(&v->mutex);
-    v->status = 1;
-    pthread_cond_signal(&v->condition);
-    pthread_mutex_unlock(&v->mutex);
+    set_status(v, 1);
     for (;;) {
         pthread_mutex_lock(&v->mutex);
         while (!v->wake && !v->geometry_dirty && !v->stop)
@@ -306,9 +318,7 @@ static void *render_worker(void *data) {
             if (error < 0) { status = -2; break; }
             if (!eglSwapBuffers(v->egl_display, v->egl_surface)) { status = -3; break; }
             mpv_render_context_report_swap(render);
-            pthread_mutex_lock(&v->mutex);
-            v->status = 2;
-            pthread_mutex_unlock(&v->mutex);
+            set_status(v, 2);
             if (v->x_display) {
                 XFlush(v->x_display);
             } else {
@@ -327,16 +337,14 @@ done:
     }
     if (v->egl_display != EGL_NO_DISPLAY)
         eglMakeCurrent(v->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    pthread_mutex_lock(&v->mutex);
-    v->status = status;
-    pthread_cond_signal(&v->condition);
-    pthread_mutex_unlock(&v->mutex);
+    set_status(v, status);
     return NULL;
 }
 
-int video_start(struct video *v, mpv_handle *core) {
+int video_start(struct video *v, mpv_handle *core, int notify_fd) {
     if (v->started) return 0;
     v->core = core;
+    v->notify_fd = notify_fd;
     v->wake = 1;
     v->geometry_dirty = 1;
     v->status = 0;
