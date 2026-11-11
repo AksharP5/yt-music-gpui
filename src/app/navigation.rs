@@ -968,7 +968,10 @@ impl CatalogRequests {
     pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let catalog_requests = CatalogRequests::new();
         let (results, completed) = async_channel::unbounded::<CatalogResult>();
-        for worker in 0..2 {
+        // Blocking reads can't be interrupted once discarded. Startup sends Home
+        // and the sidebar before verification, so keep a worker beyond those two
+        // free for whatever replaces them (the guest fallback or the next page).
+        for worker in 0..3 {
             let receiver = catalog_requests.pending.clone();
             let results = results.clone();
             let generations = catalog_requests.generations.clone();
