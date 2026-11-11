@@ -24,6 +24,14 @@ pub(in crate::app) enum Route {
 impl Route {
     fn same_page(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Home, Self::Browse(link)) | (Self::Browse(link), Self::Home) => {
+                link.id == "FEmusic_home" && link.params.is_none() && link.chart_country.is_none()
+            }
+            (Self::Explore, Self::Browse(link)) | (Self::Browse(link), Self::Explore) => {
+                link.id == "FEmusic_explore"
+                    && link.params.is_none()
+                    && link.chart_country.is_none()
+            }
             (Self::Browse(left), Self::Browse(right)) => {
                 left.id == right.id
                     && left.params == right.params
@@ -40,8 +48,6 @@ impl Route {
             Self::Recent => Some(Section::History),
             Self::Saved => Some(Section::Landing),
             Self::Library(section) => Some(*section),
-            Self::Browse(link) => Section::from_browse_id(&link.id)
-                .or_else(|| (link.id == "LM").then_some(Section::Liked)),
             _ => None,
         }
     }
@@ -188,7 +194,7 @@ impl CatalogRequests {
 }
 const PAGE_CACHE_LIMIT: usize = 12;
 
-// Inactive pages move here, including invalidated pages retained for Back restoration.
+// Forward visits only. Back owns a separate snapshot for each visit.
 pub(in crate::app) struct CachedPage {
     pub(in crate::app) route: Route,
     pub(in crate::app) account_revision: u64,
@@ -201,9 +207,33 @@ pub(in crate::app) struct CachedPage {
     pub(in crate::app) sort: Option<Continuation>,
 }
 
+// A Back restore changes list_id without adopting this forward visit's cache metadata.
+pub(in crate::app) struct ForwardPage {
+    list_id: usize,
+    pub(super) fetched_at: Option<Instant>,
+    account_generation: u64,
+    history_generation: u64,
+    pub(super) sort: Option<Continuation>,
+}
+
+impl ForwardPage {
+    pub(super) fn new(list_id: usize, account_generation: u64, history_generation: u64) -> Self {
+        Self {
+            list_id,
+            fetched_at: None,
+            account_generation,
+            history_generation,
+            sort: None,
+        }
+    }
+}
+
 pub(in crate::app) struct NavigationState {
     pub(in crate::app) route: Route,
-    pub(in crate::app) sort: Option<Continuation>,
+    pub(in crate::app) page: Option<Page>,
+    pub(in crate::app) fetched_at: Option<Instant>,
+    pub(in crate::app) coverage: sync::PageCoverage,
+    pub(in crate::app) page_error: Option<String>,
     pub(in crate::app) list_scroll: UniformListScrollHandle,
     pub(in crate::app) detail_list: DetailList,
     pub(in crate::app) shelf_scroll: HashMap<usize, ScrollHandle>,
@@ -216,17 +246,21 @@ impl Music {
         history_generation: u64,
         route: &Route,
     ) -> bool {
+        let history = route.library_section() == Some(Section::History)
+            || matches!(route, Route::Browse(link) if Section::from_browse_id(&link.id) == Some(Section::History));
         account_generation == self.account_generation
-            && (route.library_section() != Some(Section::History)
-                || history_generation == self.history_generation)
+            && (!history || history_generation == self.history_generation)
     }
 
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
         if target == CatalogTarget::Page {
-            if let Query::Reload(token) = &query {
-                self.sync.page_sort = Some(token.clone());
-                self.sync.page_fetched_at = None;
+            if let Query::Reload(token) = &query
+                && let Some(page) = &mut self.forward_page
+                && page.list_id == self.list_id
+            {
+                page.sort = Some(token.clone());
+                page.fetched_at = None;
             }
             self.sync.page_changes.clear();
             self.sync.page_reload = None;
@@ -264,119 +298,134 @@ impl Music {
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         // A guest's Liked Music is the local list of liked songs.
         let route = match route {
-            Route::Browse(link)
-                if self.account.is_none() && matches!(link.id.as_str(), "VLLM" | "LM") =>
-            {
-                Route::Liked
-            }
-            Route::Browse(link) if link.params.is_none() && link.chart_country.is_none() => {
-                match link.id.as_str() {
-                    "FEmusic_home" => Route::Home,
-                    "FEmusic_explore" => Route::Explore,
-                    _ => Route::Browse(link),
-                }
-            }
+            Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
             route => route,
         };
-        self.focus_after_navigation(cx);
-        if !self.route.same_page(&route) {
-            self.back.push(NavigationState {
-                route: self.route.clone(),
-                sort: self.sync.page_sort.clone(),
-                list_scroll: self.list_scroll.clone(),
-                shelf_scroll: std::mem::take(&mut self.shelf_scroll),
-                detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
-            });
-            if self.back.len() > PAGE_CACHE_LIMIT {
-                self.back.remove(0);
-            }
-        }
-        self.open_route(route, None, false, cx);
-    }
-
-    fn open_route(
-        &mut self,
-        route: Route,
-        sort: Option<Continuation>,
-        restore_scroll: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.artwork.cancel_pending();
-        self.catalog_requests.cancel(CatalogTarget::Page);
-        self.player_open = false;
-        let page = std::mem::take(&mut self.page);
-        if let Some(fetched_at) = self.sync.page_fetched_at.take()
+        if let Some(active) = &self.forward_page
+            && active.list_id == self.list_id
+            && let Some(fetched_at) = active.fetched_at
             && self.sync.page_error.is_none()
+            && self.page_is_current(
+                active.account_generation,
+                active.history_generation,
+                &self.route,
+            )
         {
-            self.page_cache
-                .retain(|entry| !entry.route.same_page(&self.route));
+            self.page_cache.retain(|entry| {
+                entry.account_revision != self.account_revision
+                    || !entry.route.same_page(&self.route)
+            });
             self.page_cache.push_back(CachedPage {
                 route: self.route.clone(),
                 account_revision: self.account_revision,
-                account_generation: self.sync.page_account_generation,
-                history_generation: self.sync.page_history_generation,
-                page,
+                account_generation: active.account_generation,
+                history_generation: active.history_generation,
+                page: self.page.clone(),
                 fetched_at,
                 coverage: self.sync.page_coverage,
-                sort: self.sync.page_sort.take(),
+                sort: active.sort.clone(),
             });
         }
-        self.list_id = self.list_id.wrapping_add(1);
-        self.list_scroll = UniformListScrollHandle::new();
-        self.detail_list = DetailList::new();
-        self.shelf_scroll.clear();
-        self.route = route.clone();
-        self.sync.page_reload = None;
-        self.sync.page_sort = sort;
-        self.sync.page_changes.clear();
-        self.sync.page_coverage = sync::PageCoverage::default();
-        self.sync.page_error = None;
-        self.error = None;
-        self.notice = None;
-        self.sort_menu = false;
-        self.rows.clear();
-        self.list_rows.clear();
-        let query = match &route {
-            Route::Search(search) => search.query.clone(),
-            _ => String::new(),
-        };
-        self.search
-            .update(cx, |input, cx| input.set_query(query, cx));
-
+        if self.route != route {
+            let cached = (!self.rows.is_empty()
+                || (!self.catalog_requests.is_loading(CatalogTarget::Page)
+                    && self.sync.page_error.is_none()))
+            .then(|| self.page.clone());
+            self.back.push(NavigationState {
+                route: self.route.clone(),
+                page: cached,
+                fetched_at: self.sync.page_fetched_at,
+                coverage: self.sync.page_coverage,
+                page_error: self.sync.page_error.take(),
+                list_scroll: std::mem::replace(
+                    &mut self.list_scroll,
+                    UniformListScrollHandle::new(),
+                ),
+                shelf_scroll: std::mem::take(&mut self.shelf_scroll),
+                detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
+            });
+            if self.back.len() > 12 {
+                self.back.remove(0);
+            }
+        }
         let cached = self
             .page_cache
             .iter()
             .position(|entry| {
                 entry.account_revision == self.account_revision && entry.route.same_page(&route)
             })
-            .and_then(|index| self.page_cache.remove(index));
+            .and_then(|index| self.page_cache.remove(index))
+            .filter(|entry| {
+                self.page_is_current(entry.account_generation, entry.history_generation, &route)
+            });
         if self.page_cache.len() > PAGE_CACHE_LIMIT {
             self.page_cache.pop_front();
         }
-        if let Some(entry) = cached.filter(|entry| {
-            (restore_scroll
-                || self.page_is_current(entry.account_generation, entry.history_generation, &route))
-                && (!restore_scroll
-                    || entry.sort.as_ref().map(Continuation::token)
-                        == self.sync.page_sort.as_ref().map(Continuation::token))
-        }) {
+        self.forward_page = Some(ForwardPage::new(
+            self.list_id.wrapping_add(1),
+            self.account_generation,
+            self.history_generation,
+        ));
+        self.load_route(route, cached, cx);
+    }
+
+    fn load_route(&mut self, route: Route, cached: Option<CachedPage>, cx: &mut Context<Self>) {
+        self.focus_after_navigation(cx);
+        self.artwork.cancel_pending();
+        self.player_open = false;
+        self.list_id = self.list_id.wrapping_add(1);
+        self.list_scroll = UniformListScrollHandle::new();
+        self.detail_list = DetailList::new();
+        self.shelf_scroll.clear();
+        self.route = route.clone();
+        self.sync.page_fetched_at = None;
+        self.sync.page_reload = None;
+        self.sync.page_coverage = sync::PageCoverage::default();
+        self.sync.page_error = None;
+        self.error = None;
+        self.notice = None;
+        self.page.shelves.clear();
+        self.page.header = None;
+        self.page.continuation = None;
+        self.page.editable = false;
+        self.page.description.clear();
+        self.page.privacy = None;
+        self.page.chips.clear();
+        self.page.countries.clear();
+        self.page.library = None;
+        self.sort_menu = false;
+        self.rows.clear();
+        self.list_rows.clear();
+        if !matches!(route, Route::Search(_)) {
+            // Like the web, the search box only keeps a query on its results.
+            self.search
+                .update(cx, |input, cx| input.set_query(String::new(), cx));
+        }
+        if let Some(entry) = cached {
+            self.catalog_requests.cancel(CatalogTarget::Page);
+            if let Route::Search(search) = &route {
+                self.search
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+            }
             self.page = entry.page;
-            self.sync.page_account_generation = entry.account_generation;
-            self.sync.page_history_generation = entry.history_generation;
             self.sync.page_fetched_at = Some(entry.fetched_at);
             self.sync.page_coverage = entry.coverage;
-            self.sync.page_sort = entry.sort;
+            self.forward_page = Some(ForwardPage {
+                list_id: self.list_id,
+                fetched_at: Some(entry.fetched_at),
+                account_generation: entry.account_generation,
+                history_generation: entry.history_generation,
+                sort: entry.sort.clone(),
+            });
             self.rebuild_rows();
             self.overlay_ratings();
-            if !self.page_is_current(entry.account_generation, entry.history_generation, &route)
-                || sync::needs_refresh(self.sync.page_fetched_at, Instant::now())
-            {
-                if restore_scroll {
-                    self.revalidate_page(cx);
-                } else {
-                    // Forward visits start at the top, so replace expired loaded tails too.
-                    self.request(self.page_query(), cx);
-                }
+            if sync::needs_refresh(Some(entry.fetched_at), Instant::now()) {
+                // Forward visits start at the top and replace expired loaded tails.
+                let query = entry
+                    .sort
+                    .map(Query::Reload)
+                    .unwrap_or_else(|| self.page_query());
+                self.request(query, cx);
             }
             cx.notify();
             return;
@@ -384,29 +433,35 @@ impl Music {
         match route {
             Route::Home => {
                 self.page.title = "Home".into();
+                self.request(Query::Home, cx);
             }
             Route::Explore => {
                 self.page.title = "Explore".into();
+                self.request(Query::Explore, cx);
             }
             Route::Search(search) => {
                 self.page.title = format!("Results for \"{}\"", search.query);
+                self.search
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+                self.request(Query::Search(search), cx);
             }
             Route::Browse(link) => {
                 self.page.title = link.title.clone();
+                self.request(Query::Browse(link), cx);
             }
             Route::Liked | Route::Saved | Route::Recent | Route::Library(_)
                 if self.account.is_some() =>
             {
                 let section = route.library_section().expect("library route");
                 self.page.title = section.title().into();
+                self.request(Query::Library(section), cx);
             }
             _ => {
+                self.catalog_requests.cancel(CatalogTarget::Page);
                 self.refresh_local();
                 cx.notify();
-                return;
             }
         }
-        self.request(self.page_query(), cx);
     }
 
     pub(in crate::app) fn rebuild_rows(&mut self) {
@@ -562,23 +617,37 @@ impl Music {
             return;
         }
         let Some(state) = self.back.pop() else { return };
-        self.open_route(state.route.clone(), state.sort.clone(), true, cx);
-        self.restore_navigation_scroll(state);
-        cx.notify();
-    }
-
-    fn restore_navigation_scroll(&mut self, state: NavigationState) {
-        self.list_scroll = state.list_scroll;
-        let top = state.detail_list.state.logical_scroll_top();
-        self.detail_list
-            .set_inline_header(state.detail_list.inline_header);
-        self.shelf_scroll = state.shelf_scroll;
-        if self.route.is_home() || matches!(self.route, Route::Explore) {
-            self.detail_list.state.reset(self.page.shelves.len() + 1);
-        } else if self.grouped_rows() {
-            self.detail_list.reset_rows(self.list_rows.len());
+        if let Some(page) = state.page {
+            self.catalog_requests.cancel(CatalogTarget::Page);
+            self.artwork.cancel_pending();
+            self.list_id = self.list_id.wrapping_add(1);
+            self.route = state.route;
+            let query = match &self.route {
+                Route::Search(search) => search.query.clone(),
+                _ => String::new(),
+            };
+            self.search
+                .update(cx, |input, cx| input.set_query(query, cx));
+            self.page = page;
+            self.sync.page_fetched_at = state.fetched_at;
+            self.sync.page_coverage = state.coverage;
+            self.sync.page_error = state.page_error;
+            self.error = self.sync.page_error.clone();
+            self.notice = None;
+            self.rebuild_rows();
+            if self.account.is_some() {
+                self.revalidate_page(cx);
+            } else {
+                self.refresh_local();
+            }
+        } else {
+            self.route = state.route.clone();
+            self.load_route(state.route, None, cx);
         }
-        self.detail_list.state.scroll_to(top);
+        self.list_scroll = state.list_scroll;
+        self.detail_list = state.detail_list;
+        self.shelf_scroll = state.shelf_scroll;
+        cx.notify();
     }
 
     pub(in crate::app) fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
@@ -655,13 +724,15 @@ impl Music {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                // Only replacing the page can renew the generation of its loaded rows.
-                if !result.append && (!result.revalidate || self.sync.page_reload.is_some()) {
-                    self.sync.page_account_generation = result.account_generation;
-                    self.sync.page_history_generation = result.history_generation;
-                }
-                if !result.append {
-                    self.sync.page_fetched_at = Some(Instant::now());
+                self.sync.page_fetched_at = Some(Instant::now());
+                if let Some(active) = &mut self.forward_page
+                    && active.list_id == self.list_id
+                    && !result.append
+                    && (!result.revalidate || self.sync.page_reload.is_some())
+                {
+                    active.account_generation = result.account_generation;
+                    active.history_generation = result.history_generation;
+                    active.fetched_at = self.sync.page_fetched_at;
                 }
                 self.sync.page_error = None;
                 if result.revalidate {
@@ -711,6 +782,11 @@ impl Music {
                 }
             }
             Err(error) => {
+                if let Some(active) = &mut self.forward_page
+                    && active.list_id == self.list_id
+                {
+                    active.fetched_at = None;
+                }
                 self.sync.page_error = Some(error.clone());
                 self.error = Some(error);
             }

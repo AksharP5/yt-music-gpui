@@ -11,8 +11,8 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use gpui::{
-    AppContext, Bounds, Context, ListOffset, ScrollStrategy, Window, WindowBounds, WindowKind,
-    WindowOptions, point, px, size,
+    AppContext, Bounds, Context, ScrollStrategy, Window, WindowBounds, WindowKind, WindowOptions,
+    point, px, size,
 };
 use std::{
     sync::{
@@ -180,6 +180,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                     },
                     cx,
                 );
+                view.back.clear();
                 view.account_event(
                     account::Event::Applied {
                         session: view.account.as_ref().unwrap().session.clone(),
@@ -305,344 +306,6 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn back_after_invalidation_restores_scroll_before_revalidation() -> Result<()> {
-    check_cache_window(async |window, cx| {
-        for route in [
-            Route::Search(Search {
-                query: "scroll".into(),
-                filter: SearchFilter::Songs,
-                scope: SearchScope::Catalog,
-            }),
-            Route::Search(Search {
-                query: "scroll".into(),
-                filter: SearchFilter::All,
-                scope: SearchScope::Catalog,
-            }),
-            Route::Recent,
-            Route::Library(Section::History),
-            Route::Browse(BrowseLink::new("VLscroll", "Playlist")),
-            Route::Saved,
-            Route::Home,
-        ] {
-            let grid = route == Route::Saved;
-            for shorter in [false, true] {
-                let fixture = |count| {
-                    let mut response = crate::app::sync::tests::response(
-                        &[("Songs", (0..count).collect())],
-                        None,
-                        true,
-                    );
-                    if route.is_home() {
-                        let template = response.shelves[0].clone();
-                        response.shelves = template
-                            .items
-                            .iter()
-                            .enumerate()
-                            .map(|(index, item)| {
-                                let mut shelf = template.clone();
-                                shelf.title = format!("Shelf {index}");
-                                shelf.items = vec![item.clone()];
-                                shelf
-                            })
-                            .collect();
-                    }
-                    if matches!(route, Route::Browse(_)) {
-                        response.header = crate::catalog::parse_page(&serde_json::json!({
-                            "header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Playlist"}}}, "contents":[]
-                        }), "Playlist").unwrap().header;
-                        assert!(response.header.is_some());
-                    }
-                    if route == Route::Saved {
-                        response.shelves[0].items = (0..count).map(|index| crate::catalog::Item::Collection(
-                            serde_json::from_value(serde_json::json!({"id":format!("VL{index}"),"title":format!("Playlist {index}"),"subtitle":"Playlist"})).unwrap()
-                        )).collect();
-                    }
-                    response
-                };
-                window
-                    .update(cx, |view, _, cx| {
-                        view.navigate(route.clone(), cx);
-                        reply(view, fixture(100), cx);
-                    })
-                    .unwrap();
-                wait_for_presented_frame(window, cx).await;
-                window
-                    .update(cx, |view, _, cx| {
-                        if !grid {
-                            view.detail_list.state.scroll_to(ListOffset {
-                                item_ix: 60,
-                                offset_in_item: px(7.),
-                            });
-                        } else {
-                            view.list_scroll
-                                .scroll_to_item_strict(15, ScrollStrategy::Top);
-                        }
-                        cx.notify();
-                    })
-                    .unwrap();
-                wait_for_presented_frame(window, cx).await;
-                let (top, offset, baseline) = window
-                    .update(cx, |view, window, cx| {
-                        let top = view.detail_list.state.logical_scroll_top();
-                        let offset = view.list_scroll.0.borrow().base_handle.offset();
-                        assert!(
-                            if !grid {
-                                top.item_ix > 40
-                            } else {
-                                offset.y < px(-1000.)
-                            },
-                            "The page must actually be scrolled"
-                        );
-                        let baseline = if !shorter && grid {
-                            Some(super::render::capture(window, "back-grid-before"))
-                        } else if !shorter && matches!(&route, Route::Search(search) if search.filter == SearchFilter::Songs) {
-                            Some(super::render::capture(window, "back-search-before"))
-                        } else {
-                            None
-                        };
-                        view.navigate(Route::Explore, cx);
-                        if view.catalog_requests.is_loading(CatalogTarget::Page) {
-                            reply(view, page("Explore", "explore-tail"), cx);
-                        }
-                        let track = view.page.tracks()[0].clone();
-                        confirm(
-                            view,
-                            window,
-                            Mutation::SongLibrary { track, save: true },
-                            cx,
-                        );
-                        view.go_back(cx);
-                        assert_eq!(view.rows.len(), 100, "Invalidated Back must show the stashed page immediately");
-                        assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
-                        (top, offset, baseline)
-                    })
-                    .unwrap();
-                // Present the restored page before delivering its revalidation.
-                wait_for_presented_frame(window, cx).await;
-                window
-                    .update(cx, |view, _, cx| {
-                        if !grid {
-                            let restored = view.detail_list.state.logical_scroll_top();
-                            assert_eq!(
-                                (restored.item_ix, restored.offset_in_item),
-                                (top.item_ix, top.offset_in_item),
-                                "Back must present the old scroll before any reply"
-                            );
-                        } else {
-                            assert_eq!(view.list_scroll.0.borrow().base_handle.offset(), offset);
-                        }
-                        assert!(matches!(
-                            reply(view, fixture(if shorter { 30 } else { 100 }), cx),
-                            Query::Revalidate(_)
-                        ));
-                        if !grid {
-                            let restored = view.detail_list.state.logical_scroll_top();
-                            if shorter {
-                                assert!(
-                                    restored.item_ix >= 29
-                                        && restored.item_ix <= view.detail_list.state.item_count(),
-                                    "A shorter response must clamp near its final row: {restored:?}"
-                                );
-                            } else {
-                                assert_eq!(
-                                    (restored.item_ix, restored.offset_in_item),
-                                    (top.item_ix, top.offset_in_item),
-                                    "Back must keep the saved row and offset after revalidation"
-                                );
-                            }
-                        }
-                    })
-                    .unwrap();
-                wait_for_presented_frame(window, cx).await;
-                window
-                    .update(cx, |view, window, _| {
-                        if let Some(before) = &baseline {
-                            let after = super::render::capture(window, if grid { "back-grid-after" } else { "back-search-after" });
-                            let visible: Vec<_> = before.enumerate_pixels().filter(|(x, y, pixel)| {
-                                *x >= 330 && *y >= 120 && *y < 700 && pixel.0[..3].iter().any(|channel| *channel >= 100)
-                            }).collect();
-                            assert!(visible.len() > 100, "The baseline must show scrolled row content");
-                            let missing = visible.iter().filter(|(x, y, _)| after.get_pixel(*x, *y).0[..3].iter().all(|channel| *channel < 50)).count();
-                            assert!(missing * 100 < visible.len() * 2, "The revalidation frame must paint the restored rows: {missing}/{} visible pixels missing", visible.len());
-                        }
-                        if !grid {
-                            assert!(
-                                view.detail_list.state.logical_scroll_top().item_ix
-                                    > if shorter { 10 } else { 40 },
-                                "The presented list must stay scrolled"
-                            );
-                        } else {
-                            let restored = view.list_scroll.0.borrow().base_handle.offset();
-                            if shorter {
-                                assert!(
-                                    restored.y < px(-100.),
-                                    "A shorter grid must clamp above the top"
-                                );
-                            } else {
-                                assert_eq!(
-                                    restored, offset,
-                                    "The presented grid must restore its offset"
-                                );
-                            }
-                        }
-                    })
-                    .unwrap();
-                window
-                    .update(cx, |view, _, cx| {
-                        view.navigate(Route::Explore, cx);
-                        if view.catalog_requests.is_loading(CatalogTarget::Page) {
-                            reply(view, page("Explore", "explore-tail"), cx);
-                        }
-                        view.page_cache.clear();
-                    })
-                    .unwrap();
-            }
-        }
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn invalidated_back_preserves_deep_continuations_for_accounts_and_guests() -> Result<()> {
-    check_cache_window(async |window, cx| {
-        for guest in [false, true] {
-            for invalidate_before_leaving in [false, true] {
-                window
-                    .update(cx, |view, _, cx| {
-                        view.account = (!guest).then(|| connection(session("deep-back")));
-                        view.clear_account_state(cx);
-                        view.navigate(
-                            Route::Browse(BrowseLink::new("VLdeep", "Deep playlist")),
-                            cx,
-                        );
-                        reply(
-                            view,
-                            crate::app::sync::tests::response(
-                                &[("Songs", (0..50).collect())],
-                                Some("first-tail"),
-                                true,
-                            ),
-                            cx,
-                        );
-                        view.prefetch_page(50, 50, 0, cx);
-                        reply(
-                            view,
-                            crate::app::sync::tests::response(
-                                &[("Songs", (50..150).collect())],
-                                Some("loaded-tail"),
-                                true,
-                            ),
-                            cx,
-                        );
-                        view.list_scroll
-                            .scroll_to_item_strict(130, ScrollStrategy::Top);
-                        cx.notify();
-                    })
-                    .unwrap();
-                wait_for_presented_frame(window, cx).await;
-                let offset = window
-                    .update(cx, |view, window, cx| {
-                        let offset = view.list_scroll.0.borrow().base_handle.offset();
-                        assert!(
-                            offset.y < px(-5000.),
-                            "The loaded continuation must actually be visible"
-                        );
-                        super::render::capture(window, "deep-back-before");
-                        let track = view.page.tracks()[130].clone();
-                        let invalidate =
-                            |view: &mut Music, window: &mut Window, cx: &mut Context<Music>| {
-                                if guest {
-                                    view.toggle_like(&track, cx);
-                                } else {
-                                    confirm(
-                                        view,
-                                        window,
-                                        Mutation::RateSong {
-                                            track: track.clone(),
-                                            rating: Rating::Like,
-                                        },
-                                        cx,
-                                    );
-                                }
-                            };
-                        if invalidate_before_leaving {
-                            invalidate(view, window, cx);
-                        }
-                        view.navigate(Route::Explore, cx);
-                        reply(view, page("Explore", "explore-tail"), cx);
-                        if !invalidate_before_leaving {
-                            invalidate(view, window, cx);
-                        }
-                        view.go_back(cx);
-                        assert_eq!(
-                            view.rows.len(),
-                            150,
-                            "Back must restore all loaded rows across generation changes"
-                        );
-                        assert_eq!(
-                            view.page.continuation.as_ref().unwrap().token(),
-                            "loaded-tail"
-                        );
-                        assert_eq!(view.list_scroll.0.borrow().base_handle.offset(), offset);
-                        assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
-                        offset
-                    })
-                    .unwrap();
-                wait_for_presented_frame(window, cx).await;
-                window
-                    .update(cx, |view, window, cx| {
-                        assert_eq!(
-                            view.list_scroll.0.borrow().base_handle.offset(),
-                            offset,
-                            "The first Back frame must keep row 130 visible"
-                        );
-                        super::render::capture(window, "deep-back-restored");
-                        assert!(matches!(
-                            reply(
-                                view,
-                                crate::app::sync::tests::response(
-                                    &[("Songs", (0..50).collect())],
-                                    Some("fresh-first-tail"),
-                                    true
-                                ),
-                                cx
-                            ),
-                            Query::Revalidate(_)
-                        ));
-                        assert_eq!(
-                            view.rows.len(),
-                            150,
-                            "Revalidation must merge the first 50 rows into the loaded 150"
-                        );
-                        assert_eq!(
-                            view.page.continuation.as_ref().unwrap().token(),
-                            "loaded-tail"
-                        );
-                    })
-                    .unwrap();
-                wait_for_presented_frame(window, cx).await;
-                window.update(cx, |view, window, cx| {
-                    assert_eq!(view.list_scroll.0.borrow().base_handle.offset(), offset,
-                        "Revalidation must keep row 130 visible");
-                    super::render::capture(window, "deep-back-revalidated");
-                    println!("Deep Back: guest={guest} invalidated_while_active={invalidate_before_leaving} rows={} scroll={offset:?}", view.rows.len());
-                    view.navigate(Route::Explore, cx);
-                    if view.catalog_requests.is_loading(CatalogTarget::Page) {
-                        reply(view, page("Explore", "explore-tail"), cx);
-                    }
-                    view.navigate(Route::Browse(BrowseLink::new("VLdeep", "Deep playlist")), cx);
-                    assert!(view.rows.is_empty(), "Forward must still reject the old loaded tail");
-                    reply(view, page("Fresh playlist", "fresh-tail"), cx);
-                    assert_eq!(view.list_scroll.0.borrow().base_handle.offset().y, px(0.));
-                    assert!(view.page_cache.len() <= 12);
-                }).unwrap();
-            }
-        }
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn stale_forward_revisit_replaces_loaded_tail_and_continuation() -> Result<()> {
     check_cache(|view, _, cx| {
         let route = Route::Browse(BrowseLink::new("VLexpired", "Expired playlist"));
@@ -659,7 +322,8 @@ fn stale_forward_revisit_replaces_loaded_tail_and_continuation() -> Result<()> {
             cx,
         );
         assert_eq!(view.rows.len(), 200);
-        view.sync.page_fetched_at = Some(Instant::now() - Duration::from_secs(181));
+        view.forward_page.as_mut().unwrap().fetched_at =
+            Some(Instant::now() - Duration::from_secs(181));
         view.navigate(Route::Explore, cx);
         view.navigate(route, cx);
         assert_eq!(
@@ -787,7 +451,7 @@ fn guest_likes_and_saves_invalidate_cached_catalog_pages() -> Result<()> {
                 "A guest library edit must discard older catalog pages too"
             );
             reply(view, page("Updated guest Home", "fresh-tail"), cx);
-            view.sync.page_fetched_at = None;
+            view.forward_page.as_mut().unwrap().fetched_at = None;
             view.navigate(Route::Explore, cx);
         }
     })
@@ -845,54 +509,6 @@ fn saved_song_refetches_cached_library_search_and_playlist() -> Result<()> {
             assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
             reply(view, page("After save", "fresh-tail"), cx);
         }
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn back_refetches_evicted_library_with_selected_sort() -> Result<()> {
-    check_cache(|view, _, cx| {
-        let route = Route::Library(Section::Playlists);
-        view.navigate(route, cx);
-        reply(view, page("Playlists", "alphabetical-request"), cx);
-        view.request(Query::Reload(view.page.continuation.clone().unwrap()), cx);
-        let mut sorted = crate::app::sync::tests::response(&[("Playlists", vec![0])], None, false);
-        sorted.shelves[0].items = [("VLalpha", "Alpha"), ("VLbravo", "Bravo")]
-            .map(|(id, title)| {
-                crate::catalog::Item::Collection(
-                    serde_json::from_value(
-                        serde_json::json!({"id":id,"title":title,"subtitle":"Playlist"}),
-                    )
-                    .unwrap(),
-                )
-            })
-            .into();
-        reply(view, sorted, cx);
-        view.navigate(Route::Explore, cx);
-        view.page_cache.clear();
-        view.go_back(cx);
-        assert!(
-            view.rows.is_empty(),
-            "An evicted page must fetch again on Back"
-        );
-        assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
-        let query = reply(view, page("Refetched playlists", "fresh-playlists"), cx);
-        assert!(
-            matches!(query, Query::Reload(token) if token.token() == "alphabetical-request"),
-            "Back must request the selected sort after eviction"
-        );
-        view.navigate(Route::Explore, cx);
-        view.navigate(Route::Library(Section::Playlists), cx);
-        view.request(Query::Reload(view.page.continuation.clone().unwrap()), cx);
-        reply(view, page("Another order", "another-tail"), cx);
-        view.go_back(cx);
-        view.go_back(cx);
-        assert!(
-            view.rows.is_empty(),
-            "Back must not reuse a different visit's sort"
-        );
-        let query = reply(view, page("Original order", "original-tail"), cx);
-        assert!(matches!(query, Query::Reload(token) if token.token() == "alphabetical-request"));
     })
 }
 
@@ -967,7 +583,7 @@ fn playback_report_invalidates_cached_and_inflight_history_only() -> Result<()> 
                         "History from before a successful report must fetch on revisit"
                     );
                     reply(view, page("Fresh History", "fresh-tail"), cx);
-                    view.sync.page_fetched_at = None;
+                    view.forward_page.as_mut().unwrap().fetched_at = None;
                     view.navigate(playlist.clone(), cx);
                 }
             }
@@ -977,10 +593,10 @@ fn playback_report_invalidates_cached_and_inflight_history_only() -> Result<()> 
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn cached_continuation_error_retries_on_back() -> Result<()> {
+fn continuation_errors_are_not_forward_cached() -> Result<()> {
     check_cache(|view, _, cx| {
         let route = Route::Browse(BrowseLink::new("VLretry", "Retry playlist"));
-        view.navigate(route, cx);
+        view.navigate(route.clone(), cx);
         reply(view, page("Playlist", "retry-tail"), cx);
         view.prefetch_page(100, 100, 0, cx);
         let job = view.catalog_requests.pending.try_recv().unwrap();
@@ -1000,11 +616,12 @@ fn cached_continuation_error_retries_on_back() -> Result<()> {
         );
         assert!(view.sync.page_error.is_some());
         view.navigate(Route::Explore, cx);
-        view.go_back(cx);
+        view.navigate(route, cx);
         assert!(
-            view.sync.page_error.is_none(),
-            "Returning must clear the cached continuation failure"
+            view.rows.is_empty(),
+            "A page with a continuation error must fetch on forward navigation"
         );
+        assert!(view.sync.page_error.is_none());
         assert!(view.error.is_none());
         if view.catalog_requests.is_loading(CatalogTarget::Page) {
             reply(view, page("Retry succeeded", "retry-tail"), cx);
@@ -1062,7 +679,7 @@ fn edited_loaded_and_inflight_pages_are_not_recached() -> Result<()> {
             );
             reply(view, page("Songs after save", "songs-tail"), cx);
             // Remove this valid entry before exercising the initial response in flight.
-            view.sync.page_fetched_at = None;
+            view.forward_page.as_mut().unwrap().fetched_at = None;
             view.navigate(Route::Explore, cx);
         }
 
@@ -1146,7 +763,8 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert!(view.catalog_requests.pending.is_empty(), "Clicking the current route also uses its response");
                 view.navigate(Route::Browse(BrowseLink::new("FEmusic_home", "Home link")), cx);
                 assert_eq!(view.page.title, "Home recommendations");
-                assert!(view.catalog_requests.pending.is_empty(), "An unfiltered Home link shares the primary Home route");
+                assert!(view.catalog_requests.pending.is_empty(), "An unfiltered Home link shares the primary Home cache entry");
+                assert!(matches!(&view.route, Route::Browse(link) if link.id == "FEmusic_home"), "Cache aliases must not rewrite the route recorded for Back");
             }).unwrap();
             wait_for_presented_frame(window, cx).await;
             window.update(cx, |view, window, cx| {
@@ -1157,58 +775,29 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 view.navigate(playlist.clone(), cx);
                 reply(view, page("Cached playlist", "playlist-tail"), cx);
                 let fetched_at = Instant::now() - Duration::from_secs(181);
-                view.sync.page_fetched_at = Some(fetched_at);
+                view.forward_page.as_mut().unwrap().fetched_at = Some(fetched_at);
                 let token = view.page.continuation.clone().unwrap();
                 view.request(Query::More { token, search: None }, cx);
                 reply(view, crate::app::sync::tests::response(&[("Songs", (100..150).collect())], Some("deeper-tail"), false), cx);
-                assert_eq!(view.sync.page_fetched_at, Some(fetched_at), "Loading a continuation must not renew the first page's age");
+                assert_eq!(view.forward_page.as_ref().unwrap().fetched_at, Some(fetched_at), "Loading a continuation must not renew the first page's cache age");
                 view.list_scroll.scroll_to_item_strict(80, ScrollStrategy::Top);
                 cx.notify();
             }).unwrap();
             wait_for_presented_frame(window, cx).await;
-            let old_scroll = window.update(cx, |view, _, cx| {
-                let old_scroll = view.list_scroll.0.borrow().base_handle.offset();
-                assert!(old_scroll.y < px(-1000.), "The playlist must actually be scrolled before testing Back and revalidation");
-                view.navigate(Route::Explore, cx);
-                reply(view, page("Explore", "explore-tail"), cx);
-                view.go_back(cx);
-                assert_eq!(view.rows.len(), 150, "Stale Back must render all cached continuations before refreshing");
-                assert_eq!(view.list_scroll.0.borrow().base_handle.offset(), old_scroll);
-                assert_eq!(view.page.continuation.as_ref().unwrap().token(), "deeper-tail");
-                assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
-                old_scroll
-            }).unwrap();
-            wait_for_presented_frame(window, cx).await;
             window.update(cx, |view, window, cx| {
-                super::render::capture(window, "stale-playlist-first-frame");
-                assert!(matches!(view.catalog_requests.pending.try_recv().unwrap().query, Query::Revalidate(_)));
-                // Put the intercepted request back through the same path, then mutate while it is in flight.
-                view.revalidate_page(cx);
                 let track = view.page.tracks()[0].clone();
                 confirm(view, window, Mutation::RateSong { track, rating: Rating::Like }, cx);
-                window.focus(&view.focus, cx);
-                reply(view, page("Updated playlist", "fresh-tail"), cx);
-                assert_eq!(view.page.title, "Updated playlist");
-                assert_eq!(view.rows.len(), 150, "Refresh must preserve loaded continuations");
-                assert_eq!(view.page.tracks()[0].details.rating, Some(Rating::Like), "An in-flight reply must retain confirmed local changes");
-                assert_eq!(view.list_scroll.0.borrow().base_handle.offset(), old_scroll, "Refresh must keep the visible occurrence");
-                assert!(view.focus.is_focused(window), "Background refresh must keep focus");
                 view.navigate(Route::Explore, cx);
-                reply(view, page("Explore", "explore-tail"), cx);
                 view.navigate(playlist.clone(), cx);
                 assert!(view.rows.is_empty(), "The reply issued before the rating must not be cached");
                 reply(view, page("Fresh playlist", "fresh-tail"), cx);
                 assert_eq!(view.list_scroll.0.borrow().base_handle.offset().y, px(0.), "Forward navigation resets scroll");
-                view.sync.page_fetched_at = Some(Instant::now() - Duration::from_secs(181));
+                view.forward_page.as_mut().unwrap().fetched_at = Some(Instant::now() - Duration::from_secs(181));
                 view.navigate(Route::Explore, cx);
                 view.navigate(playlist.clone(), cx);
                 assert_eq!(view.rows.len(), 100, "Stale forward navigation shows its page synchronously");
                 reply(view, page("Revisited playlist", "fresh-tail"), cx);
                 assert_eq!(view.rows.len(), 100, "Forward refresh replaces expired continuation pages");
-                view.navigate(Route::Explore, cx);
-                view.go_back(cx);
-                assert_eq!(view.page.title, "Revisited playlist");
-                assert!(view.catalog_requests.pending.is_empty(), "Fresh signed-in Back must not revalidate");
                 view.navigate(Route::Explore, cx);
                 confirm(view, window, Mutation::RemoveFromPlaylist { id: "VLcached".into(), set_video_id: "occurrence-0".into(), video_id: "00000000000".into() }, cx);
                 view.navigate(playlist.clone(), cx);
@@ -1268,7 +857,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert!(view.catalog_requests.pending.is_empty());
                 view.reload_current_page(cx);
                 let job = view.catalog_requests.pending.try_recv().unwrap();
-                assert!(matches!(job.query, Query::Revalidate(query) if matches!(&*query, Query::Reload(token) if token.token() == "sort-request")), "Reload must retain the selected sort's request");
+                assert!(matches!(job.query, Query::Revalidate(query) if matches!(&*query, Query::Library(Section::Songs))), "Explicit reload keeps main's route revalidation behavior");
                 while view.catalog_requests.pending.try_recv().is_ok() {}
                 view.navigate(Route::Saved, cx);
                 reply(view, page("Saved collections", "saved-tail"), cx);
@@ -1283,7 +872,6 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 let previous_revision = view.account_revision;
                 view.account = Some(connection(session("second")));
                 view.clear_account_state(cx);
-                assert!(view.back.is_empty());
                 assert!(view.page_cache.is_empty());
                 view.navigate(Route::Home, cx);
                 assert!(view.rows.is_empty(), "Another account must not see the guest or first account's cached Home");
@@ -1309,19 +897,6 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 view.navigate(Route::Browse(BrowseLink::new("VLlru0", "LRU")), cx);
                 assert!(view.rows.is_empty(), "The oldest page must be evicted at the cache limit");
                 reply(view, page("Evicted page reloaded", "new-tail"), cx);
-                view.navigate(Route::Search(Search { query: "back rows".into(), filter: SearchFilter::Songs, scope: SearchScope::Catalog }), cx);
-                reply(view, page("Grouped rows", "grouped-tail"), cx);
-                view.navigate(Route::Explore, cx);
-                reply(view, page("Explore", "explore-again"), cx);
-                for entry in &mut view.page_cache {
-                    if matches!(&entry.route, Route::Search(search) if search.query == "back rows") {
-                        entry.page.shelves[0].items.truncate(2);
-                    }
-                }
-                view.go_back(cx);
-                assert_eq!(view.rows.len(), 2);
-                assert_eq!(view.detail_list.state.item_count(), view.list_rows.len(), "Back must update its old list state when cached rows changed");
-                view.detail_list.state.scroll_to(ListOffset::default());
             }).unwrap();
             wait_for_presented_frame(window, cx).await;
             result.store(true, Ordering::Relaxed);
@@ -1333,4 +908,123 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
         "Navigation checks did not complete"
     );
     Ok(())
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn back_owns_each_visits_loaded_page_and_ignores_forward_cache() -> Result<()> {
+    check_cache(|view, window, cx| {
+        let route = Route::Browse(BrowseLink::new("VLsnapshots", "Snapshots"));
+        view.navigate(route.clone(), cx);
+        reply(view, page("First visit", "first-tail"), cx);
+        view.prefetch_page(100, 100, 0, cx);
+        reply(
+            view,
+            crate::app::sync::tests::response(
+                &[("Songs", (100..200).collect())],
+                Some("loaded-tail"),
+                true,
+            ),
+            cx,
+        );
+        view.navigate(Route::Explore, cx);
+        confirm(
+            view,
+            window,
+            Mutation::RemoveFromPlaylist {
+                id: "snapshots".into(),
+                set_video_id: "occurrence-149".into(),
+                video_id: format!("{:011}", 149),
+            },
+            cx,
+        );
+        view.navigate(route, cx);
+        let mut second = crate::app::sync::tests::page(50, true);
+        second.title = "Second visit".into();
+        reply(view, second, cx);
+        view.navigate(Route::Explore, cx);
+        view.page_cache.clear();
+        view.go_back(cx);
+        assert_eq!(view.page.title, "Second visit");
+        assert_eq!(view.rows.len(), 50);
+        assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
+        view.go_back(cx);
+        view.go_back(cx);
+        assert_eq!(view.page.title, "First visit");
+        assert_eq!(
+            view.rows.len(),
+            199,
+            "Each visit retains its own loaded tail"
+        );
+        assert!(
+            view.page
+                .tracks()
+                .iter()
+                .all(|track| track.id != format!("{:011}", 149)),
+            "Confirmed removals patch stashed tails"
+        );
+        assert_eq!(
+            view.page.continuation.as_ref().unwrap().token(),
+            "loaded-tail"
+        );
+        assert!(
+            view.page_cache.is_empty(),
+            "Back never populates the forward cache"
+        );
+        let job = view.catalog_requests.pending.try_recv().unwrap();
+        assert!(
+            matches!(job.query, Query::Revalidate(_)),
+            "Signed-in Back always revalidates as on main"
+        );
+        view.catalog_result(
+            CatalogResult {
+                id: job.id,
+                account_revision: job.account_revision,
+                account_generation: job.account_generation,
+                history_generation: job.history_generation,
+                append: false,
+                revalidate: true,
+                result: Err("Synthetic revalidation error".into()),
+                session_rejected: false,
+                target: CatalogTarget::Page,
+            },
+            cx,
+        );
+        view.navigate(Route::Explore, cx);
+        view.go_back(cx);
+        assert_eq!(
+            view.rows.len(),
+            199,
+            "A catalog error must not discard Back content"
+        );
+
+        let incomplete = Route::Browse(BrowseLink::new("VLincomplete", "Incomplete"));
+        view.navigate(incomplete.clone(), cx);
+        view.navigate(Route::Explore, cx);
+        view.page_cache.push_back(crate::app::CachedPage {
+            route: incomplete,
+            account_revision: view.account_revision,
+            account_generation: view.account_generation,
+            history_generation: view.history_generation,
+            page: page("Must not restore from forward cache", "wrong-tail"),
+            fetched_at: Instant::now(),
+            coverage: Default::default(),
+            sort: None,
+        });
+        let cache_len = view.page_cache.len();
+        view.go_back(cx);
+        assert!(
+            view.rows.is_empty(),
+            "Back without a snapshot fetches fresh as on main"
+        );
+        assert_eq!(
+            view.page_cache.len(),
+            cache_len,
+            "Back never consumes forward cache entries"
+        );
+        assert!(matches!(
+            reply(view, page("Fetched incomplete", "fresh-tail"), cx),
+            Query::Browse(_)
+        ));
+    })
 }

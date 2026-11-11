@@ -1271,7 +1271,7 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
         .update(cx, |music, window, cx| {
             music.catalog_requests = CatalogRequests::new();
             music.page_cache.clear();
-            music.sync.page_fetched_at = Some(Instant::now());
+            music.forward_page = None;
             music.account = None;
             music.library.saved.clear();
             music
@@ -1283,6 +1283,9 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
             let Route::Browse(artist) = music.route.clone() else {
                 unreachable!()
             };
+            let page = music.page.clone();
+            music.navigate(Route::Browse(artist.clone()), cx);
+            super::navigation::reply(music, page, cx);
             artist
         })
         .unwrap();

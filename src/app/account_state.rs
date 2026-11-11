@@ -44,7 +44,7 @@ impl Music {
         self.next_session_refresh = None;
         self.sync = sync::SyncState::default();
         self.page_cache.clear();
-        self.back.clear();
+        self.forward_page = None;
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -804,9 +804,7 @@ impl Music {
                                             view.account_generation = view.account_generation.wrapping_add(1);
                                             // Read continuations belong to the exact session snapshot.
                                             view.page_cache.clear();
-                                            for state in &mut view.back { state.sort = None; }
-                                            view.sync.page_fetched_at = None;
-                                            view.sync.page_sort = None;
+                                            view.forward_page = None;
                                             // Rebind only this verified account's queue; discard other in-flight reads.
                                             view.catalog_requests.cancel(CatalogTarget::Page);
                                             view.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -1006,7 +1004,10 @@ impl Music {
                         if !watchtime
                             && self.overlay.is_none()
                             && !self.catalog_requests.is_loading(CatalogTarget::Page)
-                            && self.route.library_section() == Some(Section::History)
+                            && matches!(
+                                self.route,
+                                Route::Recent | Route::Library(Section::History)
+                            )
                         {
                             self.revalidate_page(cx);
                         }

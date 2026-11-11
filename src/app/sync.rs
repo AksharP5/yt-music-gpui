@@ -5,8 +5,6 @@ use super::*;
 pub(in crate::app) struct SyncState {
     pub refreshed_at: Option<Instant>,
     pub page_fetched_at: Option<Instant>,
-    pub page_account_generation: u64,
-    pub page_history_generation: u64,
     pub sidebar_continuation: Option<Continuation>,
     pub sidebar_coverage: PageCoverage,
     pub rating_overrides: HashSet<String>,
@@ -15,7 +13,6 @@ pub(in crate::app) struct SyncState {
     pub page_coverage: PageCoverage,
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
-    pub page_sort: Option<Continuation>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -481,18 +478,17 @@ impl Music {
     }
 
     pub(in crate::app) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
-        if self.account.is_none()
-            && !matches!(self.route, Route::Browse(_))
-            && self.route.library_section().is_some()
-        {
+        if self.account.is_none() && self.route.library_section().is_some() {
             let anchor = self.page_anchor();
             self.refresh_local();
             self.restore_page_anchor(&anchor);
             cx.notify();
             return;
         }
-        // Leaving during an explicit reload must not make the old response fresh again.
-        self.sync.page_fetched_at = None;
+        if let Some(active) = &mut self.forward_page {
+            active.fetched_at = None;
+            active.sort = None;
+        }
         if self.account.is_some() {
             self.refresh_remote(cx);
         } else {
@@ -566,6 +562,17 @@ impl Music {
                         _ => None,
                     }))
                     .chain(
+                        self.back
+                            .iter()
+                            .filter_map(|state| state.page.as_ref())
+                            .flat_map(|page| &page.shelves)
+                            .flat_map(|shelf| &shelf.items)
+                            .filter_map(|item| match item {
+                                Item::Track(track) => Some(track),
+                                _ => None,
+                            }),
+                    )
+                    .chain(
                         self.page_cache
                             .iter()
                             .filter(|entry| {
@@ -595,7 +602,13 @@ impl Music {
                 tracks: sources.clone(),
             });
         }
-        append_added(&mut self.page, &self.route, id, &sources);
+        for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
+            self.back
+                .iter_mut()
+                .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
+        ) {
+            append_added(page, route, id, &sources);
+        }
         self.rebuild_rows();
         if sources.len() < additions.len()
             && matches!(&self.route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
@@ -606,17 +619,13 @@ impl Music {
     }
 
     pub(super) fn page_query(&self) -> Query {
-        if let Some(sort) = &self.sync.page_sort {
-            Query::Reload(sort.clone())
-        } else {
-            match &self.route {
-                Route::Home => Query::Home,
-                Route::Explore => Query::Explore,
-                Route::Search(search) => Query::Search(search.clone()),
-                Route::Browse(link) => Query::Browse(link.clone()),
-                Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => {
-                    Query::Library(self.route.library_section().expect("library route"))
-                }
+        match &self.route {
+            Route::Home => Query::Home,
+            Route::Explore => Query::Explore,
+            Route::Search(search) => Query::Search(search.clone()),
+            Route::Browse(link) => Query::Browse(link.clone()),
+            Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => {
+                Query::Library(self.route.library_section().expect("library route"))
             }
         }
     }
@@ -632,6 +641,11 @@ impl Music {
                 .push(PageChange::Confirmed(Box::new(mutation.clone())));
         }
         patch_page(&mut self.page, &self.route, mutation);
+        for state in &mut self.back {
+            if let Some(page) = &mut state.page {
+                patch_page(page, &state.route, mutation);
+            }
+        }
         if let Mutation::DeletePlaylist { id } = mutation {
             let mut index = 0;
             let first_page_len = &mut self.sync.sidebar_coverage.first_page_len;

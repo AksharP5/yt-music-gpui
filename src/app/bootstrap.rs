@@ -300,6 +300,7 @@ impl Music {
             sidebar_scroll: UniformListScrollHandle::new(),
             back: Vec::new(),
             page_cache: VecDeque::new(),
+            forward_page: Some(ForwardPage::new(0, 0, 0)),
             list_id: 0,
             error,
             notice: None,
