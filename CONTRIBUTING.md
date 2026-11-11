@@ -69,7 +69,7 @@ EOF
     PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse" \
     XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" XDG_CACHE_HOME="$runtime/cache" \
     PATH="$runtime/bin:$PATH" YT_MUSIC_NATIVE_TESTS=1 \
-    dbus-run-session -- bin/test -- --ignored --exact "$test" --nocapture || break
+    dbus-run-session --config-file=bin/private-bus.conf -- bin/test -- --ignored --exact "$test" --nocapture || break
   # Representative screenshots from the render check stay in $runtime for inspection.
   echo "Native test files: $runtime"
 done
@@ -101,10 +101,10 @@ PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse" \
 XDG_RUNTIME_DIR="$runtime" \
 XDG_DATA_HOME="$runtime/data" \
 XDG_CACHE_HOME="$runtime/cache" \
-  dbus-run-session -- cargo run -- --guest
+  dbus-run-session --config-file=bin/private-bus.conf -- cargo run -- --guest
 ```
 
-`mktemp -d` creates the directory with mode 0700. The initial library mutes playback. The cache stays inside the same directory. The first three variables keep the display and audio connections pointed at your real session. `dbus-run-session` gives the instance a private bus, so it cannot reach your keyring or claim the media keys. `--guest` skips the saved account. Remove `$runtime` when you are done.
+`mktemp -d` creates the directory with mode 0700. The initial library mutes playback. The cache stays inside the same directory. The first three variables keep the display and audio connections pointed at your real session. `dbus-run-session` gives the instance a private bus, so it cannot reach your keyring or claim the media keys. `bin/private-bus.conf` turns off service activation on that bus; with the default config, desktop portals start inside the private runtime, crash, and keep running after the instance exits. `--guest` skips the saved account. Remove `$runtime` when you are done.
 
 ## Commits and pull requests
 
