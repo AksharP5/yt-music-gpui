@@ -21,19 +21,6 @@ enum Control {
     Replies(usize),
 }
 
-fn comment_preview(text: &str) -> Option<String> {
-    let mut lines = 1;
-    for (count, (index, character)) in text.char_indices().enumerate() {
-        if count == 180 || (character == '\n' && lines == 4) {
-            return Some(format!("{}…", text[..index].trim_end()));
-        }
-        if character == '\n' {
-            lines += 1;
-        }
-    }
-    None
-}
-
 fn comment_indent(depth: usize) -> f32 {
     if depth == 0 {
         0.
@@ -57,7 +44,7 @@ struct Pending {
 struct Entry {
     thread: Thread,
     expanded: bool,
-    preview: Option<String>,
+    long: bool,
     replies_open: bool,
     replies: Vec<usize>,
     depth: usize,
@@ -84,6 +71,7 @@ pub(super) struct State {
     menu: bool,
     sort_bounds: Rc<Cell<Bounds<Pixels>>>,
     entries: Vec<Entry>,
+    measured_width: Option<Pixels>,
     roots: Vec<usize>,
     continuation: Option<Continuation>,
     message: Option<String>,
@@ -110,6 +98,7 @@ impl State {
             menu: false,
             sort_bounds: Rc::new(Cell::new(Bounds::default())),
             entries: Vec::new(),
+            measured_width: None,
             roots: Vec::new(),
             continuation: None,
             message: None,
@@ -165,7 +154,7 @@ impl State {
             match *item {
                 Row::Comment(index) => {
                     let entry = &self.entries[index];
-                    if entry.preview.is_some() {
+                    if entry.long {
                         self.controls.push((row, Control::Read(index)));
                     }
                     if !entry.replies_open
@@ -187,6 +176,50 @@ impl State {
         self.list.reset(self.rows.len());
         if !reset {
             self.list.scroll_to(top);
+        }
+    }
+
+    /// Recompute only when the panel resizes or a page adds comments.
+    fn measure(&mut self, width: Pixels, window: &Window) {
+        if self.measured_width == Some(width) {
+            return;
+        }
+        self.measured_width = Some(width);
+        let mut changed = false;
+        for entry in &mut self.entries {
+            let text = &entry.thread.comment.text;
+            let available = (width
+                - px(comment_indent(entry.depth) + if entry.depth == 0 { 96. } else { 84. }))
+            .max(px(1.));
+            let run = TextRun {
+                len: text.len(),
+                font: font("Roboto"),
+                ..Default::default()
+            };
+            let long = match window.text_system().shape_text(
+                text.clone().into(),
+                px(14.),
+                &[run],
+                Some(available),
+                Some(5),
+            ) {
+                Ok(lines) => {
+                    lines
+                        .iter()
+                        .map(|line| line.size(px(20.)).height)
+                        .sum::<Pixels>()
+                        > px(80.)
+                }
+                Err(error) => {
+                    eprintln!("Could not measure comment text: {error:#}");
+                    continue;
+                }
+            };
+            changed |= entry.long != long;
+            entry.long = long;
+        }
+        if changed {
+            self.rebuild(false);
         }
     }
 
@@ -262,10 +295,10 @@ impl State {
         let depth = parent.map_or(0, |parent| self.entries[parent].depth + 1);
         let children = std::mem::take(&mut thread.children);
         let index = self.entries.len();
-        let preview = comment_preview(&thread.comment.text);
+        self.measured_width = None;
         self.entries.push(Entry {
             thread,
-            preview,
+            long: false,
             expanded: false,
             replies_open: false,
             replies: Vec::new(),
@@ -459,7 +492,13 @@ impl Music {
         cx.notify();
     }
 
-    pub(super) fn comments_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn comments_tab(
+        &mut self,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.player_page.comments.measure(px(width), window);
         let state = &self.player_page.comments;
         if !state.loaded {
             if let Some(error) = &state.error {
@@ -982,15 +1021,7 @@ impl Music {
         let depth = entry.depth;
         let open = entry.replies_open;
         let has_replies = entry.thread.replies.is_some() || !entry.replies.is_empty();
-        let long = entry.preview.is_some();
-        let content = if expanded {
-            comment.text.clone()
-        } else {
-            entry
-                .preview
-                .clone()
-                .unwrap_or_else(|| comment.text.clone())
-        };
+        let long = entry.long;
         let read_focus = long.then(|| self.player_page.comments.handle(Control::Read(index), cx));
         let toggle = (has_replies && !open).then(|| self.comment_reply_toggle(index, cx));
         let guides = self.comment_guides(index, Guide::Comment);
@@ -1059,7 +1090,7 @@ impl Music {
                             .when(long && !expanded, |text| {
                                 text.line_clamp(4).max_h(px(80.)).overflow_hidden()
                             })
-                            .child(content),
+                            .child(comment.text),
                     )
                     .when(long, |body| {
                         body.child(
@@ -1218,18 +1249,6 @@ mod tests {
             Some(true)
         );
         assert!(state.error.is_some());
-    }
-
-    #[test]
-    fn collapsed_comments_bound_text_without_splitting_unicode() {
-        assert_eq!(
-            super::comment_preview("one\ntwo\nthree\nfour\nfive").as_deref(),
-            Some("one\ntwo\nthree\nfour…")
-        );
-        assert!(super::comment_preview("A short comment.").is_none());
-        let preview = super::comment_preview(&"é".repeat(1000)).unwrap();
-        assert_eq!(preview.chars().count(), 181);
-        assert!(preview.ends_with('…'));
     }
 
     #[test]
@@ -1454,11 +1473,38 @@ mod tests {
                         music.stop_playback(cx);
                         music.seed_comments_for_render();
                         let state = &mut music.player_page.comments;
+                        let original = state.entries[0].thread.comment.text.clone();
+                        for (text, width, long) in [
+                            ("i".repeat(200), 500., false),
+                            ("W".repeat(170), 500., true),
+                            ("W".repeat(170), 1000., false),
+                            ("one\ntwo\nthree\nfour".into(), 500., false),
+                            ("one\ntwo\nthree\nfour\nfive".into(), 500., true),
+                            ("é ".repeat(300), 500., true),
+                        ] {
+                            state.entries[0].thread.comment.text = text;
+                            state.measured_width = None;
+                            state.measure(px(width), window);
+                            assert_eq!(state.entries[0].long, long, "Read more must follow rendered lines at {width}px");
+                        }
+                        state.entries[0].thread.comment.text = original;
+                        state.measured_width = None;
                         let focus = state.handle(Control::Read(0), cx);
                         window.focus(&focus, cx);
                         cx.notify();
                     })?;
                     wait_for_presented_frame(window, cx).await;
+                    for (width, height) in [(1280., 800.), (1920., 1080.)] {
+                        window.update(cx, |_, window, cx| {
+                            window.resize(size(px(width), px(height)));
+                            cx.notify();
+                        })?;
+                        wait_for_presented_frame(window, cx).await;
+                        window.update(cx, |music, window, _| {
+                            assert!(music.player_page.comments.entries[0].long);
+                            capture_panel(music, window, "clamped");
+                        })?;
+                    }
                     key(window, cx, "enter").await;
                     window.update(cx, |music, _, _| assert!(music.player_page.comments.entries[0].expanded))?;
                     key(window, cx, "enter").await;
@@ -1490,9 +1536,10 @@ mod tests {
                         let template = state.entries[0].thread.comment.clone();
                         state.entries = (0..500).map(|index| {
                             let mut comment = template.clone(); comment.id = format!("virtual-{index}");
-                            let preview = super::comment_preview(&comment.text);
-                            super::Entry { preview, thread: crate::comments::Thread { comment, replies_label: String::new(), replies: None, children: Vec::new() }, expanded: false, replies_open: false, replies: Vec::new(), depth: 0, parent: None, error: None }
+
+                            super::Entry { long: false, thread: crate::comments::Thread { comment, replies_label: String::new(), replies: None, children: Vec::new() }, expanded: false, replies_open: false, replies: Vec::new(), depth: 0, parent: None, error: None }
                         }).collect();
+                        state.measured_width = None;
                         state.roots = (0..500).collect();
                         state.continuation = None;
                         state.rebuild(true);
