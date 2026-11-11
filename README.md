@@ -53,6 +53,7 @@ Use `--guest` to start without restoring the saved account. Guest likes and save
 - Songs you play show up in your YouTube Music history, and listening time is reported the way the web player reports it.
 - Podcast episodes and long videos resume where you left off, including progress saved by YouTube Music.
 - Likes and dislikes apply immediately and revert if YouTube Music rejects them. Playlist edits wait for confirmation.
+- Recently visited pages appear immediately from a session cache of up to 12 inactive pages. Responses stay fresh for three minutes, then refresh in place without losing scroll or focus. Forward visits start at the top; Back restores your scroll position.
 - When you return to the window after three minutes or more, the current page picks up changes made elsewhere in YouTube Music's order, without losing your scroll position. Ctrl R reloads the page right away.
 
 ## Controls

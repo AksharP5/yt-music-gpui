@@ -678,7 +678,7 @@ impl fmt::Debug for Continuation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Page {
     pub title: String,
     pub header: Option<PageHeader>,

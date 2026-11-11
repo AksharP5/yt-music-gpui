@@ -1265,9 +1265,11 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
     use crate::app::{CatalogRequests, CatalogResult, Query, Route};
     use crate::catalog::{Item, ShelfLayout};
 
-    let (artist, page) = window
+    let artist = window
         .update(cx, |music, window, cx| {
             music.catalog_requests = CatalogRequests::new();
+            music.page_cache.clear();
+            music.sync.page_fetched_at = Some(Instant::now());
             music.account = None;
             music.library.saved.clear();
             music
@@ -1279,7 +1281,7 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
             let Route::Browse(artist) = music.route.clone() else {
                 unreachable!()
             };
-            (artist, music.page.clone())
+            artist
         })
         .unwrap();
     wait_for_quiescence(window, cx).await;
@@ -1335,13 +1337,19 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
         .unwrap();
     key(window, cx, "enter").await;
     window
-        .update(cx, |music, _, cx| {
+        .update(cx, |music, _, _| {
             assert!(
                 music.route == Route::Browse(artist.clone()),
                 "Enter must reopen the artist through the Home link"
             );
-            let job = music.catalog_requests.pending.try_recv().unwrap();
-            assert!(matches!(&job.query, Query::Browse(link) if link == &artist));
+            assert!(
+                music.catalog_requests.pending.is_empty(),
+                "A fresh artist revisit must not fetch again"
+            );
+            assert!(
+                !music.rows.is_empty(),
+                "The cached artist must be present before another response"
+            );
             assert!(
                 music.artwork.is_idle(),
                 "Revisit must use decoded artwork without a late image completion"
@@ -1349,25 +1357,22 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
             assert!(
                 music
                     .artwork
-                    .get_hero(page.header.as_ref().unwrap().thumbnail.as_ref().unwrap())
+                    .get_hero(
+                        music
+                            .page
+                            .header
+                            .as_ref()
+                            .unwrap()
+                            .thumbnail
+                            .as_ref()
+                            .unwrap()
+                    )
                     .is_some()
-            );
-            music.catalog_result(
-                CatalogResult {
-                    id: job.id,
-                    account_revision: job.account_revision,
-                    append: false,
-                    revalidate: false,
-                    result: Ok(page),
-                    session_rejected: false,
-                    target: CatalogTarget::Page,
-                },
-                cx,
             );
         })
         .unwrap();
-    // No scroll, input, resize, sleep or manual notify after the response. The
-    // heading measurement must itself arrange the first redraw with cached art.
+    // No response, scroll, resize or manual notify after reopening. The cached
+    // page and decoded hero must appear in the first redraw.
     wait_for_presented_frame(window, cx).await;
     let revisit = window
         .update(cx, |_, window, _| {

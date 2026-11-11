@@ -368,6 +368,19 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 window.update(cx, |view, window, cx| {
                     view.stop_playback(cx);
                     prepare(view, original.clone());
+                    let mut cached = crate::app::sync::tests::page(1, false);
+                    cached.continuation = Some(crate::catalog::Continuation::from_response(
+                        "old-session-tail", &json!({}), Some(original.clone())
+                    ).unwrap());
+                    view.page_cache.push_back(crate::app::CachedPage {
+                        route: Route::Home,
+                        account_revision: view.account_revision,
+                        page: cached,
+                        fetched_at: Instant::now(),
+                        coverage: Default::default(),
+                        page_error: None,
+                        sort: None,
+                    });
                     if case == "signout" {
                         let operation = Operation::default();
                         let profile: BrowserProfile = serde_json::from_value(json!({
@@ -415,6 +428,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 window.update(cx, |view, _, _| {
                     assert_eq!(view.library.queue.tracks.len(), 2);
                     assert!(view.active_id.is_none());
+                    assert!(view.page_cache.is_empty(), "Credential renewal and sign-out must discard pages bound to the old session");
                     if case == "signout" {
                         assert!(view.account.is_none());
                         assert!(view.session.read().unwrap().is_none());

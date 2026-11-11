@@ -43,6 +43,8 @@ impl Music {
         self.finish_listening(false);
         self.next_session_refresh = None;
         self.sync = sync::SyncState::default();
+        self.page_cache.clear();
+        self.back.clear();
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -799,6 +801,10 @@ impl Music {
                                         let label = format!("Connected as {}", connection.account.name);
                                         view.account = Some(connection);
                                         if renewing {
+                                            // Read continuations belong to the exact session snapshot.
+                                            view.page_cache.clear();
+                                            view.sync.page_fetched_at = None;
+                                            view.sync.page_sort = None;
                                             // Rebind only this verified account's queue; discard other in-flight reads.
                                             view.catalog_requests.cancel(CatalogTarget::Page);
                                             view.catalog_requests.cancel(CatalogTarget::Sidebar);

@@ -117,6 +117,7 @@ pub struct Music {
     sidebar_error: Option<String>,
     sidebar_scroll: UniformListScrollHandle,
     back: Vec<NavigationState>,
+    page_cache: VecDeque<CachedPage>,
     list_id: usize,
     error: Option<String>,
     notice: Option<String>,

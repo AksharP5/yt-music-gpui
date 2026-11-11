@@ -13,6 +13,7 @@ pub(in crate::app) struct SyncState {
     pub page_coverage: PageCoverage,
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
+    pub page_sort: Option<Continuation>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -27,10 +28,16 @@ pub(super) enum PageChange {
 }
 
 impl PageChange {
-    pub(super) fn apply(self, page: &mut Page, route: &Route) {
+    pub(super) fn apply(self, page: &mut Page, route: &Route) -> bool {
         match self {
-            Self::Confirmed(mutation) => patch_page(page, route, &mutation),
-            Self::PlaylistAdded { id, tracks } => append_added(page, route, &id, &tracks),
+            Self::Confirmed(mutation) => {
+                patch_page(page, route, &mutation);
+                invalidates_page(route, &mutation)
+            }
+            Self::PlaylistAdded { id, tracks } => {
+                append_added(page, route, &id, &tracks);
+                false
+            }
         }
     }
 }
@@ -39,6 +46,26 @@ pub(super) const FOCUS_REFRESH_AGE: Duration = Duration::from_secs(180);
 
 pub(super) fn needs_refresh(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= FOCUS_REFRESH_AGE)
+}
+
+// These edits can change rows beyond the response we can patch locally.
+fn invalidates_page(route: &Route, mutation: &Mutation) -> bool {
+    match mutation {
+        Mutation::CollectionLibrary { .. }
+        | Mutation::CreatePlaylist { .. }
+        | Mutation::DeletePlaylist { .. }
+            if route.library_section().is_some() =>
+        {
+            true
+        }
+        Mutation::AddToPlaylist { id, .. }
+        | Mutation::RemoveFromPlaylist { id, .. }
+        | Mutation::MoveInPlaylist { id, .. }
+        | Mutation::DeletePlaylist { id } => {
+            matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
+        }
+        _ => false,
+    }
 }
 
 fn item_key(item: &Item) -> (&str, Option<&str>, u8) {
@@ -485,6 +512,8 @@ impl Music {
             cx.notify();
             return;
         }
+        // Leaving during an explicit reload must not make the old response fresh again.
+        self.sync.page_fetched_at = None;
         if self.account.is_some() {
             self.refresh_remote(cx);
         } else {
@@ -558,10 +587,9 @@ impl Music {
                         _ => None,
                     }))
                     .chain(
-                        self.back
+                        self.page_cache
                             .iter()
-                            .filter_map(|state| state.page.as_ref())
-                            .flat_map(|page| &page.shelves)
+                            .flat_map(|entry| &entry.page.shelves)
                             .flat_map(|shelf| &shelf.items)
                             .filter_map(|item| match item {
                                 Item::Track(track) => Some(track),
@@ -581,9 +609,9 @@ impl Music {
             });
         }
         for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
-            self.back
+            self.page_cache
                 .iter_mut()
-                .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
+                .map(|entry| (&mut entry.page, &entry.route)),
         ) {
             append_added(page, route, id, &sources);
         }
@@ -592,13 +620,17 @@ impl Music {
     }
 
     pub(super) fn revalidate_page(&mut self, cx: &mut Context<Self>) {
-        let query = match &self.route {
-            Route::Home => Query::Home,
-            Route::Explore => Query::Explore,
-            Route::Search(search) => Query::Search(search.clone()),
-            Route::Browse(link) => Query::Browse(link.clone()),
-            Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => {
-                Query::Library(self.route.library_section().expect("library route"))
+        let query = if let Some(sort) = &self.sync.page_sort {
+            Query::Reload(sort.clone())
+        } else {
+            match &self.route {
+                Route::Home => Query::Home,
+                Route::Explore => Query::Explore,
+                Route::Search(search) => Query::Search(search.clone()),
+                Route::Browse(link) => Query::Browse(link.clone()),
+                Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => {
+                    Query::Library(self.route.library_section().expect("library route"))
+                }
             }
         };
         self.request(Query::Revalidate(Box::new(query)), cx);
@@ -611,12 +643,26 @@ impl Music {
                 .push(PageChange::Confirmed(Box::new(mutation.clone())));
         }
         patch_page(&mut self.page, &self.route, mutation);
-        for state in &mut self.back {
-            if let Some(page) = &mut state.page {
-                patch_page(page, &state.route, mutation);
+        if invalidates_page(&self.route, mutation) {
+            self.sync.page_fetched_at = self
+                .sync
+                .page_fetched_at
+                .map(|_| Instant::now() - FOCUS_REFRESH_AGE);
+        }
+        for entry in &mut self.page_cache {
+            patch_page(&mut entry.page, &entry.route, mutation);
+            if invalidates_page(&entry.route, mutation) {
+                entry.fetched_at = Instant::now() - FOCUS_REFRESH_AGE;
             }
         }
         if let Mutation::DeletePlaylist { id } = mutation {
+            self.page_cache.retain(|entry| {
+                !matches!(&entry.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
+            });
+            if matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
+            {
+                self.sync.page_fetched_at = None;
+            }
             let mut index = 0;
             let first_page_len = &mut self.sync.sidebar_coverage.first_page_len;
             let boundary = *first_page_len;
