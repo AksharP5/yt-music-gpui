@@ -215,7 +215,7 @@ impl Music {
             .w_full()
             .min_w_0()
             .px(px(inset))
-            .pt(px(32.))
+            .pt(px(if page.tier < Tier::Wide { 16. } else { 32. }))
             .pb(px(48.))
             .flex()
             .flex_col()

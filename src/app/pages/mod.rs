@@ -226,7 +226,11 @@ impl PageLayout {
             Tier::Medium => 720.,
             _ => 860.,
         }
-        .min(self.column + 2. * self.inset - 32.)
+        .min(if self.tier < Tier::Wide {
+            self.column
+        } else {
+            self.column + 2. * self.inset - 32.
+        })
     }
 
     /// The library's small-card grid: columns, gap, card edge, and the
@@ -283,7 +287,9 @@ impl Music {
     ) -> AnyElement {
         self.prefetch_page(index, self.list_rows.len(), 8, cx);
         match self.list_rows[index] {
-            ListRow::Featured(index) => self.featured_result(index, inset, cx),
+            ListRow::Featured(index) => {
+                self.featured_result(index, inset, self.page_layout(window).search_width(), cx)
+            }
             ListRow::Heading(shelf) => div()
                 .h(px(64.))
                 .px(px(inset))
