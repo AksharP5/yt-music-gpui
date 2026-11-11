@@ -266,6 +266,8 @@ impl Music {
             pending_mutations: HashSet::new(),
             ratings: HashMap::new(),
             account_revision: 0,
+            account_generation: 0,
+            history_generation: 0,
             sync: sync::SyncState::default(),
             track_state,
             track_state_id: None,

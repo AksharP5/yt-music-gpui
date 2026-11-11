@@ -381,7 +381,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                     });
                     view.page_cache.push_back(crate::app::CachedPage {
                         route: Route::Home,
-                        account_revision: view.account_revision,
+                        account_revision: view.account_revision,account_generation:view.account_generation,history_generation:view.history_generation,
                         page: cached,
                         fetched_at: Instant::now(),
                         coverage: Default::default(),

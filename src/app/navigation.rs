@@ -93,12 +93,16 @@ impl Query {
 pub(in crate::app) struct Job {
     pub(in crate::app) id: u64,
     pub(in crate::app) account_revision: u64,
+    pub(in crate::app) account_generation: u64,
+    pub(in crate::app) history_generation: u64,
     pub(in crate::app) query: Query,
     pub(in crate::app) session: Option<Arc<Session>>,
 }
 pub(in crate::app) struct CatalogResult {
     pub(in crate::app) id: u64,
     pub(in crate::app) account_revision: u64,
+    pub(in crate::app) account_generation: u64,
+    pub(in crate::app) history_generation: u64,
     pub(in crate::app) append: bool,
     pub(in crate::app) revalidate: bool,
     pub(in crate::app) result: Result<Page, String>,
@@ -135,6 +139,8 @@ impl CatalogRequests {
         &mut self,
         query: Query,
         account_revision: u64,
+        account_generation: u64,
+        history_generation: u64,
         session: Option<Arc<Session>>,
     ) -> Result<(), String> {
         let target = query.target();
@@ -150,6 +156,8 @@ impl CatalogRequests {
         for job in other.into_iter().chain(std::iter::once(Job {
             id,
             account_revision,
+            account_generation,
+            history_generation,
             query,
             session,
         })) {
@@ -184,6 +192,8 @@ const PAGE_CACHE_LIMIT: usize = 12;
 pub(in crate::app) struct CachedPage {
     pub(in crate::app) route: Route,
     pub(in crate::app) account_revision: u64,
+    pub(in crate::app) account_generation: u64,
+    pub(in crate::app) history_generation: u64,
     pub(in crate::app) page: Page,
     pub(in crate::app) fetched_at: Instant,
     pub(in crate::app) coverage: sync::PageCoverage,
@@ -200,6 +210,17 @@ pub(in crate::app) struct NavigationState {
 }
 
 impl Music {
+    fn page_is_current(
+        &self,
+        account_generation: u64,
+        history_generation: u64,
+        route: &Route,
+    ) -> bool {
+        account_generation == self.account_generation
+            && (route.library_section() != Some(Section::History)
+                || history_generation == self.history_generation)
+    }
+
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
         if target == CatalogTarget::Page {
@@ -218,9 +239,13 @@ impl Music {
             .account
             .as_ref()
             .map(|connection| connection.session.clone());
-        let result = self
-            .catalog_requests
-            .request(query, self.account_revision, session);
+        let result = self.catalog_requests.request(
+            query,
+            self.account_revision,
+            self.account_generation,
+            self.history_generation,
+            session,
+        );
         if target == CatalogTarget::PlaylistPicker {
             if let Some(Overlay::PlaylistPicker { error, .. }) = &mut self.overlay {
                 *error = result.err();
@@ -280,12 +305,21 @@ impl Music {
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.player_open = false;
         let page = std::mem::take(&mut self.page);
-        if let Some(fetched_at) = self.sync.page_fetched_at.take() {
+        if let Some(fetched_at) = self.sync.page_fetched_at.take()
+            && self.sync.page_error.is_none()
+            && self.page_is_current(
+                self.sync.page_account_generation,
+                self.sync.page_history_generation,
+                &self.route,
+            )
+        {
             self.page_cache
                 .retain(|entry| !entry.route.same_page(&self.route));
             self.page_cache.push_back(CachedPage {
                 route: self.route.clone(),
                 account_revision: self.account_revision,
+                account_generation: self.sync.page_account_generation,
+                history_generation: self.sync.page_history_generation,
                 page,
                 fetched_at,
                 coverage: self.sync.page_coverage,
@@ -325,11 +359,14 @@ impl Music {
             self.page_cache.pop_front();
         }
         if let Some(entry) = cached.filter(|entry| {
-            !restore_scroll
-                || entry.sort.as_ref().map(Continuation::token)
-                    == self.sync.page_sort.as_ref().map(Continuation::token)
+            self.page_is_current(entry.account_generation, entry.history_generation, &route)
+                && (!restore_scroll
+                    || entry.sort.as_ref().map(Continuation::token)
+                        == self.sync.page_sort.as_ref().map(Continuation::token))
         }) {
             self.page = entry.page;
+            self.sync.page_account_generation = entry.account_generation;
+            self.sync.page_history_generation = entry.history_generation;
             self.sync.page_fetched_at = Some(entry.fetched_at);
             self.sync.page_coverage = entry.coverage;
             self.sync.page_sort = entry.sort;
@@ -583,9 +620,8 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
-                let mut invalidated = false;
                 for change in self.sync.page_changes.drain(..) {
-                    invalidated |= change.apply(&mut page, &self.route);
+                    change.apply(&mut page, &self.route);
                 }
                 for track in page
                     .shelves
@@ -612,9 +648,12 @@ impl Music {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                if invalidated {
-                    self.sync.page_fetched_at = None;
-                } else if !result.append {
+                // Only replacing the page can renew the generation of its loaded rows.
+                if !result.append && (!result.revalidate || self.sync.page_reload.is_some()) {
+                    self.sync.page_account_generation = result.account_generation;
+                    self.sync.page_history_generation = result.history_generation;
+                }
+                if !result.append {
                     self.sync.page_fetched_at = Some(Instant::now());
                 }
                 self.sync.page_error = None;
@@ -761,6 +800,8 @@ impl CatalogRequests {
                             .send_blocking(CatalogResult {
                                 id: job.id,
                                 account_revision: job.account_revision,
+                                account_generation: job.account_generation,
+                                history_generation: job.history_generation,
                                 append,
                                 revalidate,
                                 result,

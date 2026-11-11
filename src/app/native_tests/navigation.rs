@@ -23,18 +23,17 @@ use std::{
 };
 
 fn reply(view: &mut Music, page: Page, cx: &mut Context<Music>) -> Query {
-    let job = view
-        .catalog_requests
-        .pending
-        .try_recv()
-        .expect("Expected one catalog request");
-    assert!(job.query.target() == CatalogTarget::Page);
+    let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+        .find(|job| job.query.target() == CatalogTarget::Page)
+        .expect("Expected a page request");
     let append = matches!(job.query, Query::More { .. });
     let revalidate = matches!(job.query, Query::Revalidate(_));
     view.catalog_result(
         CatalogResult {
             id: job.id,
             account_revision: job.account_revision,
+            account_generation: job.account_generation,
+            history_generation: job.history_generation,
             append,
             revalidate,
             result: Ok(page),
@@ -44,6 +43,19 @@ fn reply(view: &mut Music, page: Page, cx: &mut Context<Music>) -> Query {
         cx,
     );
     job.query
+}
+
+fn confirm(view: &mut Music, window: &mut Window, mutation: Mutation, cx: &mut Context<Music>) {
+    view.account_event(
+        account::Event::Applied {
+            session: view.account.as_ref().unwrap().session.clone(),
+            mutation: Box::new(mutation),
+            result: Ok(Effect::Changed),
+            session_rejected: false,
+        },
+        window,
+        cx,
+    );
 }
 
 fn page(title: &str, token: &str) -> Page {
@@ -180,69 +192,102 @@ fn stale_forward_revisit_replaces_loaded_tail_and_continuation() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn cached_liked_music_patches_membership_for_every_route() -> Result<()> {
+fn liking_a_song_refetches_cached_library_songs() -> Result<()> {
+    check_cache(|view, window, cx| {
+        let songs = Route::Library(Section::Songs);
+        view.navigate(songs.clone(), cx);
+        reply(view, page("Library Songs", "songs-tail"), cx);
+        view.navigate(Route::Explore, cx);
+        let track = view.page.tracks()[0].clone();
+        confirm(
+            view,
+            window,
+            Mutation::RateSong {
+                track,
+                rating: Rating::Like,
+            },
+            cx,
+        );
+        view.navigate(songs, cx);
+        assert!(
+            view.rows.is_empty(),
+            "A like adds to Library Songs, so its old response must not be served"
+        );
+        assert!(matches!(
+            reply(view, page("Updated Library Songs", "fresh-tail"), cx),
+            Query::Library(Section::Songs)
+        ));
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn rejected_optimistic_like_does_not_survive_navigation() -> Result<()> {
+    check_cache(|view, window, cx| {
+        let (commands, pending) = async_channel::unbounded();
+        view.account_commands = commands;
+        let route = Route::Browse(BrowseLink::new("VLrejected", "Rejected like"));
+        view.navigate(route.clone(), cx);
+        reply(view, page("Playlist", "playlist-tail"), cx);
+        let track = view.page.tracks()[0].clone();
+        view.toggle_like(&track, cx);
+        assert_eq!(view.page.tracks()[0].details.rating, Some(Rating::Like));
+        let account::Command::Apply { mutation, .. } = pending.try_recv().unwrap() else {
+            panic!("Expected an intercepted rating")
+        };
+        view.navigate(Route::Explore, cx);
+        view.account_event(
+            account::Event::Applied {
+                session: view.account.as_ref().unwrap().session.clone(),
+                mutation,
+                result: Err("Synthetic rejection".into()),
+                session_rejected: false,
+            },
+            window,
+            cx,
+        );
+        view.navigate(route, cx);
+        assert!(
+            view.rows.is_empty(),
+            "The cached optimistic rating must be discarded after rollback"
+        );
+        reply(view, page("Playlist after rejection", "fresh-tail"), cx);
+        assert_ne!(view.page.tracks()[0].details.rating, Some(Rating::Like));
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn guest_likes_and_saves_invalidate_cached_catalog_pages() -> Result<()> {
     check_cache(|view, _, cx| {
-        for route in [
-            Route::Browse(Section::Liked.link()),
-            Route::Liked,
-            Route::Library(Section::Liked),
-            Route::Browse(BrowseLink::new("LM", "Liked Music")),
-        ] {
-            view.navigate(route.clone(), cx);
-            reply(view, page("Liked Music", "liked-tail"), cx);
-            view.request(Query::Reload(view.page.continuation.clone().unwrap()), cx);
-            reply(view, page("Sorted Liked Music", "sorted-tail"), cx);
+        view.account = None;
+        view.clear_account_state(cx);
+        for save in [false, true] {
+            view.navigate(Route::Home, cx);
+            reply(view, page("Guest Home", "home-tail"), cx);
             let track = view.page.tracks()[0].clone();
             view.navigate(Route::Explore, cx);
-            let cached = view.page_cache.len();
-            view.patch_confirmed(
-                &Mutation::RateSong {
-                    track: track.clone(),
-                    rating: Rating::Indifferent,
-                },
-                cx,
-            );
-            assert_eq!(
-                view.page_cache.len(),
-                cached,
-                "Ratings must keep cached pages"
-            );
-            view.navigate(route.clone(), cx);
-            assert_eq!(
-                view.rows.len(),
-                99,
-                "Confirmed unlikes must remove cached Liked Music membership"
-            );
+            reply(view, page("Guest Explore", "explore-tail"), cx);
+            if save {
+                view.save_collection(serde_json::from_value(serde_json::json!({"id":"MPREguest", "title":"Guest album", "subtitle":"Album"})).unwrap(), cx);
+            } else {
+                view.toggle_like(&track, cx);
+            }
+            view.navigate(Route::Home, cx);
             assert!(
-                view.page
-                    .tracks()
-                    .iter()
-                    .all(|current| current.id != track.id)
+                view.rows.is_empty(),
+                "A guest library edit must discard older catalog pages too"
             );
-            assert!(view.catalog_requests.pending.is_empty());
+            reply(view, page("Updated guest Home", "fresh-tail"), cx);
+            view.sync.page_fetched_at = None;
             view.navigate(Route::Explore, cx);
-            view.patch_confirmed(
-                &Mutation::RateSong {
-                    track,
-                    rating: Rating::Like,
-                },
-                cx,
-            );
-            assert_eq!(view.page_cache.len(), cached);
-            view.navigate(route, cx);
-            assert_eq!(
-                view.rows.len(),
-                100,
-                "Confirmed likes must restore cached Liked Music membership"
-            );
-            assert!(view.catalog_requests.pending.is_empty());
         }
     })
 }
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn saved_song_clears_cached_library_search_and_playlist() -> Result<()> {
+fn saved_song_refetches_cached_library_search_and_playlist() -> Result<()> {
     check_cache(|view, window, cx| {
         let search = Route::Search(Search {
             query: "saved songs".into(),
@@ -276,7 +321,6 @@ fn saved_song_clears_cached_library_search_and_playlist() -> Result<()> {
             window,
             cx,
         );
-        assert!(view.page_cache.is_empty());
         assert_eq!(
             view.rows.len(),
             100,
@@ -317,19 +361,11 @@ fn back_refetches_evicted_library_with_selected_sort() -> Result<()> {
             .into();
         reply(view, sorted, cx);
         view.navigate(Route::Explore, cx);
-        view.patch_confirmed(
-            &Mutation::EditPlaylist {
-                id: "alpha".into(),
-                title: "Zulu".into(),
-                description: String::new(),
-                privacy: crate::account::Privacy::Private,
-            },
-            cx,
-        );
+        view.page_cache.clear();
         view.go_back(cx);
         assert!(
             view.rows.is_empty(),
-            "A renamed playlist must not appear in its old alphabetical position on Back"
+            "An evicted page must fetch again on Back"
         );
         assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
         let query = reply(view, page("Refetched playlists", "fresh-playlists"), cx);
@@ -338,7 +374,6 @@ fn back_refetches_evicted_library_with_selected_sort() -> Result<()> {
             "Back must request the selected sort after eviction"
         );
         view.navigate(Route::Explore, cx);
-        reply(view, page("Explore", "explore-tail"), cx);
         view.navigate(Route::Library(Section::Playlists), cx);
         view.request(Query::Reload(view.page.continuation.clone().unwrap()), cx);
         reply(view, page("Another order", "another-tail"), cx);
@@ -355,7 +390,7 @@ fn back_refetches_evicted_library_with_selected_sort() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn playback_report_evicts_only_cached_history_routes() -> Result<()> {
+fn playback_report_invalidates_cached_and_inflight_history_only() -> Result<()> {
     check_cache(|view, window, cx| {
         let playlist = Route::Browse(BrowseLink::new("VLretained", "Retained playlist"));
         view.navigate(playlist.clone(), cx);
@@ -366,63 +401,69 @@ fn playback_report_evicts_only_cached_history_routes() -> Result<()> {
                 Route::Library(Section::History),
                 Route::Browse(Section::History.link()),
             ] {
-                view.navigate(route, cx);
-                reply(view, page("History", "history-tail"), cx);
+                // Exercise both a loaded History and a reply issued before the report.
+                for inflight in [false, true] {
+                    view.navigate(route.clone(), cx);
+                    if !inflight {
+                        reply(view, page("History", "history-tail"), cx);
+                    }
+                    let generation = view.history_generation;
+                    let current = view.account.as_ref().unwrap().session.clone();
+                    for (session, result) in [
+                        (current.clone(), Err("Synthetic report failure".into())),
+                        (session("other-account"), Ok(())),
+                    ] {
+                        view.account_event(
+                            account::Event::PlaybackReported {
+                                session,
+                                video_id: "00000000000".into(),
+                                result,
+                                session_rejected: false,
+                                watchtime,
+                                resume_seconds: None,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert_eq!(view.history_generation, generation);
+                    }
+                    // Keep active History's normal automatic revalidation out of this ordering test.
+                    view.navigate(playlist.clone(), cx);
+                    if inflight {
+                        view.navigate(route.clone(), cx);
+                    }
+                    view.account_event(
+                        account::Event::PlaybackReported {
+                            session: current,
+                            video_id: "00000000000".into(),
+                            result: Ok(()),
+                            session_rejected: false,
+                            watchtime,
+                            resume_seconds: None,
+                        },
+                        window,
+                        cx,
+                    );
+                    if inflight {
+                        reply(view, page("History issued before report", "old-tail"), cx);
+                        view.navigate(playlist.clone(), cx);
+                    }
+                    assert_eq!(view.page.title, "Playlist");
+                    assert!(
+                        view.catalog_requests.pending.is_empty(),
+                        "Playback reports must retain unrelated cached pages"
+                    );
+                    view.navigate(route.clone(), cx);
+                    assert!(
+                        view.rows.is_empty(),
+                        "History from before a successful report must fetch on revisit"
+                    );
+                    reply(view, page("Fresh History", "fresh-tail"), cx);
+                    view.sync.page_fetched_at = None;
+                    view.navigate(playlist.clone(), cx);
+                }
             }
-            view.navigate(Route::Explore, cx);
-            let cached = view.page_cache.len();
-            let current = view.account.as_ref().unwrap().session.clone();
-            for (session, result) in [
-                (current.clone(), Err("Synthetic report failure".into())),
-                (session("other-account"), Ok(())),
-            ] {
-                view.account_event(
-                    account::Event::PlaybackReported {
-                        session,
-                        video_id: "00000000000".into(),
-                        result,
-                        session_rejected: false,
-                        watchtime,
-                        resume_seconds: None,
-                    },
-                    window,
-                    cx,
-                );
-                assert_eq!(
-                    view.page_cache.len(),
-                    cached,
-                    "Failed or other-account reports must keep cached History"
-                );
-            }
-            view.account_event(
-                account::Event::PlaybackReported {
-                    session: current,
-                    video_id: "00000000000".into(),
-                    result: Ok(()),
-                    session_rejected: false,
-                    watchtime,
-                    resume_seconds: None,
-                },
-                window,
-                cx,
-            );
-            assert_eq!(view.page_cache.len(), cached - 3);
-            assert!(
-                view.page_cache
-                    .iter()
-                    .all(|entry| entry.route.library_section() != Some(Section::History))
-            );
-            view.navigate(playlist.clone(), cx);
-            assert_eq!(view.page.title, "Playlist");
-            assert!(
-                view.catalog_requests.pending.is_empty(),
-                "Playback reports must retain unrelated cached pages"
-            );
-            view.go_back(cx);
         }
-        view.navigate(Route::Recent, cx);
-        assert!(view.rows.is_empty());
-        reply(view, page("Fresh History", "fresh-history-tail"), cx);
     })
 }
 
@@ -439,6 +480,8 @@ fn cached_continuation_error_retries_on_back() -> Result<()> {
             CatalogResult {
                 id: job.id,
                 account_revision: job.account_revision,
+                account_generation: job.account_generation,
+                history_generation: job.history_generation,
                 append: true,
                 revalidate: false,
                 result: Err("Synthetic continuation failure".into()),
@@ -474,8 +517,8 @@ fn cached_continuation_error_retries_on_back() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn unpatchable_current_and_inflight_pages_are_not_recached() -> Result<()> {
-    check_cache(|view, _, cx| {
+fn edited_loaded_and_inflight_pages_are_not_recached() -> Result<()> {
+    check_cache(|view, window, cx| {
         let songs = Route::Browse(Section::Songs.link());
         for inflight in [false, true] {
             view.navigate(songs.clone(), cx);
@@ -483,7 +526,12 @@ fn unpatchable_current_and_inflight_pages_are_not_recached() -> Result<()> {
                 reply(view, page("Songs", "songs-tail"), cx);
             }
             let track = crate::app::sync::tests::page(1, false).tracks().remove(0);
-            view.patch_confirmed(&Mutation::SongLibrary { track, save: true }, cx);
+            confirm(
+                view,
+                window,
+                Mutation::SongLibrary { track, save: true },
+                cx,
+            );
             if inflight {
                 reply(view, page("Old songs response", "songs-tail"), cx);
             }
@@ -502,15 +550,17 @@ fn unpatchable_current_and_inflight_pages_are_not_recached() -> Result<()> {
         let playlist = Route::Browse(BrowseLink::new("VLmoving", "Moving playlist"));
         view.navigate(playlist.clone(), cx);
         reply(view, page("Playlist", "playlist-tail"), cx);
-        view.prefetch_page(100, 100, 0, cx);
-        view.patch_confirmed(
-            &Mutation::MoveInPlaylist {
+        confirm(
+            view,
+            window,
+            Mutation::MoveInPlaylist {
                 id: "moving".into(),
                 set_video_id: "occurrence-0".into(),
                 before: Some("unloaded-occurrence".into()),
             },
             cx,
         );
+        view.prefetch_page(100, 100, 0, cx);
         reply(
             view,
             crate::app::sync::tests::response(
@@ -616,7 +666,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 // Put the intercepted request back through the same path, then mutate while it is in flight.
                 view.revalidate_page(cx);
                 let track = view.page.tracks()[0].clone();
-                view.patch_confirmed(&Mutation::RateSong { track, rating: Rating::Like }, cx);
+                confirm(view, window, Mutation::RateSong { track, rating: Rating::Like }, cx);
                 window.focus(&view.focus, cx);
                 reply(view, page("Updated playlist", "fresh-tail"), cx);
                 assert_eq!(view.page.title, "Updated playlist");
@@ -625,17 +675,15 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert_eq!(view.list_scroll.0.borrow().base_handle.offset(), old_scroll, "Refresh must keep the visible occurrence");
                 assert!(view.focus.is_focused(window), "Background refresh must keep focus");
                 view.navigate(Route::Explore, cx);
-                assert!(view.catalog_requests.pending.is_empty());
-                let track = crate::app::sync::tests::page(1, false).tracks().remove(0);
-                view.patch_confirmed(&Mutation::RateSong { track, rating: Rating::Dislike }, cx);
+                reply(view, page("Explore", "explore-tail"), cx);
                 view.navigate(playlist.clone(), cx);
-                assert_eq!(view.page.tracks()[0].details.rating, Some(Rating::Dislike), "Confirmed ratings overlay cached pages");
-                assert!(view.catalog_requests.pending.is_empty());
+                assert!(view.rows.is_empty(), "The reply issued before the rating must not be cached");
+                reply(view, page("Fresh playlist", "fresh-tail"), cx);
                 assert_eq!(view.list_scroll.0.borrow().base_handle.offset().y, px(0.), "Forward navigation resets scroll");
                 view.sync.page_fetched_at = Some(Instant::now() - Duration::from_secs(181));
                 view.navigate(Route::Explore, cx);
                 view.navigate(playlist.clone(), cx);
-                assert_eq!(view.rows.len(), 150, "Stale forward navigation shows its page synchronously");
+                assert_eq!(view.rows.len(), 100, "Stale forward navigation shows its page synchronously");
                 reply(view, page("Revisited playlist", "fresh-tail"), cx);
                 assert_eq!(view.rows.len(), 100, "Forward refresh replaces expired continuation pages");
                 view.navigate(Route::Explore, cx);
@@ -643,14 +691,14 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert_eq!(view.page.title, "Revisited playlist");
                 assert!(view.catalog_requests.pending.is_empty(), "Fresh signed-in Back must not revalidate");
                 view.navigate(Route::Explore, cx);
-                view.patch_confirmed(&Mutation::RemoveFromPlaylist { id: "VLcached".into(), set_video_id: "occurrence-0".into(), video_id: "00000000000".into() }, cx);
+                confirm(view, window, Mutation::RemoveFromPlaylist { id: "VLcached".into(), set_video_id: "occurrence-0".into(), video_id: "00000000000".into() }, cx);
                 view.navigate(playlist.clone(), cx);
                 assert!(view.rows.is_empty(), "A playlist with invalidated order or continuations must be evicted");
                 assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
                 reply(view, page("After edit", "edit-tail"), cx);
                 view.navigate(Route::Explore, cx);
                 reply(view, page("Explore", "explore-tail"), cx);
-                view.patch_confirmed(&Mutation::DeletePlaylist { id: "VLcached".into() }, cx);
+                confirm(view, window, Mutation::DeletePlaylist { id: "VLcached".into() }, cx);
                 view.navigate(playlist, cx);
                 assert!(view.rows.is_empty(), "Deleted playlists must be evicted");
                 reply(view, page("Replacement", "replacement-tail"), cx);
@@ -707,7 +755,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 reply(view, page("Saved collections", "saved-tail"), cx);
                 view.navigate(Route::Explore, cx);
                 let collection = serde_json::from_value(serde_json::json!({"id":"MPREnew", "title":"New album", "subtitle":"Album"})).unwrap();
-                view.patch_confirmed(&Mutation::CollectionLibrary { collection, save: true }, cx);
+                confirm(view, window, Mutation::CollectionLibrary { collection, save: true }, cx);
                 view.navigate(Route::Saved, cx);
                 assert!(view.rows.is_empty(), "Unpatchable library membership must be evicted before display");
                 assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "Saving a new collection must invalidate cached library membership");
@@ -721,7 +769,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 view.navigate(Route::Home, cx);
                 assert!(view.rows.is_empty(), "Another account must not see the guest or first account's cached Home");
                 let generation = view.catalog_requests.generations[CatalogTarget::Page as usize].load(Ordering::Relaxed);
-                view.catalog_result(CatalogResult { id: generation, account_revision: previous_revision, append: false, revalidate: false, result: Ok(page("Wrong account", "wrong-tail")), session_rejected: false, target: CatalogTarget::Page }, cx);
+                view.catalog_result(CatalogResult { id: generation, account_revision: previous_revision, account_generation:view.account_generation,history_generation:view.history_generation, append: false, revalidate: false, result: Ok(page("Wrong account", "wrong-tail")), session_rejected: false, target: CatalogTarget::Page }, cx);
                 assert!(view.rows.is_empty());
                 assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
                 reply(view, page("Second account", "second-tail"), cx);

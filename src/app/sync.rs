@@ -5,6 +5,8 @@ use super::*;
 pub(in crate::app) struct SyncState {
     pub refreshed_at: Option<Instant>,
     pub page_fetched_at: Option<Instant>,
+    pub page_account_generation: u64,
+    pub page_history_generation: u64,
     pub sidebar_continuation: Option<Continuation>,
     pub sidebar_coverage: PageCoverage,
     pub rating_overrides: HashSet<String>,
@@ -28,16 +30,10 @@ pub(super) enum PageChange {
 }
 
 impl PageChange {
-    pub(super) fn apply(self, page: &mut Page, route: &Route) -> bool {
+    pub(super) fn apply(self, page: &mut Page, route: &Route) {
         match self {
-            Self::Confirmed(mutation) => {
-                patch_page(page, route, &mutation);
-                !matches!(*mutation, Mutation::RateSong { .. })
-            }
-            Self::PlaylistAdded { id, tracks } => {
-                append_added(page, route, &id, &tracks);
-                false
-            }
+            Self::Confirmed(mutation) => patch_page(page, route, &mutation),
+            Self::PlaylistAdded { id, tracks } => append_added(page, route, &id, &tracks),
         }
     }
 }
@@ -179,9 +175,8 @@ impl SyncState {
 
 pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     let playlist = |id: &str| matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"));
-    let section = route.library_section();
-    let liked = section == Some(Section::Liked);
-    let songs = section == Some(Section::Songs);
+    let liked = matches!(route, Route::Liked | Route::Library(Section::Liked));
+    let songs = matches!(route, Route::Library(Section::Songs));
     for shelf in &mut page.shelves {
         shelf.items.retain(|item| match (item, mutation) {
             (Item::Track(current), Mutation::RateSong { track, rating }) => {
@@ -206,14 +201,14 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
                     save: false,
                 },
             ) if matches!(
-                section,
-                Some(
-                    Section::Landing
-                        | Section::Albums
-                        | Section::Playlists
-                        | Section::Subscriptions
-                        | Section::Podcasts
-                )
+                route,
+                Route::Saved
+                    | Route::Library(
+                        Section::Albums
+                            | Section::Playlists
+                            | Section::Subscriptions
+                            | Section::Podcasts
+                    )
             ) =>
             {
                 current.id != collection.id
@@ -624,15 +619,6 @@ impl Music {
                 .push(PageChange::Confirmed(Box::new(mutation.clone())));
         }
         patch_page(&mut self.page, &self.route, mutation);
-        if matches!(mutation, Mutation::RateSong { .. }) {
-            for entry in &mut self.page_cache {
-                patch_page(&mut entry.page, &entry.route, mutation);
-            }
-        } else {
-            self.page_cache.clear();
-            // The active page stays visible, but must fetch again after leaving.
-            self.sync.page_fetched_at = None;
-        }
         if let Mutation::DeletePlaylist { id } = mutation {
             let mut index = 0;
             let first_page_len = &mut self.sync.sidebar_coverage.first_page_len;

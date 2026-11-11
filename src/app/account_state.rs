@@ -889,6 +889,7 @@ impl Music {
                 if session_rejected {
                     self.refresh_session(true, cx);
                 }
+                self.account_generation = self.account_generation.wrapping_add(1);
                 let mutation = *mutation;
                 self.pending_mutations.remove(&mutation.key());
                 let rollback = if let Mutation::RateSong { track, .. } = &mutation {
@@ -908,12 +909,6 @@ impl Music {
                             &mutation,
                         );
                         self.notice = Some("Saved to YouTube Music".into());
-                        if let Effect::PlaylistAdded { additions } = &effect
-                            && let Mutation::AddToPlaylist { id, .. } = &mutation
-                        {
-                            // Resolve added tracks before the mutation discards cached metadata.
-                            self.patch_added(id, additions, cx);
-                        }
                         self.patch_confirmed(&mutation, cx);
                         match effect {
                             Effect::CreatedPlaylist { id } => {
@@ -937,7 +932,11 @@ impl Music {
                                     self.overlay = Some(Overlay::AlreadyAdded { id, video_ids });
                                 }
                             }
-                            Effect::PlaylistAdded { .. } => {}
+                            Effect::PlaylistAdded { additions } => {
+                                if let Mutation::AddToPlaylist { id, .. } = &mutation {
+                                    self.patch_added(id, &additions, cx);
+                                }
+                            }
                             Effect::Changed => {
                                 if deleting {
                                     self.request(
@@ -1002,9 +1001,7 @@ impl Music {
                 }
                 match result {
                     Ok(()) => {
-                        self.page_cache.retain(|entry| {
-                            entry.route.library_section() != Some(Section::History)
-                        });
+                        self.history_generation = self.history_generation.wrapping_add(1);
                         if !watchtime
                             && self.overlay.is_none()
                             && !self.catalog_requests.is_loading(CatalogTarget::Page)

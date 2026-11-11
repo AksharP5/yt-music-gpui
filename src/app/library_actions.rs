@@ -66,6 +66,7 @@ impl Music {
             );
             return;
         }
+        self.account_generation = self.account_generation.wrapping_add(1);
         self.library.toggle_like(track);
         self.save();
         self.refresh_local();
@@ -82,6 +83,7 @@ impl Music {
             self.mutate(Mutation::CollectionLibrary { collection, save }, cx);
             return;
         }
+        self.account_generation = self.account_generation.wrapping_add(1);
         if let Some(i) = self
             .library
             .saved

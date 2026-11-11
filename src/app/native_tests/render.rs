@@ -154,6 +154,8 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
                 CatalogResult {
                     id: job.id,
                     account_revision: job.account_revision,
+                    account_generation: job.account_generation,
+                    history_generation: job.history_generation,
                     append: false,
                     revalidate: true,
                     result: Ok(page(0, false)),
@@ -1315,6 +1317,8 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
                 CatalogResult {
                     id: job.id,
                     account_revision: job.account_revision,
+                    account_generation: job.account_generation,
+                    history_generation: job.history_generation,
                     append: false,
                     revalidate: false,
                     result: Ok(home),
