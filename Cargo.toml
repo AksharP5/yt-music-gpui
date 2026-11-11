@@ -16,7 +16,7 @@ gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["wayland", "x11"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip", "json", "rustls-tls"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 tempfile = "3"
 unicode-segmentation = "1"
