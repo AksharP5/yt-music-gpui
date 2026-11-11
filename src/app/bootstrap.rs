@@ -4,6 +4,22 @@ use super::*;
 
 impl Music {
     pub fn new(startup: Startup, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_workers(startup, window, cx, account::start, CatalogRequests::start)
+    }
+
+    pub(in crate::app) fn new_with_workers(
+        startup: Startup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        start_account: impl FnOnce(
+            SharedSession,
+        ) -> (
+            async_channel::Sender<account::Command>,
+            async_channel::Receiver<account::Event>,
+            account::Worker,
+        ),
+        start_catalog: impl FnOnce(&mut Window, &mut Context<Self>) -> CatalogRequests,
+    ) -> Self {
         let search = cx.new(|cx| SearchBox::new(window, cx));
         let (store, library, error) = match Store::load() {
             Ok((s, l)) => (Some(s), l, None),
@@ -28,7 +44,7 @@ impl Music {
             writer
         });
         let session = auth::shared(None);
-        let (account_commands, account_events, account_worker) = account::start(session.clone());
+        let (account_commands, account_events, account_worker) = start_account(session.clone());
         let account_operation =
             (auth::ACCOUNT_LOGIN_ENABLED && startup != Startup::Guest).then(|| {
                 let operation = Operation::default();
@@ -71,7 +87,7 @@ impl Music {
             .as_ref()
             .map(|player| player.video_attachment(window, cx));
         let (artwork, loaded) = Artwork::new();
-        let catalog_requests = CatalogRequests::start(window, cx);
+        let catalog_requests = start_catalog(window, cx);
         let PlaybackChannels {
             playback_jobs,
             playback_receiver,
