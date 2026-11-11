@@ -1486,7 +1486,7 @@ async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut Async
 }
 
 async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
-    for (width, left, column) in [(956., 154, 720), (1920., 650, 860)] {
+    for (width, left, column) in [(956., 256, 684), (1920., 650, 860)] {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(1050.)));
@@ -1589,7 +1589,7 @@ async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                         .unwrap();
                     wait_for_presented_frame(window, cx).await;
                 }
-                let automatic = width < 1150.;
+                let automatic = width < 936.;
                 for compact in [automatic, !automatic] {
                     if compact != automatic {
                         cx.update_window(window.into(), |_, window, cx| {

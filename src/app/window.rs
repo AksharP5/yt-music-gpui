@@ -67,7 +67,7 @@ impl Music {
     }
 
     pub(in crate::app) fn sidebar_compact(&self, width: f32) -> bool {
-        self.sidebar_collapsed.unwrap_or(width < 1150.)
+        self.sidebar_collapsed.unwrap_or(width < 936.)
     }
 
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
