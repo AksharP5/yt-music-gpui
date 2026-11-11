@@ -1,12 +1,12 @@
 use crate::app::{
-    AccountOperation, BrowserConnection, CatalogRequests, CatalogTarget, Drag, Music, Overlay,
-    Playback, PlaybackQuery, PlaybackResult, QueueUpdate, Route, Startup,
+    AccountOperation, BrowserConnection, CatalogRequests, CatalogResult, CatalogTarget, Drag, Job,
+    Music, Overlay, Playback, PlaybackQuery, PlaybackResult, Query, QueueUpdate, Route, Startup,
 };
 use crate::{
     account::{self, Connection, Mutation},
     assets::Assets,
     auth::{BrowserProfile, Operation, Session},
-    catalog::{Account, BrowseLink, Rating, Track},
+    catalog::{Account, BrowseLink, Item, Rating, Track},
     input,
     library::{LibraryWriter, Repeat, Store},
     mpris,
@@ -567,4 +567,697 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
         "Native account recovery assertions did not finish"
     );
     Ok(())
+}
+
+// Exercise the production constructor and event handlers without allowing account
+// or catalog commands to reach keyring, browser, or network workers.
+fn startup_window(
+    startup: Startup,
+    check: impl AsyncFnOnce(
+        gpui::WindowHandle<Music>,
+        async_channel::Receiver<account::Command>,
+        &mut gpui::AsyncApp,
+    ) + 'static,
+) -> Result<()> {
+    super::isolate()?;
+    let passed = Arc::new(AtomicBool::new(false));
+    let result = passed.clone();
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx| {
+            cx.text_system()
+                .add_fonts(vec![Cow::Borrowed(
+                    include_bytes!("../../../assets/fonts/Roboto.ttf").as_slice(),
+                )])
+                .unwrap();
+            input::init(cx);
+            let (sender, commands) = async_channel::unbounded();
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(40.), px(40.)),
+                            size(px(1280.), px(800.)),
+                        ))),
+                        kind: WindowKind::PopUp,
+                        focus: true,
+                        ..Default::default()
+                    },
+                    move |window, cx| {
+                        cx.new(|cx| {
+                            let mut view = Music::new_with_workers(
+                                startup,
+                                window,
+                                cx,
+                                move |session| {
+                                    let (unused_commands, events, worker) = account::start(session);
+                                    drop(unused_commands);
+                                    (sender, events, worker)
+                                },
+                                |_, _| CatalogRequests::new(),
+                            );
+                            view.account_worker.take().unwrap().finish().unwrap();
+                            view.playback_jobs.close();
+                            let (jobs, pending) = async_channel::bounded(1);
+                            view.playback_jobs = jobs;
+                            view.pending_playback_jobs = pending;
+                            view.track_state = track_state::Worker::idle();
+                            view.store = None;
+                            view.mpris = None;
+                            view.video = None;
+                            view.player = Some(
+                                Player::new(PlayerOptions {
+                                    audio_output: Some("null".into()),
+                                    volume: 0.,
+                                    ..Default::default()
+                                })
+                                .unwrap(),
+                            );
+                            view.library.volume = 0.;
+                            view
+                        })
+                    },
+                )
+                .unwrap();
+            cx.activate(true);
+            cx.spawn(async move |cx| {
+                super::render::wait_for_presented_frame(window, cx).await;
+                check(window, commands, cx).await;
+                super::render::wait_for_presented_frame(window, cx).await;
+                result.store(true, Ordering::Relaxed);
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    ensure!(
+        passed.load(Ordering::Relaxed),
+        "Startup check did not complete"
+    );
+    Ok(())
+}
+
+fn restored_requests(
+    view: &mut Music,
+    commands: &async_channel::Receiver<account::Command>,
+    window: &mut Window,
+    cx: &mut Context<Music>,
+) -> (Operation, Arc<Session>, [Job; 2]) {
+    let account::Command::Restore(operation) = commands.try_recv().unwrap() else {
+        panic!("Expected saved-account restore")
+    };
+    assert!(
+        view.catalog_requests.pending.is_empty(),
+        "Restore must not request guest Home"
+    );
+    let saved = session("saved-startup");
+    view.account_event(
+        account::Event::RestoreLoaded {
+            operation: operation.clone(),
+            session: saved.clone(),
+        },
+        window,
+        cx,
+    );
+    let jobs = std::array::from_fn(|_| {
+        view.catalog_requests
+            .pending
+            .try_recv()
+            .expect("Home and sidebar must start before verification")
+    });
+    assert!(matches!(jobs[0].query, Query::Home));
+    assert!(matches!(jobs[1].query, Query::SidebarPlaylists));
+    for job in &jobs {
+        assert!(Arc::ptr_eq(job.session.as_ref().unwrap(), &saved));
+        assert_eq!(job.account_revision, view.account_revision.wrapping_add(1));
+    }
+    assert!(commands.is_empty());
+    (operation, saved, jobs)
+}
+
+fn startup_result(job: &Job) -> CatalogResult {
+    let mut page = crate::app::sync::tests::page(3, false);
+    page.title = "Restored Home".into();
+    for item in &mut page.shelves[0].items {
+        if let Item::Track(track) = item {
+            track.details.rating = Some(Rating::Like);
+        }
+    }
+    if matches!(job.query, Query::SidebarPlaylists) {
+        page.shelves[0].items = vec![Item::Collection(serde_json::from_value(json!({
+            "id":"VLsynthetic-startup", "title":"Restored playlist", "subtitle":"Synthetic playlist"
+        })).unwrap())];
+    }
+    CatalogResult {
+        id: job.id,
+        account_revision: job.account_revision,
+        account_generation: job.account_generation,
+        history_generation: job.history_generation,
+        append: false,
+        revalidate: false,
+        result: Ok(page),
+        session_rejected: false,
+        target: job.query.target(),
+    }
+}
+
+fn assert_startup_hidden(view: &Music) {
+    assert!(view.account.is_none());
+    assert!(view.session.read().unwrap().is_none());
+    assert!(view.rows.is_empty());
+    assert!(view.page.shelves.is_empty());
+    assert!(view.page_cache.is_empty());
+    assert!(view.back.is_empty());
+    assert!(view.ratings.is_empty());
+    assert!(view.sidebar_playlists.is_empty());
+    assert!(view.sync.page_fetched_at.is_none());
+    assert!(view.error.is_none());
+}
+
+async fn wait_for_startup_activation(window: gpui::WindowHandle<Music>, cx: &mut gpui::AsyncApp) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        super::render::wait_for_presented_frame(window, cx).await;
+        if window
+            .update(cx, |view, _, _| {
+                !matches!(
+                    view.account_operation,
+                    Some(AccountOperation::Activating { .. })
+                )
+            })
+            .unwrap()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Synthetic startup activation was not acknowledged"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn restored_home_is_hidden_until_verification_and_playback_activation() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        let (operation, saved) = window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert_startup_hidden(view);
+                assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
+                (operation, saved)
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                assert_startup_hidden(view);
+                super::render::capture(window, "restored-startup-pending");
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(saved.clone()))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(matches!(
+                    view.account_operation,
+                    Some(AccountOperation::Activating { .. })
+                ));
+                assert_startup_hidden(view);
+            })
+            .unwrap();
+        wait_for_startup_activation(window, cx).await;
+        window
+            .update(cx, |view, window, _| {
+                assert!(view.account_operation.is_none());
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &saved));
+                assert!(Arc::ptr_eq(
+                    view.session.read().unwrap().as_ref().unwrap(),
+                    &saved
+                ));
+                assert_eq!(view.page.title, "Restored Home");
+                assert_eq!(view.rows.len(), 3);
+                assert_eq!(view.ratings.len(), 3);
+                assert_eq!(view.sidebar_playlists[0].title, "Restored playlist");
+                assert!(
+                    view.catalog_requests.pending.is_empty(),
+                    "Activation must reuse both requests"
+                );
+                assert!(!view.catalog_requests.is_loading(CatalogTarget::Page));
+                assert!(!view.catalog_requests.is_loading(CatalogTarget::Sidebar));
+                assert!(
+                    commands.is_empty(),
+                    "Saved credentials must not be persisted again"
+                );
+                super::render::capture(window, "restored-startup-home");
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn restored_home_can_finish_after_activation_without_a_duplicate_request() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        let jobs = window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(saved))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_startup_hidden(view);
+                jobs
+            })
+            .unwrap();
+        wait_for_startup_activation(window, cx).await;
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.account.is_some());
+                assert!(view.rows.is_empty());
+                assert!(view.catalog_requests.pending.is_empty());
+                assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert_eq!(view.page.title, "Restored Home");
+                assert_eq!(view.sidebar_playlists.len(), 1);
+                view.navigate(Route::Explore, cx);
+                view.navigate(Route::Home, cx);
+                assert_eq!(
+                    view.page.title, "Restored Home",
+                    "Adopted Home uses the normal navigation cache"
+                );
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn failed_restore_discards_early_home_and_sidebar() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let (operation, _, jobs) = restored_requests(view, &commands, window, cx);
+                view.catalog_result(startup_result(&jobs[0]), cx);
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Err("Synthetic verification failed".into()),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert!(view.account.is_none());
+                assert!(view.rows.is_empty());
+                assert!(view.sidebar_playlists.is_empty());
+                assert!(view.page_cache.is_empty());
+                assert_eq!(view.error.as_deref(), Some("Synthetic verification failed"));
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+                view.catalog_result(startup_result(&guest), cx);
+                assert_eq!(view.rows.len(), 3, "Guest fallback still loads");
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn browser_refreshed_session_discards_saved_cookie_responses() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        let (jobs, refreshed) = window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                view.catalog_result(startup_result(&jobs[0]), cx);
+                // Even byte-identical cookies from a new verification are a different session.
+                let refreshed = Arc::new((*saved).clone());
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(refreshed.clone()))),
+                        save_session: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert_startup_hidden(view);
+                (jobs, refreshed)
+            })
+            .unwrap();
+        wait_for_startup_activation(window, cx).await;
+        window
+            .update(cx, |view, _, cx| {
+                assert!(Arc::ptr_eq(
+                    &view.account.as_ref().unwrap().session,
+                    &refreshed
+                ));
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert!(view.rows.is_empty());
+                assert!(view.sidebar_playlists.is_empty());
+                assert!(view.page_cache.is_empty());
+                for query in [Query::Home, Query::SidebarPlaylists] {
+                    let job = view.catalog_requests.pending.try_recv().unwrap();
+                    assert!(job.query.target() == query.target());
+                    assert!(Arc::ptr_eq(job.session.as_ref().unwrap(), &refreshed));
+                    view.catalog_result(startup_result(&job), cx);
+                }
+                assert_eq!(view.rows.len(), 3);
+                assert_eq!(view.sidebar_playlists.len(), 1);
+                let account::Command::Persist(saved) = commands.try_recv().unwrap() else {
+                    panic!("Expected refreshed credentials to be persisted")
+                };
+                assert!(Arc::ptr_eq(&saved, &refreshed));
+                assert!(commands.is_empty());
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn cancelled_restore_discards_early_and_late_account_responses() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                view.catalog_result(startup_result(&jobs[0]), cx);
+                view.cancel_connection(cx);
+                assert!(operation.is_cancelled());
+                view.account_event(
+                    account::Event::RestoreLoaded {
+                        operation: operation.clone(),
+                        session: saved.clone(),
+                    },
+                    window,
+                    cx,
+                );
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(saved))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert_startup_hidden(view);
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn empty_saved_account_restores_guest_home() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let account::Command::Restore(operation) = commands.try_recv().unwrap() else {
+                    panic!("Expected restore")
+                };
+                assert!(view.catalog_requests.pending.is_empty());
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(None),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+                view.catalog_result(startup_result(&guest), cx);
+                assert_eq!(view.rows.len(), 3);
+            })
+            .unwrap();
+    })
+}
+
+fn guest_startup(startup: Startup) -> Result<()> {
+    startup_window(startup, async move |window, commands, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let operation = if startup == Startup::Connect {
+                    let account::Command::Connect(operation) = commands.try_recv().unwrap() else {
+                        panic!("Connect must open sign-in without restoring saved credentials")
+                    };
+                    assert!(matches!(view.overlay, Some(Overlay::SignIn)));
+                    operation
+                } else {
+                    assert!(commands.is_empty(), "Guest must not read saved credentials");
+                    Operation::default()
+                };
+                // A stale restore notification cannot start account reads in either mode.
+                view.account_event(
+                    account::Event::RestoreLoaded {
+                        operation,
+                        session: session("ignored-startup"),
+                    },
+                    window,
+                    cx,
+                );
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+                view.catalog_result(startup_result(&guest), cx);
+                assert_eq!(view.rows.len(), 3);
+                assert!(view.account.is_none());
+                assert!(view.sidebar_playlists.is_empty());
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn guest_startup_skips_saved_account_reads() -> Result<()> {
+    guest_startup(Startup::Guest)
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn connect_startup_keeps_guest_home_and_explicit_signin() -> Result<()> {
+    guest_startup(Startup::Connect)
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn cancelled_startup_activation_discards_early_home() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        let jobs = window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                view.account_event(
+                    account::Event::Connected {
+                        operation: operation.clone(),
+                        result: Ok(Some(connection(saved))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_startup_hidden(view);
+                view.disconnect_account(cx);
+                assert!(operation.is_cancelled());
+                jobs
+            })
+            .unwrap();
+        let account::Command::Disconnect {
+            operation,
+            playback,
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("Expected sign-out to cancel activation")
+        };
+        if let Some(response) = playback.unwrap() {
+            assert!(response.recv().await.unwrap().is_ok());
+        }
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                view.account_event(
+                    account::Event::Disconnected {
+                        operation,
+                        result: Ok(()),
+                    },
+                    window,
+                    cx,
+                );
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert_startup_hidden(view);
+                assert!(view.account_operation.is_none());
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+                assert!(commands.is_empty());
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn failed_startup_playback_activation_discards_early_home() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                view.player = None;
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(saved))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert!(view.account.is_none());
+                assert!(view.session.read().unwrap().is_none());
+                assert!(view.rows.is_empty());
+                assert!(view.sidebar_playlists.is_empty());
+                assert!(view.page_cache.is_empty());
+                assert!(view.ratings.is_empty());
+                assert!(
+                    view.error
+                        .as_deref()
+                        .unwrap()
+                        .contains("Could not activate playback credentials")
+                );
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn keyring_failure_keeps_guest_home_and_the_restore_error() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let account::Command::Restore(operation) = commands.try_recv().unwrap() else {
+                    panic!("Expected restore")
+                };
+                assert!(view.catalog_requests.pending.is_empty());
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Err("Synthetic keyring unavailable".into()),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                let guest = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(guest.query, Query::Home));
+                assert!(guest.session.is_none());
+                assert!(view.catalog_requests.pending.is_empty());
+                assert_eq!(view.error.as_deref(), Some("Synthetic keyring unavailable"));
+                view.catalog_result(startup_result(&guest), cx);
+                assert_eq!(view.rows.len(), 3);
+                assert_eq!(view.error.as_deref(), Some("Synthetic keyring unavailable"));
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn rejected_early_read_discards_both_results_before_verification() -> Result<()> {
+    startup_window(Startup::Restore, async |window, commands, cx| {
+        let (saved, jobs) = window
+            .update(cx, |view, window, cx| {
+                let (operation, saved, jobs) = restored_requests(view, &commands, window, cx);
+                view.catalog_result(startup_result(&jobs[0]), cx);
+                let mut rejected = startup_result(&jobs[1]);
+                rejected.result = Err("Synthetic identity rejection".into());
+                rejected.session_rejected = true;
+                view.catalog_result(rejected, cx);
+                assert_startup_hidden(view);
+                assert!(
+                    commands.is_empty(),
+                    "Early rejection must not start recovery before verification"
+                );
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(saved.clone()))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_startup_hidden(view);
+                (saved, jobs)
+            })
+            .unwrap();
+        wait_for_startup_activation(window, cx).await;
+        window
+            .update(cx, |view, _, cx| {
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &saved));
+                for job in &jobs {
+                    view.catalog_result(startup_result(job), cx);
+                }
+                assert!(view.rows.is_empty());
+                assert!(view.ratings.is_empty());
+                assert!(view.sidebar_playlists.is_empty());
+                for query in [Query::Home, Query::SidebarPlaylists] {
+                    let job = view.catalog_requests.pending.try_recv().unwrap();
+                    assert!(job.query.target() == query.target());
+                    assert!(Arc::ptr_eq(job.session.as_ref().unwrap(), &saved));
+                    view.catalog_result(startup_result(&job), cx);
+                }
+                assert_eq!(view.rows.len(), 3);
+                assert_eq!(view.sidebar_playlists.len(), 1);
+                assert!(commands.is_empty());
+            })
+            .unwrap();
+    })
 }

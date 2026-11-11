@@ -198,9 +198,9 @@ pub struct Connection {
 }
 
 impl Connection {
-    fn verify(session: Session, catalog: &Catalog) -> Result<Self> {
+    fn verify(session: impl Into<Arc<Session>>, catalog: &Catalog) -> Result<Self> {
+        let session = session.into();
         session.validate_playback_identity()?;
-        let session = Arc::new(session);
         let account = catalog.for_session(Some(session.clone())).account()?;
         Ok(Self { account, session })
     }
@@ -222,12 +222,13 @@ impl Connection {
 }
 
 fn restore_connection(
-    candidate: Session,
+    candidate: impl Into<Arc<Session>>,
     operation: &Operation,
-    verify: impl Fn(Session) -> Result<Connection>,
+    verify: impl Fn(Arc<Session>) -> Result<Connection>,
     read_profile: impl FnOnce(&auth::BrowserProfile) -> Result<Session>,
 ) -> Result<(Connection, bool)> {
     ensure!(!operation.is_cancelled(), "Account connection cancelled");
+    let candidate = candidate.into();
     let rejected = match verify(candidate.clone()) {
         Ok(connection) => {
             ensure!(!operation.is_cancelled(), "Account connection cancelled");
@@ -246,7 +247,7 @@ fn restore_connection(
         .context("Could not refresh the saved account. Your saved connection has been kept.")?;
     ensure!(!operation.is_cancelled(), "Account connection cancelled");
     candidate.require_same_account(&refreshed)?;
-    let connection = verify(refreshed)?;
+    let connection = verify(refreshed.into())?;
     ensure!(!operation.is_cancelled(), "Account connection cancelled");
     Ok((connection, true))
 }
@@ -255,12 +256,12 @@ fn refresh_connection(
     shared: &SharedSession,
     expected: &Arc<Session>,
     operation: &Operation,
-    verify: impl Fn(Session) -> Result<Connection>,
+    verify: impl Fn(Arc<Session>) -> Result<Connection>,
     read_profile: impl FnOnce(&auth::BrowserProfile) -> Result<Session>,
 ) -> Result<(Connection, bool)> {
     require_current_session(shared, expected)?;
     let (mut connection, renewed) = restore_connection(
-        (**expected).clone(),
+        expected.clone(),
         operation,
         |candidate| {
             require_current_session(shared, expected)?;
@@ -314,6 +315,10 @@ pub enum Command {
     },
 }
 pub enum Event {
+    RestoreLoaded {
+        operation: Operation,
+        session: Arc<Session>,
+    },
     BrowserReady {
         operation: Operation,
         result: Result<auth::BrowserProfile, String>,
@@ -405,6 +410,8 @@ pub fn start(
                             let candidate = Session::load(&operation)?;
                             ensure!(!operation.is_cancelled(), "Account connection cancelled");
                             candidate.map(|candidate| {
+                                let candidate = Arc::new(candidate);
+                                let _ = events.send_blocking(Event::RestoreLoaded { operation: operation.clone(), session: candidate.clone() });
                                 let catalog = catalog.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                                 let (connection, renewed) = restore_connection(
                                     candidate,
@@ -1219,9 +1226,9 @@ mod tests {
         saved
     }
 
-    fn synthetic_connection(session: Session) -> Connection {
+    fn synthetic_connection(session: impl Into<Arc<Session>>) -> Connection {
         Connection {
-            session: Arc::new(session),
+            session: session.into(),
             account: Account {
                 thumbnail: None,
                 name: "Synthetic account".into(),
@@ -1401,8 +1408,9 @@ mod tests {
 
     #[test]
     fn valid_saved_sessions_restore_without_reading_the_browser() {
+        let saved = Arc::new(sourced_session());
         let (connection, save_session) = restore_connection(
-            sourced_session(),
+            saved.clone(),
             &Operation::default(),
             |candidate| Ok(synthetic_connection(candidate)),
             |_| panic!("A valid saved session must not read browser cookies"),
@@ -1410,6 +1418,7 @@ mod tests {
         .unwrap();
         assert!(!save_session);
         assert_eq!(connection.account.name, "Synthetic account");
+        assert!(Arc::ptr_eq(&connection.session, &saved));
     }
 
     #[test]

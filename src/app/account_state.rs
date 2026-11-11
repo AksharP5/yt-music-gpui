@@ -45,9 +45,10 @@ impl Music {
         self.sync = sync::SyncState::default();
         self.page_cache.clear();
         self.forward_page = None;
-        self.catalog_requests.cancel(CatalogTarget::Page);
-        self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
-        self.catalog_requests.cancel(CatalogTarget::Sidebar);
+        self.catalog_requests.reset_account(
+            self.account.as_ref().map(|account| &account.session),
+            self.account_revision.wrapping_add(1),
+        );
         self.sidebar_playlists.clear();
         self.sidebar_scroll = UniformListScrollHandle::new();
         self.sidebar_error = None;
@@ -416,6 +417,7 @@ impl Music {
             return;
         };
         operation.cancel();
+        self.catalog_requests.discard_restore();
         if let Ok(mut session) = self.session.write() {
             *session = self.account.as_ref().map(|account| account.session.clone());
         }
@@ -573,6 +575,18 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         match event {
+            account::Event::RestoreLoaded { operation, session } => {
+                if !operation.is_cancelled()
+                    && matches!(&self.account_operation, Some(AccountOperation::Restoring(active)) if active.matches(&operation))
+                {
+                    self.catalog_requests.restore(
+                        session,
+                        self.account_revision.wrapping_add(1),
+                        self.account_generation,
+                        self.history_generation,
+                    );
+                }
+            }
             account::Event::BrowserReady { operation, result } => {
                 let returned = match &self.account_operation {
                     Some(AccountOperation::Connecting(
@@ -671,6 +685,10 @@ impl Music {
                     }
                     _ => return,
                 };
+                if !matches!(&result, Ok(Some(connection)) if self.catalog_requests.restoring_session_is(&connection.session))
+                {
+                    self.catalog_requests.discard_restore();
+                }
                 let pending = pending.or_else(|| {
                     renewing
                         .then(|| self.queue_waiting.take().or(self.autoplay_waiting.take()))
@@ -731,6 +749,7 @@ impl Music {
                         let response = match installation {
                             Ok(response) => response,
                             Err(error) => {
+                                self.catalog_requests.discard_restore();
                                 self.account_operation = if renewing {
                                     Some(AccountOperation::RefreshFailed { resume: pending })
                                 } else {
@@ -846,6 +865,7 @@ impl Music {
                                         }
                                     }
                                     Err(error) => {
+                                        view.catalog_requests.discard_restore();
                                         view.account_operation = if renewing { Some(AccountOperation::RefreshFailed { resume }) }
                                             else { restoring.then_some(AccountOperation::RestoreFailed) };
                                         view.playback = Playback::Stopped;

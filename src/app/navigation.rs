@@ -124,11 +124,23 @@ pub(in crate::app) enum CatalogTarget {
 impl CatalogTarget {
     pub(in crate::app) const ALL: [Self; 3] = [Self::Page, Self::PlaylistPicker, Self::Sidebar];
 }
+struct RestoringRequest {
+    id: u64,
+    result: Option<CatalogResult>,
+}
+
+struct RestoringCatalog {
+    session: Arc<Session>,
+    account_revision: u64,
+    requests: [Option<RestoringRequest>; CatalogTarget::ALL.len()],
+}
+
 pub(in crate::app) struct CatalogRequests {
     pub(in crate::app) generations: Arc<[AtomicU64; CatalogTarget::ALL.len()]>,
     pub(in crate::app) loading: [bool; CatalogTarget::ALL.len()],
     pub(in crate::app) jobs: async_channel::Sender<Job>,
     pub(in crate::app) pending: async_channel::Receiver<Job>,
+    restoring: Option<RestoringCatalog>,
 }
 impl CatalogRequests {
     pub(in crate::app) fn new() -> Self {
@@ -138,7 +150,110 @@ impl CatalogRequests {
             loading: [false; CatalogTarget::ALL.len()],
             jobs,
             pending,
+            restoring: None,
         }
+    }
+
+    pub(super) fn restore(
+        &mut self,
+        session: Arc<Session>,
+        account_revision: u64,
+        account_generation: u64,
+        history_generation: u64,
+    ) {
+        self.discard_restore();
+        let mut requests = std::array::from_fn(|_| None);
+        for query in [Query::Home, Query::SidebarPlaylists] {
+            let target = query.target();
+            if self
+                .request(
+                    query,
+                    account_revision,
+                    account_generation,
+                    history_generation,
+                    Some(session.clone()),
+                )
+                .is_ok()
+            {
+                requests[target as usize] = Some(RestoringRequest {
+                    id: self.generations[target as usize].load(Ordering::Relaxed),
+                    result: None,
+                });
+            }
+        }
+        self.restoring = Some(RestoringCatalog {
+            session,
+            account_revision,
+            requests,
+        });
+    }
+
+    pub(super) fn restoring_session_is(&self, session: &Arc<Session>) -> bool {
+        self.restoring
+            .as_ref()
+            .is_some_and(|restoring| Arc::ptr_eq(&restoring.session, session))
+    }
+
+    pub(super) fn discard_restore(&mut self) {
+        let Some(restoring) = self.restoring.take() else {
+            return;
+        };
+        for target in CatalogTarget::ALL {
+            if restoring.requests[target as usize]
+                .as_ref()
+                .is_some_and(|request| {
+                    request.id == self.generations[target as usize].load(Ordering::Relaxed)
+                })
+            {
+                self.cancel(target);
+            }
+        }
+    }
+
+    // Only activation of the exact saved session can carry requests across the
+    // account reset. Refreshed cookies, even for the same account, start over.
+    pub(super) fn reset_account(&mut self, session: Option<&Arc<Session>>, account_revision: u64) {
+        if !self.restoring.as_ref().is_some_and(|restoring| {
+            restoring.account_revision == account_revision
+                && session.is_some_and(|session| Arc::ptr_eq(session, &restoring.session))
+        }) {
+            self.discard_restore();
+        }
+        for target in CatalogTarget::ALL {
+            let preserved = self.restoring.as_ref().is_some_and(|restoring| {
+                restoring.requests[target as usize]
+                    .as_ref()
+                    .is_some_and(|request| {
+                        request.id == self.generations[target as usize].load(Ordering::Relaxed)
+                    })
+            });
+            if !preserved {
+                self.cancel(target);
+            }
+        }
+    }
+
+    fn take_restored(
+        &mut self,
+        query: &Query,
+        session: Option<&Arc<Session>>,
+        account_revision: u64,
+    ) -> Option<RestoringRequest> {
+        if !matches!(query, Query::Home | Query::SidebarPlaylists) {
+            return None;
+        }
+        let restoring = self.restoring.as_mut()?;
+        if restoring.account_revision != account_revision
+            || !session.is_some_and(|session| Arc::ptr_eq(session, &restoring.session))
+        {
+            return None;
+        }
+        let target = query.target();
+        let request = restoring.requests[target as usize].take()?;
+        if restoring.requests.iter().all(Option::is_none) {
+            self.restoring = None;
+        }
+        (request.id == self.generations[target as usize].load(Ordering::Relaxed)).then_some(request)
     }
 
     pub(in crate::app) fn request(
@@ -280,6 +395,16 @@ impl Music {
             .account
             .as_ref()
             .map(|connection| connection.session.clone());
+        if let Some(request) =
+            self.catalog_requests
+                .take_restored(&query, session.as_ref(), self.account_revision)
+        {
+            if let Some(result) = request.result {
+                self.catalog_result(result, cx);
+            }
+            cx.notify();
+            return;
+        }
         let result = self.catalog_requests.request(
             query,
             self.account_revision,
@@ -661,6 +786,20 @@ impl Music {
     }
 
     pub(in crate::app) fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
+        // Quarantine early responses before finish(), refresh, ratings, page/cache,
+        // or sidebar state can observe them. Activation consumes each held request.
+        if let Some(restoring) = &mut self.catalog_requests.restoring
+            && result.account_revision == restoring.account_revision
+            && let Some(request) = &mut restoring.requests[result.target as usize]
+            && result.id == request.id
+        {
+            if result.session_rejected {
+                self.catalog_requests.discard_restore();
+            } else {
+                request.result = Some(result);
+            }
+            return;
+        }
         if result.account_revision != self.account_revision
             || !self.catalog_requests.finish(result.target, result.id)
         {
@@ -829,7 +968,10 @@ impl CatalogRequests {
     pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let catalog_requests = CatalogRequests::new();
         let (results, completed) = async_channel::unbounded::<CatalogResult>();
-        for worker in 0..2 {
+        // Blocking reads can't be interrupted once discarded. Startup sends Home
+        // and the sidebar before verification, so keep a worker beyond those two
+        // free for whatever replaces them (the guest fallback or the next page).
+        for worker in 0..3 {
             let receiver = catalog_requests.pending.clone();
             let results = results.clone();
             let generations = catalog_requests.generations.clone();
