@@ -124,6 +124,97 @@ fn renew(
 }
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        let next = session("renewed-navigation");
+        let (sender, commands) = async_channel::unbounded();
+        window
+            .update(cx, |view, window, cx| {
+                view.account_commands = sender;
+                *view.session.write().unwrap() =
+                    Some(view.account.as_ref().unwrap().session.clone());
+                view.player = Some(
+                    Player::new(PlayerOptions {
+                        audio_output: Some("null".into()),
+                        volume: 0.,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+                view.navigate(
+                    Route::Browse(BrowseLink::new("VLrenewed", "Renewed playlist")),
+                    cx,
+                );
+                let mut first = crate::app::sync::tests::page(100, true);
+                first.continuation = Some(
+                    crate::catalog::Continuation::from_response(
+                        "old-first-tail",
+                        &json!({}),
+                        Some(view.account.as_ref().unwrap().session.clone()),
+                    )
+                    .unwrap(),
+                );
+                super::navigation::reply(view, first, cx);
+                view.prefetch_page(100, 100, 0, cx);
+                let mut tail = crate::app::sync::tests::response(
+                    &[("Songs", (100..150).collect())],
+                    None,
+                    true,
+                );
+                tail.continuation = Some(
+                    crate::catalog::Continuation::from_response(
+                        "old-loaded-tail",
+                        &json!({}),
+                        Some(view.account.as_ref().unwrap().session.clone()),
+                    )
+                    .unwrap(),
+                );
+                super::navigation::reply(view, tail, cx);
+                renew(view, next.clone(), &commands, window, cx);
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            super::render::wait_for_presented_frame(window, cx).await;
+            if window
+                .update(cx, |view, _, _| view.account_operation.is_none())
+                .unwrap()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Synthetic renewal was not acknowledged"
+            );
+        }
+        window.update(cx, |view, _, cx| {
+            assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &next));
+            let mut fresh = crate::app::sync::tests::page(100, true);
+            fresh.continuation = Some(crate::catalog::Continuation::from_response("renewed-first-tail", &json!({}), Some(next.clone())).unwrap());
+            assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), crate::app::Query::Revalidate(_)));
+            assert_eq!(view.rows.len(), 150, "Renewal must preserve the active loaded rows as on main");
+            assert_eq!(view.page.continuation.as_ref().unwrap().token(), "old-loaded-tail", "Active revalidation must retain main's continuation behavior");
+            view.navigate(Route::Explore, cx);
+            super::navigation::reply(view, crate::app::sync::tests::page(1, false), cx);
+            view.go_back(cx);
+            assert_eq!(view.rows.len(), 150, "Back must immediately restore the page invalidated by renewal");
+            assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), crate::app::Query::Revalidate(_)));
+            assert_eq!(view.page.continuation.as_ref().unwrap().token(), "old-loaded-tail");
+            view.navigate(Route::Explore, cx);
+            view.navigate(Route::Browse(BrowseLink::new("VLrenewed", "Renewed playlist")), cx);
+            assert!(view.rows.is_empty(), "Forward must not serve an active page merged across renewal with an old-session tail");
+            assert!(matches!(super::navigation::reply(view, fresh, cx), crate::app::Query::Browse(_)));
+            view.prefetch_page(100, 100, 0, cx);
+            let job = view.catalog_requests.pending.try_recv().unwrap();
+            let crate::app::Query::More { mut token, .. } = job.query else { panic!("Expected load more after renewal") };
+            assert_eq!(token.token(), "renewed-first-tail");
+            token.renew_session(&next, &next).expect("Load more must be bound to the renewed session");
+        }).unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result<()> {
     super::isolate()?;
@@ -368,6 +459,18 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 window.update(cx, |view, window, cx| {
                     view.stop_playback(cx);
                     prepare(view, original.clone());
+                    let mut cached = crate::app::sync::tests::page(1, false);
+                    cached.continuation = Some(crate::catalog::Continuation::from_response(
+                        "old-session-tail", &json!({}), Some(original.clone())
+                    ).unwrap());
+                    view.page_cache.push_back(crate::app::CachedPage {
+                        route: Route::Home,
+                        account_revision: view.account_revision,account_generation:view.account_generation,history_generation:view.history_generation,
+                        page: cached,
+                        fetched_at: Instant::now(),
+                        coverage: Default::default(),
+                        sort: None,
+                    });
                     if case == "signout" {
                         let operation = Operation::default();
                         let profile: BrowserProfile = serde_json::from_value(json!({
@@ -415,6 +518,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 window.update(cx, |view, _, _| {
                     assert_eq!(view.library.queue.tracks.len(), 2);
                     assert!(view.active_id.is_none());
+                    assert!(view.page_cache.is_empty(), "Credential renewal and sign-out must discard pages bound to the old session");
                     if case == "signout" {
                         assert!(view.account.is_none());
                         assert!(view.session.read().unwrap().is_none());

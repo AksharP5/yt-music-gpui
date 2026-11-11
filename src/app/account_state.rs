@@ -43,6 +43,8 @@ impl Music {
         self.finish_listening(false);
         self.next_session_refresh = None;
         self.sync = sync::SyncState::default();
+        self.page_cache.clear();
+        self.forward_page = None;
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -799,6 +801,10 @@ impl Music {
                                         let label = format!("Connected as {}", connection.account.name);
                                         view.account = Some(connection);
                                         if renewing {
+                                            view.account_generation = view.account_generation.wrapping_add(1);
+                                            // Read continuations belong to the exact session snapshot.
+                                            view.page_cache.clear();
+                                            view.forward_page = None;
                                             // Rebind only this verified account's queue; discard other in-flight reads.
                                             view.catalog_requests.cancel(CatalogTarget::Page);
                                             view.catalog_requests.cancel(CatalogTarget::Sidebar);
@@ -882,6 +888,7 @@ impl Music {
                 if session_rejected {
                     self.refresh_session(true, cx);
                 }
+                self.account_generation = self.account_generation.wrapping_add(1);
                 let mutation = *mutation;
                 self.pending_mutations.remove(&mutation.key());
                 let rollback = if let Mutation::RateSong { track, .. } = &mutation {
@@ -992,18 +999,19 @@ impl Music {
                     self.refresh_session(true, cx);
                 }
                 match result {
-                    Ok(())
+                    Ok(()) => {
+                        self.history_generation = self.history_generation.wrapping_add(1);
                         if !watchtime
                             && self.overlay.is_none()
                             && !self.catalog_requests.is_loading(CatalogTarget::Page)
                             && matches!(
                                 self.route,
                                 Route::Recent | Route::Library(Section::History)
-                            ) =>
-                    {
-                        self.revalidate_page(cx);
+                            )
+                        {
+                            self.revalidate_page(cx);
+                        }
                     }
-                    Ok(()) => {}
                     Err(error) => {
                         let title = self
                             .library

@@ -1,6 +1,7 @@
 //! Native window checks, run individually in a fresh private guest environment.
 
 mod account;
+mod navigation;
 mod playback;
 pub(in crate::app) mod render;
 mod restart;

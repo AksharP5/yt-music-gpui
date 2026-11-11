@@ -22,6 +22,25 @@ pub(in crate::app) enum Route {
     Library(Section),
 }
 impl Route {
+    fn same_page(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Home, Self::Browse(link)) | (Self::Browse(link), Self::Home) => {
+                link.id == "FEmusic_home" && link.params.is_none() && link.chart_country.is_none()
+            }
+            (Self::Explore, Self::Browse(link)) | (Self::Browse(link), Self::Explore) => {
+                link.id == "FEmusic_explore"
+                    && link.params.is_none()
+                    && link.chart_country.is_none()
+            }
+            (Self::Browse(left), Self::Browse(right)) => {
+                left.id == right.id
+                    && left.params == right.params
+                    && left.chart_country == right.chart_country
+            }
+            _ => self == other,
+        }
+    }
+
     /// The account library page behind a library route.
     pub(in crate::app) fn library_section(&self) -> Option<Section> {
         match self {
@@ -80,12 +99,16 @@ impl Query {
 pub(in crate::app) struct Job {
     pub(in crate::app) id: u64,
     pub(in crate::app) account_revision: u64,
+    pub(in crate::app) account_generation: u64,
+    pub(in crate::app) history_generation: u64,
     pub(in crate::app) query: Query,
     pub(in crate::app) session: Option<Arc<Session>>,
 }
 pub(in crate::app) struct CatalogResult {
     pub(in crate::app) id: u64,
     pub(in crate::app) account_revision: u64,
+    pub(in crate::app) account_generation: u64,
+    pub(in crate::app) history_generation: u64,
     pub(in crate::app) append: bool,
     pub(in crate::app) revalidate: bool,
     pub(in crate::app) result: Result<Page, String>,
@@ -122,6 +145,8 @@ impl CatalogRequests {
         &mut self,
         query: Query,
         account_revision: u64,
+        account_generation: u64,
+        history_generation: u64,
         session: Option<Arc<Session>>,
     ) -> Result<(), String> {
         let target = query.target();
@@ -137,6 +162,8 @@ impl CatalogRequests {
         for job in other.into_iter().chain(std::iter::once(Job {
             id,
             account_revision,
+            account_generation,
+            history_generation,
             query,
             session,
         })) {
@@ -165,6 +192,42 @@ impl CatalogRequests {
         self.loading[target as usize]
     }
 }
+const PAGE_CACHE_LIMIT: usize = 12;
+
+// Forward visits only. Back owns a separate snapshot for each visit.
+pub(in crate::app) struct CachedPage {
+    pub(in crate::app) route: Route,
+    pub(in crate::app) account_revision: u64,
+    pub(in crate::app) account_generation: u64,
+    pub(in crate::app) history_generation: u64,
+    pub(in crate::app) page: Page,
+    pub(in crate::app) fetched_at: Instant,
+    pub(in crate::app) coverage: sync::PageCoverage,
+    // Forward revisits need the order of the cached response too.
+    pub(in crate::app) sort: Option<Continuation>,
+}
+
+// A Back restore changes list_id without adopting this forward visit's cache metadata.
+pub(in crate::app) struct ForwardPage {
+    list_id: usize,
+    pub(super) fetched_at: Option<Instant>,
+    account_generation: u64,
+    history_generation: u64,
+    pub(super) sort: Option<Continuation>,
+}
+
+impl ForwardPage {
+    pub(super) fn new(list_id: usize, account_generation: u64, history_generation: u64) -> Self {
+        Self {
+            list_id,
+            fetched_at: None,
+            account_generation,
+            history_generation,
+            sort: None,
+        }
+    }
+}
+
 pub(in crate::app) struct NavigationState {
     pub(in crate::app) route: Route,
     pub(in crate::app) page: Option<Page>,
@@ -177,9 +240,35 @@ pub(in crate::app) struct NavigationState {
 }
 
 impl Music {
+    pub(super) fn page_is_current(
+        &self,
+        account_generation: u64,
+        history_generation: u64,
+        route: &Route,
+    ) -> bool {
+        let history = route.library_section() == Some(Section::History)
+            || matches!(route, Route::Browse(link) if Section::from_browse_id(&link.id) == Some(Section::History));
+        account_generation == self.account_generation
+            && (!history || history_generation == self.history_generation)
+    }
+
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
         if target == CatalogTarget::Page {
+            if let Some(page) = &mut self.forward_page
+                && page.list_id == self.list_id
+            {
+                // Remember the order the next response will show, so a stale
+                // revisit refreshes in that order.
+                match &query {
+                    Query::Reload(token) => {
+                        page.sort = Some(token.clone());
+                        page.fetched_at = None;
+                    }
+                    Query::More { .. } => {}
+                    _ => page.sort = None,
+                }
+            }
             self.sync.page_changes.clear();
             self.sync.page_reload = None;
             if self.error == self.sync.page_error {
@@ -191,9 +280,13 @@ impl Music {
             .account
             .as_ref()
             .map(|connection| connection.session.clone());
-        let result = self
-            .catalog_requests
-            .request(query, self.account_revision, session);
+        let result = self.catalog_requests.request(
+            query,
+            self.account_revision,
+            self.account_generation,
+            self.history_generation,
+            session,
+        );
         if target == CatalogTarget::PlaylistPicker {
             if let Some(Overlay::PlaylistPicker { error, .. }) = &mut self.overlay {
                 *error = result.err();
@@ -215,9 +308,29 @@ impl Music {
             Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
             route => route,
         };
-        self.focus_after_navigation(cx);
-        self.artwork.cancel_pending();
-        self.player_open = false;
+        // Like the web, clicking the page you're on loads it again.
+        let reopening = self.route.same_page(&route);
+        if let Some(active) = &self.forward_page
+            && active.list_id == self.list_id
+            && let Some(fetched_at) = active.fetched_at
+            && self.sync.page_error.is_none()
+            && self.page_is_current(
+                active.account_generation,
+                active.history_generation,
+                &self.route,
+            )
+        {
+            self.page_cache.push_back(CachedPage {
+                route: self.route.clone(),
+                account_revision: self.account_revision,
+                account_generation: active.account_generation,
+                history_generation: active.history_generation,
+                page: self.page.clone(),
+                fetched_at,
+                coverage: self.sync.page_coverage,
+                sort: active.sort.clone(),
+            });
+        }
         if self.route != route {
             let cached = (!self.rows.is_empty()
                 || (!self.catalog_requests.is_loading(CatalogTarget::Page)
@@ -240,7 +353,40 @@ impl Music {
                 self.back.remove(0);
             }
         }
+        let cached = self
+            .page_cache
+            .iter()
+            .position(|entry| {
+                entry.account_revision == self.account_revision && entry.route.same_page(&route)
+            })
+            .and_then(|index| self.page_cache.remove(index))
+            .filter(|entry| {
+                !reopening
+                    && self.page_is_current(
+                        entry.account_generation,
+                        entry.history_generation,
+                        &route,
+                    )
+            });
+        if self.page_cache.len() > PAGE_CACHE_LIMIT {
+            self.page_cache.pop_front();
+        }
+        self.forward_page = Some(ForwardPage::new(
+            self.list_id.wrapping_add(1),
+            self.account_generation,
+            self.history_generation,
+        ));
+        self.load_route(route, cached, cx);
+    }
+
+    fn load_route(&mut self, route: Route, cached: Option<CachedPage>, cx: &mut Context<Self>) {
+        self.focus_after_navigation(cx);
+        self.artwork.cancel_pending();
+        self.player_open = false;
         self.list_id = self.list_id.wrapping_add(1);
+        self.list_scroll = UniformListScrollHandle::new();
+        self.detail_list = DetailList::new();
+        self.shelf_scroll.clear();
         self.route = route.clone();
         self.sync.page_fetched_at = None;
         self.sync.page_reload = None;
@@ -264,6 +410,35 @@ impl Music {
             // Like the web, the search box only keeps a query on its results.
             self.search
                 .update(cx, |input, cx| input.set_query(String::new(), cx));
+        }
+        if let Some(entry) = cached {
+            self.catalog_requests.cancel(CatalogTarget::Page);
+            if let Route::Search(search) = &route {
+                self.search
+                    .update(cx, |input, cx| input.set_query(search.query.clone(), cx));
+            }
+            self.page = entry.page;
+            self.sync.page_fetched_at = Some(entry.fetched_at);
+            self.sync.page_coverage = entry.coverage;
+            self.forward_page = Some(ForwardPage {
+                list_id: self.list_id,
+                fetched_at: Some(entry.fetched_at),
+                account_generation: entry.account_generation,
+                history_generation: entry.history_generation,
+                sort: entry.sort.clone(),
+            });
+            self.rebuild_rows();
+            self.overlay_ratings();
+            if sync::needs_refresh(Some(entry.fetched_at), Instant::now()) {
+                // Forward visits start at the top and replace expired loaded tails.
+                let query = entry
+                    .sort
+                    .map(Query::Reload)
+                    .unwrap_or_else(|| self.page_query());
+                self.request(query, cx);
+            }
+            cx.notify();
+            return;
         }
         match route {
             Route::Home => {
@@ -477,7 +652,7 @@ impl Music {
             }
         } else {
             self.route = state.route.clone();
-            self.navigate(state.route, cx);
+            self.load_route(state.route, None, cx);
         }
         self.list_scroll = state.list_scroll;
         self.detail_list = state.detail_list;
@@ -486,10 +661,12 @@ impl Music {
     }
 
     pub(in crate::app) fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
-        if !self.catalog_requests.finish(result.target, result.id) {
+        if result.account_revision != self.account_revision
+            || !self.catalog_requests.finish(result.target, result.id)
+        {
             return;
         }
-        if result.session_rejected && result.account_revision == self.account_revision {
+        if result.session_rejected {
             self.refresh_session(false, cx);
         }
         if result.target == CatalogTarget::Sidebar {
@@ -529,24 +706,14 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
+                // The view now has newer content for this route than any cached copy,
+                // however the user leaves it (link, Back, or another Back).
+                self.page_cache.retain(|entry| {
+                    entry.account_revision != self.account_revision
+                        || !entry.route.same_page(&self.route)
+                });
                 for change in self.sync.page_changes.drain(..) {
                     change.apply(&mut page, &self.route);
-                }
-                if result.account_revision != self.account_revision {
-                    for track in page
-                        .shelves
-                        .iter_mut()
-                        .flat_map(|shelf| &mut shelf.items)
-                        .filter_map(|item| {
-                            if let Item::Track(track) = item {
-                                Some(track)
-                            } else {
-                                None
-                            }
-                        })
-                    {
-                        track.details.clear_account_state();
-                    }
                 }
                 for track in page
                     .shelves
@@ -574,6 +741,15 @@ impl Music {
                     }
                 }
                 self.sync.page_fetched_at = Some(Instant::now());
+                if let Some(active) = &mut self.forward_page
+                    && active.list_id == self.list_id
+                    && !result.append
+                    && (!result.revalidate || self.sync.page_reload.is_some())
+                {
+                    active.account_generation = result.account_generation;
+                    active.history_generation = result.history_generation;
+                    active.fetched_at = self.sync.page_fetched_at;
+                }
                 self.sync.page_error = None;
                 if result.revalidate {
                     let anchor = self.page_anchor();
@@ -622,6 +798,11 @@ impl Music {
                 }
             }
             Err(error) => {
+                if let Some(active) = &mut self.forward_page
+                    && active.list_id == self.list_id
+                {
+                    active.fetched_at = None;
+                }
                 self.sync.page_error = Some(error.clone());
                 self.error = Some(error);
             }
@@ -718,6 +899,8 @@ impl CatalogRequests {
                             .send_blocking(CatalogResult {
                                 id: job.id,
                                 account_revision: job.account_revision,
+                                account_generation: job.account_generation,
+                                history_generation: job.history_generation,
                                 append,
                                 revalidate,
                                 result,

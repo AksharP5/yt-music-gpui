@@ -485,6 +485,9 @@ impl Music {
             cx.notify();
             return;
         }
+        if let Some(active) = &mut self.forward_page {
+            active.fetched_at = None;
+        }
         if self.account.is_some() {
             self.refresh_remote(cx);
         } else {
@@ -588,11 +591,16 @@ impl Music {
             append_added(page, route, id, &sources);
         }
         self.rebuild_rows();
+        if sources.len() < additions.len()
+            && matches!(&self.route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
+        {
+            self.revalidate_page(cx);
+        }
         cx.notify();
     }
 
-    pub(super) fn revalidate_page(&mut self, cx: &mut Context<Self>) {
-        let query = match &self.route {
+    pub(super) fn page_query(&self) -> Query {
+        match &self.route {
             Route::Home => Query::Home,
             Route::Explore => Query::Explore,
             Route::Search(search) => Query::Search(search.clone()),
@@ -600,8 +608,11 @@ impl Music {
             Route::Liked | Route::Recent | Route::Saved | Route::Library(_) => {
                 Query::Library(self.route.library_section().expect("library route"))
             }
-        };
-        self.request(Query::Revalidate(Box::new(query)), cx);
+        }
+    }
+
+    pub(super) fn revalidate_page(&mut self, cx: &mut Context<Self>) {
+        self.request(Query::Revalidate(Box::new(self.page_query())), cx);
     }
 
     pub(super) fn patch_confirmed(&mut self, mutation: &Mutation, cx: &mut Context<Self>) {
