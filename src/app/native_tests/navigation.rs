@@ -1043,5 +1043,20 @@ fn refresh_after_back_supersedes_the_forward_cache_entry() -> Result<()> {
             "An older forward entry must not undo content refreshed after Back"
         );
         assert!(view.catalog_requests.is_loading(CatalogTarget::Page));
+        reply(view, page("Current", "current-tail"), cx);
+
+        // Leaving the refreshed page through Back must not resurrect an older entry either.
+        let playlist = Route::Browse(BrowseLink::new("VLrefreshed-back", "Refreshed"));
+        view.navigate(playlist.clone(), cx);
+        reply(view, page("Original", "original-tail"), cx);
+        view.navigate(Route::Explore, cx);
+        view.go_back(cx);
+        reply(view, page("Refreshed", "refreshed-tail"), cx);
+        view.go_back(cx);
+        view.navigate(playlist, cx);
+        assert_ne!(
+            view.page.title, "Original",
+            "Back must not leave an entry older than the content last shown"
+        );
     })
 }

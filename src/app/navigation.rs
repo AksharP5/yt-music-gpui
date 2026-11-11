@@ -301,11 +301,6 @@ impl Music {
             Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
             route => route,
         };
-        // Whatever the user last saw for this route supersedes an older entry,
-        // including a page refreshed after Back or Ctrl R that can't be cached.
-        self.page_cache.retain(|entry| {
-            entry.account_revision != self.account_revision || !entry.route.same_page(&self.route)
-        });
         if let Some(active) = &self.forward_page
             && active.list_id == self.list_id
             && let Some(fetched_at) = active.fetched_at
@@ -697,6 +692,12 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
+                // The view now has newer content for this route than any cached copy,
+                // however the user leaves it (link, Back, or another Back).
+                self.page_cache.retain(|entry| {
+                    entry.account_revision != self.account_revision
+                        || !entry.route.same_page(&self.route)
+                });
                 for change in self.sync.page_changes.drain(..) {
                     change.apply(&mut page, &self.route);
                 }
