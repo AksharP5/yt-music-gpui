@@ -46,6 +46,9 @@ impl AssetSource for Assets {
             "volume" => Some(Cow::Borrowed(include_bytes!("../assets/icons/volume.svg"))),
             "mute" => Some(Cow::Borrowed(include_bytes!("../assets/icons/mute.svg"))),
             "plus" => Some(Cow::Borrowed(include_bytes!("../assets/icons/plus.svg"))),
+            "search-clear" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/search-clear.svg"
+            ))),
             "close" => Some(Cow::Borrowed(include_bytes!("../assets/icons/close.svg"))),
             "back" => Some(Cow::Borrowed(include_bytes!("../assets/icons/back.svg"))),
             "forward" => Some(Cow::Borrowed(include_bytes!("../assets/icons/forward.svg"))),
