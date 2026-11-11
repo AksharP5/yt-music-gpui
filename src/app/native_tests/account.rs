@@ -372,6 +372,13 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                     cached.continuation = Some(crate::catalog::Continuation::from_response(
                         "old-session-tail", &json!({}), Some(original.clone())
                     ).unwrap());
+                    view.back.push(crate::app::NavigationState {
+                        route: Route::Saved,
+                        sort: cached.continuation.clone(),
+                        list_scroll: gpui::UniformListScrollHandle::new(),
+                        detail_list: crate::app::DetailList::new(),
+                        shelf_scroll: Default::default(),
+                    });
                     view.page_cache.push_back(crate::app::CachedPage {
                         route: Route::Home,
                         account_revision: view.account_revision,
@@ -428,6 +435,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                     assert_eq!(view.library.queue.tracks.len(), 2);
                     assert!(view.active_id.is_none());
                     assert!(view.page_cache.is_empty(), "Credential renewal and sign-out must discard pages bound to the old session");
+                    assert!(view.back.iter().all(|state| state.sort.is_none()), "Back must not reuse sort requests bound to the old session");
                     if case == "signout" {
                         assert!(view.account.is_none());
                         assert!(view.session.read().unwrap().is_none());

@@ -187,11 +187,13 @@ pub(in crate::app) struct CachedPage {
     pub(in crate::app) page: Page,
     pub(in crate::app) fetched_at: Instant,
     pub(in crate::app) coverage: sync::PageCoverage,
+    // Forward revisits need the order of the cached response too.
     pub(in crate::app) sort: Option<Continuation>,
 }
 
 pub(in crate::app) struct NavigationState {
     pub(in crate::app) route: Route,
+    pub(in crate::app) sort: Option<Continuation>,
     pub(in crate::app) list_scroll: UniformListScrollHandle,
     pub(in crate::app) detail_list: DetailList,
     pub(in crate::app) shelf_scroll: HashMap<usize, ScrollHandle>,
@@ -255,6 +257,7 @@ impl Music {
         if !self.route.same_page(&route) {
             self.back.push(NavigationState {
                 route: self.route.clone(),
+                sort: self.sync.page_sort.clone(),
                 list_scroll: self.list_scroll.clone(),
                 shelf_scroll: std::mem::take(&mut self.shelf_scroll),
                 detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
@@ -263,10 +266,16 @@ impl Music {
                 self.back.remove(0);
             }
         }
-        self.open_route(route, false, cx);
+        self.open_route(route, None, false, cx);
     }
 
-    fn open_route(&mut self, route: Route, restore_scroll: bool, cx: &mut Context<Self>) {
+    fn open_route(
+        &mut self,
+        route: Route,
+        sort: Option<Continuation>,
+        restore_scroll: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.artwork.cancel_pending();
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.player_open = false;
@@ -289,7 +298,7 @@ impl Music {
         self.shelf_scroll.clear();
         self.route = route.clone();
         self.sync.page_reload = None;
-        self.sync.page_sort = None;
+        self.sync.page_sort = sort;
         self.sync.page_changes.clear();
         self.sync.page_coverage = sync::PageCoverage::default();
         self.sync.page_error = None;
@@ -315,7 +324,11 @@ impl Music {
         if self.page_cache.len() > PAGE_CACHE_LIMIT {
             self.page_cache.pop_front();
         }
-        if let Some(entry) = cached {
+        if let Some(entry) = cached.filter(|entry| {
+            !restore_scroll
+                || entry.sort.as_ref().map(Continuation::token)
+                    == self.sync.page_sort.as_ref().map(Continuation::token)
+        }) {
             self.page = entry.page;
             self.sync.page_fetched_at = Some(entry.fetched_at);
             self.sync.page_coverage = entry.coverage;
@@ -336,32 +349,29 @@ impl Music {
         match route {
             Route::Home => {
                 self.page.title = "Home".into();
-                self.request(Query::Home, cx);
             }
             Route::Explore => {
                 self.page.title = "Explore".into();
-                self.request(Query::Explore, cx);
             }
             Route::Search(search) => {
                 self.page.title = format!("Results for \"{}\"", search.query);
-                self.request(Query::Search(search), cx);
             }
             Route::Browse(link) => {
                 self.page.title = link.title.clone();
-                self.request(Query::Browse(link), cx);
             }
             Route::Liked | Route::Saved | Route::Recent | Route::Library(_)
                 if self.account.is_some() =>
             {
                 let section = route.library_section().expect("library route");
                 self.page.title = section.title().into();
-                self.request(Query::Library(section), cx);
             }
             _ => {
                 self.refresh_local();
                 cx.notify();
+                return;
             }
         }
+        self.request(self.page_query(), cx);
     }
 
     pub(in crate::app) fn rebuild_rows(&mut self) {
@@ -517,7 +527,7 @@ impl Music {
             return;
         }
         let Some(state) = self.back.pop() else { return };
-        self.open_route(state.route, true, cx);
+        self.open_route(state.route, state.sort, true, cx);
         self.list_scroll = state.list_scroll;
         self.detail_list = state.detail_list;
         self.shelf_scroll = state.shelf_scroll;
@@ -575,8 +585,7 @@ impl Music {
             Ok(mut page) => {
                 let mut invalidated = false;
                 for change in self.sync.page_changes.drain(..) {
-                    invalidated |=
-                        change.apply(&mut page, &self.route, self.sync.page_sort.is_some());
+                    invalidated |= change.apply(&mut page, &self.route);
                 }
                 for track in page
                     .shelves

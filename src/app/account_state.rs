@@ -803,6 +803,7 @@ impl Music {
                                         if renewing {
                                             // Read continuations belong to the exact session snapshot.
                                             view.page_cache.clear();
+                                            for state in &mut view.back { state.sort = None; }
                                             view.sync.page_fetched_at = None;
                                             view.sync.page_sort = None;
                                             // Rebind only this verified account's queue; discard other in-flight reads.
@@ -907,6 +908,12 @@ impl Music {
                             &mutation,
                         );
                         self.notice = Some("Saved to YouTube Music".into());
+                        if let Effect::PlaylistAdded { additions } = &effect
+                            && let Mutation::AddToPlaylist { id, .. } = &mutation
+                        {
+                            // Resolve added tracks before the mutation discards cached metadata.
+                            self.patch_added(id, additions, cx);
+                        }
                         self.patch_confirmed(&mutation, cx);
                         match effect {
                             Effect::CreatedPlaylist { id } => {
@@ -930,11 +937,7 @@ impl Music {
                                     self.overlay = Some(Overlay::AlreadyAdded { id, video_ids });
                                 }
                             }
-                            Effect::PlaylistAdded { additions } => {
-                                if let Mutation::AddToPlaylist { id, .. } = &mutation {
-                                    self.patch_added(id, &additions, cx);
-                                }
-                            }
+                            Effect::PlaylistAdded { .. } => {}
                             Effect::Changed => {
                                 if deleting {
                                     self.request(
@@ -998,18 +1001,18 @@ impl Music {
                     self.refresh_session(true, cx);
                 }
                 match result {
-                    Ok(())
+                    Ok(()) => {
+                        self.page_cache.retain(|entry| {
+                            entry.route.library_section() != Some(Section::History)
+                        });
                         if !watchtime
                             && self.overlay.is_none()
                             && !self.catalog_requests.is_loading(CatalogTarget::Page)
-                            && matches!(
-                                self.route,
-                                Route::Recent | Route::Library(Section::History)
-                            ) =>
-                    {
-                        self.revalidate_page(cx);
+                            && self.route.library_section() == Some(Section::History)
+                        {
+                            self.revalidate_page(cx);
+                        }
                     }
-                    Ok(()) => {}
                     Err(error) => {
                         let title = self
                             .library
