@@ -26,6 +26,7 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 plugin_dirs.value = []
 plugin_root = Path(sys.argv.pop(1))
+server_script = Path(sys.argv.pop(1)).read_text()
 spec = importlib.util.spec_from_file_location("account_contract", plugin_root / "account/yt_dlp_plugins/extractor/account.py")
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
@@ -217,6 +218,90 @@ with YoutubeDL({'quiet': True, 'allowed_extractors': ['^ytmusicaccount$']}) as y
         load_all_plugins()
         with yt_dlp.YoutubeDL(params) as ydl:
             self.assertEqual([ie.IE_NAME for ie in ydl._ies.values()], ["ytmusicaccount"])
+
+
+class WarmServerContract(unittest.TestCase):
+    def server(self, *, disabled=False):
+        identity = ram_file(b'{"authuser":"2","delegated_session_id":"brand","data_sync_id":"brand||user"}')
+        cookies = ram_file(b'# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tINVENTED_COOKIE\n', sealed=False)
+        config = ram_file((f"--no-plugin-dirs\n--plugin-dirs '{plugin_root}'\n"
+                           "--use-extractors '^ytmusicaccount$'\n"
+                           f"--extractor-args ytmusicaccount:context=/proc/{os.getpid()}/fd/{identity}\n").encode())
+        for fd in [identity, cookies, config]:
+            self.addCleanup(os.close, fd)
+        # Patch the remote boundary only. The real plugin still selects authority,
+        # verifies each response, and must be discovered by the server's CLI setup.
+        code = r"""
+import sys
+import yt_dlp
+from yt_dlp.extractor.youtube import YoutubeIE
+from yt_dlp.utils import DownloadError
+
+def no_network(*args, **kwargs):
+    raise AssertionError('offline contract attempted a network request')
+
+yt_dlp.YoutubeDL.urlopen = no_network
+YoutubeIE._real_initialize = lambda self: None
+
+def extract(self, url):
+    self.calls = getattr(self, 'calls', 0) + 1
+    assert self.IE_NAME == 'ytmusicaccount'
+    assert self._account['authuser'] == 2
+    assert self._account['data_sync_id'] == 'brand||user'
+    assert any(cookie.value == 'INVENTED_COOKIE' for cookie in self.cookiejar)
+    assert not self._server_identity_confirmed, 'identity confirmation leaked across requests'
+    if url.endswith('badbadbad00'):
+        self._verify_server_identity({'DATASYNC_ID': 'other||account'})
+    if not url.endswith('unconfirmed'):
+        self._verify_server_identity({'DATASYNC_ID': 'brand||user'})
+    return {'id': 'abcdefghijk', 'title': 'Synthetic', 'formats': [
+        {'format_id':'audio', 'url':f'https://rr1.googlevideo.com/audio?call={self.calls}',
+         'ext':'webm', 'vcodec':'none', 'acodec':'opus'},
+        {'format_id':'video', 'url':'https://rr1.googlevideo.com/video',
+         'ext':'webm', 'vcodec':'vp9', 'acodec':'none', 'height':720}]}
+
+YoutubeIE._real_extract = extract
+exec(sys.argv.pop(1))
+"""
+        server = subprocess.Popen([sys.executable, '-I', '-B', '-u', '-c', code,
+                                   server_script, 'unused-script', '--ignore-config', '--get-url',
+                                   '--no-cache-dir', '--quiet', '--no-warnings', '--no-playlist',
+                                   '--cookies', f'/proc/{os.getpid()}/fd/{cookies}',
+                                   '--config-locations', f'/proc/{os.getpid()}/fd/{config}'],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, env={**os.environ, **({'YTDLP_NO_PLUGINS': '1'} if disabled else {})})
+        def cleanup():
+            if server.poll() is None:
+                server.kill()
+            server.wait()
+            for pipe in [server.stdin, server.stdout, server.stderr]:
+                pipe.close()
+        self.addCleanup(cleanup)
+        return server
+
+    def test_warm_server_uses_account_plugin_and_reuses_it_for_audio_and_video(self):
+        server = self.server()
+        requests = [
+            {'url': 'https://music.youtube.com/watch?v=abcdefghijk', 'format': 'bestaudio'},
+            {'url': 'https://music.youtube.com/watch?v=badbadbad00', 'format': 'bestaudio'},
+            {'url': 'https://music.youtube.com/watch?v=unconfirmed', 'format': 'bestaudio'},
+            {'url': 'https://music.youtube.com/watch?v=abcdefghijk', 'format': 'bestvideo+bestaudio'},
+        ]
+        stdout, stderr = server.communicate(''.join(json.dumps(request) + '\n' for request in requests), timeout=15)
+        self.assertEqual(server.returncode, 0, stderr)
+        self.assertEqual([json.loads(line) for line in stdout.splitlines()], [
+            {'ready': True}, {'urls': ['https://rr1.googlevideo.com/audio?call=1']},
+            {'urls': None}, {'urls': None},
+            {'urls': ['https://rr1.googlevideo.com/video', 'https://rr1.googlevideo.com/audio?call=4']},
+        ])
+        self.assertNotIn('INVENTED_COOKIE', stdout)
+        self.assertNotIn('other||account', stdout)
+
+    def test_warm_server_refuses_startup_without_the_account_plugin(self):
+        server = self.server(disabled=True)
+        stdout, _ = server.communicate('', timeout=15)
+        self.assertNotEqual(server.returncode, 0)
+        self.assertEqual(stdout, '')
 
 
 unittest.main()

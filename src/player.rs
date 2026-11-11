@@ -15,7 +15,7 @@ use std::{
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     ptr::NonNull,
     rc::Rc,
     sync::{
@@ -324,7 +324,11 @@ impl CommandSender {
     }
 }
 
-fn wait_for_player_input(socket: &UnixStream, wake: &OwnedFd) -> Result<bool> {
+fn wait_for_player_input(
+    socket: &UnixStream,
+    wake: &OwnedFd,
+    resolver_fd: Option<c_int>,
+) -> Result<bool> {
     let mut descriptors = [
         libc::pollfd {
             fd: socket.as_raw_fd(),
@@ -333,6 +337,11 @@ fn wait_for_player_input(socket: &UnixStream, wake: &OwnedFd) -> Result<bool> {
         },
         libc::pollfd {
             fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: resolver_fd.unwrap_or(-1),
             events: libc::POLLIN,
             revents: 0,
         },
@@ -380,13 +389,17 @@ pub struct Player {
 
 impl Player {
     pub fn new(options: PlayerOptions) -> Result<Self> {
+        Self::with_extractor(options, find_ytdlp()?)
+    }
+
+    fn with_extractor(options: PlayerOptions, ytdlp: PathBuf) -> Result<Self> {
         let (commands, receiver) = command_channel()?;
         let wake = commands.wake.clone();
         let (events, event_receiver) = async_channel::unbounded();
         let worker = thread::Builder::new()
             .name("music-player".into())
             .spawn(move || {
-                if let Err(error) = run(options, receiver, &wake, &events) {
+                if let Err(error) = run(options, receiver, &wake, &events, &ytdlp) {
                     let _ = events.send_blocking(PlayerEvent::Error {
                         track_id: None,
                         message: format!("{error:#}"),
@@ -506,7 +519,7 @@ impl Player {
         })?;
         Ok(response)
     }
-    /// A successful response confirms extractor termination, option reset, and credential revocation.
+    /// A successful response confirms extractor termination and credential revocation.
     /// A closed response channel means the player exited without confirming cleanup.
     pub fn clear_credentials(&self) -> Result<async_channel::Receiver<Result<(), String>>> {
         self.next.lock().unwrap().take();
@@ -793,7 +806,7 @@ unsafe extern "C" {
 struct MpvCore(NonNull<c_void>);
 
 impl MpvCore {
-    fn new(options: &PlayerOptions, ytdlp: &Path, socket: &Path) -> Result<Self> {
+    fn new(options: &PlayerOptions, socket: &Path) -> Result<Self> {
         let core = Self(NonNull::new(unsafe { mpv_create() }).context("Could not create mpv")?);
         for (name, value) in [
             (c"terminal", "no"),
@@ -814,20 +827,12 @@ impl MpvCore {
             (c"demuxer-max-bytes", "32MiB"),
             (c"demuxer-max-back-bytes", "8MiB"),
             (c"audio-client-name", "YouTube Music"),
-            (c"ytdl-raw-options", "ignore-config=,no-plugin-dirs="),
+            (c"ytdl", "no"),
         ] {
             core.set_option(name, value)?;
         }
         core.set_option(c"volume", &options.volume.clamp(0., 100.).to_string())?;
         core.set_option(c"speed", &f64::from(options.speed).to_string())?;
-        core.set_option(
-            c"script-opts",
-            &format!(
-                "ytdl_hook-ytdl_path=%{}%{}",
-                ytdlp.as_os_str().len(),
-                ytdlp.display()
-            ),
-        )?;
         core.set_option(
             c"input-ipc-server",
             socket
@@ -897,13 +902,9 @@ fn write_pause(socket: &mut UnixStream, paused: bool, revision: u64) -> Result<(
 }
 
 fn load_command(url: &str, title: &str, options: PlayOptions) -> Value {
-    let selector = options
-        .video
-        .map(|video| video.selector(options.quality))
-        .unwrap_or_else(|| options.quality.selector().to_owned());
     json!(["loadfile", url, "replace", -1, {
         "force-media-title": title,
-        "ytdl-format": selector,
+        "ytdl": "no",
         "start": options.start.to_string(),
         "pause": if options.paused { "yes" } else { "no" },
     }])
@@ -976,7 +977,7 @@ const ACCOUNT_EXTRACTOR: &str = include_str!("ytdlp_account.py");
 
 struct ExtractorCredentials {
     cookies: File,
-    identity: File,
+    _identity: File,
     config: File,
 }
 
@@ -998,7 +999,7 @@ fn prepare_credentials(
         .to_str()
         .context("Invalid private playback directory")?;
     let quoted_directory = format!("'{}'", plugin_dir.replace('\'', "'\"'\"'"));
-    // Keep ordered plugin switches in a RAM config; mpv's option map has no CLI ordering contract.
+    // Keep the account-only extractor and its sealed identity together in RAM.
     let config = format!(
         "--no-plugin-dirs\n--plugin-dirs {quoted_directory}\n--use-extractors '^ytmusicaccount$'\n--extractor-args ytmusicaccount:context=/proc/{}/fd/{}\n",
         std::process::id(),
@@ -1006,7 +1007,7 @@ fn prepare_credentials(
     );
     Ok(ExtractorCredentials {
         cookies,
-        identity,
+        _identity: identity,
         config: sealed_file(config.as_bytes())?,
     })
 }
@@ -1046,37 +1047,13 @@ fn replace_playback_credentials(
             state.message(value, events);
         },
     )?;
-    // The stop reply and idle-active can precede the extractor's exit. end-file
-    // follows the synchronous ytdl hook, including subprocess termination/reaping.
+    // Drain the old file's events before accepting loads under the new identity.
     let deadline = Instant::now() + Duration::from_secs(5);
     while !marker_seen || state.file_active {
         let value = read_message(socket, pending, deadline)?;
         marker_seen |= value["event"] == "client-message" && value["args"] == marker;
         state.message(value, events);
     }
-    let mut options = json!({"ignore-config":""});
-    if let Some(credentials) = &next {
-        options["cookies"] = json!(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            credentials.cookies.as_raw_fd()
-        ));
-        options["config-locations"] = json!(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            credentials.config.as_raw_fd()
-        ));
-        // The identity descriptor must remain open alongside the RAM config that names it.
-        let _ = &credentials.identity;
-    } else {
-        options["no-plugin-dirs"] = json!("");
-    }
-    request(
-        socket,
-        pending,
-        json!(["set_property", "options/ytdl-raw-options", options]),
-        |value| state.message(value, events),
-    )?;
     *current = next;
     Ok(())
 }
@@ -1179,11 +1156,329 @@ impl ResolvedStream {
     }
 }
 
+impl StreamKey {
+    fn selector(&self) -> String {
+        self.video
+            .map(|video| video.selector(self.quality))
+            .unwrap_or_else(|| self.quality.selector().to_owned())
+    }
+}
+
+fn extractor_arguments(
+    command: &mut Command,
+    credentials: Option<&ExtractorCredentials>,
+) -> Result<Option<File>> {
+    command.args([
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        "--get-url",
+        // Extraction must not persist account data or signed URLs in a disk cache.
+        "--no-cache-dir",
+    ]);
+    let cookies = credentials
+        .map(|credentials| writable_playback_cookies(credentials.cookies.try_clone()?))
+        .transpose()?;
+    if let Some(credentials) = credentials {
+        command
+            .arg("--cookies")
+            .arg(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                cookies.as_ref().unwrap().as_raw_fd()
+            ))
+            .arg("--config-locations")
+            .arg(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                credentials.config.as_raw_fd()
+            ));
+    } else {
+        command.arg("--no-plugin-dirs");
+    }
+    Ok(cookies)
+}
+
+fn python_interpreter(ytdlp: &Path) -> Result<Command> {
+    let mut header = [0; 1024];
+    let count = File::open(ytdlp)?.read(&mut header)?;
+    let line = header[..count].split(|byte| *byte == b'\n').next().unwrap();
+    let line = std::str::from_utf8(line)?
+        .strip_prefix("#!")
+        .context("Not a Python script")?;
+    let words: Vec<_> = line.split_whitespace().collect();
+    let executable = *words.first().context("Missing interpreter")?;
+    let mut interpreter = 0;
+    if Path::new(executable)
+        .file_name()
+        .is_some_and(|name| name == "env")
+    {
+        interpreter = if words.get(1) == Some(&"-S") { 2 } else { 1 };
+    }
+    let name = Path::new(
+        words
+            .get(interpreter)
+            .context("Missing Python interpreter")?,
+    )
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("");
+    ensure!(
+        name.strip_prefix("python").is_some_and(|version| {
+            version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        }),
+        "Not a Python interpreter"
+    );
+    let mut command = Command::new(executable);
+    command.args(&words[1..]);
+    Ok(command)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResolverResponse {
+    Ready { ready: bool },
+    Stream { urls: Option<Vec<String>> },
+}
+
+struct WarmResolver {
+    child: Child,
+    input: ChildStdin,
+    output: ChildStdout,
+    bytes: Vec<u8>,
+    ready: bool,
+    started: Instant,
+    _cookies: Option<File>,
+}
+
+impl WarmResolver {
+    fn start(ytdlp: &Path, credentials: Option<&ExtractorCredentials>) -> Result<Self> {
+        let mut command = python_interpreter(ytdlp)?;
+        command
+            .args(["-I", "-B", "-u", "-c", include_str!("ytdlp_resolver.py")])
+            .arg(ytdlp);
+        let cookies = extractor_arguments(&mut command, credentials)?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let resolver = Self {
+            input: child.stdin.take().unwrap(),
+            output: child.stdout.take().unwrap(),
+            child,
+            bytes: Vec::new(),
+            ready: false,
+            started: Instant::now(),
+            _cookies: cookies,
+        };
+        let fd = resolver.output.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        ensure!(
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+            "Could not read resolver output asynchronously"
+        );
+        Ok(resolver)
+    }
+
+    fn send(&mut self, key: &StreamKey) -> Result<()> {
+        serde_json::to_writer(
+            &mut self.input,
+            &json!({"url": key.url, "format": key.selector()}),
+        )?;
+        self.input.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn read(&mut self) -> Result<Option<Option<Vec<String>>>> {
+        loop {
+            if let Some(end) = self.bytes.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<_> = self.bytes.drain(..=end).collect();
+                match serde_json::from_slice(&line)? {
+                    ResolverResponse::Ready { ready: true } if !self.ready => self.ready = true,
+                    ResolverResponse::Stream { urls } if self.ready => return Ok(Some(urls)),
+                    _ => bail!("Invalid resolver response"),
+                }
+            } else {
+                let mut bytes = [0; 8192];
+                match self.output.read(&mut bytes) {
+                    Ok(0) => bail!("Resolver closed its output"),
+                    Ok(count) => self.bytes.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                ensure!(self.bytes.len() <= 32 * 1024, "Oversized resolver response");
+            }
+        }
+    }
+}
+
+impl Drop for WarmResolver {
+    fn drop(&mut self) {
+        // The group can still contain a JS runtime after Python has exited.
+        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        let _ = self.child.wait();
+    }
+}
+
+struct StreamResolver {
+    ytdlp: PathBuf,
+    warm: Option<WarmResolver>,
+    warm_enabled: bool,
+    one_shot: Option<StreamPreparation>,
+    target: Option<PreparedTarget>,
+    started: Instant,
+}
+
+impl StreamResolver {
+    fn new(ytdlp: &Path, credentials: Option<&ExtractorCredentials>) -> Self {
+        let warm = WarmResolver::start(ytdlp, credentials).ok();
+        Self {
+            ytdlp: ytdlp.to_owned(),
+            warm_enabled: warm.is_some(),
+            warm,
+            one_shot: None,
+            target: None,
+            started: Instant::now(),
+        }
+    }
+
+    fn fd(&self) -> Option<c_int> {
+        self.warm.as_ref().map(|warm| warm.output.as_raw_fd())
+    }
+
+    fn stop(&mut self) {
+        self.warm.take();
+        self.one_shot.take();
+        self.target = None;
+    }
+
+    fn cancel(&mut self) {
+        if self.target.is_some() {
+            self.stop();
+        }
+    }
+
+    fn start(
+        &mut self,
+        target: PreparedTarget,
+        credentials: Option<&ExtractorCredentials>,
+    ) -> Result<()> {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|current| current.key == target.key)
+        {
+            self.target = Some(target);
+            return Ok(());
+        }
+        self.cancel();
+        if self.warm.is_none() && self.warm_enabled {
+            self.warm = WarmResolver::start(&self.ytdlp, credentials).ok();
+            self.warm_enabled = self.warm.is_some();
+        }
+        self.started = Instant::now();
+        self.target = Some(target);
+        if let Some(warm) = &mut self.warm {
+            if warm.send(&self.target.as_ref().unwrap().key).is_ok() {
+                return Ok(());
+            }
+            self.warm.take();
+            self.warm_enabled = false;
+        }
+        match StreamPreparation::start(
+            self.target.as_ref().unwrap().clone(),
+            &self.ytdlp,
+            credentials,
+        ) {
+            Ok(job) => self.one_shot = Some(job),
+            Err(error) => {
+                self.target = None;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        credentials: Option<&ExtractorCredentials>,
+    ) -> Option<(PreparedTarget, Result<ResolvedStream>)> {
+        let mut result = None;
+        if let Some(warm) = &mut self.warm {
+            let response = if !warm.ready && warm.started.elapsed() > Duration::from_secs(30) {
+                Err(anyhow::anyhow!("Resolver did not start"))
+            } else {
+                warm.read()
+            };
+            match response {
+                Ok(Some(urls)) => {
+                    if let Some(target) = &self.target {
+                        result = Some(urls.context("Could not resolve the stream").and_then(
+                            |urls| {
+                                ResolvedStream::parse(
+                                    target.key.clone(),
+                                    urls.join("\n").as_bytes(),
+                                    SystemTime::now(),
+                                )
+                            },
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // Unsupported installs and failed servers retain the CLI path,
+                    // with the very same account/plugin/cookie arguments.
+                    self.warm.take();
+                    self.warm_enabled = false;
+                    if let Some(target) = &self.target {
+                        match StreamPreparation::start(target.clone(), &self.ytdlp, credentials) {
+                            Ok(job) => {
+                                self.started = Instant::now();
+                                self.one_shot = Some(job);
+                            }
+                            Err(error) => result = Some(Err(error)),
+                        }
+                    }
+                }
+                Ok(None) => {}
+            }
+        }
+        if result.is_none()
+            && let Some(job) = &mut self.one_shot
+        {
+            match job.finish() {
+                Ok(Some(stream)) => result = Some(Ok(stream)),
+                Err(error) => result = Some(Err(error)),
+                Ok(None) => {}
+            }
+        }
+        if result.is_none()
+            && self.target.is_some()
+            && self.started.elapsed() > Duration::from_secs(30)
+        {
+            self.warm.take();
+            result = Some(Err(anyhow::anyhow!("Stream resolution timed out")));
+        }
+        let result = result?;
+        self.one_shot.take();
+        Some((self.target.take().unwrap(), result))
+    }
+}
+
+struct PendingPlay {
+    title: String,
+    options: PlayOptions,
+}
+
 struct StreamPreparation {
     target: PreparedTarget,
     child: Child,
     output: File,
-    started: Instant,
     _cookies: Option<File>,
 }
 
@@ -1195,56 +1490,19 @@ impl StreamPreparation {
     ) -> Result<Self> {
         // Keep signed URLs and any extractor output in anonymous RAM, never disk.
         let output = writable_playback_cookies(sealed_file(b"")?)?;
-        let key = &target.key;
-        let selector = key
-            .video
-            .map(|video| video.selector(key.quality))
-            .unwrap_or_else(|| key.quality.selector().to_owned());
         let mut command = Command::new(ytdlp);
+        let cookies = extractor_arguments(&mut command, credentials)?;
         command
-            .args([
-                "--ignore-config",
-                "--no-playlist",
-                "--no-warnings",
-                "--quiet",
-                "--get-url",
-                "--format",
-                &selector,
-            ])
+            .arg("--format")
+            .arg(target.key.selector())
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(Stdio::null());
-        let cookies = credentials
-            .map(|credentials| {
-                credentials
-                    .cookies
-                    .try_clone()
-                    .and_then(|file| writable_playback_cookies(file).map_err(io::Error::other))
-            })
-            .transpose()?;
-        if let Some(credentials) = credentials {
-            command
-                .arg("--cookies")
-                .arg(format!(
-                    "/proc/{}/fd/{}",
-                    std::process::id(),
-                    cookies.as_ref().unwrap().as_raw_fd()
-                ))
-                .arg("--config-locations")
-                .arg(format!(
-                    "/proc/{}/fd/{}",
-                    std::process::id(),
-                    credentials.config.as_raw_fd()
-                ));
-        } else {
-            command.arg("--no-plugin-dirs");
-        }
-        let child = command.process_group(0).arg(&key.url).spawn()?;
+        let child = command.process_group(0).arg(&target.key.url).spawn()?;
         Ok(Self {
             target,
             child,
             output,
-            started: Instant::now(),
             _cookies: cookies,
         })
     }
@@ -1266,10 +1524,8 @@ impl StreamPreparation {
 
 impl Drop for StreamPreparation {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            // yt-dlp can start a JS runtime. Cancel its process group as well.
-            unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
-        }
+        // yt-dlp can start a JS runtime. Cancel its process group as well.
+        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
         let _ = self.child.wait();
     }
 }
@@ -1282,30 +1538,43 @@ fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
         .context("Could not create the private playback directory")
 }
 
-fn run(
-    options: PlayerOptions,
-    commands: Receiver<PlayerCommand>,
-    wake: &OwnedFd,
-    events: &async_channel::Sender<PlayerEvent>,
-) -> Result<()> {
-    let runtime = playback_runtime(&private_runtime()?)?;
-    let socket_path = runtime.path().join("mpv.sock");
-    let plugin_dir = write_account_extractor(runtime.path())?;
-    let ytdlp = std::env::var_os("PATH")
+fn find_ytdlp() -> Result<PathBuf> {
+    std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .map(|path| path.join("yt-dlp"))
         .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/yt-dlp")))
         .find(|path| path.is_file())
-        .context("Could not find yt-dlp. Install it, then restart the app.")?;
-    let account_supported = account_playback_supported(&ytdlp);
+        .context("Could not find yt-dlp. Install it, then restart the app.")
+}
+
+fn run(
+    mut options: PlayerOptions,
+    commands: Receiver<PlayerCommand>,
+    wake: &OwnedFd,
+    events: &async_channel::Sender<PlayerEvent>,
+    ytdlp: &Path,
+) -> Result<()> {
+    let runtime = playback_runtime(&private_runtime()?)?;
+    let socket_path = runtime.path().join("mpv.sock");
+    let plugin_dir = write_account_extractor(runtime.path())?;
+    let account_supported = account_playback_supported(ytdlp);
     let mut account_warned = false;
     let mut account_notice = None;
-    let mut credentials = None;
+    let mut credentials = account_credentials(
+        options.credentials.take(),
+        account_supported,
+        account_warned,
+        &mut account_notice,
+    )
+    .map(|source| prepare_credentials(source, &plugin_dir))
+    .transpose()?;
     // Destroy the core before dropping the RAM credentials or private runtime.
-    let core = MpvCore::new(&options, &ytdlp, &socket_path)?;
-    // Cancel/reap ahead-of-time extraction before credentials or the core can drop.
-    let mut preparation: Option<StreamPreparation> = None;
+    let core = MpvCore::new(&options, &socket_path)?;
+    // Cancel/reap the resolver before credentials or the core can drop.
+    let mut resolver = StreamResolver::new(ytdlp, credentials.as_ref());
+    let mut pending_play: Option<PendingPlay> = None;
+    let mut next_target: Option<PreparedTarget> = None;
     let mut prepared: Option<(PreparedTarget, ResolvedStream)> = None;
     // Every actor exit frees the renderer before destroying the core.
     let mut video: Option<AttachedVideo> = None;
@@ -1324,20 +1593,6 @@ fn run(
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut state = PlaybackState::default();
     let mut pending = Vec::new();
-    replace_playback_credentials(
-        &mut socket,
-        &mut pending,
-        &mut credentials,
-        account_credentials(
-            options.credentials,
-            account_supported,
-            account_warned,
-            &mut account_notice,
-        ),
-        &plugin_dir,
-        &mut state,
-        events,
-    )?;
     for (id, name) in [
         "time-pos",
         "duration",
@@ -1363,22 +1618,24 @@ fn run(
             match commands.try_recv() {
                 Ok(PlayerCommand::Prepare(target)) => {
                     if target.as_ref().is_some_and(|target| {
-                        preparation
-                            .as_ref()
-                            .is_some_and(|job| job.target.track_id == target.track_id)
-                            || prepared.as_ref().is_some_and(|(current, stream)| {
-                                current.track_id == target.track_id && stream.matches(&target.key)
-                            })
+                        prepared.as_ref().is_some_and(|(current, stream)| {
+                            current.track_id == target.track_id && stream.matches(&target.key)
+                        })
                     }) {
                         continue;
                     }
-                    preparation.take();
+                    next_target = target;
                     prepared = None;
                     state.discard_upcoming();
                     write_command(&mut socket, json!(["playlist-clear"]), None)?;
-                    if let Some(target) = target {
-                        preparation =
-                            StreamPreparation::start(target, &ytdlp, credentials.as_ref()).ok();
+                    // A queue render can prepare the following song while Play is
+                    // resolving. Interactive playback keeps the single request slot.
+                    if pending_play.is_none() {
+                        if let Some(target) = next_target.take() {
+                            let _ = resolver.start(target, credentials.as_ref());
+                        } else {
+                            resolver.cancel();
+                        }
                     }
                 }
                 Ok(PlayerCommand::Play {
@@ -1392,12 +1649,13 @@ fn run(
                         quality: options.quality,
                         video: options.video,
                     };
-                    let prefetched = prepared.take().is_some_and(|(target, stream)| {
-                        target.track_id == track_id
-                            && stream.matches(&key)
-                            && state.entries.values().any(|entry| *entry == track_id)
+                    let resolved = prepared.take().filter(|(target, stream)| {
+                        target.track_id == track_id && stream.matches(&key)
                     });
-                    preparation.take();
+                    let prefetched = resolved.is_some()
+                        && state.entries.values().any(|entry| *entry == track_id);
+                    next_target = None;
+                    pending_play = None;
                     let already_restarted = state.restarted && state.current == Some(track_id);
                     state.invalidate_seeks();
                     state.restarted = already_restarted;
@@ -1408,6 +1666,7 @@ fn run(
                     state.pause_after_load = true;
                     state.upcoming = None;
                     if prefetched {
+                        resolver.cancel();
                         if state.current != Some(track_id) {
                             state.loaded = false;
                             state.pause_after_load = true;
@@ -1425,12 +1684,36 @@ fn run(
                         write_pause(&mut socket, options.paused, state.pause_revision)?;
                     } else {
                         state.loaded = false;
-                        state.pause_after_load = true;
-                        write_command(
-                            &mut socket,
-                            load_command(&url, &title, options),
-                            Some(json!(track_id)),
-                        )?;
+                        #[cfg(test)]
+                        if Path::new(&url).is_absolute() {
+                            resolver.cancel();
+                            write_command(
+                                &mut socket,
+                                load_command(&url, &title, options),
+                                Some(json!(track_id)),
+                            )?;
+                            continue;
+                        }
+                        write_command(&mut socket, json!(["stop"]), None)?;
+                        // The append acknowledgement can still be queued when the
+                        // user clicks Next. Reuse its resolved URL in that case.
+                        if let Some((_, stream)) = resolved {
+                            resolver.cancel();
+                            write_command(
+                                &mut socket,
+                                load_command(&stream.url, &title, options),
+                                Some(json!(track_id)),
+                            )?;
+                            continue;
+                        }
+                        pending_play = Some(PendingPlay { title, options });
+                        if resolver
+                            .start(PreparedTarget { key, track_id }, credentials.as_ref())
+                            .is_err()
+                        {
+                            pending_play = None;
+                            stream_error(track_id, events);
+                        }
                     }
                 }
                 Ok(PlayerCommand::Pause(paused)) => {
@@ -1443,7 +1726,10 @@ fn run(
                 Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Credentials { next, reply }) => {
-                    preparation.take();
+                    // Reap even an idle resolver before revoking its cookie copy.
+                    resolver.stop();
+                    pending_play = None;
+                    next_target = None;
                     prepared = None;
                     state.upcoming = None;
                     let next = account_credentials(
@@ -1464,6 +1750,9 @@ fn run(
                         &mut state,
                         events,
                     );
+                    if result.is_ok() {
+                        resolver = StreamResolver::new(ytdlp, credentials.as_ref());
+                    }
                     let _ = reply.send_blocking(
                         result
                             .as_ref()
@@ -1521,7 +1810,9 @@ fn run(
                     let _ = reply.send_blocking(());
                 }
                 Ok(PlayerCommand::Stop) => {
-                    preparation.take();
+                    resolver.cancel();
+                    pending_play = None;
+                    next_target = None;
                     prepared = None;
                     state.upcoming = None;
                     state.invalidate_seeks();
@@ -1530,48 +1821,57 @@ fn run(
                     write_command(&mut socket, json!(["stop"]), None)?;
                 }
                 Ok(PlayerCommand::Quit) | Err(mpsc::TryRecvError::Disconnected) => {
-                    preparation.take();
+                    resolver.stop();
                     let _ = write_command(&mut socket, json!(["quit"]), None);
                     return Ok(());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        if let Some(job) = &mut preparation {
-            match job.finish() {
-                Ok(Some(stream)) => {
-                    let target = job.target.clone();
-                    let mut command = load_command(
-                        &stream.url,
-                        "",
-                        PlayOptions {
-                            quality: target.key.quality,
-                            video: target.key.video,
-                            ..Default::default()
-                        },
-                    );
-                    command[2] = json!("append");
-                    command[4]["ytdl"] = json!("no");
-                    state.upcoming = Some(target.track_id);
-                    write_command(
-                        &mut socket,
-                        command,
-                        Some(json!(format!("prepare:{}", target.track_id))),
-                    )?;
-                    #[cfg(test)]
-                    let _ = events.send_blocking(PlayerEvent::Prepared {
-                        video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
-                    });
-                    prepared = Some((target, stream));
-                    preparation.take();
+        if let Some((target, result)) = resolver.finish(credentials.as_ref()) {
+            if let Some(play) = pending_play.take() {
+                match result {
+                    Ok(stream) => {
+                        let options = PlayOptions {
+                            paused: state.paused,
+                            ..play.options
+                        };
+                        write_command(
+                            &mut socket,
+                            load_command(&stream.url, &play.title, options),
+                            Some(json!(target.track_id)),
+                        )?;
+                        if let Some(target) = next_target.take() {
+                            let _ = resolver.start(target, credentials.as_ref());
+                        }
+                    }
+                    Err(_) => {
+                        next_target = None;
+                        stream_error(target.track_id, events);
+                    }
                 }
-                Err(_) => {
-                    preparation.take();
-                }
-                Ok(None) if job.started.elapsed() > Duration::from_secs(30) => {
-                    preparation.take();
-                }
-                Ok(None) => {}
+            } else if let Ok(stream) = result {
+                let mut command = load_command(
+                    &stream.url,
+                    "",
+                    PlayOptions {
+                        quality: target.key.quality,
+                        video: target.key.video,
+                        ..Default::default()
+                    },
+                );
+                command[2] = json!("append");
+                state.upcoming = Some(target.track_id);
+                write_command(
+                    &mut socket,
+                    command,
+                    Some(json!(format!("prepare:{}", target.track_id))),
+                )?;
+                #[cfg(test)]
+                let _ = events.send_blocking(PlayerEvent::Prepared {
+                    video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
+                });
+                prepared = Some((target, stream));
             }
         }
         if prepared.as_ref().is_some_and(|(target, stream)| {
@@ -1580,7 +1880,7 @@ fn run(
             let (target, _) = prepared.take().unwrap();
             state.discard_upcoming();
             write_command(&mut socket, json!(["playlist-clear"]), None)?;
-            preparation = StreamPreparation::start(target, &ytdlp, credentials.as_ref()).ok();
+            let _ = resolver.start(target, credentials.as_ref());
         }
         if let Some(attached) = &mut video {
             match attached.video.ready() {
@@ -1605,7 +1905,7 @@ fn run(
             }
         }
         state.write_seek(&mut socket)?;
-        if pending.contains(&b'\n') || wait_for_player_input(&socket, wake)? {
+        if pending.contains(&b'\n') || wait_for_player_input(&socket, wake, resolver.fd())? {
             state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
         }
         if state.loaded
@@ -1620,6 +1920,14 @@ fn run(
         let _ = &credentials;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
     }
+}
+
+fn stream_error(track_id: u64, events: &async_channel::Sender<PlayerEvent>) {
+    let _ = events.send_blocking(PlayerEvent::Error {
+        track_id: Some(track_id),
+        message: "YouTube could not provide this stream. Try another track or update yt-dlp."
+            .into(),
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -2194,6 +2502,251 @@ mod tests {
         );
     }
 
+    fn resolver_target(id: &str, track_id: u64) -> PreparedTarget {
+        PreparedTarget {
+            key: StreamKey {
+                url: format!("https://music.youtube.com/watch?v={id}"),
+                quality: AudioQuality::Normal,
+                video: None,
+            },
+            track_id,
+        }
+    }
+
+    fn synthetic_resolver_plugin(directory: &Path) -> PathBuf {
+        let plugin = write_account_extractor(directory).unwrap();
+        let path = plugin.join("account/yt_dlp_plugins/extractor/account.py");
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        // The actual account plugin is discovered normally. Replace only remote
+        // extraction for these process-lifetime tests; Python tests cover identity checks.
+        writeln!(file, r#"
+import signal, subprocess, sys
+from pathlib import Path
+
+def initialize(self):
+    self._account
+
+def extract(self, url):
+    self.calls = getattr(self, 'calls', 0) + 1
+    if url.endswith('blocked0000'):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        Path({ready:?}).write_text(json.dumps({{'pid': os.getpid(), 'child': child.pid}}))
+        os.kill(os.getpid(), signal.SIGSTOP)
+    return {{'id': 'abcdefghijk', 'title': 'Synthetic', 'formats': [{{
+        'format_id': 'audio', 'ext': 'webm', 'vcodec': 'none', 'acodec': 'opus',
+        'url': 'https://rr1.googlevideo.com/audio?call=' + str(self.calls) + '&identity=' + self._account['data_sync_id']}}]}}
+
+YtMusicAccountIE._real_initialize = initialize
+YtMusicAccountIE._real_extract = extract
+"#, ready=directory.join("ready").to_str().unwrap()).unwrap();
+        plugin
+    }
+
+    fn resolved(
+        resolver: &mut StreamResolver,
+        credentials: Option<&ExtractorCredentials>,
+    ) -> ResolvedStream {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some((_, result)) = resolver.finish(credentials) {
+                return result.unwrap();
+            }
+            assert!(Instant::now() < deadline, "resolver did not answer");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic account and process group, no network"]
+    fn warm_resolver_reuses_requests_and_supersession_kills_the_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = synthetic_resolver_plugin(directory.path());
+        let credentials =
+            prepare_credentials(synthetic_credentials("INVENTED_FIRST"), &plugin).unwrap();
+        let ytdlp = find_ytdlp().unwrap();
+        let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials));
+        let old = resolver.warm.as_ref().unwrap();
+        let pid = old.child.id();
+        let cookie = format!(
+            "/proc/self/fd/{}",
+            old._cookies.as_ref().unwrap().as_raw_fd()
+        );
+        let cookie_identity = file_identity(&cookie);
+        let blocked = resolver_target("blocked0000", 1);
+        resolver.start(blocked.clone(), Some(&credentials)).unwrap();
+        let ready = directory.path().join("ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "synthetic extractor did not start"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let child = serde_json::from_slice::<Value>(&fs::read(ready).unwrap()).unwrap()["child"]
+            .as_u64()
+            .unwrap();
+        resolver
+            .start(
+                PreparedTarget {
+                    track_id: 2,
+                    ..blocked
+                },
+                Some(&credentials),
+            )
+            .unwrap();
+        assert_eq!(
+            resolver.warm.as_ref().unwrap().child.id(),
+            pid,
+            "Play of the preparing track must keep its request"
+        );
+        resolver
+            .start(resolver_target("abcdefghijk", 3), Some(&credentials))
+            .unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "superseded resolver must be reaped synchronously"
+        );
+        assert_ne!(file_identity(&cookie), cookie_identity);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stat = fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
+            if stat.is_empty() || stat.split_once(") ").unwrap().1.starts_with('Z') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "JS runtime survived process-group cancellation"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let new_pid = resolver.warm.as_ref().unwrap().child.id();
+        assert_ne!(pid, new_pid);
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("call=1")
+        );
+        resolver
+            .start(resolver_target("dQw4w9WgXcQ", 4), Some(&credentials))
+            .unwrap();
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("call=2")
+        );
+        assert_eq!(resolver.warm.as_ref().unwrap().child.id(), new_pid);
+        drop(resolver);
+        assert!(!Path::new(&format!("/proc/{new_pid}")).exists());
+    }
+
+    #[test]
+    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic accounts, no network"]
+    fn warm_credential_change_respawns_with_new_identity_and_revokes_old_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = synthetic_resolver_plugin(directory.path());
+        let credentials =
+            prepare_credentials(synthetic_credentials("INVENTED_FIRST"), &plugin).unwrap();
+        let ytdlp = find_ytdlp().unwrap();
+        let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials));
+        resolver
+            .start(resolver_target("abcdefghijk", 1), Some(&credentials))
+            .unwrap();
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("identity=brand||user")
+        );
+        let old = resolver.warm.as_ref().unwrap();
+        let pid = old.child.id();
+        let paths = [
+            old._cookies.as_ref().unwrap().as_raw_fd(),
+            credentials._identity.as_raw_fd(),
+            credentials.config.as_raw_fd(),
+        ]
+        .map(|fd| {
+            let path = format!("/proc/self/fd/{fd}");
+            let identity = file_identity(&path);
+            (path, identity)
+        });
+        resolver.stop();
+        drop(credentials);
+        for (path, identity) in paths {
+            assert_ne!(file_identity(&path), identity);
+        }
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        let mut source = synthetic_credentials("INVENTED_SECOND");
+        source.identity = sealed_file(
+            br#"{"authuser":"3","delegated_session_id":"other","data_sync_id":"other||second"}"#,
+        )
+        .unwrap();
+        let credentials = prepare_credentials(source, &plugin).unwrap();
+        resolver = StreamResolver::new(&ytdlp, Some(&credentials));
+        resolver
+            .start(resolver_target("abcdefghijk", 2), Some(&credentials))
+            .unwrap();
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("identity=other||second")
+        );
+    }
+
+    #[test]
+    fn resolver_output_wakes_the_actor_without_mpv_or_commands() {
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (resolver, mut output) = UnixStream::pair().unwrap();
+        let (commands, _received) = command_channel().unwrap();
+        output.write_all(b"{\"ready\":true}\n").unwrap();
+        let start = Instant::now();
+        assert!(
+            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_raw_fd())).unwrap()
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(60),
+            "resolver output waited for the actor's timer"
+        );
+    }
+
+    #[test]
+    fn unsupported_interpreters_and_failed_warm_start_use_one_shot_resolution() {
+        for fails_start in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let ytdlp = directory.path().join("yt-dlp");
+            let interpreter = if fails_start {
+                let path = directory.path().join("python3");
+                fs::write(
+                    &path,
+                    "#!/bin/sh\nif [ \"$1\" = -I ]; then exit 23; fi\nexec /bin/sh \"$@\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                path
+            } else {
+                PathBuf::from("/bin/sh")
+            };
+            fs::write(
+                &ytdlp,
+                format!(
+                    "#!{}\nprintf '%s\\n' 'https://rr1.googlevideo.com/audio?mode=oneshot'\n",
+                    interpreter.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&ytdlp, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut resolver = StreamResolver::new(&ytdlp, None);
+            resolver
+                .start(resolver_target("abcdefghijk", 1), None)
+                .unwrap();
+            assert!(resolved(&mut resolver, None).url.ends_with("mode=oneshot"));
+            assert!(resolver.warm.is_none() && !resolver.warm_enabled);
+            resolver
+                .start(resolver_target("dQw4w9WgXcQ", 2), None)
+                .unwrap();
+            assert!(resolved(&mut resolver, None).url.ends_with("mode=oneshot"));
+        }
+    }
+
     #[test]
     fn cancelling_preparation_reaps_the_extractor_and_revokes_its_cookie_copy() {
         let directory = tempfile::tempdir().unwrap();
@@ -2559,7 +3112,7 @@ mod tests {
         let (mut mpv, socket) = UnixStream::pair().unwrap();
         commands.send(PlayerCommand::Stop).unwrap();
         commands.clone().send(PlayerCommand::Pause(true)).unwrap();
-        assert!(!wait_for_player_input(&socket, &commands.wake).unwrap());
+        assert!(!wait_for_player_input(&socket, &commands.wake, None).unwrap());
         assert!(matches!(received.try_recv(), Ok(PlayerCommand::Stop)));
         assert!(matches!(
             received.try_recv(),
@@ -2578,7 +3131,7 @@ mod tests {
 
         mpv.write_all(b"mpv reply\n").unwrap();
         commands.send(PlayerCommand::Quit).unwrap();
-        assert!(wait_for_player_input(&socket, &commands.wake).unwrap());
+        assert!(wait_for_player_input(&socket, &commands.wake, None).unwrap());
         let mut reply = [0; 10];
         (&socket).read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"mpv reply\n");
@@ -3086,7 +3639,13 @@ mod tests {
         let (events, received) = async_channel::unbounded();
         let (finished, completion) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let result = run(PlayerOptions::default(), receiver, &wake, &events);
+            let result = run(
+                PlayerOptions::default(),
+                receiver,
+                &wake,
+                &events,
+                &find_ytdlp().unwrap(),
+            );
             finished.send(result).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3157,11 +3716,11 @@ mod tests {
         assert_eq!(command[2], "replace");
         assert_eq!(command[4]["start"], "32.5");
         assert_eq!(command[4]["pause"], "yes");
-        assert_eq!(command[4]["ytdl-format"], AudioQuality::Low.selector());
+        assert_eq!(command[4]["ytdl"], "no");
         let defaults = load_command("unused", "Track", PlayOptions::default());
         assert_eq!(defaults[4]["start"], "0");
         assert_eq!(defaults[4]["pause"], "no");
-        assert_eq!(defaults[4]["ytdl-format"], AudioQuality::Normal.selector());
+        assert_eq!(defaults[4]["ytdl"], "no");
         let video = load_command(
             "unused",
             "Track",
@@ -3170,10 +3729,7 @@ mod tests {
                 ..options
             },
         );
-        assert_eq!(
-            video[4]["ytdl-format"],
-            VideoQuality::P720.selector(AudioQuality::Low)
-        );
+        assert_eq!(video[4]["ytdl"], "no");
         assert_eq!(video[4]["start"], "32.5");
         assert_eq!(video[4]["pause"], "yes");
     }
@@ -3516,7 +4072,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
     }
 
     #[test]
-    fn credential_changes_wait_for_stop_and_revoke_old_ram_files() {
+    fn credential_changes_wait_for_old_file_events_and_revoke_ram_files() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_millis(80)))
@@ -3527,79 +4083,59 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         let plugin_dir = Path::new("/private/synthetic-plugin-root");
         let mut current =
             Some(prepare_credentials(synthetic_credentials("INVENTED_FIRST"), plugin_dir).unwrap());
-        let first_path = format!(
-            "/proc/self/fd/{}",
-            current.as_ref().unwrap().cookies.as_raw_fd()
-        );
-        let first_identity = format!(
-            "/proc/self/fd/{}",
-            current.as_ref().unwrap().identity.as_raw_fd()
-        );
-        let first_config = format!(
-            "/proc/self/fd/{}",
-            current.as_ref().unwrap().config.as_raw_fd()
-        );
-        let first_files = [&first_path, &first_identity, &first_config]
-            .map(|path| (path.clone(), file_identity(path)));
-        let old_path = first_path.clone();
+        let files = [
+            current.as_ref().unwrap().cookies.as_raw_fd(),
+            current.as_ref().unwrap()._identity.as_raw_fd(),
+            current.as_ref().unwrap().config.as_raw_fd(),
+        ]
+        .map(|fd| {
+            let path = format!("/proc/self/fd/{fd}");
+            let identity = file_identity(&path);
+            (path, identity)
+        });
+        let old_files = files.clone();
         let worker = thread::spawn(move || {
-            let mut active_path = old_path;
-            for replacing in [true, false] {
-                for stopping in [true, false] {
-                    let message = socket_message(&mut server);
-                    let line = message.to_string();
-                    assert!(!line.contains("INVENTED_"));
-                    assert!(!line.contains("brand||user"));
-                    assert!(std::path::Path::new(&active_path).exists());
-                    if stopping {
-                        assert_eq!(message["command"], json!(["stop"]));
-                        writeln!(server, "{}", json!({"event":"start-file"})).unwrap();
-                    } else {
-                        assert_eq!(message["command"][0], "set_property");
-                        assert_eq!(message["command"][1], "options/ytdl-raw-options");
-                        let options = &message["command"][2];
-                        assert_eq!(options["ignore-config"], "");
-                        if replacing {
-                            let config =
-                                fs::read_to_string(options["config-locations"].as_str().unwrap())
-                                    .unwrap();
-                            assert!(config.starts_with("--no-plugin-dirs\n--plugin-dirs "));
-                            assert!(config.contains("--use-extractors '^ytmusicaccount$'"));
-                            assert!(!config.contains("brand||user"));
-                            let path = options["cookies"].as_str().unwrap();
-                            assert!(
-                                fs::read_to_string(path)
-                                    .unwrap()
-                                    .contains("INVENTED_SECOND")
-                            );
-                            active_path = path.to_owned();
-                        } else {
-                            assert!(options.get("cookies").is_none());
-                        }
-                    }
+            for start_after_marker_reply in [true, false] {
+                let stop = socket_message(&mut server);
+                assert_eq!(stop["command"], json!(["stop"]));
+                writeln!(
+                    server,
+                    "{}",
+                    json!({"request_id":stop["request_id"], "error":"success"})
+                )
+                .unwrap();
+                if start_after_marker_reply {
+                    let marker = credential_barrier_command(&mut server);
                     writeln!(
                         server,
                         "{}",
-                        json!({"request_id":message["request_id"],"error":"success"})
+                        json!({"request_id":marker["request_id"], "error":"success"})
                     )
                     .unwrap();
-                    if stopping {
-                        reply_to_credential_barrier(&mut server);
-                        server
-                            .set_read_timeout(Some(Duration::from_millis(25)))
-                            .unwrap();
-                        let error = server.read(&mut [0]).unwrap_err();
-                        assert!(matches!(
-                            error.kind(),
-                            ErrorKind::WouldBlock | ErrorKind::TimedOut
-                        ));
-                        server
-                            .set_read_timeout(Some(Duration::from_secs(1)))
-                            .unwrap();
-                        assert!(Path::new(&active_path).exists());
-                        writeln!(server, "{}", json!({"event":"end-file"})).unwrap();
+                    writeln!(server, "{}", json!({"event":"start-file"})).unwrap();
+                    writeln!(
+                        server,
+                        "{}",
+                        json!({"event":"client-message", "args":[marker["command"][2]]})
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(server, "{}", json!({"event":"start-file"})).unwrap();
+                    reply_to_credential_barrier(&mut server);
+                }
+                server
+                    .set_read_timeout(Some(Duration::from_millis(25)))
+                    .unwrap();
+                assert!(server.read(&mut [0]).is_err());
+                if start_after_marker_reply {
+                    for (path, identity) in &old_files {
+                        assert_eq!(file_identity(path), *identity);
                     }
                 }
+                server
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                writeln!(server, "{}", json!({"event":"end-file"})).unwrap();
             }
         });
         let mut pending = Vec::new();
@@ -3615,23 +4151,17 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             &events,
         )
         .unwrap();
-        for (path, original) in first_files {
-            assert_ne!(file_identity(&path), original);
+        for (path, identity) in files {
+            assert_ne!(file_identity(&path), identity);
         }
-        let second_path = format!(
-            "/proc/self/fd/{}",
-            current.as_ref().unwrap().cookies.as_raw_fd()
+        assert!(
+            fs::read_to_string(format!(
+                "/proc/self/fd/{}",
+                current.as_ref().unwrap().cookies.as_raw_fd()
+            ))
+            .unwrap()
+            .contains("INVENTED_SECOND")
         );
-        let second_identity = format!(
-            "/proc/self/fd/{}",
-            current.as_ref().unwrap().identity.as_raw_fd()
-        );
-        let second_config = format!(
-            "/proc/self/fd/{}",
-            current.as_ref().unwrap().config.as_raw_fd()
-        );
-        let second_files = [&second_path, &second_identity, &second_config]
-            .map(|path| (path.clone(), file_identity(path)));
         replace_playback_credentials(
             &mut client,
             &mut pending,
@@ -3643,188 +4173,43 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         )
         .unwrap();
         assert!(current.is_none());
-        for (path, original) in second_files {
-            assert_ne!(file_identity(&path), original);
-        }
         worker.join().unwrap();
     }
 
     #[test]
-    fn credential_clear_waits_for_start_queued_after_stop_reply() {
-        for start_after_marker_reply in [false, true] {
-            let (mut client, mut server) = UnixStream::pair().unwrap();
-            client
-                .set_read_timeout(Some(Duration::from_millis(80)))
-                .unwrap();
-            server
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let plugin_dir = Path::new("/private/synthetic-plugin-root");
-            let mut current = Some(
-                prepare_credentials(synthetic_credentials("INVENTED_FIRST"), plugin_dir).unwrap(),
-            );
-            let path = format!(
-                "/proc/self/fd/{}",
-                current.as_ref().unwrap().cookies.as_raw_fd()
-            );
-            let original = file_identity(&path);
-            let (completed, response) = mpsc::channel();
-            let worker = thread::spawn(move || {
-                let (events, _) = async_channel::unbounded();
-                let result = replace_playback_credentials(
-                    &mut client,
-                    &mut Vec::new(),
-                    &mut current,
-                    None,
-                    plugin_dir,
-                    &mut PlaybackState::default(),
-                    &events,
-                );
-                completed
-                    .send(result.map_err(|error| error.to_string()))
-                    .unwrap();
-            });
-            let stop = socket_message(&mut server);
-            assert_eq!(stop["command"], json!(["stop"]));
-            writeln!(
-                server,
-                "{}",
-                json!({"request_id":stop["request_id"],"error":"success"})
-            )
-            .unwrap();
-            if !start_after_marker_reply {
-                writeln!(server, "{}", json!({"event":"start-file"})).unwrap();
-            }
-            // Accept the old stop/options protocol too, so removing the barrier
-            // reproduces premature success instead of just a protocol mismatch.
-            let options_sent = loop {
-                let command = socket_message(&mut server);
-                let reply = json!({
-                    "request_id":command["request_id"], "error":"success", "data":"test-ipc",
-                });
-                writeln!(server, "{reply}").unwrap();
-                match command["command"][0].as_str().unwrap() {
-                    "client_name" => continue,
-                    "script-message-to" => {
-                        if start_after_marker_reply {
-                            writeln!(server, "{}", json!({"event":"start-file"})).unwrap();
-                        }
-                        writeln!(
-                            server,
-                            "{}",
-                            json!({
-                                "event":"client-message", "args":[command["command"][2]],
-                            })
-                        )
-                        .unwrap();
-                        break false;
-                    }
-                    "set_property" => {
-                        assert_eq!(command["command"][1], "options/ytdl-raw-options");
-                        break true;
-                    }
-                    other => panic!("unexpected command: {other}"),
-                }
-            };
-            let early = response.recv_timeout(Duration::from_millis(25));
-            let preserved = file_identity(&path) == original;
-            let mut byte = 0_u8;
-            // Check for an option write without consuming it or replying early.
-            let options_waiting = unsafe {
-                libc::recv(
-                    server.as_raw_fd(),
-                    (&mut byte as *mut u8).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            } > 0;
-            // Always release the worker before asserting, including on the failing implementation.
-            let _ = writeln!(server, "{}", json!({"event":"end-file"}));
-            if !options_sent {
-                let options = socket_message(&mut server);
-                assert_eq!(options["command"][1], "options/ytdl-raw-options");
-                writeln!(
-                    server,
-                    "{}",
-                    json!({"request_id":options["request_id"],"error":"success"})
-                )
-                .unwrap();
-            }
-            if early.is_err() {
-                response
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap()
-                    .unwrap();
-            }
-            worker.join().unwrap();
-            assert!(
-                matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
-                "cleanup completed before the queued start-file's end-file: {early:?}"
-            );
-            assert!(preserved, "credentials were revoked before end-file");
-            assert!(
-                !options_sent && !options_waiting,
-                "options changed before end-file"
-            );
-            assert_ne!(file_identity(&path), original);
-        }
-    }
-
-    #[test]
-    fn credential_clear_does_not_wait_for_a_file_that_never_started_or_already_ended() {
+    fn credential_clear_handles_idle_or_already_ended_files() {
         for queued in [
             vec![],
-            vec![json!({"request_id":1,"error":"success","data":{"playlist_entry_id":1}})],
-            vec![json!({"request_id":1,"error":"invalid parameter"})],
             vec![json!({"event":"start-file"}), json!({"event":"end-file"})],
         ] {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_millis(80)))
                 .unwrap();
-            server
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
             let worker = thread::spawn(move || {
-                for messages in [queued, vec![]] {
-                    let stop = socket_message(&mut server);
-                    assert_eq!(stop["command"], json!(["stop"]));
-                    writeln!(
-                        server,
-                        "{}",
-                        json!({"request_id":stop["request_id"],"error":"success"})
-                    )
-                    .unwrap();
-                    for message in messages {
-                        writeln!(server, "{message}").unwrap();
-                    }
-                    reply_to_credential_barrier(&mut server);
-                    let options = socket_message(&mut server);
-                    assert_eq!(options["command"][1], "options/ytdl-raw-options");
-                    writeln!(
-                        server,
-                        "{}",
-                        json!({"request_id":options["request_id"],"error":"success"})
-                    )
-                    .unwrap();
-                }
-            });
-            let (events, _) = async_channel::unbounded();
-            let mut state = PlaybackState::default();
-            let mut pending = Vec::new();
-            let mut current = None;
-            for _ in 0..2 {
-                replace_playback_credentials(
-                    &mut client,
-                    &mut pending,
-                    &mut current,
-                    None,
-                    Path::new("/private/synthetic-plugin-root"),
-                    &mut state,
-                    &events,
+                let stop = socket_message(&mut server);
+                writeln!(
+                    server,
+                    "{}",
+                    json!({"request_id":stop["request_id"], "error":"success"})
                 )
                 .unwrap();
-            }
+                for message in queued {
+                    writeln!(server, "{message}").unwrap();
+                }
+                reply_to_credential_barrier(&mut server);
+            });
+            let (events, _) = async_channel::unbounded();
+            replace_playback_credentials(
+                &mut client,
+                &mut Vec::new(),
+                &mut None,
+                None,
+                Path::new("/private/plugins"),
+                &mut PlaybackState::default(),
+                &events,
+            )
+            .unwrap();
             worker.join().unwrap();
         }
     }
@@ -3858,7 +4243,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
 
     #[test]
     fn failed_credential_cleanup_does_not_report_success() {
-        for failure in ["stop", "marker", "end-file", "options"] {
+        for failure in ["stop", "marker", "end-file"] {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_secs(1)))
@@ -3896,15 +4281,8 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                     )
                     .unwrap();
                 }
-                if matches!(failure, "end-file" | "options") {
+                if failure == "end-file" {
                     reply_to_credential_barrier(&mut server);
-                }
-                if failure == "options" {
-                    let options = socket_message(&mut server);
-                    assert_eq!(options["command"][1], "options/ytdl-raw-options");
-                    writeln!(server, "{}", json!({
-                        "request_id":options["request_id"], "error":"INVENTED_PRIVATE_DIAGNOSTIC",
-                    })).unwrap();
                 }
             });
             let (events, _) = async_channel::unbounded();
@@ -3935,7 +4313,9 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         let extractor = directory.join("extractor");
         fs::write(
             &extractor,
-            r#"#!/usr/bin/python3
+            r#"#!/bin/sh
+if [ "$3" = --version ]; then echo 2026.08.19; exit; fi
+exec python3 - "$@" <<'PYTHON'
 import json, os, re, signal, sys
 from pathlib import Path
 
@@ -3946,26 +4326,25 @@ identity = re.search(r'context=(/proc/\d+/fd/\d+)', Path(config).read_text())[1]
 paths = [cookies, config, identity]
 files = [open(path, 'rb') for path in paths]
 assert b'INVENTED_' in files[0].read()
-ready = Path(__file__).with_name('ready')
+ready = Path('READY_PATH')
 ready.with_suffix('.tmp').write_text(json.dumps({'pid': os.getpid(), 'paths': paths}))
 ready.with_suffix('.tmp').replace(ready)
 os.kill(os.getpid(), signal.SIGSTOP)
-"#,
+PYTHON
+"#
+            .replace("READY_PATH", directory.join("ready").to_str().unwrap()),
         )
         .unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
-        let player = Player::new(PlayerOptions {
-            credentials: Some(synthetic_credentials("INVENTED_FIRST")),
-            audio_output: Some("null".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        player
-            .command(json!([
-                "set_property", "options/script-opts", {"ytdl_hook-ytdl_path": extractor},
-            ]))
-            .unwrap();
-        player
+        Player::with_extractor(
+            PlayerOptions {
+                credentials: Some(synthetic_credentials("INVENTED_FIRST")),
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            extractor,
+        )
+        .unwrap()
     }
 
     struct ExtractorProcess {
@@ -3981,7 +4360,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             }
             player
                 .play_url(
-                    format!("ytdl://{}", directory.join("missing.media").display()),
+                    "https://music.youtube.com/watch?v=abcdefghijk".into(),
                     "Synthetic local extractor",
                     PlayOptions::default(),
                 )
@@ -4099,10 +4478,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 .unwrap();
             player
                 .play_url(
-                    format!(
-                        "ytdl://{}",
-                        directory.path().join("missing.media").display()
-                    ),
+                    "https://music.youtube.com/watch?v=abcdefghijk".into(),
                     "Synthetic immediate clear",
                     PlayOptions::default(),
                 )
@@ -4179,9 +4555,15 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let runtime = tempfile::tempdir().unwrap();
         let plugin_dir = write_account_extractor(runtime.path()).unwrap();
         let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
+        let server_script = sealed_file(include_bytes!("ytdlp_resolver.py")).unwrap();
         let mut child = Command::new(python)
             .args(["-B", "-"])
             .arg(plugin_dir)
+            .arg(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                server_script.as_raw_fd()
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
