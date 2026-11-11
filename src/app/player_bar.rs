@@ -348,9 +348,10 @@ impl Music {
                             })
                             .when(compact, |group| {
                                 group.child(
-                                    control(
+                                    tinted_control(
                                         "more-player-controls",
-                                        "expand-more",
+                                        "player-controls",
+                                        rgb(INACTIVE),
                                         theme,
                                         cx,
                                         |view, window, cx| {

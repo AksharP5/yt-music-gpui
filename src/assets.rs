@@ -39,6 +39,9 @@ impl AssetSource for Assets {
             "expand-more" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/expand-more.svg"
             ))),
+            "player-controls" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/player-controls.svg"
+            ))),
             "queue" => Some(Cow::Borrowed(include_bytes!("../assets/icons/queue.svg"))),
             "volume" => Some(Cow::Borrowed(include_bytes!("../assets/icons/volume.svg"))),
             "mute" => Some(Cow::Borrowed(include_bytes!("../assets/icons/mute.svg"))),
