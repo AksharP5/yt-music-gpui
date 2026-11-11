@@ -255,12 +255,25 @@ impl Music {
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
         if target == CatalogTarget::Page {
-            if let Query::Reload(token) = &query
-                && let Some(page) = &mut self.forward_page
+            if let Some(page) = &mut self.forward_page
                 && page.list_id == self.list_id
             {
-                page.sort = Some(token.clone());
-                page.fetched_at = None;
+                // Remember the order the next response will show, so a stale
+                // revisit refreshes in that order.
+                let fresh = match &query {
+                    Query::Revalidate(query) => query,
+                    query => query,
+                };
+                match fresh {
+                    Query::Reload(token) => {
+                        page.sort = Some(token.clone());
+                        if matches!(query, Query::Reload(_)) {
+                            page.fetched_at = None;
+                        }
+                    }
+                    Query::More { .. } => {}
+                    _ => page.sort = None,
+                }
             }
             self.sync.page_changes.clear();
             self.sync.page_reload = None;

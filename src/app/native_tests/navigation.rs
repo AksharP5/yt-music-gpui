@@ -1060,3 +1060,28 @@ fn refresh_after_back_supersedes_the_forward_cache_entry() -> Result<()> {
         );
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn route_revalidation_forgets_the_previous_sort() -> Result<()> {
+    check_cache(|view, _, cx| {
+        view.navigate(Route::Library(Section::Songs), cx);
+        reply(view, page("Songs", "sort-request"), cx);
+        let sort = view.page.continuation.clone().unwrap();
+        view.request(Query::Reload(sort), cx);
+        reply(view, page("Sorted songs", "sorted-tail"), cx);
+        // Returning to the window after three minutes revalidates the route in its default order.
+        view.revalidate_page(cx);
+        reply(view, page("Default order", "default-tail"), cx);
+        view.navigate(Route::Explore, cx);
+        for entry in &mut view.page_cache {
+            entry.fetched_at = Instant::now() - Duration::from_secs(181);
+        }
+        view.navigate(Route::Library(Section::Songs), cx);
+        let job = view.catalog_requests.pending.try_recv().unwrap();
+        assert!(
+            matches!(job.query, Query::Library(Section::Songs)),
+            "A stale revisit must refresh in the order last shown"
+        );
+    })
+}
