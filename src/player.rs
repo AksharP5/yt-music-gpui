@@ -1991,6 +1991,8 @@ fn run(
         state.write_seek(&mut socket)?;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
         // Only queued streams need refreshing; the current stream is already open.
+        // Expiry is wall-clock time, which a monotonic wait doesn't follow across
+        // clock changes or suspend, so recheck it at least once a minute.
         let expiry = prepared
             .as_ref()
             .filter(|(target, _)| state.current != Some(target.track_id))
@@ -2000,6 +2002,7 @@ fn run(
                         .expires
                         .duration_since(SystemTime::now())
                         .unwrap_or_default()
+                        .min(Duration::from_secs(60))
             });
         let deadline = resolver.deadline().into_iter().chain(expiry).min();
         if pending.contains(&b'\n')
