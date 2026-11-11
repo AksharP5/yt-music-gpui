@@ -1603,6 +1603,60 @@ async fn responsive_search(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     }
 }
 
+async fn responsive_explore(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::Route;
+    use crate::catalog::{BrowseLink, Item, Shelf, ShelfLayout};
+    for (width, left, top, tile_width, height) in [
+        (935., 134, 96, 361, 88),
+        (936., 302, 96, 131, 103),
+        (956., 302, 96, 136, 103),
+        (1149., 302, 96, 184, 88),
+        (1150., 346, 96, 156, 129),
+        (1280., 346, 96, 189, 110),
+        (1920., 346, 104, 349, 132),
+    ] {
+        window
+            .update(cx, |music, window, cx| {
+                window.resize(size(px(width), px(900.)));
+                music.sidebar_collapsed = None;
+                music.player_open = false;
+                music.route = Route::Explore;
+                music.page = crate::app::sync::tests::page(6, false);
+                music.page.shelves.insert(
+                    0,
+                    Shelf {
+                        title: String::new(),
+                        items: [
+                            ("FEmusic_new_releases", "New releases"),
+                            ("FEmusic_charts", "Charts"),
+                            ("FEmusic_moods_and_genres", "Moods & genres"),
+                            ("FEmusic_podcasts", "Podcasts"),
+                        ]
+                        .into_iter()
+                        .map(|(id, title)| Item::Navigation(BrowseLink::new(id, title)))
+                        .collect(),
+                        layout: ShelfLayout::Cards,
+                        more: None,
+                    },
+                );
+                music.detail_list = crate::app::DetailList::new();
+                music.rebuild_rows();
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window.update(cx, |_, window, _| {
+            let image = capture(window, &format!("responsive-explore-{width}"));
+            let x = left + tile_width / 2;
+            assert_eq!(image.get_pixel(x, top - 1).0[0], 3);
+            assert!(image.get_pixel(x, top).0[0] > 3);
+            assert!(image.get_pixel(x, top + height - 1).0[0] > 3);
+            assert_eq!(image.get_pixel(x, top + height + 1).0[0], 3, "Tile height must follow the longest wrapped label");
+            println!("RESPONSIVE_EXPLORE width={width} left={left} top={top} tile_width={tile_width} height={height}");
+        }).unwrap();
+    }
+}
+
 async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     for width in [956., 1920.] {
         for home in [true, false] {
@@ -2377,6 +2431,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 home_chips_and_narrow_error(window, cx).await;
                 search_song_rows(window, cx).await;
                 responsive_search(window, cx).await;
+                responsive_explore(window, cx).await;
                 guide_chrome(window, cx).await;
                 player_chrome(window, cx).await;
                 result.store(true, Ordering::SeqCst);

@@ -49,7 +49,12 @@ impl Music {
                     ),
             );
         } else if home {
-            content = content.child(div().h(px(32.)).flex_shrink_0());
+            let above = if matches!(self.route, Route::Explore) && layout.window >= 1800. {
+                40.
+            } else {
+                32.
+            };
+            content = content.child(div().h(px(above)).flex_shrink_0());
         }
         content
     }
@@ -89,7 +94,8 @@ impl Music {
                             .w(px(width))
                             .flex_shrink_0()
                             .min_w_0()
-                            .h(px(text_size * 5.5))
+                            .min_h(px(text_size * 5.5))
+                            .gap(px(text_size * 0.75))
                             .p(px(text_size))
                             .rounded(px(16.))
                             .bg(gpui::white().opacity(0.15))
@@ -101,7 +107,7 @@ impl Music {
                             .child(icon(glyph, text_size * 1.3, self.theme.text))
                             .child(
                                 div()
-                                    .truncate()
+                                    .whitespace_normal()
                                     .text_size(px(text_size))
                                     .line_height(relative(1.2))
                                     .font_weight(FontWeight::MEDIUM)
