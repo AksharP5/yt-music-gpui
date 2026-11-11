@@ -28,11 +28,11 @@ pub(super) enum PageChange {
 }
 
 impl PageChange {
-    pub(super) fn apply(self, page: &mut Page, route: &Route) -> bool {
+    pub(super) fn apply(self, page: &mut Page, route: &Route, sorted: bool) -> bool {
         match self {
             Self::Confirmed(mutation) => {
                 patch_page(page, route, &mutation);
-                invalidates_page(route, &mutation)
+                invalidates_page(route, &mutation, sorted)
             }
             Self::PlaylistAdded { id, tracks } => {
                 append_added(page, route, &id, &tracks);
@@ -49,15 +49,21 @@ pub(super) fn needs_refresh(last: Option<Instant>, now: Instant) -> bool {
 }
 
 // These edits can change rows beyond the response we can patch locally.
-fn invalidates_page(route: &Route, mutation: &Mutation) -> bool {
+fn invalidates_page(route: &Route, mutation: &Mutation, sorted: bool) -> bool {
     match mutation {
-        Mutation::CollectionLibrary { .. }
+        Mutation::SongLibrary { .. }
+        | Mutation::EditPlaylist { .. }
+        | Mutation::CollectionLibrary { .. }
         | Mutation::CreatePlaylist { .. }
         | Mutation::DeletePlaylist { .. }
             if route.library_section().is_some() =>
         {
             true
         }
+        Mutation::RateSong {
+            rating: Rating::Like,
+            ..
+        } if sorted && route.library_section() == Some(Section::Liked) => true,
         Mutation::AddToPlaylist { id, .. }
         | Mutation::RemoveFromPlaylist { id, .. }
         | Mutation::MoveInPlaylist { id, .. }
@@ -199,8 +205,9 @@ impl SyncState {
 
 pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     let playlist = |id: &str| matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"));
-    let liked = matches!(route, Route::Liked | Route::Library(Section::Liked));
-    let songs = matches!(route, Route::Library(Section::Songs));
+    let section = route.library_section();
+    let liked = section == Some(Section::Liked);
+    let songs = section == Some(Section::Songs);
     for shelf in &mut page.shelves {
         shelf.items.retain(|item| match (item, mutation) {
             (Item::Track(current), Mutation::RateSong { track, rating }) => {
@@ -225,14 +232,14 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
                     save: false,
                 },
             ) if matches!(
-                route,
-                Route::Saved
-                    | Route::Library(
-                        Section::Albums
-                            | Section::Playlists
-                            | Section::Subscriptions
-                            | Section::Podcasts
-                    )
+                section,
+                Some(
+                    Section::Landing
+                        | Section::Albums
+                        | Section::Playlists
+                        | Section::Subscriptions
+                        | Section::Podcasts
+                )
             ) =>
             {
                 current.id != collection.id
@@ -505,7 +512,10 @@ impl Music {
     }
 
     pub(in crate::app) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
-        if self.account.is_none() && self.route.library_section().is_some() {
+        if self.account.is_none()
+            && !matches!(self.route, Route::Browse(_))
+            && self.route.library_section().is_some()
+        {
             let anchor = self.page_anchor();
             self.refresh_local();
             self.restore_page_anchor(&anchor);
@@ -619,8 +629,8 @@ impl Music {
         cx.notify();
     }
 
-    pub(super) fn revalidate_page(&mut self, cx: &mut Context<Self>) {
-        let query = if let Some(sort) = &self.sync.page_sort {
+    pub(super) fn page_query(&self) -> Query {
+        if let Some(sort) = &self.sync.page_sort {
             Query::Reload(sort.clone())
         } else {
             match &self.route {
@@ -632,8 +642,11 @@ impl Music {
                     Query::Library(self.route.library_section().expect("library route"))
                 }
             }
-        };
-        self.request(Query::Revalidate(Box::new(query)), cx);
+        }
+    }
+
+    pub(super) fn revalidate_page(&mut self, cx: &mut Context<Self>) {
+        self.request(Query::Revalidate(Box::new(self.page_query())), cx);
     }
 
     pub(super) fn patch_confirmed(&mut self, mutation: &Mutation, cx: &mut Context<Self>) {
@@ -643,26 +656,17 @@ impl Music {
                 .push(PageChange::Confirmed(Box::new(mutation.clone())));
         }
         patch_page(&mut self.page, &self.route, mutation);
-        if invalidates_page(&self.route, mutation) {
-            self.sync.page_fetched_at = self
-                .sync
-                .page_fetched_at
-                .map(|_| Instant::now() - FOCUS_REFRESH_AGE);
+        if invalidates_page(&self.route, mutation, self.sync.page_sort.is_some()) {
+            self.sync.page_fetched_at = None;
         }
-        for entry in &mut self.page_cache {
+        self.page_cache.retain_mut(|entry| {
+            if invalidates_page(&entry.route, mutation, entry.sort.is_some()) {
+                return false;
+            }
             patch_page(&mut entry.page, &entry.route, mutation);
-            if invalidates_page(&entry.route, mutation) {
-                entry.fetched_at = Instant::now() - FOCUS_REFRESH_AGE;
-            }
-        }
+            true
+        });
         if let Mutation::DeletePlaylist { id } = mutation {
-            self.page_cache.retain(|entry| {
-                !matches!(&entry.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
-            });
-            if matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
-            {
-                self.sync.page_fetched_at = None;
-            }
             let mut index = 0;
             let first_page_len = &mut self.sync.sidebar_coverage.first_page_len;
             let boundary = *first_page_len;

@@ -40,6 +40,8 @@ impl Route {
             Self::Recent => Some(Section::History),
             Self::Saved => Some(Section::Landing),
             Self::Library(section) => Some(*section),
+            Self::Browse(link) => Section::from_browse_id(&link.id)
+                .or_else(|| (link.id == "LM").then_some(Section::Liked)),
             _ => None,
         }
     }
@@ -185,7 +187,6 @@ pub(in crate::app) struct CachedPage {
     pub(in crate::app) page: Page,
     pub(in crate::app) fetched_at: Instant,
     pub(in crate::app) coverage: sync::PageCoverage,
-    pub(in crate::app) page_error: Option<String>,
     pub(in crate::app) sort: Option<Continuation>,
 }
 
@@ -236,7 +237,11 @@ impl Music {
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         // A guest's Liked Music is the local list of liked songs.
         let route = match route {
-            Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,
+            Route::Browse(link)
+                if self.account.is_none() && matches!(link.id.as_str(), "VLLM" | "LM") =>
+            {
+                Route::Liked
+            }
             Route::Browse(link) if link.params.is_none() && link.chart_country.is_none() => {
                 match link.id.as_str() {
                     "FEmusic_home" => Route::Home,
@@ -258,10 +263,10 @@ impl Music {
                 self.back.remove(0);
             }
         }
-        self.open_route(route, cx);
+        self.open_route(route, false, cx);
     }
 
-    fn open_route(&mut self, route: Route, cx: &mut Context<Self>) {
+    fn open_route(&mut self, route: Route, restore_scroll: bool, cx: &mut Context<Self>) {
         self.artwork.cancel_pending();
         self.catalog_requests.cancel(CatalogTarget::Page);
         self.player_open = false;
@@ -275,7 +280,6 @@ impl Music {
                 page,
                 fetched_at,
                 coverage: self.sync.page_coverage,
-                page_error: self.sync.page_error.take(),
                 sort: self.sync.page_sort.take(),
             });
         }
@@ -315,13 +319,16 @@ impl Music {
             self.page = entry.page;
             self.sync.page_fetched_at = Some(entry.fetched_at);
             self.sync.page_coverage = entry.coverage;
-            self.sync.page_error = entry.page_error;
             self.sync.page_sort = entry.sort;
-            self.error = self.sync.page_error.clone();
             self.rebuild_rows();
             self.overlay_ratings();
             if sync::needs_refresh(self.sync.page_fetched_at, Instant::now()) {
-                self.revalidate_page(cx);
+                if restore_scroll {
+                    self.revalidate_page(cx);
+                } else {
+                    // Forward visits start at the top, so replace expired loaded tails too.
+                    self.request(self.page_query(), cx);
+                }
             }
             cx.notify();
             return;
@@ -510,7 +517,7 @@ impl Music {
             return;
         }
         let Some(state) = self.back.pop() else { return };
-        self.open_route(state.route, cx);
+        self.open_route(state.route, true, cx);
         self.list_scroll = state.list_scroll;
         self.detail_list = state.detail_list;
         self.shelf_scroll = state.shelf_scroll;
@@ -568,7 +575,8 @@ impl Music {
             Ok(mut page) => {
                 let mut invalidated = false;
                 for change in self.sync.page_changes.drain(..) {
-                    invalidated |= change.apply(&mut page, &self.route);
+                    invalidated |=
+                        change.apply(&mut page, &self.route, self.sync.page_sort.is_some());
                 }
                 for track in page
                     .shelves
@@ -595,12 +603,10 @@ impl Music {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                if !result.append {
-                    self.sync.page_fetched_at = Some(if invalidated {
-                        Instant::now() - sync::FOCUS_REFRESH_AGE
-                    } else {
-                        Instant::now()
-                    });
+                if invalidated {
+                    self.sync.page_fetched_at = None;
+                } else if !result.append {
+                    self.sync.page_fetched_at = Some(Instant::now());
                 }
                 self.sync.page_error = None;
                 if result.revalidate {

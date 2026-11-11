@@ -144,6 +144,10 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 assert!(!view.sidebar_playlists.iter().any(|playlist| playlist.id=="VLfirst"));
                 assert!(std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).any(|job| job.query.target()==CatalogTarget::Sidebar),"Deleting a playlist reloads sidebar membership");
                 view.go_back(cx);
+                assert!(view.rows.is_empty(),"The earlier playlist edit must prevent restoring a page whose continuation may be wrong");
+                let job = view.catalog_requests.pending.try_recv().expect("An evicted playlist must be fetched again");
+                assert!(job.query.target()==CatalogTarget::Page);
+                view.catalog_result(CatalogResult { id:job.id,account_revision:job.account_revision,append:false,revalidate:false,result:Ok(page(500,true)),session_rejected:false,target:CatalogTarget::Page },cx);
                 assert_eq!(view.rows.len(),500);
                 view.navigate(Route::Browse(BrowseLink::new("VLtarget","Target playlist")),cx);
                 view.page = page(0,false);
