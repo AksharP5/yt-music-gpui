@@ -424,7 +424,7 @@ impl Render for SearchBox {
             .min_w_0()
             .h(px(HEIGHT))
             .pl(px(16.))
-            .pr(px(4.))
+            .pr(px(9.))
             .rounded(px(8.))
             .when(open, |view| view.rounded_b_none())
             // Focused, the web darkens the box rather than underlining the text.
@@ -456,7 +456,12 @@ impl Render for SearchBox {
                         .justify_center()
                         .cursor_pointer()
                         .hover(|button| button.bg(gpui::white().opacity(0.1)))
-                        .child(svg().path("close").size(px(20.)).text_color(theme.text))
+                        .child(
+                            svg()
+                                .path("search-clear")
+                                .size(px(18.))
+                                .text_color(gpui::rgb(0x909090)),
+                        )
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|view, _, window, cx| {
                             cx.stop_propagation();
