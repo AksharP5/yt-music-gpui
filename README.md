@@ -14,7 +14,7 @@ This is an independent client using YouTube Music's unofficial API. Account supp
 
 ## Build and install
 
-Requires Rust, a C compiler and pkg-config. On Arch:
+Requires Rust, a C compiler, pkg-config and Linux 5.3 or newer for extractor exit notifications. On Arch:
 
 ```sh
 sudo pacman -S --needed git rust base-devel mpv yt-dlp libglvnd wayland libx11 libxext libxcb libxkbcommon libxkbcommon-x11 fontconfig freetype2 vulkan-driver

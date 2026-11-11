@@ -79,6 +79,14 @@ The wrapper handles `--version` after other flags because the player queries `yt
 
 No test signs in to a real Google account. Do not add one that does.
 
+## Player waits
+
+The player actor blocks on mpv IPC, the command eventfd and the resolver's stdout or one-shot extractor pidfd. Native video status changes also signal the eventfd. Resolver startup and requests have 30-second deadlines; queued stream URLs wake the actor at expiry. Seek writes and account notices are flushed before sleeping. Synchronous mpv requests use their remaining five-second deadline for reads. Buffered IPC events are processed before waiting, and socket closure reports mpv shutdown. An idle or paused actor with no pending work has no timer.
+
+`one_shot_exit_wakes_the_actor_without_mpv_or_commands` and `resolver_startup_and_request_deadlines_wake_without_output` cover extractor notifications and timeouts. The ignored `paused_actor_refreshes_expired_preparation_and_writes_pending_seek` uses synthetic silence and a local extractor to check expiry and seeks without network access or audible output.
+
+To repeat the null-audio wakeup and Play/seek measurements, run `bin/test --release player::tests::local_actor_wakeups_and_latency -- --ignored --nocapture --test-threads=1`. It samples only the `music-player` thread's voluntary context switches over three five-second intervals per mode.
+
 ## Run an isolated instance
 
 The app allows one instance per `XDG_RUNTIME_DIR`, and it keeps its library under `XDG_DATA_HOME`. To run a development build next to your installed app without touching your library, saved account or media keys:
