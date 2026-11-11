@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Condvar, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -340,22 +340,51 @@ impl Preferences {
     }
 }
 
+#[derive(Default)]
+struct PendingSave {
+    request: Option<SaveRequest>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct SaveQueue {
+    pending: Mutex<PendingSave>,
+    ready: Condvar,
+}
+
+/// Coalesces pending saves without waiting for disk I/O. Drop flushes and joins the worker.
 pub struct LibraryWriter {
-    requests: async_channel::Sender<SaveRequest>,
-    pending: async_channel::Receiver<SaveRequest>,
+    queue: Arc<SaveQueue>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LibraryWriter {
     pub fn new(store: Store) -> (Self, async_channel::Receiver<String>) {
-        let (requests, pending) = async_channel::bounded::<SaveRequest>(1);
-        let receiver = pending.clone();
+        Self::with_save(store, Store::save)
+    }
+
+    fn with_save(
+        store: Store,
+        mut save: impl FnMut(&Store, &Library) -> Result<()> + Send + 'static,
+    ) -> (Self, async_channel::Receiver<String>) {
+        let queue = Arc::new(SaveQueue::default());
+        let worker_queue = queue.clone();
         let (errors, failed) = async_channel::unbounded();
         let worker = std::thread::Builder::new()
             .name("library-writer".into())
             .spawn(move || {
                 let mut current = None;
-                while let Ok(request) = receiver.recv_blocking() {
+                loop {
+                    let request = {
+                        let mut pending = worker_queue.pending.lock().unwrap();
+                        while pending.request.is_none() && !pending.closed {
+                            pending = worker_queue.ready.wait(pending).unwrap();
+                        }
+                        let Some(request) = pending.request.take() else {
+                            break;
+                        };
+                        request
+                    };
                     match request {
                         SaveRequest::Snapshot(library) => current = Some(*library),
                         SaveRequest::Update(update) => {
@@ -382,7 +411,7 @@ impl LibraryWriter {
                             update.apply(library);
                         }
                     }
-                    if let Err(error) = store.save(current.as_ref().unwrap()) {
+                    if let Err(error) = save(&store, current.as_ref().unwrap()) {
                         let _ = errors.send_blocking(format!("{error:#}"));
                     }
                 }
@@ -390,8 +419,7 @@ impl LibraryWriter {
             .expect("start library writer");
         (
             Self {
-                requests,
-                pending,
+                queue,
                 worker: Some(worker),
             },
             failed,
@@ -399,11 +427,10 @@ impl LibraryWriter {
     }
 
     pub fn save(&self, library: &Library) {
-        // Keep only the newest snapshot while a previous atomic write is in flight.
-        let _ = self.pending.try_recv();
-        let _ = self
-            .requests
-            .try_send(SaveRequest::Snapshot(Box::new(library.clone())));
+        let snapshot = Box::new(library.clone());
+        let mut pending = self.queue.pending.lock().unwrap();
+        pending.request = Some(SaveRequest::Snapshot(snapshot));
+        self.queue.ready.notify_one();
     }
 
     /// Save settings without cloning queue or library collections on the UI thread.
@@ -422,24 +449,27 @@ impl LibraryWriter {
     }
 
     fn update(&self, update: LibraryUpdate) {
-        let request = match self.pending.try_recv() {
-            Ok(SaveRequest::Snapshot(mut snapshot)) => {
+        // Merge and dequeue use the same lock; the worker never holds it during I/O.
+        let mut pending = self.queue.pending.lock().unwrap();
+        pending.request = Some(match pending.request.take() {
+            Some(SaveRequest::Snapshot(mut snapshot)) => {
                 update.apply(&mut snapshot);
                 SaveRequest::Snapshot(snapshot)
             }
-            Ok(SaveRequest::Update(pending)) => SaveRequest::Update(LibraryUpdate {
-                preferences: update.preferences.or(pending.preferences),
-                positions: update.positions.or(pending.positions),
+            Some(SaveRequest::Update(previous)) => SaveRequest::Update(LibraryUpdate {
+                preferences: update.preferences.or(previous.preferences),
+                positions: update.positions.or(previous.positions),
             }),
-            Err(_) => SaveRequest::Update(update),
-        };
-        let _ = self.requests.try_send(request);
+            None => SaveRequest::Update(update),
+        });
+        self.queue.ready.notify_one();
     }
 }
 
 impl Drop for LibraryWriter {
     fn drop(&mut self) {
-        self.requests.close();
+        self.queue.pending.lock().unwrap().closed = true;
+        self.queue.ready.notify_one();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -559,6 +589,44 @@ mod tests {
             assert_eq!(saved.positions.get("guest", &episode), 199.);
             assert_eq!(saved.volume, 99.);
             assert_eq!(saved.queue.tracks, library.queue.tracks);
+        }
+    }
+
+    #[test]
+    fn interleaved_saves_keep_latest_state_with_a_slow_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.json");
+        let mut episode = track("episode");
+        episode.details.episode = Some(Box::default());
+        episode.duration = Some(3600);
+        let mut library = Library::new();
+        for round in 0..2000 {
+            let (writer, errors) =
+                LibraryWriter::with_save(Store { path: path.clone() }, |store, library| {
+                    std::thread::yield_now();
+                    store.save(library)
+                });
+            for n in 0..32 {
+                library
+                    .queue
+                    .replace(vec![track(&format!("{round}-{n}"))], 0);
+                writer.save(&library);
+                library.volume = f64::from(n);
+                library.autoplay = n % 2 == 0;
+                writer.save_preferences(&library);
+                library
+                    .positions
+                    .set("guest", &episode, f64::from(100 + n), 3600., false);
+                writer.save_positions(&library.positions);
+            }
+            drop(writer);
+            assert!(errors.is_empty());
+            let saved: Library = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&library).unwrap(),
+                "latest library, preferences and positions must survive release in round {round}"
+            );
         }
     }
 
