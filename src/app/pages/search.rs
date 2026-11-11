@@ -52,12 +52,14 @@ impl Music {
         &mut self,
         shelf: usize,
         inset: f32,
+        width: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let index = self.page.shelves[..shelf]
             .iter()
             .map(|shelf| shelf.items.len())
             .sum::<usize>();
+        let stacked = width < 800.;
         let item = self.rows[index].clone();
         let artist =
             matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
@@ -306,7 +308,7 @@ impl Music {
             } else {
                 details.into_any_element()
             };
-            card.h(px(232.))
+            card.h(px(if stacked { 164. } else { 232. }))
                 .pr(px(15.))
                 .child(text.child(actions.mt(px(4.))))
                 .child(div().absolute().top(px(4.)).right(px(8.)).child(corner))
@@ -339,16 +341,20 @@ impl Music {
                 linear_color_stop(gpui::black(), 0.8667),
             )))
             .flex()
-            .flex_wrap()
+            .when(stacked, |panel| panel.flex_col())
             .child(
                 card.bg(gpui::white().opacity(0.1))
                     .rounded(px(8.))
-                    .when(!related.is_empty(), |card| card.rounded_r(px(0.))),
+                    .when(!related.is_empty() && !stacked, |card| {
+                        card.rounded_r(px(0.))
+                    })
+                    .when(stacked, |card| card.flex_none().w_full()),
             )
             .when(!related.is_empty(), |body| {
                 body.child(
                     div()
                         .flex_1()
+                        .when(stacked, |songs| songs.flex_none().w_full())
                         .min_w(px(280.))
                         .pl(px(15.))
                         .pr(px(17.))

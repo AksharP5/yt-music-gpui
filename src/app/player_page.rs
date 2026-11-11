@@ -45,6 +45,7 @@ pub(in crate::app) struct PlayerPage {
     comments: comments::State,
     related_list: ListState,
     related_scroll: Vec<ScrollHandle>,
+    pub(in crate::app) tabs_scroll: ScrollHandle,
     /// Focus handles for each shelf's items, so keyboard focus can scroll its carousel.
     related_focus: Vec<Vec<FocusHandle>>,
     pub(in crate::app) queue_scroll: UniformListScrollHandle,
@@ -89,6 +90,7 @@ impl PlayerPage {
             comments: comments::State::new(),
             related_list: ListState::new(0, ListAlignment::Top, px(400.)),
             related_scroll: Vec::new(),
+            tabs_scroll: ScrollHandle::new(),
             related_focus: Vec::new(),
             queue_scroll: UniformListScrollHandle::new(),
             queue_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -400,7 +402,7 @@ impl Music {
                     .justify_center()
                     .child(media),
             );
-        let tabs = self.player_tabs(cx);
+        let tabs = self.player_tabs(side, window, cx);
         let body = match self.player_page.tab {
             PlayerTab::UpNext => self.up_next(cx),
             PlayerTab::Lyrics => self.lyrics_tab(),
@@ -525,7 +527,7 @@ impl Music {
             .into_any_element()
     }
 
-    fn player_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn player_tabs(&self, width: f32, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.player_page.tab;
         let watch = self.current_watch();
         let available = |tab: PlayerTab| match tab {
@@ -534,12 +536,15 @@ impl Music {
             PlayerTab::Lyrics => watch.is_some_and(|watch| watch.lyrics.is_some()),
             PlayerTab::Related => watch.is_some_and(|watch| watch.related.is_some()),
         };
-        div()
-            .h(px(49.))
-            .flex_shrink_0()
+        let scroll = self.player_page.tabs_scroll.clone();
+        let tabs = div()
+            .id("player-tabs")
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&scroll)
+            .h(px(48.))
             .flex()
-            .border_b_1()
-            .border_color(gpui::white().opacity(0.1))
             .children(PlayerTab::ALL.into_iter().map(|tab| {
                 let active = tab == selected;
                 let enabled = available(tab);
@@ -548,6 +553,8 @@ impl Music {
                     .id(tab.label())
                     .when(enabled, |tab| tab.keyboard_control(self.theme))
                     .flex_auto()
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
                     .h(px(48.))
                     .px(px(12.))
                     .relative()
@@ -581,7 +588,54 @@ impl Music {
                             view.select_player_tab(tab, cx);
                         }
                     }))
+            }));
+        let minimum = PlayerTab::ALL
+            .into_iter()
+            .map(|tab| {
+                let label: SharedString = tab.label().into();
+                let run = TextRun {
+                    len: label.len(),
+                    font: Font {
+                        weight: FontWeight::MEDIUM,
+                        ..font("Roboto")
+                    },
+                    ..Default::default()
+                };
+                window
+                    .text_system()
+                    .shape_line(label, px(14.), &[run], None)
+                    .width
+                    + px(24.)
+            })
+            .sum::<Pixels>();
+        let overflow = minimum > px(width);
+        let back = scroll.offset().x < px(0.);
+        let mut control = overflow.then(|| {
+            button(
+                "player-tabs-scroll",
+                if back { "back" } else { "forward" },
+                self.theme,
+            )
+            .size(px(48.))
+            .flex_shrink_0()
+            .bg(self.theme.bg)
+            .on_click(cx.listener(move |_, _, _, cx| {
+                scroll.set_offset(point(
+                    if back { px(0.) } else { -scroll.max_offset().x },
+                    px(0.),
+                ));
+                cx.notify();
             }))
+        });
+        div()
+            .h(px(49.))
+            .flex_shrink_0()
+            .flex()
+            .border_b_1()
+            .border_color(gpui::white().opacity(0.1))
+            .children(if back { control.take() } else { None })
+            .child(tabs)
+            .children(control)
             .into_any_element()
     }
 

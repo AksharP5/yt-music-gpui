@@ -46,7 +46,15 @@ impl Music {
     ) -> AnyElement {
         let avatar = self.account.is_some().then(|| self.account_avatar(26.));
         let account_inset = if matches!(self.route, Route::Search(_)) {
-            if width < 936. { 50. } else { 68. }
+            if width < 936. {
+                50.
+            } else if width < 1150. {
+                24.
+            } else {
+                68.
+            }
+        } else if width < 1150. && !compact {
+            if avatar.is_some() { 66. } else { 47. }
         } else {
             100.
         };
@@ -65,7 +73,7 @@ impl Music {
             // Below the wide breakpoint, center between the brand and account controls.
             brand_width + ((width - brand_width - 194. - crate::search_box::WIDTH) / 2.).max(0.)
         } else {
-            guide_width + inset
+            guide_width + if width < 1150. { 56. } else { inset }
         };
         // Only an expanded, unscrolled guide has its own header background.
         let home_band = self.route.is_home() && !self.player_open && !scrolled;

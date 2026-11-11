@@ -1486,7 +1486,7 @@ async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut Async
 }
 
 async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
-    for (width, left, column) in [(956., 256, 684), (1920., 650, 860)] {
+    for (width, left, column) in [(956., 302, 592), (1920., 650, 860)] {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(1050.)));
@@ -1549,6 +1549,58 @@ async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         );
     }
     println!("SEARCH_ROWS widths=956,1920 first_row=172 pitch=81 duration=byline_only");
+}
+
+async fn responsive_search(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::{Route, Search};
+    use crate::catalog::{Item, ShelfLayout};
+    use crate::search::{SearchFilter, SearchScope};
+    for (width, compact, left, column, height) in [
+        (956., false, 302, 592, 396),
+        (956., true, 154, 720, 396),
+        (1280., false, 330, 860, 232),
+        (1920., false, 650, 860, 232),
+    ] {
+        window.update(cx, |music, window, cx| {
+            window.resize(size(px(width), px(900.)));
+            music.sidebar_collapsed = Some(compact);
+            music.account = None;
+            music.catalog_requests = crate::app::CatalogRequests::new();
+            music.player_open = false;
+            music.library.queue = Default::default();
+            music.route = Route::Search(Search { query: "daft punk".into(), filter: SearchFilter::All, scope: SearchScope::Catalog });
+            music.search.update(cx, |search, cx| search.set_query("daft punk".into(), cx));
+            let mut page = crate::app::sync::tests::page(3, false);
+            let artist = crate::catalog::parse_page(&serde_json::json!({"contents":[{"musicCardShelfRenderer":{
+                "title":{"runs":[{"text":"Daft Punk","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}]},
+                "subtitle":{"simpleText":"Artist • 67.4M monthly audience"},
+                "buttons":[
+                    {"buttonRenderer":{"icon":{"iconType":"MUSIC_SHUFFLE"},"command":{"watchPlaylistEndpoint":{"playlistId":"RDAOshuffle"}}}},
+                    {"buttonRenderer":{"icon":{"iconType":"MIX"},"command":{"watchPlaylistEndpoint":{"playlistId":"RDEMmix"}}}}
+                ]
+            }}]}), "Top result").unwrap().shelves.remove(0).items.remove(0);
+            assert!(matches!(&artist, Item::Collection(_)));
+            page.shelves[0].items.insert(0, artist);
+            page.shelves[0].layout = ShelfLayout::Featured;
+            music.page = page;
+            music.error = None;
+            music.notice = None;
+            music.detail_list = crate::app::DetailList::new();
+            music.rebuild_rows();
+            window.focus(&music.focus, cx);
+            cx.notify();
+        }).unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window.update(cx, |_, window, _| {
+            let image = capture(window, &format!("responsive-search-{width}-{compact}"));
+            // The guest's 44px filter row starts directly below the header.
+            let x = left + column / 2;
+            assert!(image.get_pixel(x, 112).0[0] > 3, "Top-result background must span the search column");
+            assert!(image.get_pixel(x, 108 + height - 4).0[0] > 3, "Top-result card must use the web's height");
+            assert_eq!(image.get_pixel(x, 108 + height + 2).0[0], 3, "Top-result card must end at the web's height");
+            println!("RESPONSIVE_SEARCH width={width} mini={compact} left={left} column={column} card_height={height}");
+        }).unwrap();
+    }
 }
 
 async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
@@ -1750,11 +1802,16 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
             cx.notify();
         })
         .unwrap();
-    for width in [1280., 956.] {
+    for (width, compact, left, top) in [
+        (1280., false, 890., 277.),
+        (956., true, 593., 269.),
+        (956., false, 660., 287.),
+        (1920., false, 1288., 309.),
+    ] {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(800.)));
-                music.sidebar_collapsed = Some(width < 1150.);
+                music.sidebar_collapsed = Some(compact);
                 music.player_open = true;
                 music.player_page.hovered_row = None;
                 cx.notify();
@@ -1763,13 +1820,8 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         wait_for_presented_frame(window, cx).await;
         window
             .update(cx, |music, window, cx| {
-                capture(window, &format!("chrome-queue-{width}"));
+                capture(window, &format!("chrome-queue-{width}-{compact}"));
                 let bounds = music.player_page.queue_bounds.get();
-                let (left, top) = if width == 1280. {
-                    (890., 277.)
-                } else {
-                    (593., 269.)
-                };
                 assert_eq!(
                     bounds.origin,
                     point(px(left), px(top)),
@@ -1783,10 +1835,43 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         wait_for_presented_frame(window, cx).await;
         window
             .update(cx, |_, window, _| {
-                capture(window, &format!("chrome-queue-hover-{width}"));
+                capture(window, &format!("chrome-queue-hover-{width}-{compact}"));
             })
             .unwrap();
-        if width == 956. {
+        if width == 956. && !compact {
+            cx.update_window(window.into(), |_, window, cx| {
+                let position = point(px(892.), px(112.));
+                for event in [
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                ] {
+                    window.dispatch_event(event, cx);
+                }
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            window
+                .update(cx, |music, window, _| {
+                    assert!(
+                        music.player_page.tabs_scroll.offset().x < px(0.),
+                        "The tab arrow must reveal the clipped tabs"
+                    );
+                    capture(window, "chrome-tabs-scrolled-956");
+                })
+                .unwrap();
+        }
+        if width == 956. && compact {
             // Open the compact controls with a real pointer event, then dismiss with Escape.
             cx.update_window(window.into(), |_, window, cx| {
                 let position = point(px(878.), px(764.));
@@ -2291,6 +2376,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 inline_links_follow_row_order(window, cx).await;
                 home_chips_and_narrow_error(window, cx).await;
                 search_song_rows(window, cx).await;
+                responsive_search(window, cx).await;
                 guide_chrome(window, cx).await;
                 player_chrome(window, cx).await;
                 result.store(true, Ordering::SeqCst);
