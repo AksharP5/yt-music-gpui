@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -624,32 +624,57 @@ fn lock_file(path: &Path) -> Result<File> {
 
 fn page_config(page: impl Read) -> Result<Value> {
     const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
-    let mut html = String::new();
-    page.take((MAX_PAGE_BYTES + 1) as u64)
-        .read_to_string(&mut html)
-        .context("Could not read the account verification page")?;
-    ensure!(
-        html.len() <= MAX_PAGE_BYTES,
-        "YouTube Music returned an oversized account verification page"
-    );
     // The first ytcfg.set call is the JSON bootstrap used by yt-dlp's extract_ytcfg.
     // Later calls can contain JavaScript expressions; never execute or merge those.
-    let (_, bootstrap) = html
-        .split_once("ytcfg.set(")
-        .context("YouTube Music returned no account configuration")?;
-    let bootstrap = bootstrap.trim_start();
-    let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
-    let config = values
-        .next()
-        .transpose()
-        .context("YouTube Music returned an invalid account configuration")?
-        .context("YouTube Music returned no account configuration")?;
-    ensure!(
-        bootstrap[values.byte_offset()..]
-            .trim_start()
-            .starts_with(')'),
-        "YouTube Music returned an invalid account configuration"
-    );
+    // It arrives in the first ~75 KB, while the server keeps rendering the rest
+    // of the page for another second, so stop reading once it is complete.
+    let mut page = page.take((MAX_PAGE_BYTES + 1) as u64);
+    let mut html = Vec::new();
+    let mut chunk = [0; 16 * 1024];
+    let config = loop {
+        let read = page
+            .read(&mut chunk)
+            .context("Could not read the account verification page")?;
+        html.extend_from_slice(&chunk[..read]);
+        ensure!(
+            html.len() <= MAX_PAGE_BYTES,
+            "YouTube Music returned an oversized account verification page"
+        );
+        let complete = read == 0;
+        // A read can end inside a multi-byte character; parse the valid prefix.
+        let text = match std::str::from_utf8(&html) {
+            Ok(text) => text,
+            Err(error) if !complete && error.error_len().is_none() => {
+                std::str::from_utf8(&html[..error.valid_up_to()]).expect("valid prefix")
+            }
+            Err(error) => {
+                return Err(error).context("YouTube Music returned an unreadable account page");
+            }
+        };
+        let Some((_, bootstrap)) = text.split_once("ytcfg.set(") else {
+            ensure!(!complete, "YouTube Music returned no account configuration");
+            continue;
+        };
+        let bootstrap = bootstrap.trim_start();
+        let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
+        let config = match values.next() {
+            Some(Err(error)) if error.is_eof() && !complete => continue,
+            Some(value) => {
+                value.context("YouTube Music returned an invalid account configuration")?
+            }
+            None if !complete => continue,
+            None => bail!("YouTube Music returned no account configuration"),
+        };
+        let rest = bootstrap[values.byte_offset()..].trim_start();
+        if rest.is_empty() && !complete {
+            continue;
+        }
+        ensure!(
+            rest.starts_with(')'),
+            "YouTube Music returned an invalid account configuration"
+        );
+        break config;
+    };
     if config["LOGGED_IN"] == false {
         return Err(RejectedSession.into());
     }
@@ -1408,6 +1433,29 @@ mod tests {
         }
     }
     #[test]
+    fn html_account_proof_stops_reading_once_the_bootstrap_is_complete() {
+        // The server renders the rest of the page for about a second after the
+        // bootstrap. Byte-at-a-time reads also split the multi-byte character.
+        struct Page(Vec<u8>, usize);
+        impl Read for Page {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let Some(&byte) = self.0.get(self.1) else {
+                    return Err(std::io::Error::other("read past the account bootstrap"));
+                };
+                buffer[0] = byte;
+                self.1 += 1;
+                Ok(1)
+            }
+        }
+        let s = session("SAPISID=synthetic");
+        let config = json!({"LOGGED_IN":true, "DATASYNC_ID":"synthetic-user||", "name":"Beyoncé"});
+        let unclosed = Page(format!("<script>ytcfg.set({config}").into_bytes(), 0);
+        let error = s.verify_html_identity(unclosed).unwrap_err();
+        assert!(format!("{error:#}").contains("read past"), "{error:#}");
+        let page = Page(format!("<script>ytcfg.set({config})").into_bytes(), 0);
+        s.verify_html_identity(page).unwrap();
+    }
+    #[test]
     fn html_account_proof_rejects_missing_conflicting_and_logged_out_identity() {
         let s = session("SAPISID=synthetic");
         let valid = json!({
@@ -1459,7 +1507,7 @@ mod tests {
             assert!(s.verify_html_identity(html.as_bytes()).is_err());
         }
         let html = format!(
-            "ytcfg.set({{\"LOGGED_IN\":true,\"DATASYNC_ID\":\"synthetic-user||\"}});{}",
+            "{}ytcfg.set({{\"LOGGED_IN\":true,\"DATASYNC_ID\":\"synthetic-user||\"}});",
             " ".repeat(4 * 1024 * 1024)
         );
         assert!(
