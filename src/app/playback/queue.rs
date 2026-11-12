@@ -18,6 +18,7 @@ impl Music {
             self.playback = Playback::Loading {
                 paused: false,
                 retried: false,
+                full_lookup: false,
             };
             self.notice = Some("Loading music…".into());
             self.player_command(Player::stop);
@@ -48,6 +49,7 @@ impl Music {
         self.playback = Playback::Loading {
             paused: false,
             retried: false,
+            full_lookup: false,
         };
         self.now_playing = None;
         self.media_pair = None;
@@ -186,6 +188,7 @@ impl Music {
             self.playback = Playback::Loading {
                 paused: intent.playback.is_paused(),
                 retried: false,
+                full_lookup: false,
             };
         } else {
             self.autoplay_waiting = None;
@@ -607,6 +610,7 @@ impl Music {
             self.playback = Playback::Loading {
                 paused: playback.is_paused(),
                 retried: false,
+                full_lookup: false,
             };
             self.player_command(Player::stop);
             self.active_id = None;
@@ -675,6 +679,7 @@ impl Music {
                     self.playback = Playback::Loading {
                         paused: intent.playback.is_paused(),
                         retried: false,
+                        full_lookup: false,
                     };
                 }
                 self.notice = Some("Loading more queued songs".into());
@@ -692,6 +697,7 @@ impl Music {
                             self.playback = Playback::Loading {
                                 paused: intent.playback.is_paused(),
                                 retried: false,
+                                full_lookup: false,
                             };
                         }
                         self.notice = Some("Loading more queued songs".into());
