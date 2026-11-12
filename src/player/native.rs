@@ -223,7 +223,7 @@ struct Format<'a> {
     height: Option<u64>,
     class: Option<u8>,
     abr: Option<f64>,
-    score: [f64; 16],
+    score: [f64; 17],
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -266,6 +266,32 @@ fn codec_rank(codec: &str, video: bool) -> Option<f64> {
         .map(|index| (prefixes.len() - index) as f64)
 }
 
+/// yt-dlp's `hdr:12` rank, from its codec parsing: HDR10 above SDR, and Dolby
+/// Vision, which sits past the limit, below both.
+fn dynamic_range(codec: &str) -> f64 {
+    // yt-dlp first drops leading zeros: re.sub(r'0+(?=\d)', '', codec).
+    let mut normalized = String::new();
+    let mut chars = codec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '0' {
+            normalized.push(c);
+            continue;
+        }
+        while chars.peek() == Some(&'0') {
+            chars.next();
+        }
+        if !chars.peek().is_some_and(char::is_ascii_digit) {
+            normalized.push('0');
+        }
+    }
+    let parts: Vec<_> = normalized.split('.').collect();
+    match parts.as_slice() {
+        ["dvh1" | "dvhe", ..] => -8.,
+        ["av1", _, _, "10", ..] | ["vp9", "2", ..] => 5.,
+        _ => 2.,
+    }
+}
+
 impl<'a> Format<'a> {
     fn parse(raw: &'a Value, duration: Option<f64>) -> Option<Self> {
         if raw["drmFamilies"]
@@ -291,9 +317,11 @@ impl<'a> Format<'a> {
         let (kind, codecs) = mime.split_once(';')?;
         let codecs = codecs.trim().strip_prefix("codecs=\"")?.strip_suffix('"')?;
         let (mut acodec, mut vcodec) = (None, None);
+        let mut hdr = f64::NEG_INFINITY;
         for codec in codecs.split(',').map(str::trim) {
             if let Some(rank) = codec_rank(codec, true) {
                 vcodec = Some(rank);
+                hdr = dynamic_range(codec);
             } else {
                 acodec = Some(codec_rank(codec, false)?);
             }
@@ -379,7 +407,7 @@ impl<'a> Format<'a> {
         };
         // yt-dlp's YouTube order: hasvid, preference, quality, res, fps, hdr,
         // source, vcodec, channels, acodec, lang, proto, size, br, asr, ext,
-        // hasaud, id. HDR/protocol are identical for these direct HTTPS formats.
+        // hasaud, id. Protocol is identical for these direct HTTPS formats.
         let unknown = f64::NEG_INFINITY;
         Some(Self {
             url,
@@ -403,6 +431,7 @@ impl<'a> Format<'a> {
                 number(&raw["fps"])
                     .filter(|fps| *fps > 1.)
                     .unwrap_or(unknown),
+                hdr,
                 (if itag == 22 { -5. } else { -1. })
                     + if raw["qualityLabel"]
                         .as_str()
@@ -602,7 +631,8 @@ pub(super) mod tests {
             assert_eq!(itags(&select(&player, audio, None).unwrap()), [expected]);
             for (video, expected_video) in VideoQuality::ALL
                 .into_iter()
-                .zip(["160", "133", "134", "135", "298", "303", "271", "313"])
+                // 480p prefers the HDR VP9.2 format, as yt-dlp does.
+                .zip(["160", "133", "134", "333", "298", "303", "271", "313"])
             {
                 assert_eq!(
                     itags(&select(&player, audio, Some(video)).unwrap()),

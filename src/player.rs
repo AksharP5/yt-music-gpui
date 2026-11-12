@@ -2152,6 +2152,8 @@ fn run(
         if pending_play.is_none()
             && let Some((target, stream)) = &prepared
             && state.upcoming != Some(target.track_id)
+            // After a natural transition the prepared song is already playing.
+            && state.current != Some(target.track_id)
         {
             let mut command = load_command(
                 &stream.url,

@@ -142,6 +142,34 @@
         "averageBitrate": 960000
       },
       {
+        "itag": 397,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=397",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"av01.0.04M.08\"",
+        "quality": "large",
+        "height": 480,
+        "width": 853,
+        "fps": 30,
+        "averageBitrate": 960000
+      },
+      {
+        "itag": 333,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=333",
+        "approxDurationMs": "200000",
+        "mimeType": "video/webm; codecs=\"vp09.02.30.10.01.09.16.09.00\"",
+        "quality": "large",
+        "height": 480,
+        "width": 853,
+        "fps": 30,
+        "averageBitrate": 960000,
+        "qualityLabel": "480p HDR",
+        "colorInfo": {
+          "primaries": "COLOR_PRIMARIES_BT2020",
+          "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_SMPTEST2084",
+          "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT2020_NCL"
+        }
+      },
+      {
         "itag": 136,
         "url": "https://rr1.googlevideo.com/videoplayback?itag=136",
         "approxDurationMs": "200000",
