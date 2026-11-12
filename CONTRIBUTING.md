@@ -81,7 +81,7 @@ No test signs in to a real Google account. Do not add one that does.
 
 ## Player waits
 
-The fast lookup runs in Rust with a cookie-free HTTP client and the VISIONOS player context reviewed against yt-dlp 2026.08.19. It skips the watch page and manifests, reuses connections, and caches visitor data from the first Music homepage bootstrap in memory. Short-lived lookup threads deliver completions through the player's eventfd, independently of the sequential Python resolver. A click keeps useful full preparation running; obsolete work can still be cancelled. Late native results cannot satisfy a full lookup or load an obsolete track.
+The fast lookup runs in Rust with a cookie-free HTTP client and the VISIONOS player context reviewed against yt-dlp 2026.08.19. It skips the watch page and manifests, reuses connections, and caches visitor data from the first Music homepage bootstrap in memory. Short-lived lookup threads deliver completions through the player's eventfd, independently of the sequential Python resolver. A click never waits behind or restarts the Python resolver; preparation the click made obsolete is cancelled. Visitor data and pauses reset when the account changes. Late native results cannot satisfy a full lookup or load an obsolete track.
 
 Preparation uses the native path too, except signed-in High audio uses the full account extractor for Premium formats. Video above 1080p always uses the full extractor. Native format selection follows the existing quality selectors and YouTube's yt-dlp sort order. A selected format that needs signature or `n` deciphering falls back rather than lowering quality. All URLs pass the same HTTPS/googlevideo and expiry validation as prepared streams, including separate video/audio URLs.
 

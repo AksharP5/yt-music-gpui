@@ -92,6 +92,12 @@ impl Lookup {
         self.pause(STALL_COOLDOWN);
     }
 
+    /// Forget the guest visitor ID and any pause, so a new account session
+    /// cannot be linked to the previous one through cookie-free lookups.
+    pub(super) fn reset(&self) {
+        *self.visitor.lock().unwrap() = Visitor::default();
+    }
+
     fn send(
         &self,
         request: RequestBuilder,
@@ -193,7 +199,10 @@ fn visitor_data(mut page: impl Read) -> Result<String> {
         bytes.extend_from_slice(&chunk[..count]);
         ensure!(bytes.len() <= 4 * 1024 * 1024, "Oversized visitor page");
         let text = String::from_utf8_lossy(&bytes);
-        if let Some((_, bootstrap)) = text.split_once("ytcfg.set(") {
+        // yt-dlp's ytcfg pattern requires an object; `ytcfg.set("KEY", value)`
+        // calls are skipped.
+        if let Some(start) = text.find("ytcfg.set({") {
+            let bootstrap = &text[start + "ytcfg.set(".len()..];
             let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
             match values.next() {
                 Some(Ok(config))
@@ -264,6 +273,15 @@ fn codec_rank(codec: &str, video: bool) -> Option<f64> {
         .iter()
         .position(|prefixes| prefixes.iter().any(|prefix| codec.starts_with(prefix)))
         .map(|index| (prefixes.len() - index) as f64)
+        // Dolby Vision is a video codec outside yt-dlp's codec order, which
+        // ranks it below every listed codec rather than dropping the format.
+        .or_else(|| {
+            (video
+                && ["dvh1", "dvhe"]
+                    .iter()
+                    .any(|prefix| codec.starts_with(prefix)))
+            .then_some(0.)
+        })
 }
 
 /// yt-dlp's `hdr:12` rank, from its codec parsing: HDR10 above SDR, and Dolby
@@ -787,6 +805,20 @@ pub(super) mod tests {
                 > Duration::from_secs(590)
         );
         server.join().unwrap();
+        // A new account session starts with no visitor ID and no pause.
+        lookup.reset();
+        let visitor = lookup.visitor.lock().unwrap();
+        assert!(visitor.data.is_none() && visitor.paused_until.is_none());
+    }
+
+    #[test]
+    fn visitor_data_skips_key_value_ytcfg_calls_and_dolby_vision_is_kept() {
+        let page = "ytcfg.set(\"EXPERIMENT\", true);ytcfg.set({\"VISITOR_DATA\":\"VD\"});";
+        assert_eq!(visitor_data(page.as_bytes()).unwrap(), "VD");
+        // yt-dlp ranks an unlisted video codec below listed ones, not out.
+        assert_eq!(codec_rank("dvh1.05.06", true), Some(0.));
+        assert!(codec_rank("theora", true) > codec_rank("dvh1.05.06", true));
+        assert_eq!(dynamic_range("dvh1.05.06"), -8.);
     }
 
     #[test]

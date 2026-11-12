@@ -2047,6 +2047,9 @@ fn run(
                     );
                     if result.is_ok() {
                         let native = resolver.native.take();
+                        if let Some(native) = &native {
+                            native.lookup.reset();
+                        }
                         resolver = StreamResolver::new(ytdlp, credentials.as_ref());
                         resolver.native = native;
                     }
