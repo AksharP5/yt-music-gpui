@@ -1,0 +1,273 @@
+{
+  "playabilityStatus": {
+    "status": "OK"
+  },
+  "videoDetails": {
+    "videoId": "abcdefghijk",
+    "title": "Synthetic",
+    "lengthSeconds": "200"
+  },
+  "streamingData": {
+    "formats": [
+      {
+        "itag": 18,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=18",
+        "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+        "quality": "medium",
+        "height": 360,
+        "width": 640,
+        "averageBitrate": 500000
+      }
+    ],
+    "adaptiveFormats": [
+      {
+        "itag": 599,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=599",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.5\"",
+        "audioQuality": "AUDIO_QUALITY_ULTRALOW",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 31000
+      },
+      {
+        "itag": 600,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=600",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "audioQuality": "AUDIO_QUALITY_ULTRALOW",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 35000
+      },
+      {
+        "itag": 139,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=139",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.5\"",
+        "audioQuality": "AUDIO_QUALITY_LOW",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 58000
+      },
+      {
+        "itag": 249,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=249",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "audioQuality": "AUDIO_QUALITY_LOW",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 70000
+      },
+      {
+        "itag": 140,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=140",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "audioQuality": "AUDIO_QUALITY_MEDIUM",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 130000
+      },
+      {
+        "itag": 251,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=251",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "audioQuality": "AUDIO_QUALITY_MEDIUM",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 150000
+      },
+      {
+        "itag": 141,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=141",
+        "approxDurationMs": "200000",
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "audioQuality": "AUDIO_QUALITY_HIGH",
+        "quality": "tiny",
+        "audioSampleRate": "48000",
+        "audioChannels": 2,
+        "averageBitrate": 260000
+      },
+      {
+        "itag": 160,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=160",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.4d400c\"",
+        "quality": "tiny",
+        "height": 144,
+        "width": 256,
+        "fps": 30,
+        "averageBitrate": 288000
+      },
+      {
+        "itag": 133,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=133",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.4d4015\"",
+        "quality": "small",
+        "height": 240,
+        "width": 427,
+        "fps": 30,
+        "averageBitrate": 480000
+      },
+      {
+        "itag": 134,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=134",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.4d401e\"",
+        "quality": "medium",
+        "height": 360,
+        "width": 640,
+        "fps": 30,
+        "averageBitrate": 720000
+      },
+      {
+        "itag": 135,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=135",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.4d401e\"",
+        "quality": "large",
+        "height": 480,
+        "width": 853,
+        "fps": 30,
+        "averageBitrate": 960000
+      },
+      {
+        "itag": 397,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=397",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"av01.0.04M.08\"",
+        "quality": "large",
+        "height": 480,
+        "width": 853,
+        "fps": 30,
+        "averageBitrate": 960000
+      },
+      {
+        "itag": 333,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=333",
+        "approxDurationMs": "200000",
+        "mimeType": "video/webm; codecs=\"vp09.02.30.10.01.09.16.09.00\"",
+        "quality": "large",
+        "height": 480,
+        "width": 853,
+        "fps": 30,
+        "averageBitrate": 960000,
+        "qualityLabel": "480p HDR",
+        "colorInfo": {
+          "primaries": "COLOR_PRIMARIES_BT2020",
+          "transferCharacteristics": "COLOR_TRANSFER_CHARACTERISTICS_SMPTEST2084",
+          "matrixCoefficients": "COLOR_MATRIX_COEFFICIENTS_BT2020_NCL"
+        }
+      },
+      {
+        "itag": 136,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=136",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.4d401f\"",
+        "quality": "hd720",
+        "height": 720,
+        "width": 1280,
+        "fps": 30,
+        "averageBitrate": 1440000
+      },
+      {
+        "itag": 247,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=247",
+        "approxDurationMs": "200000",
+        "mimeType": "video/webm; codecs=\"vp9\"",
+        "quality": "hd720",
+        "height": 720,
+        "width": 1280,
+        "fps": 30,
+        "averageBitrate": 1440000
+      },
+      {
+        "itag": 298,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=298",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.4d4020\"",
+        "quality": "hd720",
+        "height": 720,
+        "width": 1280,
+        "fps": 60,
+        "averageBitrate": 1440000
+      },
+      {
+        "itag": 137,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=137",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.640028\"",
+        "quality": "hd1080",
+        "height": 1080,
+        "width": 1920,
+        "fps": 30,
+        "averageBitrate": 2160000
+      },
+      {
+        "itag": 399,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=399",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"av01.0.08M.08\"",
+        "quality": "hd1080",
+        "height": 1080,
+        "width": 1920,
+        "fps": 30,
+        "averageBitrate": 2160000
+      },
+      {
+        "itag": 299,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=299",
+        "approxDurationMs": "200000",
+        "mimeType": "video/mp4; codecs=\"avc1.64002a\"",
+        "quality": "hd1080",
+        "height": 1080,
+        "width": 1920,
+        "fps": 60,
+        "averageBitrate": 2160000
+      },
+      {
+        "itag": 303,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=303",
+        "approxDurationMs": "200000",
+        "mimeType": "video/webm; codecs=\"vp9\"",
+        "quality": "hd1080",
+        "height": 1080,
+        "width": 1920,
+        "fps": 60,
+        "averageBitrate": 2160000
+      },
+      {
+        "itag": 271,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=271",
+        "approxDurationMs": "200000",
+        "mimeType": "video/webm; codecs=\"vp9\"",
+        "quality": "hd1440",
+        "height": 1440,
+        "width": 2560,
+        "fps": 30,
+        "averageBitrate": 2880000
+      },
+      {
+        "itag": 313,
+        "url": "https://rr1.googlevideo.com/videoplayback?itag=313",
+        "approxDurationMs": "200000",
+        "mimeType": "video/webm; codecs=\"vp9\"",
+        "quality": "hd2160",
+        "height": 2160,
+        "width": 3840,
+        "fps": 30,
+        "averageBitrate": 4320000
+      }
+    ]
+  }
+}

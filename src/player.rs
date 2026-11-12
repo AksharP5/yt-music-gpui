@@ -27,6 +27,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod native;
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
 pub struct PlaybackSpeed(f64);
@@ -304,25 +306,25 @@ fn command_channel() -> Result<(CommandSender, Receiver<PlayerCommand>)> {
 impl CommandSender {
     fn send(&self, command: PlayerCommand) -> Result<(), mpsc::SendError<PlayerCommand>> {
         self.sender.send(command)?;
-        let increment = 1_u64.to_ne_bytes();
-        loop {
-            let result = unsafe {
-                libc::write(
-                    self.wake.as_raw_fd(),
-                    increment.as_ptr().cast(),
-                    increment.len(),
-                )
-            };
-            if result == increment.len() as isize {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                ErrorKind::Interrupted => continue,
-                // A saturated eventfd is already readable, so no wakeup is lost.
-                ErrorKind::WouldBlock => return Ok(()),
-                _ => unreachable!("The owned player wakeup must remain writable: {error}"),
-            }
+        signal_player(&self.wake);
+        Ok(())
+    }
+}
+
+fn signal_player(wake: &OwnedFd) {
+    let increment = 1_u64.to_ne_bytes();
+    loop {
+        let result =
+            unsafe { libc::write(wake.as_raw_fd(), increment.as_ptr().cast(), increment.len()) };
+        if result == increment.len() as isize {
+            return;
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            ErrorKind::Interrupted => continue,
+            // A saturated eventfd is already readable, so no wakeup is lost.
+            ErrorKind::WouldBlock => return,
+            _ => unreachable!("The owned player wakeup must remain writable: {error}"),
         }
     }
 }
@@ -407,17 +409,26 @@ pub struct Player {
 
 impl Player {
     pub fn new(options: PlayerOptions) -> Result<Self> {
-        Self::with_extractor(options, find_ytdlp()?)
+        Self::with_lookup(options, find_ytdlp()?, native::Lookup::new().ok())
     }
 
+    #[cfg(test)]
     fn with_extractor(options: PlayerOptions, ytdlp: PathBuf) -> Result<Self> {
+        Self::with_lookup(options, ytdlp, None)
+    }
+
+    fn with_lookup(
+        options: PlayerOptions,
+        ytdlp: PathBuf,
+        lookup: Option<native::Lookup>,
+    ) -> Result<Self> {
         let (commands, receiver) = command_channel()?;
         let wake = commands.wake.clone();
         let (events, event_receiver) = async_channel::unbounded();
         let worker = thread::Builder::new()
             .name("music-player".into())
             .spawn(move || {
-                if let Err(error) = run(options, receiver, &wake, &events, &ytdlp) {
+                if let Err(error) = run(options, receiver, &wake, &events, &ytdlp, lookup) {
                     let _ = events.send_blocking(PlayerEvent::Error {
                         track_id: None,
                         message: format!("{error:#}"),
@@ -1130,8 +1141,7 @@ struct StreamKey {
     video: Option<VideoQuality>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolverLane {
     Fast,
     Full,
@@ -1362,7 +1372,7 @@ impl WarmResolver {
     fn send(&mut self, target: &PreparedTarget) -> Result<()> {
         serde_json::to_writer(
             &mut self.input,
-            &json!({"url": target.key.url, "format": target.key.selector(), "lane": target.lane}),
+            &json!({"url": target.key.url, "format": target.key.selector()}),
         )?;
         self.input.write_all(b"\n")?;
         Ok(())
@@ -1400,6 +1410,87 @@ impl Drop for WarmResolver {
     }
 }
 
+struct NativeResolver {
+    lookup: native::Lookup,
+    wake: Arc<OwnedFd>,
+    sender: Sender<(u64, Result<ResolvedStream>)>,
+    receiver: Receiver<(u64, Result<ResolvedStream>)>,
+    target: Option<PreparedTarget>,
+    generation: u64,
+    started: Instant,
+}
+
+impl NativeResolver {
+    fn new(lookup: native::Lookup, wake: Arc<OwnedFd>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            lookup,
+            wake,
+            sender,
+            receiver,
+            target: None,
+            generation: 0,
+            started: Instant::now(),
+        }
+    }
+
+    fn start(&mut self, target: PreparedTarget) -> Result<()> {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|current| current.key == target.key)
+        {
+            self.target = Some(target);
+            return Ok(());
+        }
+        self.target = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let key = target.key.clone();
+        let lookup = self.lookup.clone();
+        let sender = self.sender.clone();
+        let wake = self.wake.clone();
+        thread::Builder::new()
+            .name("stream-lookup".into())
+            .spawn(move || {
+                let result = (|| {
+                    let url = reqwest::Url::parse(&key.url)?;
+                    let id = url
+                        .query_pairs()
+                        .find_map(|(name, value)| (name == "v").then(|| value.into_owned()))
+                        .context("Missing video ID")?;
+                    let urls = lookup.lookup(&id, key.quality, key.video)?;
+                    ResolvedStream::parse(key, urls.join("\n").as_bytes(), SystemTime::now())
+                })();
+                if sender.send((generation, result)).is_ok() {
+                    signal_player(&wake);
+                }
+            })?;
+        self.started = Instant::now();
+        self.target = Some(target);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Option<(PreparedTarget, Result<ResolvedStream>, Instant)> {
+        while let Ok((generation, result)) = self.receiver.try_recv() {
+            if generation == self.generation
+                && let Some(target) = self.target.take()
+            {
+                return Some((target, result, self.started));
+            }
+        }
+        if self.target.is_some() && self.started.elapsed() >= native::BUDGET {
+            self.lookup.stalled();
+            return Some((
+                self.target.take().unwrap(),
+                Err(anyhow::anyhow!("Native lookup timed out")),
+                self.started,
+            ));
+        }
+        None
+    }
+}
+
 struct StreamResolver {
     ytdlp: PathBuf,
     warm: Option<WarmResolver>,
@@ -1407,6 +1498,7 @@ struct StreamResolver {
     one_shot: Option<StreamPreparation>,
     target: Option<PreparedTarget>,
     started: Instant,
+    native: Option<NativeResolver>,
 }
 
 impl StreamResolver {
@@ -1419,6 +1511,7 @@ impl StreamResolver {
             one_shot: None,
             target: None,
             started: Instant::now(),
+            native: None,
         }
     }
 
@@ -1439,16 +1532,27 @@ impl StreamResolver {
             .target
             .as_ref()
             .map(|_| self.started + RESOLVER_TIMEOUT);
-        startup.into_iter().chain(request).min()
+        let native = self
+            .native
+            .as_ref()
+            .filter(|native| native.target.is_some())
+            .map(|native| native.started + native::BUDGET);
+        startup.into_iter().chain(request).chain(native).min()
     }
 
     fn stop(&mut self) {
+        if let Some(native) = &mut self.native {
+            native.target = None;
+        }
         self.warm.take();
         self.one_shot.take();
         self.target = None;
     }
 
     fn cancel(&mut self) {
+        if let Some(native) = &mut self.native {
+            native.target = None;
+        }
         if self.target.is_some() {
             self.stop();
         }
@@ -1456,18 +1560,40 @@ impl StreamResolver {
 
     fn start(
         &mut self,
-        target: PreparedTarget,
+        mut target: PreparedTarget,
         credentials: Option<&ExtractorCredentials>,
     ) -> Result<()> {
-        if self.target.as_ref().is_some_and(|current| {
-            // A fast lookup in flight cannot stand in for a requested full one.
-            current.key == target.key
-                && (target.lane == ResolverLane::Fast || current.lane == ResolverLane::Full)
-        }) {
+        if target.lane == ResolverLane::Fast
+            && let Some(native) = &mut self.native
+        {
+            if native.start(target.clone()).is_ok() {
+                return Ok(());
+            }
+            target.lane = ResolverLane::Full;
+        }
+        if let Some(native) = &mut self.native
+            && native
+                .target
+                .as_ref()
+                .is_some_and(|current| current.key == target.key)
+        {
+            native.target = None;
+        }
+        // Python only runs full lookups, so its result can satisfy either lane.
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|current| current.key == target.key)
+        {
             self.target = Some(target);
             return Ok(());
         }
-        self.cancel();
+        // Only supersede the full extractor here. Native clicks are independent.
+        if self.target.is_some() {
+            self.warm.take();
+            self.one_shot.take();
+            self.target = None;
+        }
         if self.warm.is_none() && self.warm_enabled {
             self.warm = WarmResolver::start(&self.ytdlp, credentials).ok();
             self.warm_enabled = self.warm.is_some();
@@ -1495,10 +1621,64 @@ impl StreamResolver {
         Ok(())
     }
 
+    fn retain(&mut self, play: Option<&PreparedTarget>, next: Option<&PreparedTarget>) {
+        let wanted = [play, next];
+        if let Some(current) = &mut self.target {
+            if let Some(target) = wanted
+                .into_iter()
+                .flatten()
+                .find(|target| target.key == current.key)
+            {
+                current.track_id = target.track_id;
+            } else {
+                self.warm.take();
+                self.one_shot.take();
+                self.target = None;
+            }
+        }
+        if let Some(native) = &mut self.native
+            && let Some(current) = &mut native.target
+        {
+            if let Some(target) = wanted
+                .into_iter()
+                .flatten()
+                .find(|target| target.lane == ResolverLane::Fast && target.key == current.key)
+            {
+                current.track_id = target.track_id;
+            } else {
+                native.target = None;
+            }
+        }
+    }
+
+    /// `play` is the song waiting to load. A failed native preparation must not
+    /// take the full extractor from it; preparation restarts once it loads.
     fn finish(
         &mut self,
+        play: Option<&PreparedTarget>,
         credentials: Option<&ExtractorCredentials>,
     ) -> Option<(PreparedTarget, Result<ResolvedStream>)> {
+        if let Some((mut target, result, started)) =
+            self.native.as_mut().and_then(NativeResolver::finish)
+        {
+            if result.is_ok() {
+                return Some((target, result));
+            }
+            let serving_play = play.is_some_and(|play| {
+                play.track_id != target.track_id
+                    && self
+                        .target
+                        .as_ref()
+                        .is_some_and(|current| current.key == play.key)
+            });
+            if !serving_play {
+                target.lane = ResolverLane::Full;
+                if let Err(error) = self.start(target.clone(), credentials) {
+                    return Some((target, Err(error)));
+                }
+                self.started = started;
+            }
+        }
         let mut result = None;
         if let Some(warm) = &mut self.warm {
             let response = if !warm.ready && warm.started.elapsed() >= RESOLVER_TIMEOUT {
@@ -1559,6 +1739,7 @@ impl StreamResolver {
 }
 
 struct PendingPlay {
+    target: PreparedTarget,
     title: String,
     options: PlayOptions,
 }
@@ -1651,9 +1832,10 @@ fn find_ytdlp() -> Result<PathBuf> {
 fn run(
     mut options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
-    wake: &OwnedFd,
+    wake: &Arc<OwnedFd>,
     events: &async_channel::Sender<PlayerEvent>,
     ytdlp: &Path,
+    lookup: Option<native::Lookup>,
 ) -> Result<()> {
     let runtime = playback_runtime(&private_runtime()?)?;
     let socket_path = runtime.path().join("mpv.sock");
@@ -1673,6 +1855,7 @@ fn run(
     let core = MpvCore::new(&options, &socket_path)?;
     // Cancel/reap the resolver before credentials or the core can drop.
     let mut resolver = StreamResolver::new(ytdlp, credentials.as_ref());
+    resolver.native = lookup.map(|lookup| NativeResolver::new(lookup, wake.clone()));
     let mut pending_play: Option<PendingPlay> = None;
     let mut next_target: Option<PreparedTarget> = None;
     let mut prepared: Option<(PreparedTarget, ResolvedStream)> = None;
@@ -1733,7 +1916,7 @@ fn run(
                     // A queue render can prepare the following song while Play is
                     // resolving. Interactive playback keeps the single request slot.
                     if pending_play.is_none() {
-                        if let Some(target) = next_target.take() {
+                        if let Some(target) = next_target.clone() {
                             let _ = resolver.start(target, credentials.as_ref());
                         } else {
                             resolver.cancel();
@@ -1808,22 +1991,21 @@ fn run(
                             )?;
                             continue;
                         }
-                        pending_play = Some(PendingPlay { title, options });
-                        if resolver
-                            .start(
-                                PreparedTarget {
-                                    lane: if options.full_lookup {
-                                        ResolverLane::Full
-                                    } else {
-                                        key.lane(false, credentials.is_some())
-                                    },
-                                    key,
-                                    track_id,
-                                },
-                                credentials.as_ref(),
-                            )
-                            .is_err()
-                        {
+                        let target = PreparedTarget {
+                            lane: if options.full_lookup {
+                                ResolverLane::Full
+                            } else {
+                                key.lane(false, credentials.is_some())
+                            },
+                            key,
+                            track_id,
+                        };
+                        pending_play = Some(PendingPlay {
+                            target: target.clone(),
+                            title,
+                            options,
+                        });
+                        if resolver.start(target, credentials.as_ref()).is_err() {
                             pending_play = None;
                             stream_error(track_id, events);
                         }
@@ -1864,7 +2046,12 @@ fn run(
                         events,
                     );
                     if result.is_ok() {
+                        let native = resolver.native.take();
+                        if let Some(native) = &native {
+                            native.lookup.reset();
+                        }
                         resolver = StreamResolver::new(ytdlp, credentials.as_ref());
+                        resolver.native = native;
                     }
                     let _ = reply.send_blocking(
                         result
@@ -1875,20 +2062,13 @@ fn run(
                     result?;
                 }
                 Ok(PlayerCommand::AttachVideo { video: next }) => {
-                    let result = (|| {
+                    let result: Result<()> = (|| {
                         ensure!(video.is_none(), "A video surface is already attached");
                         next.start(core.0.as_ptr(), wake)?;
                         let attached = AttachedVideo {
                             video: next,
                             ready: false,
                         };
-                        request(
-                            &mut socket,
-                            &mut pending,
-                            json!(["set_property", "vid", "auto"]),
-                            |value| state.message(value, events),
-                        )
-                        .map_err(|_| anyhow::anyhow!("Could not enable the video track"))?;
                         video = Some(attached);
                         Ok(())
                     })();
@@ -1941,8 +2121,18 @@ fn run(
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        if let Some((target, result)) = resolver.finish(credentials.as_ref()) {
-            if let Some(play) = pending_play.take() {
+        resolver.retain(
+            pending_play.as_ref().map(|play| &play.target),
+            next_target.as_ref(),
+        );
+        if let Some((target, result)) = resolver.finish(
+            pending_play.as_ref().map(|play| &play.target),
+            credentials.as_ref(),
+        ) {
+            if pending_play.as_ref().is_some_and(|play| {
+                play.target.track_id == target.track_id && play.target.key == target.key
+            }) {
+                let play = pending_play.take().unwrap();
                 match result {
                     Ok(stream) => {
                         let options = PlayOptions {
@@ -1954,7 +2144,11 @@ fn run(
                             load_command(&stream.url, &play.title, options),
                             Some(json!(target.track_id)),
                         )?;
-                        if let Some(target) = next_target.take() {
+                        if let Some(target) = next_target.clone()
+                            && !prepared.as_ref().is_some_and(|(current, stream)| {
+                                current.track_id == target.track_id && stream.matches(&target.key)
+                            })
+                        {
                             let _ = resolver.start(target, credentials.as_ref());
                         }
                     }
@@ -1963,29 +2157,42 @@ fn run(
                         stream_error(target.track_id, events);
                     }
                 }
-            } else if let Ok(stream) = result {
-                let mut command = load_command(
-                    &stream.url,
-                    "",
-                    PlayOptions {
-                        quality: target.key.quality,
-                        video: target.key.video,
-                        ..Default::default()
-                    },
-                );
-                command[2] = json!("append");
-                state.upcoming = Some(target.track_id);
-                write_command(
-                    &mut socket,
-                    command,
-                    Some(json!(format!("prepare:{}", target.track_id))),
-                )?;
-                #[cfg(test)]
-                let _ = events.send_blocking(PlayerEvent::Prepared {
-                    video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
-                });
+            } else if next_target
+                .as_ref()
+                .is_some_and(|next| next.track_id == target.track_id && next.key == target.key)
+                && let Ok(stream) = result
+            {
                 prepared = Some((target, stream));
             }
+        }
+        // A full preparation can finish while a native click is resolving. Hold
+        // it until that click loads, so append cannot replace its pending load.
+        if pending_play.is_none()
+            && let Some((target, stream)) = &prepared
+            && state.upcoming != Some(target.track_id)
+            // After a natural transition the prepared song is already playing.
+            && state.current != Some(target.track_id)
+        {
+            let mut command = load_command(
+                &stream.url,
+                "",
+                PlayOptions {
+                    quality: target.key.quality,
+                    video: target.key.video,
+                    ..Default::default()
+                },
+            );
+            command[2] = json!("append");
+            state.upcoming = Some(target.track_id);
+            write_command(
+                &mut socket,
+                command,
+                Some(json!(format!("prepare:{}", target.track_id))),
+            )?;
+            #[cfg(test)]
+            let _ = events.send_blocking(PlayerEvent::Prepared {
+                video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
+            });
         }
         if prepared.as_ref().is_some_and(|(target, stream)| {
             state.current != Some(target.track_id) && SystemTime::now() >= stream.expires
@@ -1996,25 +2203,34 @@ fn run(
             let _ = resolver.start(target, credentials.as_ref());
         }
         if let Some(attached) = &mut video {
-            match attached.video.ready_for_player() {
-                Ok(true) if !attached.ready => {
+            let result = attached.video.ready_for_player().and_then(|ready| {
+                if ready && !attached.ready {
+                    // A native lookup can load video before EGL/libmpv finishes
+                    // starting. Enabling it sooner leaves mpv with no renderer.
+                    request(
+                        &mut socket,
+                        &mut pending,
+                        json!(["set_property", "vid", "auto"]),
+                        |value| state.message(value, events),
+                    )
+                    .map_err(|_| anyhow::anyhow!("Could not enable the video track"))?;
                     attached.ready = true;
                     let _ = events.send_blocking(PlayerEvent::VideoChanged);
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = request(
-                        &mut socket,
-                        &mut pending,
-                        json!(["set_property", "vid", "no"]),
-                        |value| state.message(value, events),
-                    );
-                    video.take();
-                    let _ = events.send_blocking(PlayerEvent::VideoError {
-                        message: error.to_string(),
-                    });
-                    let _ = events.send_blocking(PlayerEvent::VideoChanged);
-                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                let _ = request(
+                    &mut socket,
+                    &mut pending,
+                    json!(["set_property", "vid", "no"]),
+                    |value| state.message(value, events),
+                );
+                video.take();
+                let _ = events.send_blocking(PlayerEvent::VideoError {
+                    message: error.to_string(),
+                });
+                let _ = events.send_blocking(PlayerEvent::VideoChanged);
             }
         }
         if state.loaded
@@ -2676,120 +2892,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic responses, no network"]
-    fn warm_fast_lane_is_isolated_and_falls_back_to_the_full_instance() {
-        let directory = tempfile::tempdir().unwrap();
-        let plugin = synthetic_resolver_plugin(directory.path());
-        let path = plugin.join("account/yt_dlp_plugins/extractor/account.py");
-        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
-        writeln!(
-            file,
-            r#"
-import io, time, urllib.request
-import yt_dlp
-from yt_dlp.extractor.youtube import YoutubeIE
-from yt_dlp.utils import DownloadError
-
-visits = 0
-def homepage(url, **kwargs):
-    global visits
-    assert url.full_url == 'https://music.youtube.com/'
-    assert url.get_header('User-agent').startswith('Mozilla/')
-    assert not url.has_header('Cookie')
-    visits += 1
-    Path({visitor:?}).write_text(str(visits))
-    return io.BytesIO(('{{"VISITOR_DATA":"VD_' + str(visits) + '"}}').encode())
-
-urllib.request.urlopen = homepage
-
-def no_network(*args, **kwargs):
-    raise AssertionError('offline test attempted a network request')
-
-yt_dlp.YoutubeDL.urlopen = no_network
-YoutubeIE._real_initialize = lambda self: None
-
-def fast_extract(self, url):
-    ydl = self._downloader
-    assert set(ydl._ies) == {{'Youtube'}}
-    assert not list(self.cookiejar)
-    assert ydl.params.get('cookiefile') is None
-    assert ydl.params.get('cookiesfrombrowser') is None
-    assert ydl.params['cachedir'] is False
-    assert 'ytmusicaccount' not in ydl.params['extractor_args']
-    args = ydl.params['extractor_args']['youtube']
-    assert args['player_client'] == ['visionos']
-    assert args['player_skip'] == ['webpage', 'initial_data', 'configs']
-    assert args['skip'] == ['hls', 'dash']
-    self.calls = getattr(self, 'calls', 0) + 1
-    if url.endswith('botonce0000') and visits == 1 or url.endswith('alwaysbot00'):
-        ydl.report_error('Sign in to confirm you are not a bot. INVENTED_SECRET')
-    if url.endswith('failfast000'):
-        raise DownloadError('INVENTED_SECRET')
-    if url.endswith('stalled0000'):
-        time.sleep(60)
-    formats = [] if url.endswith('nourls00000') else [{{
-        'format_id':'audio', 'ext':'webm', 'vcodec':'none', 'acodec':'opus',
-        'url':'https://rr1.googlevideo.com/audio?visitor=' + args['visitor_data'][0]}}]
-    return {{'id':'abcdefghijk', 'title':'Synthetic', 'formats':formats}}
-
-YoutubeIE._real_extract = fast_extract
-"#,
-            visitor = directory.path().join("visits").to_str().unwrap()
-        )
-        .unwrap();
-        drop(file);
-        let credentials =
-            prepare_credentials(synthetic_credentials("INVENTED_COOKIE"), &plugin).unwrap();
-        let mut resolver = StreamResolver::new(&find_ytdlp().unwrap(), Some(&credentials));
-        resolver
-            .start(resolver_target("abcdefghijk", 1), Some(&credentials))
-            .unwrap();
-        assert!(
-            resolved(&mut resolver, Some(&credentials))
-                .url
-                .contains("call=1")
-        );
-        assert!(
-            !directory.path().join("visits").exists(),
-            "full requests must not fetch visitor data"
-        );
-        let pid = resolver.warm.as_ref().unwrap().child.id();
-        let fast = |resolver: &mut StreamResolver, id: &str, expected: &str| {
-            let mut target = resolver_target(id, 2);
-            target.lane = ResolverLane::Fast;
-            resolver.start(target, Some(&credentials)).unwrap();
-            let stream = resolved(resolver, Some(&credentials));
-            assert!(stream.url.contains(expected), "{id}: {}", stream.url);
-        };
-        // Fast URLs carry the visitor data; full-instance URLs count its calls.
-        for (id, expected) in [
-            ("abcdefghijk", "visitor=VD_1"),
-            ("botonce0000", "visitor=VD_2"),
-            ("abcdefghijk", "visitor=VD_2"),
-            ("failfast000", "call=2"),
-            ("nourls00000", "call=3"),
-            ("alwaysbot00", "call=4"),
-            // A bot check that survives a fresh visitor ID pauses the fast lane.
-            ("abcdefghijk", "call=5"),
-        ] {
-            fast(&mut resolver, id, expected);
-            assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
-        }
-        assert_eq!(
-            fs::read_to_string(directory.path().join("visits")).unwrap(),
-            "3"
-        );
-        resolver.stop();
-        // A fast attempt that never finishes yields to the full instance within
-        // its budget, and pauses the fast lane too.
-        let mut resolver = StreamResolver::new(&find_ytdlp().unwrap(), Some(&credentials));
-        let started = Instant::now();
-        fast(&mut resolver, "stalled0000", "call=1");
-        assert!(started.elapsed() < Duration::from_secs(15));
-        fast(&mut resolver, "abcdefghijk", "call=2");
-    }
-
     fn synthetic_resolver_plugin(directory: &Path) -> PathBuf {
         let plugin = write_account_extractor(directory).unwrap();
         let path = plugin.join("account/yt_dlp_plugins/extractor/account.py");
@@ -2825,7 +2927,7 @@ YtMusicAccountIE._real_extract = extract
     ) -> ResolvedStream {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some((_, result)) = resolver.finish(credentials) {
+            if let Some((_, result)) = resolver.finish(None, credentials) {
                 return result.unwrap();
             }
             assert!(Instant::now() < deadline, "resolver did not answer");
@@ -3034,43 +3136,162 @@ YtMusicAccountIE._real_extract = extract
             .unwrap()
         );
         let (_, stream) = resolver
-            .finish(None)
+            .finish(None, None)
             .expect("child exit must wake the actor");
         assert!(stream.is_ok());
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(resolver.fd().is_none() && resolver.deadline().is_none());
     }
 
+    fn synthetic_full_resolver(directory: &Path, blocked: bool) -> StreamResolver {
+        let interpreter = directory.join("python3");
+        let response = if blocked {
+            format!(
+                "echo started > {}; exec sleep 60",
+                directory.join("started").display()
+            )
+        } else {
+            "printf '%s\\n' '{\"urls\":[\"https://rr1.googlevideo.com/full\"]}'".into()
+        };
+        fs::write(&interpreter, format!("#!/bin/sh\nprintf '%s\\n' '{{\"ready\":true}}'\nwhile IFS= read -r request; do {response}; done\n")).unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+        let extractor = directory.join("extractor");
+        fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
+        StreamResolver::new(&extractor, None)
+    }
+
+    #[test]
+    fn native_click_during_full_preparation_does_not_wait_or_restart_python() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let (commands, _received) = command_channel().unwrap();
+        let (lookup, server) = native::tests::server(vec![
+            native::tests::homepage(),
+            native::tests::fixture().to_string(),
+        ]);
+        resolver.native = Some(NativeResolver::new(lookup, commands.wake.clone()));
+        let preparation = resolver_target("blocked0000", 1);
+        resolver.start(preparation.clone(), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !directory.path().join("started").exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pid = resolver.warm.as_ref().unwrap().child.id();
+        let mut click = resolver_target("abcdefghijk", 2);
+        click.lane = ResolverLane::Fast;
+        let start = Instant::now();
+        resolver.start(click.clone(), None).unwrap();
+        resolver.retain(Some(&click), Some(&preparation));
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (target, stream) = loop {
+            if let Some(result) = resolver.finish(None, None) {
+                break result;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            wait_for_player_input(
+                &socket,
+                &commands.wake,
+                resolver.fd(),
+                Some(start + Duration::from_secs(2)),
+            )
+            .unwrap();
+        };
+        assert_eq!(target.track_id, 2);
+        assert!(stream.unwrap().url.contains("itag=251"));
+        assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
+        assert_eq!(resolver.target.as_ref().unwrap().track_id, 1);
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_native_preparation_leaves_the_full_reload_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let (commands, _received) = command_channel().unwrap();
+        let (lookup, server) =
+            native::tests::server(vec![native::tests::homepage(), "invalid json".into()]);
+        resolver.native = Some(NativeResolver::new(lookup, commands.wake.clone()));
+        // The next song starts natively, then the current song's automatic
+        // reload takes the full extractor while that preparation is in flight.
+        let mut preparation = resolver_target("abcdefghijk", 2);
+        preparation.lane = ResolverLane::Fast;
+        resolver.start(preparation.clone(), None).unwrap();
+        let reload = resolver_target("blocked0000", 1);
+        resolver.start(reload.clone(), None).unwrap();
+        let pid = resolver.warm.as_ref().unwrap().child.id();
+        resolver.retain(Some(&reload), Some(&preparation));
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        loop {
+            assert!(resolver.finish(Some(&reload), None).is_none());
+            if resolver.native.as_ref().unwrap().target.is_none() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            wait_for_player_input(
+                &socket,
+                &commands.wake,
+                resolver.fd(),
+                Some(start + Duration::from_secs(2)),
+            )
+            .unwrap();
+        }
+        assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
+        assert_eq!(resolver.target.as_ref().unwrap().track_id, 1);
+        assert!(resolver.deadline().is_some());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_failures_fall_back_to_the_same_full_resolver() {
+        let mut cipher = native::tests::fixture();
+        for field in ["formats", "adaptiveFormats"] {
+            for format in cipher["streamingData"][field].as_array_mut().unwrap() {
+                format.as_object_mut().unwrap().remove("url");
+                format["signatureCipher"] = json!("s=encrypted");
+            }
+        }
+        for response in ["invalid json".into(),json!({"videoDetails":{"videoId":"abcdefghijk"},"playabilityStatus":{"status":"UNPLAYABLE"}}).to_string(),cipher.to_string()] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut resolver = synthetic_full_resolver(directory.path(),false);
+            let pid = resolver.warm.as_ref().unwrap().child.id();
+            let (commands,_received) = command_channel().unwrap();
+            let (lookup,server) = native::tests::server(vec![native::tests::homepage(),response]);
+            resolver.native = Some(NativeResolver::new(lookup,commands.wake.clone()));
+            let mut target = resolver_target("abcdefghijk",7);
+            target.lane = ResolverLane::Fast;
+            resolver.start(target,None).unwrap();
+            let stream = resolved(&mut resolver,None);
+            assert!(stream.url.ends_with("/full"));
+            assert_eq!(resolver.warm.as_ref().unwrap().child.id(),pid);
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn a_fast_lookup_in_flight_never_answers_a_full_request() {
         let directory = tempfile::tempdir().unwrap();
-        let interpreter = directory.path().join("python3");
-        fs::write(&interpreter, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
-        let extractor = directory.path().join("extractor");
-        fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
-        let pid = |resolver: &StreamResolver| resolver.warm.as_ref().map(|warm| warm.child.id());
-        for (first, second, reused) in [
-            (ResolverLane::Fast, ResolverLane::Full, false),
-            (ResolverLane::Full, ResolverLane::Fast, true),
-            (ResolverLane::Fast, ResolverLane::Fast, true),
-        ] {
-            let mut resolver = StreamResolver::new(&extractor, None);
-            resolver.warm.as_mut().unwrap().ready = true;
-            let mut target = resolver_target("abcdefghijk", 1);
-            target.lane = first;
-            resolver.start(target.clone(), None).unwrap();
-            let before = pid(&resolver);
-            target.lane = second;
-            resolver.start(target, None).unwrap();
-            assert_eq!(
-                pid(&resolver) == before,
-                reused,
-                "{first:?} then {second:?}"
-            );
-            assert_eq!(resolver.target.as_ref().unwrap().lane, second);
-            resolver.stop();
-        }
+        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let (commands, _received) = command_channel().unwrap();
+        let mut native = NativeResolver::new(native::Lookup::new().unwrap(), commands.wake);
+        let mut target = resolver_target("abcdefghijk", 1);
+        target.lane = ResolverLane::Fast;
+        native.target = Some(target.clone());
+        let stream = ResolvedStream::parse(
+            target.key.clone(),
+            b"https://rr1.googlevideo.com/obsolete",
+            SystemTime::now(),
+        )
+        .unwrap();
+        native.sender.send((native.generation, Ok(stream))).unwrap();
+        resolver.native = Some(native);
+        target.lane = ResolverLane::Full;
+        resolver.start(target, None).unwrap();
+        assert!(resolver.finish(None, None).is_none());
+        assert!(resolver.native.as_ref().unwrap().target.is_none());
+        assert_eq!(resolver.target.as_ref().unwrap().lane, ResolverLane::Full);
     }
 
     #[test]
@@ -3100,7 +3321,7 @@ YtMusicAccountIE._real_extract = extract
                 !wait_for_player_input(&socket, &commands.wake, resolver.fd(), Some(deadline))
                     .unwrap()
             );
-            let result = resolver.finish(None);
+            let result = resolver.finish(None, None);
             if ready {
                 assert!(
                     result
@@ -4135,6 +4356,7 @@ YtMusicAccountIE._real_extract = extract
                 &wake,
                 &events,
                 &find_ytdlp().unwrap(),
+                None,
             );
             finished.send(result).unwrap();
         });
@@ -4428,6 +4650,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        native::tests::compare_ytdlp(&native::tests::fixture());
     }
 
     #[test]
