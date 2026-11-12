@@ -9,6 +9,37 @@ import sys
 # entry is ignored and the shebang's interpreter supplies the installed package.
 sys.path.insert(0, sys.argv.pop(1))
 
+
+def remember_player_scripts(ydl):
+    """Keep YouTube's processed player script in memory between requests.
+
+    Without it, every song that needs a JavaScript challenge re-processes the
+    multi-megabyte player in a fresh JS runtime (~0.45 s). The cache lives only
+    in this process, so nothing reaches the disk (--no-cache-dir still holds).
+    """
+    from yt_dlp.cache import Cache
+    try:
+        from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
+    except ImportError:
+        return  # Other yt-dlp versions keep their default behavior.
+
+    class MemoryCache(Cache):
+        enabled = True
+
+        def __init__(self, ydl):
+            super().__init__(ydl)
+            self._entries = {}
+
+        def store(self, section, key, data, dtype='json'):
+            self._entries[section, key] = data
+
+        def load(self, section, key, dtype='json', default=None, *, min_ver=None):
+            return self._entries.get((section, key), default)
+
+    ydl.cache = MemoryCache(ydl)
+    EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
+
+
 protocol = sys.stdout
 output = io.StringIO()
 with contextlib.redirect_stdout(output):
@@ -22,6 +53,7 @@ with contextlib.redirect_stdout(output):
     plugin_dirs.value = parsed.options.plugin_dirs
     load_all_plugins()
     with yt_dlp.YoutubeDL(parsed.ydl_opts) as ydl:
+        remember_player_scripts(ydl)
         if parsed.ydl_opts['allowed_extractors'] == ['^ytmusicaccount$']:
             if (set(ydl._ies) != {'YtMusicAccount'}
                     or ydl.get_info_extractor('YtMusicAccount').IE_NAME != 'ytmusicaccount'):
