@@ -20,6 +20,9 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWe
 struct Visitor {
     data: Option<String>,
     paused_until: Option<Instant>,
+    // Bumped by reset(). A lookup from an earlier account session may still
+    // be running; it must not write its visitor ID or pause into this one.
+    epoch: u64,
 }
 
 #[derive(Clone)]
@@ -53,17 +56,18 @@ impl Lookup {
         video: Option<VideoQuality>,
     ) -> Result<Vec<String>> {
         let deadline = Instant::now() + BUDGET;
-        ensure!(
-            !self
-                .visitor
-                .lock()
-                .unwrap()
-                .paused_until
-                .is_some_and(|until| until > Instant::now()),
-            "Native lookup is paused"
-        );
+        let epoch = {
+            let visitor = self.visitor.lock().unwrap();
+            ensure!(
+                !visitor
+                    .paused_until
+                    .is_some_and(|until| until > Instant::now()),
+                "Native lookup is paused"
+            );
+            visitor.epoch
+        };
         let result = self
-            .player_response(video_id, deadline)
+            .player_response(video_id, deadline, epoch)
             .and_then(|player| select(&player, audio, video));
         if result.as_ref().err().is_some_and(|error| {
             Instant::now() >= deadline
@@ -73,13 +77,16 @@ impl Lookup {
                         .is_some_and(|error| error.is_timeout())
                 })
         }) {
-            self.pause(STALL_COOLDOWN);
+            self.pause(STALL_COOLDOWN, epoch);
         }
         result
     }
 
-    fn pause(&self, duration: Duration) {
+    fn pause(&self, duration: Duration, epoch: u64) {
         let mut visitor = self.visitor.lock().unwrap();
+        if visitor.epoch != epoch {
+            return;
+        }
         let until = Instant::now() + duration;
         visitor.paused_until = Some(
             visitor
@@ -89,13 +96,18 @@ impl Lookup {
     }
 
     pub(super) fn stalled(&self) {
-        self.pause(STALL_COOLDOWN);
+        let epoch = self.visitor.lock().unwrap().epoch;
+        self.pause(STALL_COOLDOWN, epoch);
     }
 
     /// Forget the guest visitor ID and any pause, so a new account session
     /// cannot be linked to the previous one through cookie-free lookups.
     pub(super) fn reset(&self) {
-        *self.visitor.lock().unwrap() = Visitor::default();
+        let mut visitor = self.visitor.lock().unwrap();
+        *visitor = Visitor {
+            epoch: visitor.epoch + 1,
+            ..Visitor::default()
+        };
     }
 
     fn send(
@@ -111,7 +123,7 @@ impl Lookup {
             .error_for_status()?)
     }
 
-    fn visitor_data(&self, refresh: bool, deadline: Instant) -> Result<String> {
+    fn visitor_data(&self, refresh: bool, deadline: Instant, epoch: u64) -> Result<String> {
         if !refresh && let Some(data) = self.visitor.lock().unwrap().data.clone() {
             return Ok(data);
         }
@@ -122,7 +134,10 @@ impl Lookup {
             .and_then(visitor_data);
         match result {
             Ok(data) => {
-                self.visitor.lock().unwrap().data = Some(data.clone());
+                let mut visitor = self.visitor.lock().unwrap();
+                if visitor.epoch == epoch {
+                    visitor.data = Some(data.clone());
+                }
                 Ok(data)
             }
             Err(error) => {
@@ -133,15 +148,15 @@ impl Lookup {
                         .is_some_and(|error| error.is_timeout())
                 }) && Instant::now() < deadline
                 {
-                    self.pause(COOLDOWN);
+                    self.pause(COOLDOWN, epoch);
                 }
                 Err(error)
             }
         }
     }
 
-    fn player_response(&self, video_id: &str, deadline: Instant) -> Result<Value> {
-        let mut visitor = self.visitor_data(false, deadline)?;
+    fn player_response(&self, video_id: &str, deadline: Instant, epoch: u64) -> Result<Value> {
+        let mut visitor = self.visitor_data(false, deadline, epoch)?;
         for attempt in 0..2 {
             let response = self.send(
                 self.client.post(&self.player)
@@ -173,10 +188,10 @@ impl Lookup {
                 .contains("not a bot")
             {
                 if attempt == 0 {
-                    visitor = self.visitor_data(true, deadline)?;
+                    visitor = self.visitor_data(true, deadline, epoch)?;
                     continue;
                 }
-                self.pause(COOLDOWN);
+                self.pause(COOLDOWN, epoch);
                 bail!("Native player requires a bot check");
             }
             ensure!(
@@ -809,6 +824,10 @@ pub(super) mod tests {
         lookup.reset();
         let visitor = lookup.visitor.lock().unwrap();
         assert!(visitor.data.is_none() && visitor.paused_until.is_none());
+        drop(visitor);
+        // A lookup that began before the reset cannot write into the new session.
+        lookup.pause(COOLDOWN, 0);
+        assert!(lookup.visitor.lock().unwrap().paused_until.is_none());
     }
 
     #[test]
@@ -924,7 +943,9 @@ print('27 selectors matched')
     fn live_native_formats_match_ytdlp_and_download() {
         let lookup = Lookup::new().unwrap();
         for id in ["dQw4w9WgXcQ", "csILUDfmtqM", "fJ9rUzIMcZQ", "jNQXAC9IVRw"] {
-            let player = lookup.player_response(id, Instant::now() + BUDGET).unwrap();
+            let player = lookup
+                .player_response(id, Instant::now() + BUDGET, 0)
+                .unwrap();
             compare_ytdlp(&player);
             let mut checked = std::collections::HashSet::new();
             for audio in AudioQuality::ALL {
