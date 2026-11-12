@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import re
+import signal
 import sys
 import urllib.request
 
@@ -52,8 +53,20 @@ def remember_player_scripts(ydl):
     EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
 
 
-# A stalled fast lane gives up quickly and falls back to the full lane.
+# A stalled fast lane gives up quickly and falls back to the full lane, leaving
+# it most of the player's 30 s deadline. Socket timeouts alone cannot bound a
+# response that trickles in, so the whole attempt also has one time budget.
 FAST_TIMEOUT = 3
+FAST_BUDGET = 5
+
+
+class FastBudgetExpired(BaseException):
+    # Not an Exception, so yt-dlp's own handlers cannot swallow it.
+    pass
+
+
+def expire_fast_budget(signum, frame):
+    raise FastBudgetExpired
 
 protocol = sys.stdout
 output = io.StringIO()
@@ -120,6 +133,8 @@ with contextlib.redirect_stdout(output):
                 request = json.loads(line)
                 urls = None
                 if request.get('lane') == 'fast':
+                    signal.signal(signal.SIGALRM, expire_fast_budget)
+                    signal.setitimer(signal.ITIMER_REAL, FAST_BUDGET)
                     try:
                         if fast is None:
                             # Never inherit the full instance's options, cookies, plugin
@@ -145,12 +160,13 @@ with contextlib.redirect_stdout(output):
                         if not urls and logger.bot_check:
                             args['visitor_data'] = [visitor_data()]
                             urls = extract(fast, request)
-                    except Exception:
-                        pass
-                # Keep the URL payload unchanged. The optional flag identifies actual
-                # fast-lane successes so mpv can retry an early open failure once.
-                response = {'urls': urls, 'fast': True} if urls else {'urls': extract(ydl, request)}
-            except Exception:
+                    except (Exception, FastBudgetExpired):
+                        urls = None
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                response = {'urls': urls or extract(ydl, request)}
+            except (Exception, FastBudgetExpired):
+                # The budget can expire just as a fast attempt finishes.
                 response = {'urls': None}
             protocol.write(json.dumps(response) + '\n')
             protocol.flush()

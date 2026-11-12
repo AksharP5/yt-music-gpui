@@ -1139,7 +1139,6 @@ struct PreparedTarget {
 }
 
 struct ResolvedStream {
-    fast: bool,
     key: StreamKey,
     url: String,
     expires: SystemTime,
@@ -1186,12 +1185,7 @@ impl ResolvedStream {
                 urls[1]
             )
         };
-        Ok(Self {
-            fast: false,
-            key,
-            url,
-            expires,
-        })
+        Ok(Self { key, url, expires })
     }
 
     fn matches(&self, key: &StreamKey) -> bool {
@@ -1311,14 +1305,8 @@ fn exit_with_parent(command: &mut Command) {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ResolverResponse {
-    Ready {
-        ready: bool,
-    },
-    Stream {
-        urls: Option<Vec<String>>,
-        #[serde(default)]
-        fast: bool,
-    },
+    Ready { ready: bool },
+    Stream { urls: Option<Vec<String>> },
 }
 
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1374,15 +1362,13 @@ impl WarmResolver {
         Ok(())
     }
 
-    fn read(&mut self) -> Result<Option<(Option<Vec<String>>, bool)>> {
+    fn read(&mut self) -> Result<Option<Option<Vec<String>>>> {
         loop {
             if let Some(end) = self.bytes.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.bytes.drain(..=end).collect();
                 match serde_json::from_slice(&line)? {
                     ResolverResponse::Ready { ready: true } if !self.ready => self.ready = true,
-                    ResolverResponse::Stream { urls, fast } if self.ready => {
-                        return Ok(Some((urls, fast)));
-                    }
+                    ResolverResponse::Stream { urls } if self.ready => return Ok(Some(urls)),
                     _ => bail!("Invalid resolver response"),
                 }
             } else {
@@ -1515,7 +1501,7 @@ impl StreamResolver {
                 warm.read()
             };
             match response {
-                Ok(Some((urls, fast))) => {
+                Ok(Some(urls)) => {
                     if let Some(target) = &self.target {
                         result = Some(urls.context("Could not resolve the stream").and_then(
                             |urls| {
@@ -1524,10 +1510,6 @@ impl StreamResolver {
                                     urls.join("\n").as_bytes(),
                                     SystemTime::now(),
                                 )
-                                .map(|mut stream| {
-                                    stream.fast = fast;
-                                    stream
-                                })
                             },
                         ));
                     }
@@ -1770,14 +1752,6 @@ fn run(
                         && state.entries.values().any(|entry| *entry == track_id);
                     next_target = None;
                     pending_play = None;
-                    state.retry = None;
-                    state.fast_loads.retain(|id, _| *id == track_id);
-                    if let Some((_, play)) = state.fast_loads.get_mut(&track_id) {
-                        *play = PendingPlay {
-                            title: title.clone(),
-                            options,
-                        };
-                    }
                     let already_restarted = state.restarted && state.current == Some(track_id);
                     state.invalidate_seeks();
                     state.restarted = already_restarted;
@@ -1821,18 +1795,6 @@ fn run(
                         // user clicks Next. Reuse its resolved URL in that case.
                         if let Some((_, stream)) = resolved {
                             resolver.cancel();
-                            state.remember_fast_load(
-                                PreparedTarget {
-                                    lane: ResolverLane::Fast,
-                                    key: key.clone(),
-                                    track_id,
-                                },
-                                &stream,
-                                PendingPlay {
-                                    title: title.clone(),
-                                    options,
-                                },
-                            );
                             write_command(
                                 &mut socket,
                                 load_command(&stream.url, &title, options),
@@ -1844,7 +1806,11 @@ fn run(
                         if resolver
                             .start(
                                 PreparedTarget {
-                                    lane: key.lane(false, credentials.is_some()),
+                                    lane: if std::mem::take(&mut state.full_lane_next) {
+                                        ResolverLane::Full
+                                    } else {
+                                        key.lane(false, credentials.is_some())
+                                    },
                                     key,
                                     track_id,
                                 },
@@ -1872,8 +1838,6 @@ fn run(
                     pending_play = None;
                     next_target = None;
                     prepared = None;
-                    state.fast_loads.clear();
-                    state.retry = None;
                     state.upcoming = None;
                     let next = account_credentials(
                         next,
@@ -1957,8 +1921,6 @@ fn run(
                     pending_play = None;
                     next_target = None;
                     prepared = None;
-                    state.fast_loads.clear();
-                    state.retry = None;
                     state.upcoming = None;
                     state.invalidate_seeks();
                     state.desired = None;
@@ -1973,41 +1935,6 @@ fn run(
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        if let Some((target, play)) = state.retry.take()
-            && state.desired == Some(target.track_id)
-        {
-            state.loaded = false;
-            state.restarted = false;
-            state.seekable = false;
-            state.pause_after_load = true;
-            write_command(&mut socket, json!(["stop"]), None)?;
-            // The failed occurrence may itself be the prepared successor; never
-            // queue it again behind its own retry.
-            if let Some((next, _)) = prepared
-                .take()
-                .filter(|(next, _)| next.track_id != target.track_id)
-            {
-                next_target = Some(next);
-            }
-            state.discard_upcoming();
-            // An early stream failure supersedes any background preparation.
-            if let Some(next) = resolver
-                .target
-                .as_ref()
-                .filter(|next| next.track_id != target.track_id)
-            {
-                next_target = Some(next.clone());
-            }
-            resolver.cancel();
-            pending_play = Some(play);
-            if resolver
-                .start(target.clone(), credentials.as_ref())
-                .is_err()
-            {
-                pending_play = None;
-                stream_error(target.track_id, events);
-            }
-        }
         if let Some((target, result)) = resolver.finish(credentials.as_ref()) {
             if let Some(play) = pending_play.take() {
                 match result {
@@ -2016,14 +1943,6 @@ fn run(
                             paused: state.paused,
                             ..play.options
                         };
-                        state.remember_fast_load(
-                            target.clone(),
-                            &stream,
-                            PendingPlay {
-                                title: play.title.clone(),
-                                options,
-                            },
-                        );
                         write_command(
                             &mut socket,
                             load_command(&stream.url, &play.title, options),
@@ -2049,18 +1968,6 @@ fn run(
                     },
                 );
                 command[2] = json!("append");
-                state.remember_fast_load(
-                    target.clone(),
-                    &stream,
-                    PendingPlay {
-                        title: String::new(),
-                        options: PlayOptions {
-                            quality: target.key.quality,
-                            video: target.key.video,
-                            ..Default::default()
-                        },
-                    },
-                );
                 state.upcoming = Some(target.track_id);
                 write_command(
                     &mut socket,
@@ -2172,10 +2079,6 @@ struct ActiveSeek {
 
 #[derive(Default)]
 struct PlaybackState {
-    // At most the opening current stream and the prepared successor. Successful
-    // playback removes the retry, so later errors and seeks cannot restart a song.
-    fast_loads: HashMap<u64, (PreparedTarget, PendingPlay)>,
-    retry: Option<(PreparedTarget, PendingPlay)>,
     file_active: bool,
     desired: Option<u64>,
     upcoming: Option<u64>,
@@ -2191,30 +2094,13 @@ struct PlaybackState {
     seek: Option<ActiveSeek>,
     next_seek: Option<SeekRequest>,
     position_observer: u64,
+    // After a stream fails to open, the app retries the song once through
+    // Player::play. That lookup uses the full extractor, in case the fast lane's
+    // stream was the one YouTube rejected.
+    full_lane_next: bool,
 }
 
 impl PlaybackState {
-    fn remember_fast_load(
-        &mut self,
-        target: PreparedTarget,
-        stream: &ResolvedStream,
-        play: PendingPlay,
-    ) {
-        if stream.fast {
-            self.fast_loads.insert(target.track_id, (target, play));
-        }
-    }
-
-    fn retry_fast_load(&mut self, track_id: u64) -> bool {
-        if let Some((mut target, play)) = self.fast_loads.remove(&track_id) {
-            target.lane = ResolverLane::Full;
-            self.retry = Some((target, play));
-            true
-        } else {
-            false
-        }
-    }
-
     fn read_messages(
         &mut self,
         socket: &mut UnixStream,
@@ -2277,8 +2163,6 @@ impl PlaybackState {
         // following song must preserve that entry's event identity as well.
         self.entries
             .retain(|_, id| Some(*id) == self.current || Some(*id) == self.desired);
-        self.fast_loads
-            .retain(|id, _| Some(*id) == self.current || Some(*id) == self.desired);
     }
 
     fn invalidate_seeks(&mut self) {
@@ -2496,10 +2380,8 @@ impl PlaybackState {
                 .and_then(Value::as_u64)
             {
                 self.entries.insert(entry, id);
-            } else if value["error"].as_str() != Some("success")
-                && self.desired == Some(id)
-                && !self.retry_fast_load(id)
-            {
+            } else if value["error"].as_str() != Some("success") && self.desired == Some(id) {
+                self.full_lane_next = true;
                 let _ = events.send_blocking(PlayerEvent::Error {
                     track_id: Some(id),
                     message: "mpv could not load this track. Try another track or update yt-dlp."
@@ -2518,9 +2400,6 @@ impl PlaybackState {
             }
             Some("playback-restart") if self.loaded && self.current == self.desired => {
                 self.restarted = true;
-                if let Some(id) = self.current {
-                    self.fast_loads.remove(&id);
-                }
                 if let Some(seek) = &mut self.seek
                     && seek.phase == SeekPhase::Restart
                 {
@@ -2533,7 +2412,7 @@ impl PlaybackState {
                 self.current = value["playlist_entry_id"]
                     .as_u64()
                     .and_then(|id| self.entries.get(&id).copied());
-                if self.retry.is_none() && self.current.is_some() && self.current == self.upcoming {
+                if self.current.is_some() && self.current == self.upcoming {
                     self.desired = self.current;
                     self.upcoming = None;
                     self.loaded = false;
@@ -2563,11 +2442,6 @@ impl PlaybackState {
                     .and_then(|id| self.entries.remove(&id));
                 if let Some(track_id) = track_id.filter(|id| Some(*id) == self.desired) {
                     self.fail_seeks(events);
-                    if value["reason"] == "error" && self.retry_fast_load(track_id) {
-                        self.loaded = false;
-                        return;
-                    }
-                    self.fast_loads.remove(&track_id);
                     match value["reason"].as_str() {
                         Some("eof") => {
                             let _ = events.send_blocking(PlayerEvent::Ended { track_id });
@@ -2577,6 +2451,7 @@ impl PlaybackState {
                             let _ = events.send_blocking(PlayerEvent::Stopped { track_id });
                         }
                         Some("error") => {
+                            self.full_lane_next = true;
                             let _ = events.send_blocking(PlayerEvent::Error {
                                 track_id: Some(track_id),
                                 message: "YouTube could not provide this stream. Try another track or update yt-dlp."
@@ -2802,85 +2677,6 @@ mod tests {
     }
 
     #[test]
-    fn fast_stream_open_failure_retries_once_before_playback() {
-        for failure in ["load-command", "end-file"] {
-            for started in [false, true] {
-                let (events, received) = async_channel::unbounded();
-                let target = resolver_target("abcdefghijk", 1);
-                let mut stream = ResolvedStream::parse(
-                    target.key.clone(),
-                    b"https://rr1.googlevideo.com/audio",
-                    SystemTime::now(),
-                )
-                .unwrap();
-                stream.fast = true;
-                let mut state = PlaybackState {
-                    desired: Some(1),
-                    current: Some(1),
-                    entries: HashMap::from([(10, 1)]),
-                    loaded: started,
-                    ..Default::default()
-                };
-                state.remember_fast_load(
-                    target,
-                    &stream,
-                    PendingPlay {
-                        title: "Synthetic".into(),
-                        options: PlayOptions::default(),
-                    },
-                );
-                if started {
-                    state.message(json!({"event":"playback-restart"}), &events);
-                }
-                let error = if failure == "load-command" {
-                    json!({"request_id":1,"error":"loading failed"})
-                } else {
-                    json!({"event":"end-file","playlist_entry_id":10,"reason":"error"})
-                };
-                state.message(error.clone(), &events);
-                if started {
-                    assert!(state.retry.is_none());
-                    assert!(matches!(
-                        received.try_recv(),
-                        Ok(PlayerEvent::Error {
-                            track_id: Some(1),
-                            ..
-                        })
-                    ));
-                    continue;
-                }
-                // mpv may advance to its prepared entry in the same IPC batch.
-                // The failed song must keep ownership until its full-lane retry.
-                state.entries.insert(11, 2);
-                state.upcoming = Some(2);
-                state.message(
-                    json!({"event":"start-file","playlist_entry_id":11}),
-                    &events,
-                );
-                assert_eq!(state.desired, Some(1));
-                let (target, play) = state.retry.take().expect("retry before first audio");
-                assert_eq!(target.track_id, 1);
-                assert_eq!(target.lane, ResolverLane::Full);
-                assert_eq!(play.title, "Synthetic");
-                assert!(received.try_recv().is_err());
-                // A full-lane failure must surface, even for the same track ID.
-                stream.fast = false;
-                state.remember_fast_load(target, &stream, play);
-                state.entries.insert(10, 1);
-                state.message(error, &events);
-                assert!(state.retry.is_none());
-                assert!(matches!(
-                    received.try_recv(),
-                    Ok(PlayerEvent::Error {
-                        track_id: Some(1),
-                        ..
-                    })
-                ));
-            }
-        }
-    }
-
-    #[test]
     #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic responses, no network"]
     fn warm_fast_lane_is_isolated_and_falls_back_to_the_full_instance() {
         let directory = tempfile::tempdir().unwrap();
@@ -2890,7 +2686,7 @@ mod tests {
         writeln!(
             file,
             r#"
-import io, urllib.request
+import io, time, urllib.request
 import yt_dlp
 from yt_dlp.extractor.youtube import YoutubeIE
 from yt_dlp.utils import DownloadError
@@ -2930,6 +2726,8 @@ def fast_extract(self, url):
         ydl.report_error('Sign in to confirm you are not a bot. INVENTED_SECRET')
     if url.endswith('failfast000'):
         raise DownloadError('INVENTED_SECRET')
+    if url.endswith('stalled0000'):
+        time.sleep(60)
     formats = [] if url.endswith('nourls00000') else [{{
         'format_id':'audio', 'ext':'webm', 'vcodec':'none', 'acodec':'opus',
         'url':'https://rr1.googlevideo.com/audio?visitor=' + args['visitor_data'][0]}}]
@@ -2957,24 +2755,22 @@ YoutubeIE._real_extract = fast_extract
             "full requests must not fetch visitor data"
         );
         let pid = resolver.warm.as_ref().unwrap().child.id();
-        for (id, expected_fast, expected_visitor) in [
-            ("abcdefghijk", true, "VD_1"),
-            ("botonce0000", true, "VD_2"),
-            ("abcdefghijk", true, "VD_2"),
-            ("failfast000", false, "call=2"),
-            ("nourls00000", false, "call=3"),
-            ("alwaysbot00", false, "call=4"),
+        // Fast URLs carry the visitor data; full-instance URLs count its calls.
+        for (id, expected) in [
+            ("abcdefghijk", "visitor=VD_1"),
+            ("botonce0000", "visitor=VD_2"),
+            ("abcdefghijk", "visitor=VD_2"),
+            ("failfast000", "call=2"),
+            ("nourls00000", "call=3"),
+            ("alwaysbot00", "call=4"),
+            // A fast attempt that never finishes yields to the full instance.
+            ("stalled0000", "call=5"),
         ] {
             let mut target = resolver_target(id, 2);
             target.lane = ResolverLane::Fast;
             resolver.start(target, Some(&credentials)).unwrap();
             let stream = resolved(&mut resolver, Some(&credentials));
-            assert_eq!(stream.fast, expected_fast);
-            assert!(
-                stream.url.contains(expected_visitor),
-                "{id}: {}",
-                stream.url
-            );
+            assert!(stream.url.contains(expected), "{id}: {}", stream.url);
             assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
         }
         assert_eq!(
