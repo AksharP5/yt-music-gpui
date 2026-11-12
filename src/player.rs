@@ -2755,6 +2755,13 @@ YoutubeIE._real_extract = fast_extract
             "full requests must not fetch visitor data"
         );
         let pid = resolver.warm.as_ref().unwrap().child.id();
+        let fast = |resolver: &mut StreamResolver, id: &str, expected: &str| {
+            let mut target = resolver_target(id, 2);
+            target.lane = ResolverLane::Fast;
+            resolver.start(target, Some(&credentials)).unwrap();
+            let stream = resolved(resolver, Some(&credentials));
+            assert!(stream.url.contains(expected), "{id}: {}", stream.url);
+        };
         // Fast URLs carry the visitor data; full-instance URLs count its calls.
         for (id, expected) in [
             ("abcdefghijk", "visitor=VD_1"),
@@ -2763,20 +2770,24 @@ YoutubeIE._real_extract = fast_extract
             ("failfast000", "call=2"),
             ("nourls00000", "call=3"),
             ("alwaysbot00", "call=4"),
-            // A fast attempt that never finishes yields to the full instance.
-            ("stalled0000", "call=5"),
+            // A bot check that survives a fresh visitor ID pauses the fast lane.
+            ("abcdefghijk", "call=5"),
         ] {
-            let mut target = resolver_target(id, 2);
-            target.lane = ResolverLane::Fast;
-            resolver.start(target, Some(&credentials)).unwrap();
-            let stream = resolved(&mut resolver, Some(&credentials));
-            assert!(stream.url.contains(expected), "{id}: {}", stream.url);
+            fast(&mut resolver, id, expected);
             assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
         }
         assert_eq!(
             fs::read_to_string(directory.path().join("visits")).unwrap(),
             "3"
         );
+        resolver.stop();
+        // A fast attempt that never finishes yields to the full instance within
+        // its budget, and pauses the fast lane too.
+        let mut resolver = StreamResolver::new(&find_ytdlp().unwrap(), Some(&credentials));
+        let started = Instant::now();
+        fast(&mut resolver, "stalled0000", "call=1");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        fast(&mut resolver, "abcdefghijk", "call=2");
     }
 
     fn synthetic_resolver_plugin(directory: &Path) -> PathBuf {
