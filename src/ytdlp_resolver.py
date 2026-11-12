@@ -16,7 +16,11 @@ def remember_player_scripts(ydl):
     Without it, every song that needs a JavaScript challenge re-processes the
     multi-megabyte player in a fresh JS runtime (~0.45 s). The cache lives only
     in this process, so nothing reaches the disk (--no-cache-dir still holds).
+    Each processed player is ~4 MB, so only the most recent entries are kept
+    when YouTube ships a new player mid-session.
     """
+    from collections import OrderedDict
+
     from yt_dlp.cache import Cache
     try:
         from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
@@ -28,13 +32,19 @@ def remember_player_scripts(ydl):
 
         def __init__(self, ydl):
             super().__init__(ydl)
-            self._entries = {}
+            self._entries = OrderedDict()
 
         def store(self, section, key, data, dtype='json'):
             self._entries[section, key] = data
+            self._entries.move_to_end((section, key))
+            while len(self._entries) > 8:
+                self._entries.popitem(last=False)
 
         def load(self, section, key, dtype='json', default=None, *, min_ver=None):
-            return self._entries.get((section, key), default)
+            if (section, key) not in self._entries:
+                return default
+            self._entries.move_to_end((section, key))
+            return self._entries[section, key]
 
     ydl.cache = MemoryCache(ydl)
     EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
