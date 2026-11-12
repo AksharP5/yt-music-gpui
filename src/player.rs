@@ -1453,11 +1453,11 @@ impl StreamResolver {
         target: PreparedTarget,
         credentials: Option<&ExtractorCredentials>,
     ) -> Result<()> {
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|current| current.key == target.key)
-        {
+        if self.target.as_ref().is_some_and(|current| {
+            // A fast lookup in flight cannot stand in for a requested full one.
+            current.key == target.key
+                && (target.lane == ResolverLane::Fast || current.lane == ResolverLane::Full)
+        }) {
             self.target = Some(target);
             return Ok(());
         }
@@ -1745,8 +1745,11 @@ fn run(
                         quality: options.quality,
                         video: options.video,
                     };
+                    // A reload after a stream failed to open must reach the full
+                    // extractor, even when Repeat One prepared this song on the fast lane.
+                    let full = std::mem::take(&mut state.full_lane_next);
                     let resolved = prepared.take().filter(|(target, stream)| {
-                        target.track_id == track_id && stream.matches(&key)
+                        !full && target.track_id == track_id && stream.matches(&key)
                     });
                     let prefetched = resolved.is_some()
                         && state.entries.values().any(|entry| *entry == track_id);
@@ -1806,7 +1809,7 @@ fn run(
                         if resolver
                             .start(
                                 PreparedTarget {
-                                    lane: if std::mem::take(&mut state.full_lane_next) {
+                                    lane: if full {
                                         ResolverLane::Full
                                     } else {
                                         key.lane(false, credentials.is_some())
@@ -3028,6 +3031,38 @@ YtMusicAccountIE._real_extract = extract
         assert!(stream.is_ok());
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(resolver.fd().is_none() && resolver.deadline().is_none());
+    }
+
+    #[test]
+    fn a_fast_lookup_in_flight_never_answers_a_full_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let interpreter = directory.path().join("python3");
+        fs::write(&interpreter, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
+        let pid = |resolver: &StreamResolver| resolver.warm.as_ref().map(|warm| warm.child.id());
+        for (first, second, reused) in [
+            (ResolverLane::Fast, ResolverLane::Full, false),
+            (ResolverLane::Full, ResolverLane::Fast, true),
+            (ResolverLane::Fast, ResolverLane::Fast, true),
+        ] {
+            let mut resolver = StreamResolver::new(&extractor, None);
+            resolver.warm.as_mut().unwrap().ready = true;
+            let mut target = resolver_target("abcdefghijk", 1);
+            target.lane = first;
+            resolver.start(target.clone(), None).unwrap();
+            let before = pid(&resolver);
+            target.lane = second;
+            resolver.start(target, None).unwrap();
+            assert_eq!(
+                pid(&resolver) == before,
+                reused,
+                "{first:?} then {second:?}"
+            );
+            assert_eq!(resolver.target.as_ref().unwrap().lane, second);
+            resolver.stop();
+        }
     }
 
     #[test]
