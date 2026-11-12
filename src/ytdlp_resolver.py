@@ -60,8 +60,10 @@ def remember_player_scripts(ydl):
 FAST_TIMEOUT = 3
 FAST_BUDGET = 5
 # When YouTube keeps refusing the fast lane (bot checks on this network, an
-# unreadable homepage, stalls), stop paying for it on every click for a while.
+# unreadable homepage), stop paying for it on every click for a while. A single
+# stall is more likely a network blip, so it pauses the lane only briefly.
 FAST_COOLDOWN = 600
+FAST_STALL_COOLDOWN = 60
 
 
 class FastBudgetExpired(BaseException):
@@ -79,6 +81,12 @@ with contextlib.redirect_stdout(output):
     import yt_dlp
     from yt_dlp.globals import plugin_dirs
     from yt_dlp.plugins import load_all_plugins
+    try:
+        # Taken before plugins load, so an override plugin can never become the
+        # fast lane's extractor. Without it, every request uses the full lane.
+        from yt_dlp.extractor.youtube import YoutubeIE
+    except Exception:
+        YoutubeIE = None
 
     def extract(ydl, request):
         output.seek(0)
@@ -116,7 +124,7 @@ with contextlib.redirect_stdout(output):
 
         def lookup(self, request):
             """Return stream URLs, or None to use the full lane. Never raises."""
-            if time.monotonic() < self.paused_until:
+            if YoutubeIE is None or time.monotonic() < self.paused_until:
                 return None
             signal.signal(signal.SIGALRM, expire_fast_budget)
             signal.setitimer(signal.ITIMER_REAL, FAST_BUDGET)
@@ -128,18 +136,16 @@ with contextlib.redirect_stdout(output):
                     signal.signal(signal.SIGALRM, signal.SIG_IGN)
             except FastBudgetExpired:
                 # Also covers the budget expiring as a lookup finishes.
-                self.pause()
+                self.pause(FAST_STALL_COOLDOWN)
             except Exception:
                 pass
             return None
 
-        def pause(self):
-            self.paused_until = time.monotonic() + FAST_COOLDOWN
+        def pause(self, seconds=FAST_COOLDOWN):
+            self.paused_until = time.monotonic() + seconds
 
         def extract(self, request):
             if self.ydl is None:
-                from yt_dlp.extractor.youtube import YoutubeIE
-
                 # Never inherit the full instance's options, cookies, plugin
                 # registry or account identity. Register only the stock IE.
                 self.ydl = self.instances.enter_context(yt_dlp.YoutubeDL({
