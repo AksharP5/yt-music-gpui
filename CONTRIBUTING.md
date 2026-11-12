@@ -81,6 +81,10 @@ No test signs in to a real Google account. Do not add one that does.
 
 ## Player waits
 
+The resident Python resolver keeps separate fast and full yt-dlp instances. Clicks try the cookie-free visionOS client first, skipping the watch page and manifests. Preparation does too, except signed-in High audio uses the full account extractor for Premium formats. Video above 1080p always uses the full instance. Visitor data comes from a cookie-free Music homepage request on the first fast resolve, stays in memory, and refreshes once on a bot check. Fast extraction failures fall back within the same request. An opening fast stream can retry once through the full instance before its first playback restart. The one-shot CLI path is unchanged.
+
+`resolver_lanes_keep_clicks_fast_and_prepare_premium_audio` and `fast_stream_open_failure_retries_once_before_playback` cover routing and early playback errors. The ignored `warm_fast_lane_is_isolated_and_falls_back_to_the_full_instance` uses synthetic responses with the installed yt-dlp to check cookie isolation, visitor-data reuse and refresh, and fallback to the same full instance without network access.
+
 The player actor blocks on mpv IPC, the command eventfd and the resolver's stdout or one-shot extractor pidfd. Native video status changes also signal the eventfd. Resolver startup and requests have 30-second deadlines; queued stream URLs wake the actor at expiry. Seek writes and account notices are flushed before sleeping. Synchronous mpv requests use their remaining five-second deadline for reads. Buffered IPC events are processed before waiting, and socket closure reports mpv shutdown. An idle or paused actor with no pending work has no timer.
 
 `one_shot_exit_wakes_the_actor_without_mpv_or_commands` and `resolver_startup_and_request_deadlines_wake_without_output` cover extractor notifications and timeouts. The ignored `paused_actor_refreshes_expired_preparation_and_writes_pending_seek` uses synthetic silence and a local extractor to check expiry and seeks without network access or audible output.

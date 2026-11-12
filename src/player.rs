@@ -477,6 +477,7 @@ impl Player {
             video: options.video,
         });
         *next = key.map(|key| PreparedTarget {
+            lane: ResolverLane::Fast,
             key,
             track_id: self.next_id.fetch_add(1, Ordering::Relaxed),
         });
@@ -1123,13 +1124,22 @@ struct StreamKey {
     video: Option<VideoQuality>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResolverLane {
+    Fast,
+    Full,
+}
+
 #[derive(Clone)]
 struct PreparedTarget {
+    lane: ResolverLane,
     key: StreamKey,
     track_id: u64,
 }
 
 struct ResolvedStream {
+    fast: bool,
     key: StreamKey,
     url: String,
     expires: SystemTime,
@@ -1176,7 +1186,12 @@ impl ResolvedStream {
                 urls[1]
             )
         };
-        Ok(Self { key, url, expires })
+        Ok(Self {
+            fast: false,
+            key,
+            url,
+            expires,
+        })
     }
 
     fn matches(&self, key: &StreamKey) -> bool {
@@ -1185,6 +1200,16 @@ impl ResolvedStream {
 }
 
 impl StreamKey {
+    fn lane(&self, preparing: bool, signed_in: bool) -> ResolverLane {
+        if self.video.is_some_and(|video| video.height() > 1080)
+            || (preparing && signed_in && self.quality == AudioQuality::High)
+        {
+            ResolverLane::Full
+        } else {
+            ResolverLane::Fast
+        }
+    }
+
     fn selector(&self) -> String {
         self.video
             .map(|video| video.selector(self.quality))
@@ -1286,8 +1311,14 @@ fn exit_with_parent(command: &mut Command) {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ResolverResponse {
-    Ready { ready: bool },
-    Stream { urls: Option<Vec<String>> },
+    Ready {
+        ready: bool,
+    },
+    Stream {
+        urls: Option<Vec<String>>,
+        #[serde(default)]
+        fast: bool,
+    },
 }
 
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1334,22 +1365,24 @@ impl WarmResolver {
         Ok(resolver)
     }
 
-    fn send(&mut self, key: &StreamKey) -> Result<()> {
+    fn send(&mut self, target: &PreparedTarget) -> Result<()> {
         serde_json::to_writer(
             &mut self.input,
-            &json!({"url": key.url, "format": key.selector()}),
+            &json!({"url": target.key.url, "format": target.key.selector(), "lane": target.lane}),
         )?;
         self.input.write_all(b"\n")?;
         Ok(())
     }
 
-    fn read(&mut self) -> Result<Option<Option<Vec<String>>>> {
+    fn read(&mut self) -> Result<Option<(Option<Vec<String>>, bool)>> {
         loop {
             if let Some(end) = self.bytes.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.bytes.drain(..=end).collect();
                 match serde_json::from_slice(&line)? {
                     ResolverResponse::Ready { ready: true } if !self.ready => self.ready = true,
-                    ResolverResponse::Stream { urls } if self.ready => return Ok(Some(urls)),
+                    ResolverResponse::Stream { urls, fast } if self.ready => {
+                        return Ok(Some((urls, fast)));
+                    }
                     _ => bail!("Invalid resolver response"),
                 }
             } else {
@@ -1450,7 +1483,7 @@ impl StreamResolver {
         self.started = Instant::now();
         self.target = Some(target);
         if let Some(warm) = &mut self.warm {
-            if warm.send(&self.target.as_ref().unwrap().key).is_ok() {
+            if warm.send(self.target.as_ref().unwrap()).is_ok() {
                 return Ok(());
             }
             self.warm_enabled = warm.ready;
@@ -1482,7 +1515,7 @@ impl StreamResolver {
                 warm.read()
             };
             match response {
-                Ok(Some(urls)) => {
+                Ok(Some((urls, fast))) => {
                     if let Some(target) = &self.target {
                         result = Some(urls.context("Could not resolve the stream").and_then(
                             |urls| {
@@ -1491,6 +1524,10 @@ impl StreamResolver {
                                     urls.join("\n").as_bytes(),
                                     SystemTime::now(),
                                 )
+                                .map(|mut stream| {
+                                    stream.fast = fast;
+                                    stream
+                                })
                             },
                         ));
                     }
@@ -1698,7 +1735,10 @@ fn run(
                     }) {
                         continue;
                     }
-                    next_target = target;
+                    next_target = target.map(|mut target| {
+                        target.lane = target.key.lane(true, credentials.is_some());
+                        target
+                    });
                     prepared = None;
                     state.discard_upcoming();
                     write_command(&mut socket, json!(["playlist-clear"]), None)?;
@@ -1730,6 +1770,14 @@ fn run(
                         && state.entries.values().any(|entry| *entry == track_id);
                     next_target = None;
                     pending_play = None;
+                    state.retry = None;
+                    state.fast_loads.retain(|id, _| *id == track_id);
+                    if let Some((_, play)) = state.fast_loads.get_mut(&track_id) {
+                        *play = PendingPlay {
+                            title: title.clone(),
+                            options,
+                        };
+                    }
                     let already_restarted = state.restarted && state.current == Some(track_id);
                     state.invalidate_seeks();
                     state.restarted = already_restarted;
@@ -1773,6 +1821,18 @@ fn run(
                         // user clicks Next. Reuse its resolved URL in that case.
                         if let Some((_, stream)) = resolved {
                             resolver.cancel();
+                            state.remember_fast_load(
+                                PreparedTarget {
+                                    lane: ResolverLane::Fast,
+                                    key: key.clone(),
+                                    track_id,
+                                },
+                                &stream,
+                                PendingPlay {
+                                    title: title.clone(),
+                                    options,
+                                },
+                            );
                             write_command(
                                 &mut socket,
                                 load_command(&stream.url, &title, options),
@@ -1782,7 +1842,14 @@ fn run(
                         }
                         pending_play = Some(PendingPlay { title, options });
                         if resolver
-                            .start(PreparedTarget { key, track_id }, credentials.as_ref())
+                            .start(
+                                PreparedTarget {
+                                    lane: key.lane(false, credentials.is_some()),
+                                    key,
+                                    track_id,
+                                },
+                                credentials.as_ref(),
+                            )
                             .is_err()
                         {
                             pending_play = None;
@@ -1805,6 +1872,8 @@ fn run(
                     pending_play = None;
                     next_target = None;
                     prepared = None;
+                    state.fast_loads.clear();
+                    state.retry = None;
                     state.upcoming = None;
                     let next = account_credentials(
                         next,
@@ -1888,6 +1957,8 @@ fn run(
                     pending_play = None;
                     next_target = None;
                     prepared = None;
+                    state.fast_loads.clear();
+                    state.retry = None;
                     state.upcoming = None;
                     state.invalidate_seeks();
                     state.desired = None;
@@ -1902,6 +1973,36 @@ fn run(
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
+        if let Some((target, play)) = state.retry.take()
+            && state.desired == Some(target.track_id)
+        {
+            state.loaded = false;
+            state.restarted = false;
+            state.seekable = false;
+            state.pause_after_load = true;
+            write_command(&mut socket, json!(["stop"]), None)?;
+            if let Some((next, _)) = prepared.take() {
+                next_target = Some(next);
+            }
+            state.discard_upcoming();
+            // An early stream failure supersedes any background preparation.
+            if let Some(next) = resolver
+                .target
+                .as_ref()
+                .filter(|next| next.track_id != target.track_id)
+            {
+                next_target = Some(next.clone());
+            }
+            resolver.cancel();
+            pending_play = Some(play);
+            if resolver
+                .start(target.clone(), credentials.as_ref())
+                .is_err()
+            {
+                pending_play = None;
+                stream_error(target.track_id, events);
+            }
+        }
         if let Some((target, result)) = resolver.finish(credentials.as_ref()) {
             if let Some(play) = pending_play.take() {
                 match result {
@@ -1910,6 +2011,14 @@ fn run(
                             paused: state.paused,
                             ..play.options
                         };
+                        state.remember_fast_load(
+                            target.clone(),
+                            &stream,
+                            PendingPlay {
+                                title: play.title.clone(),
+                                options,
+                            },
+                        );
                         write_command(
                             &mut socket,
                             load_command(&stream.url, &play.title, options),
@@ -1935,6 +2044,18 @@ fn run(
                     },
                 );
                 command[2] = json!("append");
+                state.remember_fast_load(
+                    target.clone(),
+                    &stream,
+                    PendingPlay {
+                        title: String::new(),
+                        options: PlayOptions {
+                            quality: target.key.quality,
+                            video: target.key.video,
+                            ..Default::default()
+                        },
+                    },
+                );
                 state.upcoming = Some(target.track_id);
                 write_command(
                     &mut socket,
@@ -2046,6 +2167,10 @@ struct ActiveSeek {
 
 #[derive(Default)]
 struct PlaybackState {
+    // At most the opening current stream and the prepared successor. Successful
+    // playback removes the retry, so later errors and seeks cannot restart a song.
+    fast_loads: HashMap<u64, (PreparedTarget, PendingPlay)>,
+    retry: Option<(PreparedTarget, PendingPlay)>,
     file_active: bool,
     desired: Option<u64>,
     upcoming: Option<u64>,
@@ -2064,6 +2189,27 @@ struct PlaybackState {
 }
 
 impl PlaybackState {
+    fn remember_fast_load(
+        &mut self,
+        target: PreparedTarget,
+        stream: &ResolvedStream,
+        play: PendingPlay,
+    ) {
+        if stream.fast {
+            self.fast_loads.insert(target.track_id, (target, play));
+        }
+    }
+
+    fn retry_fast_load(&mut self, track_id: u64) -> bool {
+        if let Some((mut target, play)) = self.fast_loads.remove(&track_id) {
+            target.lane = ResolverLane::Full;
+            self.retry = Some((target, play));
+            true
+        } else {
+            false
+        }
+    }
+
     fn read_messages(
         &mut self,
         socket: &mut UnixStream,
@@ -2126,6 +2272,8 @@ impl PlaybackState {
         // following song must preserve that entry's event identity as well.
         self.entries
             .retain(|_, id| Some(*id) == self.current || Some(*id) == self.desired);
+        self.fast_loads
+            .retain(|id, _| Some(*id) == self.current || Some(*id) == self.desired);
     }
 
     fn invalidate_seeks(&mut self) {
@@ -2343,7 +2491,10 @@ impl PlaybackState {
                 .and_then(Value::as_u64)
             {
                 self.entries.insert(entry, id);
-            } else if value["error"].as_str() != Some("success") && self.desired == Some(id) {
+            } else if value["error"].as_str() != Some("success")
+                && self.desired == Some(id)
+                && !self.retry_fast_load(id)
+            {
                 let _ = events.send_blocking(PlayerEvent::Error {
                     track_id: Some(id),
                     message: "mpv could not load this track. Try another track or update yt-dlp."
@@ -2362,6 +2513,9 @@ impl PlaybackState {
             }
             Some("playback-restart") if self.loaded && self.current == self.desired => {
                 self.restarted = true;
+                if let Some(id) = self.current {
+                    self.fast_loads.remove(&id);
+                }
                 if let Some(seek) = &mut self.seek
                     && seek.phase == SeekPhase::Restart
                 {
@@ -2374,7 +2528,7 @@ impl PlaybackState {
                 self.current = value["playlist_entry_id"]
                     .as_u64()
                     .and_then(|id| self.entries.get(&id).copied());
-                if self.current.is_some() && self.current == self.upcoming {
+                if self.retry.is_none() && self.current.is_some() && self.current == self.upcoming {
                     self.desired = self.current;
                     self.upcoming = None;
                     self.loaded = false;
@@ -2404,6 +2558,11 @@ impl PlaybackState {
                     .and_then(|id| self.entries.remove(&id));
                 if let Some(track_id) = track_id.filter(|id| Some(*id) == self.desired) {
                     self.fail_seeks(events);
+                    if value["reason"] == "error" && self.retry_fast_load(track_id) {
+                        self.loaded = false;
+                        return;
+                    }
+                    self.fast_loads.remove(&track_id);
                     match value["reason"].as_str() {
                         Some("eof") => {
                             let _ = events.send_blocking(PlayerEvent::Ended { track_id });
@@ -2595,6 +2754,7 @@ mod tests {
 
     fn resolver_target(id: &str, track_id: u64) -> PreparedTarget {
         PreparedTarget {
+            lane: ResolverLane::Full,
             key: StreamKey {
                 url: format!("https://music.youtube.com/watch?v={id}"),
                 quality: AudioQuality::Normal,
@@ -2602,6 +2762,220 @@ mod tests {
             },
             track_id,
         }
+    }
+
+    #[test]
+    fn resolver_lanes_keep_clicks_fast_and_prepare_premium_audio() {
+        for quality in AudioQuality::ALL {
+            for video in [None].into_iter().chain(VideoQuality::ALL.map(Some)) {
+                let key = StreamKey {
+                    quality,
+                    video,
+                    ..resolver_target("abcdefghijk", 1).key
+                };
+                let above_1080 = matches!(video, Some(VideoQuality::P1440 | VideoQuality::P2160));
+                for signed_in in [false, true] {
+                    assert_eq!(
+                        key.lane(false, signed_in),
+                        if above_1080 {
+                            ResolverLane::Full
+                        } else {
+                            ResolverLane::Fast
+                        }
+                    );
+                    assert_eq!(
+                        key.lane(true, signed_in),
+                        if above_1080 || (signed_in && quality == AudioQuality::High) {
+                            ResolverLane::Full
+                        } else {
+                            ResolverLane::Fast
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_stream_open_failure_retries_once_before_playback() {
+        for failure in ["load-command", "end-file"] {
+            for started in [false, true] {
+                let (events, received) = async_channel::unbounded();
+                let target = resolver_target("abcdefghijk", 1);
+                let mut stream = ResolvedStream::parse(
+                    target.key.clone(),
+                    b"https://rr1.googlevideo.com/audio",
+                    SystemTime::now(),
+                )
+                .unwrap();
+                stream.fast = true;
+                let mut state = PlaybackState {
+                    desired: Some(1),
+                    current: Some(1),
+                    entries: HashMap::from([(10, 1)]),
+                    loaded: started,
+                    ..Default::default()
+                };
+                state.remember_fast_load(
+                    target,
+                    &stream,
+                    PendingPlay {
+                        title: "Synthetic".into(),
+                        options: PlayOptions::default(),
+                    },
+                );
+                if started {
+                    state.message(json!({"event":"playback-restart"}), &events);
+                }
+                let error = if failure == "load-command" {
+                    json!({"request_id":1,"error":"loading failed"})
+                } else {
+                    json!({"event":"end-file","playlist_entry_id":10,"reason":"error"})
+                };
+                state.message(error.clone(), &events);
+                if started {
+                    assert!(state.retry.is_none());
+                    assert!(matches!(
+                        received.try_recv(),
+                        Ok(PlayerEvent::Error {
+                            track_id: Some(1),
+                            ..
+                        })
+                    ));
+                    continue;
+                }
+                // mpv may advance to its prepared entry in the same IPC batch.
+                // The failed song must keep ownership until its full-lane retry.
+                state.entries.insert(11, 2);
+                state.upcoming = Some(2);
+                state.message(
+                    json!({"event":"start-file","playlist_entry_id":11}),
+                    &events,
+                );
+                assert_eq!(state.desired, Some(1));
+                let (target, play) = state.retry.take().expect("retry before first audio");
+                assert_eq!(target.track_id, 1);
+                assert_eq!(target.lane, ResolverLane::Full);
+                assert_eq!(play.title, "Synthetic");
+                assert!(received.try_recv().is_err());
+                // A full-lane failure must surface, even for the same track ID.
+                stream.fast = false;
+                state.remember_fast_load(target, &stream, play);
+                state.entries.insert(10, 1);
+                state.message(error, &events);
+                assert!(state.retry.is_none());
+                assert!(matches!(
+                    received.try_recv(),
+                    Ok(PlayerEvent::Error {
+                        track_id: Some(1),
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic responses, no network"]
+    fn warm_fast_lane_is_isolated_and_falls_back_to_the_full_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = synthetic_resolver_plugin(directory.path());
+        let path = plugin.join("account/yt_dlp_plugins/extractor/account.py");
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(
+            file,
+            r#"
+import io, urllib.request
+import yt_dlp
+from yt_dlp.extractor.youtube import YoutubeIE
+from yt_dlp.utils import DownloadError
+
+visits = 0
+def homepage(url, **kwargs):
+    global visits
+    assert url.full_url == 'https://music.youtube.com/'
+    assert url.get_header('User-agent').startswith('Mozilla/')
+    assert not url.has_header('Cookie')
+    visits += 1
+    Path({visitor:?}).write_text(str(visits))
+    return io.BytesIO(('{{"VISITOR_DATA":"VD_' + str(visits) + '"}}').encode())
+
+urllib.request.urlopen = homepage
+
+def no_network(*args, **kwargs):
+    raise AssertionError('offline test attempted a network request')
+
+yt_dlp.YoutubeDL.urlopen = no_network
+YoutubeIE._real_initialize = lambda self: None
+
+def fast_extract(self, url):
+    ydl = self._downloader
+    assert set(ydl._ies) == {{'Youtube'}}
+    assert not list(self.cookiejar)
+    assert ydl.params.get('cookiefile') is None
+    assert ydl.params.get('cookiesfrombrowser') is None
+    assert ydl.params['cachedir'] is False
+    assert 'ytmusicaccount' not in ydl.params['extractor_args']
+    args = ydl.params['extractor_args']['youtube']
+    assert args['player_client'] == ['visionos']
+    assert args['player_skip'] == ['webpage', 'initial_data', 'configs']
+    assert args['skip'] == ['hls', 'dash']
+    self.calls = getattr(self, 'calls', 0) + 1
+    if url.endswith('botonce0000') and visits == 1 or url.endswith('alwaysbot00'):
+        ydl.report_error('Sign in to confirm you are not a bot. INVENTED_SECRET')
+    if url.endswith('failfast000'):
+        raise DownloadError('INVENTED_SECRET')
+    formats = [] if url.endswith('nourls00000') else [{{
+        'format_id':'audio', 'ext':'webm', 'vcodec':'none', 'acodec':'opus',
+        'url':'https://rr1.googlevideo.com/audio?visitor=' + args['visitor_data'][0]}}]
+    return {{'id':'abcdefghijk', 'title':'Synthetic', 'formats':formats}}
+
+YoutubeIE._real_extract = fast_extract
+"#,
+            visitor = directory.path().join("visits").to_str().unwrap()
+        )
+        .unwrap();
+        drop(file);
+        let credentials =
+            prepare_credentials(synthetic_credentials("INVENTED_COOKIE"), &plugin).unwrap();
+        let mut resolver = StreamResolver::new(&find_ytdlp().unwrap(), Some(&credentials));
+        resolver
+            .start(resolver_target("abcdefghijk", 1), Some(&credentials))
+            .unwrap();
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("call=1")
+        );
+        assert!(
+            !directory.path().join("visits").exists(),
+            "full requests must not fetch visitor data"
+        );
+        let pid = resolver.warm.as_ref().unwrap().child.id();
+        for (id, expected_fast, expected_visitor) in [
+            ("abcdefghijk", true, "VD_1"),
+            ("botonce0000", true, "VD_2"),
+            ("abcdefghijk", true, "VD_2"),
+            ("failfast000", false, "call=2"),
+            ("nourls00000", false, "call=3"),
+            ("alwaysbot00", false, "call=4"),
+        ] {
+            let mut target = resolver_target(id, 2);
+            target.lane = ResolverLane::Fast;
+            resolver.start(target, Some(&credentials)).unwrap();
+            let stream = resolved(&mut resolver, Some(&credentials));
+            assert_eq!(stream.fast, expected_fast);
+            assert!(
+                stream.url.contains(expected_visitor),
+                "{id}: {}",
+                stream.url
+            );
+            assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
+        }
+        assert_eq!(
+            fs::read_to_string(directory.path().join("visits")).unwrap(),
+            "3"
+        );
     }
 
     fn synthetic_resolver_plugin(directory: &Path) -> PathBuf {
@@ -2953,6 +3327,7 @@ YtMusicAccountIE._real_extract = extract
         let credentials =
             prepare_credentials(synthetic_credentials("INVENTED"), directory.path()).unwrap();
         let target = PreparedTarget {
+            lane: ResolverLane::Full,
             key: StreamKey {
                 url: "https://music.youtube.com/watch?v=abcdefghijk".into(),
                 quality: AudioQuality::Normal,
