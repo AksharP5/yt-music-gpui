@@ -426,13 +426,11 @@ impl Music {
             return;
         }
         self.library.quality = quality;
-        if self.active_id.is_some() && self.playback != Playback::Stopped {
-            if let Playback::Loading { retried, .. } = &mut self.playback {
-                *retried = false;
-            }
-            if let Err(error) = self.reload_stream() {
-                self.error = Some(error.to_string());
-            }
+        if self.active_id.is_some()
+            && self.playback != Playback::Stopped
+            && let Err(error) = self.reload_stream()
+        {
+            self.error = Some(error.to_string());
         }
         self.save_preferences();
         self.notify_playback(cx);
@@ -506,13 +504,12 @@ impl Music {
             return;
         }
         self.library.video_quality = quality;
-        if self.library.video && self.active_id.is_some() && self.playback != Playback::Stopped {
-            if let Playback::Loading { retried, .. } = &mut self.playback {
-                *retried = false;
-            }
-            if let Err(error) = self.reload_stream() {
-                self.error = Some(error.to_string());
-            }
+        if self.library.video
+            && self.active_id.is_some()
+            && self.playback != Playback::Stopped
+            && let Err(error) = self.reload_stream()
+        {
+            self.error = Some(error.to_string());
         }
         self.save_preferences();
         self.notify_playback(cx);
