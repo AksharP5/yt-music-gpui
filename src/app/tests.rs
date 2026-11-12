@@ -403,6 +403,7 @@ fn a_load_retries_once_and_pause_changes_do_not_reset_its_budget() {
         let mut playback = Playback::Loading {
             paused,
             retried: false,
+            full_lookup: false,
         };
         assert!(playback.retry());
         assert_eq!(playback.is_paused(), paused);
@@ -445,15 +446,41 @@ fn play_starts_a_stopped_wait_and_loading_toggles_preserve_the_retry_budget() {
     let loading = Playback::Loading {
         paused: false,
         retried: true,
+        full_lookup: false,
     };
     assert_eq!(
         loading.toggled(),
         Playback::Loading {
             paused: true,
             retried: true,
+            full_lookup: false,
         }
     );
     assert_eq!(loading.toggled().toggled(), loading);
+}
+
+#[test]
+fn a_failed_stream_keeps_its_song_on_the_full_lookup_after_quality_changes() {
+    let mut loading = Playback::Loading {
+        paused: false,
+        retried: false,
+        full_lookup: false,
+    };
+    assert!(loading.retry());
+    assert!(!loading.retry());
+    // A quality change resets only the retry budget, as the setters do.
+    if let Playback::Loading { retried, .. } = &mut loading {
+        *retried = false;
+    }
+    assert!(loading.retry());
+    assert!(matches!(
+        loading.with_pause(true),
+        Playback::Loading {
+            paused: true,
+            full_lookup: true,
+            ..
+        }
+    ));
 }
 
 #[test]

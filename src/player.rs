@@ -181,6 +181,9 @@ pub struct PlayOptions {
     pub video: Option<VideoQuality>,
     pub start: f64,
     pub paused: bool,
+    /// Skip the fast lookup. The automatic reload after a stream fails to open
+    /// sets this, in case YouTube rejected the fast lookup's stream.
+    pub full_lookup: bool,
 }
 
 pub struct PlayerOptions {
@@ -477,6 +480,7 @@ impl Player {
             video: options.video,
         });
         *next = key.map(|key| PreparedTarget {
+            lane: ResolverLane::Fast,
             key,
             track_id: self.next_id.fetch_add(1, Ordering::Relaxed),
         });
@@ -498,9 +502,12 @@ impl Player {
             "Invalid playback start position."
         );
         let next = self.next.lock().unwrap().take();
+        // A full lookup reload gets a fresh ID, so late events from a prepared
+        // occurrence of the same song can never be mistaken for it.
         let track_id = next
             .filter(|next| {
-                options.start == 0.
+                !options.full_lookup
+                    && options.start == 0.
                     && next.key
                         == StreamKey {
                             url: url.clone(),
@@ -1123,8 +1130,16 @@ struct StreamKey {
     video: Option<VideoQuality>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResolverLane {
+    Fast,
+    Full,
+}
+
 #[derive(Clone)]
 struct PreparedTarget {
+    lane: ResolverLane,
     key: StreamKey,
     track_id: u64,
 }
@@ -1185,6 +1200,16 @@ impl ResolvedStream {
 }
 
 impl StreamKey {
+    fn lane(&self, preparing: bool, signed_in: bool) -> ResolverLane {
+        if self.video.is_some_and(|video| video.height() > 1080)
+            || (preparing && signed_in && self.quality == AudioQuality::High)
+        {
+            ResolverLane::Full
+        } else {
+            ResolverLane::Fast
+        }
+    }
+
     fn selector(&self) -> String {
         self.video
             .map(|video| video.selector(self.quality))
@@ -1334,10 +1359,10 @@ impl WarmResolver {
         Ok(resolver)
     }
 
-    fn send(&mut self, key: &StreamKey) -> Result<()> {
+    fn send(&mut self, target: &PreparedTarget) -> Result<()> {
         serde_json::to_writer(
             &mut self.input,
-            &json!({"url": key.url, "format": key.selector()}),
+            &json!({"url": target.key.url, "format": target.key.selector(), "lane": target.lane}),
         )?;
         self.input.write_all(b"\n")?;
         Ok(())
@@ -1434,11 +1459,11 @@ impl StreamResolver {
         target: PreparedTarget,
         credentials: Option<&ExtractorCredentials>,
     ) -> Result<()> {
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|current| current.key == target.key)
-        {
+        if self.target.as_ref().is_some_and(|current| {
+            // A fast lookup in flight cannot stand in for a requested full one.
+            current.key == target.key
+                && (target.lane == ResolverLane::Fast || current.lane == ResolverLane::Full)
+        }) {
             self.target = Some(target);
             return Ok(());
         }
@@ -1450,7 +1475,7 @@ impl StreamResolver {
         self.started = Instant::now();
         self.target = Some(target);
         if let Some(warm) = &mut self.warm {
-            if warm.send(&self.target.as_ref().unwrap().key).is_ok() {
+            if warm.send(self.target.as_ref().unwrap()).is_ok() {
                 return Ok(());
             }
             self.warm_enabled = warm.ready;
@@ -1698,7 +1723,10 @@ fn run(
                     }) {
                         continue;
                     }
-                    next_target = target;
+                    next_target = target.map(|mut target| {
+                        target.lane = target.key.lane(true, credentials.is_some());
+                        target
+                    });
                     prepared = None;
                     state.discard_upcoming();
                     write_command(&mut socket, json!(["playlist-clear"]), None)?;
@@ -1782,7 +1810,18 @@ fn run(
                         }
                         pending_play = Some(PendingPlay { title, options });
                         if resolver
-                            .start(PreparedTarget { key, track_id }, credentials.as_ref())
+                            .start(
+                                PreparedTarget {
+                                    lane: if options.full_lookup {
+                                        ResolverLane::Full
+                                    } else {
+                                        key.lane(false, credentials.is_some())
+                                    },
+                                    key,
+                                    track_id,
+                                },
+                                credentials.as_ref(),
+                            )
                             .is_err()
                         {
                             pending_play = None;
@@ -2595,6 +2634,7 @@ mod tests {
 
     fn resolver_target(id: &str, track_id: u64) -> PreparedTarget {
         PreparedTarget {
+            lane: ResolverLane::Full,
             key: StreamKey {
                 url: format!("https://music.youtube.com/watch?v={id}"),
                 quality: AudioQuality::Normal,
@@ -2602,6 +2642,152 @@ mod tests {
             },
             track_id,
         }
+    }
+
+    #[test]
+    fn resolver_lanes_keep_clicks_fast_and_prepare_premium_audio() {
+        for quality in AudioQuality::ALL {
+            for video in [None].into_iter().chain(VideoQuality::ALL.map(Some)) {
+                let key = StreamKey {
+                    quality,
+                    video,
+                    ..resolver_target("abcdefghijk", 1).key
+                };
+                let above_1080 = matches!(video, Some(VideoQuality::P1440 | VideoQuality::P2160));
+                for signed_in in [false, true] {
+                    assert_eq!(
+                        key.lane(false, signed_in),
+                        if above_1080 {
+                            ResolverLane::Full
+                        } else {
+                            ResolverLane::Fast
+                        }
+                    );
+                    assert_eq!(
+                        key.lane(true, signed_in),
+                        if above_1080 || (signed_in && quality == AudioQuality::High) {
+                            ResolverLane::Full
+                        } else {
+                            ResolverLane::Fast
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic responses, no network"]
+    fn warm_fast_lane_is_isolated_and_falls_back_to_the_full_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = synthetic_resolver_plugin(directory.path());
+        let path = plugin.join("account/yt_dlp_plugins/extractor/account.py");
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(
+            file,
+            r#"
+import io, time, urllib.request
+import yt_dlp
+from yt_dlp.extractor.youtube import YoutubeIE
+from yt_dlp.utils import DownloadError
+
+visits = 0
+def homepage(url, **kwargs):
+    global visits
+    assert url.full_url == 'https://music.youtube.com/'
+    assert url.get_header('User-agent').startswith('Mozilla/')
+    assert not url.has_header('Cookie')
+    visits += 1
+    Path({visitor:?}).write_text(str(visits))
+    return io.BytesIO(('{{"VISITOR_DATA":"VD_' + str(visits) + '"}}').encode())
+
+urllib.request.urlopen = homepage
+
+def no_network(*args, **kwargs):
+    raise AssertionError('offline test attempted a network request')
+
+yt_dlp.YoutubeDL.urlopen = no_network
+YoutubeIE._real_initialize = lambda self: None
+
+def fast_extract(self, url):
+    ydl = self._downloader
+    assert set(ydl._ies) == {{'Youtube'}}
+    assert not list(self.cookiejar)
+    assert ydl.params.get('cookiefile') is None
+    assert ydl.params.get('cookiesfrombrowser') is None
+    assert ydl.params['cachedir'] is False
+    assert 'ytmusicaccount' not in ydl.params['extractor_args']
+    args = ydl.params['extractor_args']['youtube']
+    assert args['player_client'] == ['visionos']
+    assert args['player_skip'] == ['webpage', 'initial_data', 'configs']
+    assert args['skip'] == ['hls', 'dash']
+    self.calls = getattr(self, 'calls', 0) + 1
+    if url.endswith('botonce0000') and visits == 1 or url.endswith('alwaysbot00'):
+        ydl.report_error('Sign in to confirm you are not a bot. INVENTED_SECRET')
+    if url.endswith('failfast000'):
+        raise DownloadError('INVENTED_SECRET')
+    if url.endswith('stalled0000'):
+        time.sleep(60)
+    formats = [] if url.endswith('nourls00000') else [{{
+        'format_id':'audio', 'ext':'webm', 'vcodec':'none', 'acodec':'opus',
+        'url':'https://rr1.googlevideo.com/audio?visitor=' + args['visitor_data'][0]}}]
+    return {{'id':'abcdefghijk', 'title':'Synthetic', 'formats':formats}}
+
+YoutubeIE._real_extract = fast_extract
+"#,
+            visitor = directory.path().join("visits").to_str().unwrap()
+        )
+        .unwrap();
+        drop(file);
+        let credentials =
+            prepare_credentials(synthetic_credentials("INVENTED_COOKIE"), &plugin).unwrap();
+        let mut resolver = StreamResolver::new(&find_ytdlp().unwrap(), Some(&credentials));
+        resolver
+            .start(resolver_target("abcdefghijk", 1), Some(&credentials))
+            .unwrap();
+        assert!(
+            resolved(&mut resolver, Some(&credentials))
+                .url
+                .contains("call=1")
+        );
+        assert!(
+            !directory.path().join("visits").exists(),
+            "full requests must not fetch visitor data"
+        );
+        let pid = resolver.warm.as_ref().unwrap().child.id();
+        let fast = |resolver: &mut StreamResolver, id: &str, expected: &str| {
+            let mut target = resolver_target(id, 2);
+            target.lane = ResolverLane::Fast;
+            resolver.start(target, Some(&credentials)).unwrap();
+            let stream = resolved(resolver, Some(&credentials));
+            assert!(stream.url.contains(expected), "{id}: {}", stream.url);
+        };
+        // Fast URLs carry the visitor data; full-instance URLs count its calls.
+        for (id, expected) in [
+            ("abcdefghijk", "visitor=VD_1"),
+            ("botonce0000", "visitor=VD_2"),
+            ("abcdefghijk", "visitor=VD_2"),
+            ("failfast000", "call=2"),
+            ("nourls00000", "call=3"),
+            ("alwaysbot00", "call=4"),
+            // A bot check that survives a fresh visitor ID pauses the fast lane.
+            ("abcdefghijk", "call=5"),
+        ] {
+            fast(&mut resolver, id, expected);
+            assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
+        }
+        assert_eq!(
+            fs::read_to_string(directory.path().join("visits")).unwrap(),
+            "3"
+        );
+        resolver.stop();
+        // A fast attempt that never finishes yields to the full instance within
+        // its budget, and pauses the fast lane too.
+        let mut resolver = StreamResolver::new(&find_ytdlp().unwrap(), Some(&credentials));
+        let started = Instant::now();
+        fast(&mut resolver, "stalled0000", "call=1");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        fast(&mut resolver, "abcdefghijk", "call=2");
     }
 
     fn synthetic_resolver_plugin(directory: &Path) -> PathBuf {
@@ -2856,6 +3042,38 @@ YtMusicAccountIE._real_extract = extract
     }
 
     #[test]
+    fn a_fast_lookup_in_flight_never_answers_a_full_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let interpreter = directory.path().join("python3");
+        fs::write(&interpreter, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
+        let pid = |resolver: &StreamResolver| resolver.warm.as_ref().map(|warm| warm.child.id());
+        for (first, second, reused) in [
+            (ResolverLane::Fast, ResolverLane::Full, false),
+            (ResolverLane::Full, ResolverLane::Fast, true),
+            (ResolverLane::Fast, ResolverLane::Fast, true),
+        ] {
+            let mut resolver = StreamResolver::new(&extractor, None);
+            resolver.warm.as_mut().unwrap().ready = true;
+            let mut target = resolver_target("abcdefghijk", 1);
+            target.lane = first;
+            resolver.start(target.clone(), None).unwrap();
+            let before = pid(&resolver);
+            target.lane = second;
+            resolver.start(target, None).unwrap();
+            assert_eq!(
+                pid(&resolver) == before,
+                reused,
+                "{first:?} then {second:?}"
+            );
+            assert_eq!(resolver.target.as_ref().unwrap().lane, second);
+            resolver.stop();
+        }
+    }
+
+    #[test]
     fn resolver_startup_and_request_deadlines_wake_without_output() {
         let directory = tempfile::tempdir().unwrap();
         let interpreter = directory.path().join("python3");
@@ -2953,6 +3171,7 @@ YtMusicAccountIE._real_extract = extract
         let credentials =
             prepare_credentials(synthetic_credentials("INVENTED"), directory.path()).unwrap();
         let target = PreparedTarget {
+            lane: ResolverLane::Full,
             key: StreamKey {
                 url: "https://music.youtube.com/watch?v=abcdefghijk".into(),
                 quality: AudioQuality::Normal,
@@ -3032,6 +3251,26 @@ YtMusicAccountIE._real_extract = extract
                 .unwrap(),
             target.track_id
         );
+        // Repeat One prepares the song that just failed to open. The app's reload
+        // must not inherit that occurrence's ID, or its late stop would end it.
+        received.try_recv().unwrap();
+        player
+            .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+            .unwrap();
+        let PlayerCommand::Prepare(Some(target)) = received.try_recv().unwrap() else {
+            panic!("missing preparation")
+        };
+        let reload = player
+            .play(
+                "abcdefghijk",
+                "Reload",
+                PlayOptions {
+                    full_lookup: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(reload, target.track_id);
     }
 
     #[test]
@@ -3947,6 +4186,7 @@ YtMusicAccountIE._real_extract = extract
             quality: AudioQuality::Low,
             start: 32.5,
             paused: true,
+            full_lookup: false,
         };
         let first = player.play("csILUDfmtqM", "Track", options).unwrap();
         let second = player.play("csILUDfmtqM", "Track", options).unwrap();
@@ -5403,6 +5643,7 @@ PYTHON
                     quality: AudioQuality::Low,
                     start: 30.,
                     paused: true,
+                    full_lookup: false,
                 },
             )
             .unwrap();

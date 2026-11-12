@@ -179,6 +179,7 @@ impl Music {
                     self.playback = Playback::Loading {
                         paused: intent.playback.is_paused(),
                         retried: false,
+                        full_lookup: false,
                     };
                     self.playback_request(
                         PlaybackQuery::Watch {
@@ -283,6 +284,7 @@ impl Music {
             self.playback = Playback::Loading {
                 paused: intent.is_paused(),
                 retried: false,
+                full_lookup: false,
             };
             self.player_command(Player::stop);
             self.active_id = None;
@@ -790,6 +792,7 @@ impl Music {
                                 .map_or(Playback::Stopped, |resume| Playback::Loading {
                                     paused: resume.is_paused(),
                                     retried: false,
+                                    full_lookup: false,
                                 });
                         self.account_operation = Some(AccountOperation::Activating {
                             operation: operation.clone(),

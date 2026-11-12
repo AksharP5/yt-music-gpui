@@ -51,8 +51,17 @@ pub(in crate::app) enum PlaybackResult {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::app) enum Playback {
     Stopped,
-    Loading { paused: bool, retried: bool },
-    Loaded { paused: bool, buffering: bool },
+    Loading {
+        paused: bool,
+        retried: bool,
+        // Set once a stream failed to open. Every reload of this song then skips
+        // the fast lookup, while quality changes still earn their own retry.
+        full_lookup: bool,
+    },
+    Loaded {
+        paused: bool,
+        buffering: bool,
+    },
 }
 #[derive(Clone, Copy)]
 pub(in crate::app) struct SeekIntent {
@@ -76,7 +85,15 @@ impl Playback {
 
     pub(in crate::app) fn with_pause(self, paused: bool) -> Self {
         match self {
-            Self::Loading { retried, .. } => Self::Loading { paused, retried },
+            Self::Loading {
+                retried,
+                full_lookup,
+                ..
+            } => Self::Loading {
+                paused,
+                retried,
+                full_lookup,
+            },
             Self::Loaded { buffering, .. } => Self::Loaded { paused, buffering },
             Self::Stopped => Self::Loaded {
                 paused,
@@ -107,13 +124,19 @@ impl Playback {
     }
 
     pub(in crate::app) fn retry(&mut self) -> bool {
-        let Self::Loading { retried, .. } = self else {
+        let Self::Loading {
+            retried,
+            full_lookup,
+            ..
+        } = self
+        else {
             return false;
         };
         if *retried {
             return false;
         }
         *retried = true;
+        *full_lookup = true;
         true
     }
 }
@@ -244,6 +267,7 @@ impl Music {
             self.playback = Playback::Loading {
                 paused,
                 retried: false,
+                full_lookup: false,
             };
             self.player_command(Player::stop);
             self.active_id = None;
@@ -305,6 +329,7 @@ impl Music {
                 video: self.library.video.then_some(self.library.video_quality),
                 start,
                 paused,
+                ..Default::default()
             },
         ) {
             Ok(id) => {
@@ -312,6 +337,7 @@ impl Music {
                 self.playback = Playback::Loading {
                     paused,
                     retried: false,
+                    full_lookup: false,
                 };
                 self.position = start;
                 self.duration = track.duration.unwrap_or(0) as f64;
@@ -541,7 +567,14 @@ impl Music {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("The audio player is unavailable. Restart the app."))?;
         let paused = self.playback.is_paused();
-        let retried = matches!(self.playback, Playback::Loading { retried: true, .. });
+        let (retried, full_lookup) = match self.playback {
+            Playback::Loading {
+                retried,
+                full_lookup,
+                ..
+            } => (retried, full_lookup),
+            _ => (false, false),
+        };
         let start = self.playback_position();
         let id = player.play(
             &track.id,
@@ -551,6 +584,7 @@ impl Music {
                 video: self.library.video.then_some(self.library.video_quality),
                 start,
                 paused,
+                full_lookup,
             },
         )?;
         if self.active_id.is_some() && self.history_track == self.active_id {
@@ -559,7 +593,11 @@ impl Music {
         self.active_id = Some(id);
         self.seekable = false;
         self.position = start;
-        self.playback = Playback::Loading { paused, retried };
+        self.playback = Playback::Loading {
+            paused,
+            retried,
+            full_lookup,
+        };
         self.error = None;
         Ok(())
     }
@@ -599,6 +637,7 @@ impl Music {
                 .map_or(Playback::Stopped, |intent| Playback::Loading {
                     paused: intent.is_paused(),
                     retried: false,
+                    full_lookup: false,
                 });
             if matches!(
                 self.account_operation,
@@ -620,6 +659,7 @@ impl Music {
             self.playback = Playback::Loading {
                 paused: intent.playback.is_paused(),
                 retried: false,
+                full_lookup: false,
             };
             self.notify_playback(cx);
             return;

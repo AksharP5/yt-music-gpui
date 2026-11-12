@@ -40,7 +40,9 @@ Connection requires Python 3, xdg-utils, libsecret's `secret-tool` and a running
 
 The app reads YouTube cookies from your default browser profile and saves the confirmed session in your desktop keyring. For Chromium, Chrome and Brave that is the profile you used last, and the cookies are decrypted with the browser's own Safe Storage key from the same keyring. The app uses your browser session rather than OAuth, so it has that session's YouTube access. It creates no persistent plaintext cookie export. Private windows, containers and partitioned sessions are unsupported.
 
-Signed-in playback runs through an extractor reviewed against one yt-dlp release, pinned in `src/ytdlp_account.py` (currently **2026.08.19**). With any other yt-dlp version, songs play as a guest instead. A weekly CI job tests each new yt-dlp release so the pin can be bumped promptly.
+Clicked songs first use a cookie-free player request that skips the watch page. The next song is prepared in the background; when signed in with High audio quality, that preparation uses your account to keep Premium audio. Video above 1080p also uses the full extractor. If the fast request fails, the same lookup continues through the full extractor. If a stream fails to open, the automatic retry uses the full extractor.
+
+Account playback uses an extractor reviewed against one yt-dlp release, pinned in `src/ytdlp_account.py` (currently **2026.08.19**). With any other yt-dlp version, the full extractor plays as a guest instead. A weekly CI job tests each new yt-dlp release so the pin can be bumped promptly.
 
 Once connected, the browser can stay closed. The app restores your saved account and can renew rejected sessions from its confirmed profile. Google can still revoke a sign-in. Older saved connections need one reconnect to enable renewal.
 
