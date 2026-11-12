@@ -52,6 +52,9 @@ def remember_player_scripts(ydl):
     EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
 
 
+# A stalled fast lane gives up quickly and falls back to the full lane.
+FAST_TIMEOUT = 3
+
 protocol = sys.stdout
 output = io.StringIO()
 with contextlib.redirect_stdout(output):
@@ -78,7 +81,7 @@ with contextlib.redirect_stdout(output):
         request = urllib.request.Request('https://music.youtube.com/', headers={
             'User-Agent': std_headers['User-Agent'],
         })
-        with urllib.request.urlopen(request, timeout=10) as page:
+        with urllib.request.urlopen(request, timeout=FAST_TIMEOUT) as page:
             html = page.read().decode('utf-8')
         return json.loads('"' + re.search(r'"VISITOR_DATA"\s*:\s*"([^"\n]+)"', html)[1] + '"')
 
@@ -125,6 +128,8 @@ with contextlib.redirect_stdout(output):
                                 'quiet': True, 'no_warnings': True, 'logger': logger,
                                 'forceurl': True, 'simulate': True, 'noplaylist': True,
                                 'cachedir': False,
+                                # Leave the full lane most of the actor's 30 s deadline.
+                                'socket_timeout': FAST_TIMEOUT, 'extractor_retries': 0,
                                 'extractor_args': {'youtube': {
                                     'player_client': ['visionos'],
                                     'player_skip': ['webpage', 'initial_data', 'configs'],

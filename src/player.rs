@@ -1981,7 +1981,12 @@ fn run(
             state.seekable = false;
             state.pause_after_load = true;
             write_command(&mut socket, json!(["stop"]), None)?;
-            if let Some((next, _)) = prepared.take() {
+            // The failed occurrence may itself be the prepared successor; never
+            // queue it again behind its own retry.
+            if let Some((next, _)) = prepared
+                .take()
+                .filter(|(next, _)| next.track_id != target.track_id)
+            {
                 next_target = Some(next);
             }
             state.discard_upcoming();
