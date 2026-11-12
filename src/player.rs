@@ -1651,8 +1651,11 @@ impl StreamResolver {
         }
     }
 
+    /// `play` is the song waiting to load. A failed native preparation must not
+    /// take the full extractor from it; preparation restarts once it loads.
     fn finish(
         &mut self,
+        play: Option<&PreparedTarget>,
         credentials: Option<&ExtractorCredentials>,
     ) -> Option<(PreparedTarget, Result<ResolvedStream>)> {
         if let Some((mut target, result, started)) =
@@ -1661,11 +1664,20 @@ impl StreamResolver {
             if result.is_ok() {
                 return Some((target, result));
             }
-            target.lane = ResolverLane::Full;
-            if let Err(error) = self.start(target.clone(), credentials) {
-                return Some((target, Err(error)));
+            let serving_play = play.is_some_and(|play| {
+                play.track_id != target.track_id
+                    && self
+                        .target
+                        .as_ref()
+                        .is_some_and(|current| current.key == play.key)
+            });
+            if !serving_play {
+                target.lane = ResolverLane::Full;
+                if let Err(error) = self.start(target.clone(), credentials) {
+                    return Some((target, Err(error)));
+                }
+                self.started = started;
             }
-            self.started = started;
         }
         let mut result = None;
         if let Some(warm) = &mut self.warm {
@@ -2110,7 +2122,10 @@ fn run(
             pending_play.as_ref().map(|play| &play.target),
             next_target.as_ref(),
         );
-        if let Some((target, result)) = resolver.finish(credentials.as_ref()) {
+        if let Some((target, result)) = resolver.finish(
+            pending_play.as_ref().map(|play| &play.target),
+            credentials.as_ref(),
+        ) {
             if pending_play.as_ref().is_some_and(|play| {
                 play.target.track_id == target.track_id && play.target.key == target.key
             }) {
@@ -2909,7 +2924,7 @@ YtMusicAccountIE._real_extract = extract
     ) -> ResolvedStream {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some((_, result)) = resolver.finish(credentials) {
+            if let Some((_, result)) = resolver.finish(None, credentials) {
                 return result.unwrap();
             }
             assert!(Instant::now() < deadline, "resolver did not answer");
@@ -3118,7 +3133,7 @@ YtMusicAccountIE._real_extract = extract
             .unwrap()
         );
         let (_, stream) = resolver
-            .finish(None)
+            .finish(None, None)
             .expect("child exit must wake the actor");
         assert!(stream.is_ok());
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -3167,7 +3182,7 @@ YtMusicAccountIE._real_extract = extract
         resolver.retain(Some(&click), Some(&preparation));
         let (socket, _mpv) = UnixStream::pair().unwrap();
         let (target, stream) = loop {
-            if let Some(result) = resolver.finish(None) {
+            if let Some(result) = resolver.finish(None, None) {
                 break result;
             }
             assert!(start.elapsed() < Duration::from_secs(2));
@@ -3184,6 +3199,45 @@ YtMusicAccountIE._real_extract = extract
         assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
         assert_eq!(resolver.target.as_ref().unwrap().track_id, 1);
         assert!(Path::new(&format!("/proc/{pid}")).exists());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_native_preparation_leaves_the_full_reload_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let (commands, _received) = command_channel().unwrap();
+        let (lookup, server) =
+            native::tests::server(vec![native::tests::homepage(), "invalid json".into()]);
+        resolver.native = Some(NativeResolver::new(lookup, commands.wake.clone()));
+        // The next song starts natively, then the current song's automatic
+        // reload takes the full extractor while that preparation is in flight.
+        let mut preparation = resolver_target("abcdefghijk", 2);
+        preparation.lane = ResolverLane::Fast;
+        resolver.start(preparation.clone(), None).unwrap();
+        let reload = resolver_target("blocked0000", 1);
+        resolver.start(reload.clone(), None).unwrap();
+        let pid = resolver.warm.as_ref().unwrap().child.id();
+        resolver.retain(Some(&reload), Some(&preparation));
+        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        loop {
+            assert!(resolver.finish(Some(&reload), None).is_none());
+            if resolver.native.as_ref().unwrap().target.is_none() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            wait_for_player_input(
+                &socket,
+                &commands.wake,
+                resolver.fd(),
+                Some(start + Duration::from_secs(2)),
+            )
+            .unwrap();
+        }
+        assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
+        assert_eq!(resolver.target.as_ref().unwrap().track_id, 1);
+        assert!(resolver.deadline().is_some());
         server.join().unwrap();
     }
 
@@ -3232,7 +3286,7 @@ YtMusicAccountIE._real_extract = extract
         resolver.native = Some(native);
         target.lane = ResolverLane::Full;
         resolver.start(target, None).unwrap();
-        assert!(resolver.finish(None).is_none());
+        assert!(resolver.finish(None, None).is_none());
         assert!(resolver.native.as_ref().unwrap().target.is_none());
         assert_eq!(resolver.target.as_ref().unwrap().lane, ResolverLane::Full);
     }
@@ -3264,7 +3318,7 @@ YtMusicAccountIE._real_extract = extract
                 !wait_for_player_input(&socket, &commands.wake, resolver.fd(), Some(deadline))
                     .unwrap()
             );
-            let result = resolver.finish(None);
+            let result = resolver.finish(None, None);
             if ready {
                 assert!(
                     result
