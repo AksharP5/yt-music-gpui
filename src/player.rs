@@ -181,6 +181,9 @@ pub struct PlayOptions {
     pub video: Option<VideoQuality>,
     pub start: f64,
     pub paused: bool,
+    /// Skip the fast lookup. The automatic reload after a stream fails to open
+    /// sets this, in case YouTube rejected the fast lookup's stream.
+    pub full_lookup: bool,
 }
 
 pub struct PlayerOptions {
@@ -499,9 +502,12 @@ impl Player {
             "Invalid playback start position."
         );
         let next = self.next.lock().unwrap().take();
+        // A full lookup reload gets a fresh ID, so late events from a prepared
+        // occurrence of the same song can never be mistaken for it.
         let track_id = next
             .filter(|next| {
-                options.start == 0.
+                !options.full_lookup
+                    && options.start == 0.
                     && next.key
                         == StreamKey {
                             url: url.clone(),
@@ -1745,11 +1751,8 @@ fn run(
                         quality: options.quality,
                         video: options.video,
                     };
-                    // A reload after a stream failed to open must reach the full
-                    // extractor, even when Repeat One prepared this song on the fast lane.
-                    let full = std::mem::take(&mut state.full_lane_next);
                     let resolved = prepared.take().filter(|(target, stream)| {
-                        !full && target.track_id == track_id && stream.matches(&key)
+                        target.track_id == track_id && stream.matches(&key)
                     });
                     let prefetched = resolved.is_some()
                         && state.entries.values().any(|entry| *entry == track_id);
@@ -1809,7 +1812,7 @@ fn run(
                         if resolver
                             .start(
                                 PreparedTarget {
-                                    lane: if full {
+                                    lane: if options.full_lookup {
                                         ResolverLane::Full
                                     } else {
                                         key.lane(false, credentials.is_some())
@@ -2097,10 +2100,6 @@ struct PlaybackState {
     seek: Option<ActiveSeek>,
     next_seek: Option<SeekRequest>,
     position_observer: u64,
-    // After a stream fails to open, the app retries the song once through
-    // Player::play. That lookup uses the full extractor, in case the fast lane's
-    // stream was the one YouTube rejected.
-    full_lane_next: bool,
 }
 
 impl PlaybackState {
@@ -2384,7 +2383,6 @@ impl PlaybackState {
             {
                 self.entries.insert(entry, id);
             } else if value["error"].as_str() != Some("success") && self.desired == Some(id) {
-                self.full_lane_next = true;
                 let _ = events.send_blocking(PlayerEvent::Error {
                     track_id: Some(id),
                     message: "mpv could not load this track. Try another track or update yt-dlp."
@@ -2454,7 +2452,6 @@ impl PlaybackState {
                             let _ = events.send_blocking(PlayerEvent::Stopped { track_id });
                         }
                         Some("error") => {
-                            self.full_lane_next = true;
                             let _ = events.send_blocking(PlayerEvent::Error {
                                 track_id: Some(track_id),
                                 message: "YouTube could not provide this stream. Try another track or update yt-dlp."
@@ -3243,6 +3240,26 @@ YtMusicAccountIE._real_extract = extract
                 .unwrap(),
             target.track_id
         );
+        // Repeat One prepares the song that just failed to open. The app's reload
+        // must not inherit that occurrence's ID, or its late stop would end it.
+        received.try_recv().unwrap();
+        player
+            .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+            .unwrap();
+        let PlayerCommand::Prepare(Some(target)) = received.try_recv().unwrap() else {
+            panic!("missing preparation")
+        };
+        let reload = player
+            .play(
+                "abcdefghijk",
+                "Reload",
+                PlayOptions {
+                    full_lookup: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(reload, target.track_id);
     }
 
     #[test]
@@ -4158,6 +4175,7 @@ YtMusicAccountIE._real_extract = extract
             quality: AudioQuality::Low,
             start: 32.5,
             paused: true,
+            full_lookup: false,
         };
         let first = player.play("csILUDfmtqM", "Track", options).unwrap();
         let second = player.play("csILUDfmtqM", "Track", options).unwrap();
@@ -5614,6 +5632,7 @@ PYTHON
                     quality: AudioQuality::Low,
                     start: 30.,
                     paused: true,
+                    full_lookup: false,
                 },
             )
             .unwrap();

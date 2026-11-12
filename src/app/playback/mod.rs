@@ -305,6 +305,7 @@ impl Music {
                 video: self.library.video.then_some(self.library.video_quality),
                 start,
                 paused,
+                ..Default::default()
             },
         ) {
             Ok(id) => {
@@ -551,6 +552,9 @@ impl Music {
                 video: self.library.video.then_some(self.library.video_quality),
                 start,
                 paused,
+                // The automatic retry after a stream failed to open, and any reload
+                // while that retry loads, skips the fast lookup.
+                full_lookup: retried,
             },
         )?;
         if self.active_id.is_some() && self.history_track == self.active_id {
