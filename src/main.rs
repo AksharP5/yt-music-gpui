@@ -69,6 +69,11 @@ fn main() {
             }
             "--version" | "-V" => {
                 println!("yt-music-gpui {}", env!("CARGO_PKG_VERSION"));
+                // Which helpers passed the trust checks, for bug reports and package tests.
+                let ytdlp = player::find_ytdlp().map(|path| path.display().to_string());
+                let deno = player::private_tool("deno").map(|path| path.display().to_string());
+                println!("yt-dlp: {}", ytdlp.as_deref().unwrap_or("not found"));
+                println!("deno: {}", deno.as_deref().unwrap_or("from PATH"));
                 return;
             }
             _ => {

@@ -1,0 +1,104 @@
+# .deb and .rpm packages, built by .github/workflows/release-build.yml from
+# the tarball's files in dist/stage and the pinned helpers in dist/helpers.
+name: yt-music-gpui
+arch: amd64
+platform: linux
+version: ${VERSION}
+release: 1
+maintainer: Akshar Patel <123344143+AksharP5@users.noreply.github.com>
+description: |-
+  Native YouTube Music client for Linux, built with GPUI.
+  Includes the reviewed yt-dlp zipapp and Deno it uses for signed-in playback.
+homepage: https://github.com/AksharP5/yt-music-gpui
+license: MIT AND Apache-2.0 AND ISC AND OFL-1.1 AND Unlicense
+section: sound
+
+contents:
+  - src: dist/stage/yt-music-gpui
+    dst: /usr/bin/yt-music-gpui
+    file_info: {mode: 0755}
+  # The app only uses these when they and every parent directory are root-owned
+  # and not writable by group or others.
+  - dst: /usr/lib/yt-music-gpui
+    type: dir
+    file_info: {mode: 0755}
+  - src: dist/helpers/yt-dlp
+    dst: /usr/lib/yt-music-gpui/yt-dlp
+    file_info: {mode: 0755}
+  - src: dist/helpers/deno
+    dst: /usr/lib/yt-music-gpui/deno
+    file_info: {mode: 0755}
+  - src: dist/stage/yt-music-gpui.desktop
+    dst: /usr/share/applications/yt-music-gpui.desktop
+    file_info: {mode: 0644}
+  - src: dist/stage/yt-music-gpui.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/yt-music-gpui.svg
+    file_info: {mode: 0644}
+  - dst: /usr/share/doc/yt-music-gpui
+    type: dir
+    file_info: {mode: 0755}
+    packager: deb
+  - src: dist/licenses/*
+    dst: /usr/share/doc/yt-music-gpui/
+    file_info: {mode: 0644}
+    packager: deb
+  - dst: /usr/share/licenses/yt-music-gpui
+    type: dir
+    file_info: {mode: 0755}
+    packager: rpm
+  - src: dist/licenses/*
+    dst: /usr/share/licenses/yt-music-gpui/
+    file_info: {mode: 0644}
+    packager: rpm
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.39)
+      - libgcc-s1
+      - libmpv2
+      - libegl1
+      - libgles2
+      - libwayland-client0
+      - libwayland-egl1
+      - libx11-6
+      - libxext6
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libfontconfig1
+      - libfreetype6
+      - libvulkan1
+      - python3 (>= 3.10)
+      - libsecret-tools
+      - xdg-utils
+    recommends:
+      - mesa-vulkan-drivers
+  # Library and file dependencies, so one package resolves on Fedora and openSUSE.
+  rpm:
+    depends:
+      - libc.so.6(GLIBC_2.39)(64bit)
+      - libgcc_s.so.1()(64bit)
+      - libmpv.so.2()(64bit)
+      - libEGL.so.1()(64bit)
+      - libGLESv2.so.2()(64bit)
+      - libwayland-client.so.0()(64bit)
+      - libwayland-egl.so.1()(64bit)
+      - libX11.so.6()(64bit)
+      - libXext.so.6()(64bit)
+      - libxcb.so.1()(64bit)
+      - libxkbcommon.so.0()(64bit)
+      - libxkbcommon-x11.so.0()(64bit)
+      - libfontconfig.so.1()(64bit)
+      - libfreetype.so.6()(64bit)
+      - libvulkan.so.1()(64bit)
+      - python3 >= 3.10
+      - /usr/bin/secret-tool
+      - /usr/bin/xdg-open
+    recommends:
+      - mesa-vulkan-drivers
+
+deb:
+  compression: zstd:19
+rpm:
+  compression: zstd:19

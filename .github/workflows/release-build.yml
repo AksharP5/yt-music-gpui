@@ -71,7 +71,25 @@ jobs:
             echo 'ldd on Ubuntu 24.04:'
             ldd target/release/yt-music-gpui
           } | tee dist/dependencies.txt
-          rm -r dist/stage
+      - name: Build .deb and .rpm packages with the pinned yt-dlp and Deno
+        env:
+          NFPM_VERSION: 2.49.0
+          NFPM_SHA256: 2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7
+        run: |
+          get() { curl -q --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"; echo "$3  $2" | sha256sum -c; }
+          pin() { jq -r ".$1" dist/stage/runtime-pins.json; }
+          mkdir -p dist/helpers dist/licenses tools
+          get "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" tools/nfpm.tar.gz "$NFPM_SHA256"
+          tar -xzf tools/nfpm.tar.gz -C tools nfpm
+          get "https://github.com/yt-dlp/yt-dlp/releases/download/$(pin ytdlp_version)/yt-dlp" dist/helpers/yt-dlp "$(pin ytdlp_sha256)"
+          get "https://github.com/denoland/deno/releases/download/v$(pin deno_version)/deno-x86_64-unknown-linux-gnu.zip" tools/deno.zip "$(pin deno_sha256)"
+          [ "$(zipinfo -1 tools/deno.zip)" = deno ]
+          unzip -q tools/deno.zip deno -d dist/helpers
+          chmod 755 dist/helpers/yt-dlp dist/helpers/deno
+          cp dist/stage/LICENSE* dist/stage/NOTICE dist/stage/OFL.txt packaging/LICENSE-DENO packaging/LICENSE-YT-DLP dist/licenses/
+          for packager in deb rpm; do tools/nfpm package --config packaging/nfpm.yaml --packager "$packager" --target dist/; done
+          (cd dist && for package in *.deb *.rpm; do sha256sum "$package" > "$package.sha256"; done)
+          rm -r dist/stage dist/helpers dist/licenses tools
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: linux-x86_64
@@ -111,3 +129,26 @@ jobs:
             su -s /bin/sh music -c "sh /dist/install.sh --uninstall"
           '
 
+
+  packages:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu:24.04, debian:13, fedora:43, opensuse/tumbleweed]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Install, check and remove the package in a clean container
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          YTDLP_VERSION=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          docker run --rm -e "YTDLP_VERSION=$YTDLP_VERSION" -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/packaging/test-package.sh:/test-package.sh:ro" "$DISTRO" sh /test-package.sh
