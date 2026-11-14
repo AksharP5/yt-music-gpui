@@ -838,6 +838,8 @@ unsafe extern "C" {
 
 struct MpvCore(NonNull<c_void>);
 
+const MPV_ERROR_OPTION_NOT_FOUND: c_int = -5;
+
 impl MpvCore {
     fn new(options: &PlayerOptions, socket: &Path) -> Result<Self> {
         let core = Self(NonNull::new(unsafe { mpv_create() }).context("Could not create mpv")?);
@@ -845,15 +847,6 @@ impl MpvCore {
             (c"terminal", "no"),
             (c"config", "no"),
             (c"load-scripts", "no"),
-            // mpv also starts a Lua VM for each built-in script. This player is
-            // controlled only over IPC, so none of them has any use.
-            (c"load-auto-profiles", "no"),
-            (c"load-commands", "no"),
-            (c"load-console", "no"),
-            (c"load-context-menu", "no"),
-            (c"load-positioning", "no"),
-            (c"load-select", "no"),
-            (c"load-stats-overlay", "no"),
             (c"idle", "yes"),
             (c"vid", "no"),
             (c"vo", "libmpv"),
@@ -872,6 +865,26 @@ impl MpvCore {
             (c"ytdl", "no"),
         ] {
             core.set_option(name, value)?;
+        }
+        // mpv also starts a Lua VM for each built-in script. This player is
+        // controlled only over IPC, so none of them has any use. Older mpv
+        // releases lack some of these scripts, and so their switches.
+        for name in [
+            c"load-auto-profiles",
+            c"load-commands",
+            c"load-console",
+            c"load-context-menu",
+            c"load-positioning",
+            c"load-select",
+            c"load-stats-overlay",
+        ] {
+            let result =
+                unsafe { mpv_set_option_string(core.0.as_ptr(), name.as_ptr(), c"no".as_ptr()) };
+            ensure!(
+                result >= 0 || result == MPV_ERROR_OPTION_NOT_FOUND,
+                "Could not set mpv startup option {} ({result})",
+                name.to_string_lossy()
+            );
         }
         core.set_option(c"volume", &options.volume.clamp(0., 100.).to_string())?;
         core.set_option(c"speed", &f64::from(options.speed).to_string())?;
@@ -963,16 +976,19 @@ fn normalization_gain(audio_config: &Value, format: &Value) -> f64 {
 }
 
 fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOptions) -> Value {
-    json!(["loadfile", url, "replace", -1, {
+    // Named arguments, because mpv 0.38 inserted an index argument before the
+    // options; positional ones work with only one side of that change.
+    json!({"name": "loadfile", "url": url, "flags": "replace", "options": {
         "force-media-title": title,
         "ytdl": "no",
         "start": options.start.to_string(),
         "pause": if options.paused { "yes" } else { "no" },
         // A file-local option: it applies to this entry only, including when
         // mpv reaches a prepared entry on its own, and sits on top of the
-        // user's volume instead of changing it.
+        // user's volume instead of changing it. mpv before 0.38 ignores it,
+        // so songs play unlevelled there.
         "volume-gain": gain_db.to_string(),
-    }])
+    }})
 }
 
 fn writable_playback_cookies(mut source: File) -> Result<File> {
@@ -2310,7 +2326,7 @@ fn run(
                     ..Default::default()
                 },
             );
-            command[2] = json!("append");
+            command["flags"] = json!("append");
             state.upcoming = Some(target.track_id);
             write_command(
                 &mut socket,
@@ -4619,17 +4635,20 @@ YtMusicAccountIE._real_extract = extract
         };
         assert_eq!(track_id, first);
         let command = load_command(&url, &title, -2.29, options);
-        assert_eq!(command[0], "loadfile");
-        assert_eq!(command[1], "https://music.youtube.com/watch?v=csILUDfmtqM");
-        assert_eq!(command[2], "replace");
-        assert_eq!(command[4]["start"], "32.5");
-        assert_eq!(command[4]["pause"], "yes");
-        assert_eq!(command[4]["ytdl"], "no");
-        assert_eq!(command[4]["volume-gain"], "-2.29");
+        assert_eq!(command["name"], "loadfile");
+        assert_eq!(
+            command["url"],
+            "https://music.youtube.com/watch?v=csILUDfmtqM"
+        );
+        assert_eq!(command["flags"], "replace");
+        assert_eq!(command["options"]["start"], "32.5");
+        assert_eq!(command["options"]["pause"], "yes");
+        assert_eq!(command["options"]["ytdl"], "no");
+        assert_eq!(command["options"]["volume-gain"], "-2.29");
         let defaults = load_command("unused", "Track", 0., PlayOptions::default());
-        assert_eq!(defaults[4]["start"], "0");
-        assert_eq!(defaults[4]["pause"], "no");
-        assert_eq!(defaults[4]["ytdl"], "no");
+        assert_eq!(defaults["options"]["start"], "0");
+        assert_eq!(defaults["options"]["pause"], "no");
+        assert_eq!(defaults["options"]["ytdl"], "no");
         let video = load_command(
             "unused",
             "Track",
@@ -4639,9 +4658,9 @@ YtMusicAccountIE._real_extract = extract
                 ..options
             },
         );
-        assert_eq!(video[4]["ytdl"], "no");
-        assert_eq!(video[4]["start"], "32.5");
-        assert_eq!(video[4]["pause"], "yes");
+        assert_eq!(video["options"]["ytdl"], "no");
+        assert_eq!(video["options"]["start"], "32.5");
+        assert_eq!(video["options"]["pause"], "yes");
     }
 
     #[test]
