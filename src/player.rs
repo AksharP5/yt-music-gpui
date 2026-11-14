@@ -1240,7 +1240,7 @@ fn extractor_arguments(
         // Extraction must not persist account data or signed URLs in a disk cache.
         "--no-cache-dir",
     ]);
-    // Only Deno: yt-dlp runs it with no file, process or network permissions.
+    // Only Deno: yt-dlp runs it without file, process or network permissions.
     // Bun and QuickJS get full access, and Node's permission model can still
     // be escaped by player code, so YouTube's player JavaScript never runs there.
     command.args(["--js-runtimes", "deno"]);
