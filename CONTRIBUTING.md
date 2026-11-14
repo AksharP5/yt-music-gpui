@@ -129,11 +129,11 @@ Never commit cookies, account data or keyring contents. Use synthetic values in 
 
 Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything.
 
-1. Bump the package version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check --locked` after updating the root package entry. Merge the reviewed version change.
+1. Bump the package version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
 2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.
 3. The Release workflow builds with `--locked`, checks the installed artifact in Ubuntu and Fedora containers, and publishes the tarball, SHA-256 checksum, `install.sh` and dependency report to a GitHub Release.
 
-Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the Release workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
+Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the same read-only release build workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
 
 Download the artifact and test the installer without touching an existing installation:
 

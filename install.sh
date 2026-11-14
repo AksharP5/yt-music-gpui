@@ -247,11 +247,16 @@ try:
             os.close(fd)
         for name, source in sources.items():
             content = source.read_bytes()
+            if name == 'yt-music-gpui.desktop':
+                executable = str(targets['yt-music-gpui']).replace('%', '%%')
+                for character in ['\\', '"', '`', '$']:
+                    executable = executable.replace(character, '\\' + character)
+                content = content.replace(b'Exec=yt-music-gpui\n', f'Exec="{executable}"\n'.encode())
             mode = 0o755 if name in ('yt-music-gpui', 'yt-dlp', 'deno') else 0o644
-            atomic_write(targets[name], content, mode)
             saved[name] = {'path': str(targets[name]), 'sha256': digest(content)}
-            # Record each completed file so an interrupted install is recoverable.
+            # Record ownership before replacement so an interrupted install can resume.
             atomic_write(manifest, json.dumps(saved).encode(), 0o600)
+            atomic_write(targets[name], content, mode)
     elif action == 'uninstall':
         saved = load_manifest()
         kept = {}
@@ -294,7 +299,7 @@ PY
         printf '%s\n' 'Uninstalled. Library, settings and saved account were kept.'
         exit 0
     fi
-    download() { curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
+    download() { curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
     if [ "$action" = install ]; then
         command -v curl >/dev/null 2>&1 || { packages curl || exit 1; }
         if [ -n "$archive" ]; then
@@ -303,7 +308,7 @@ PY
             archive=$work/$(basename -- "$archive")
         else
             # Resolve latest once, so a release published mid-install cannot mix assets.
-            effective=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
+            effective=$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
                 https://github.com/AksharP5/yt-music-gpui/releases/latest)
             tag=${effective##*/}
             version=${tag#v}
