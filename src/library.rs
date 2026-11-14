@@ -142,17 +142,29 @@ impl Queue {
         self.index = Some(index);
         true
     }
+    #[cfg(test)]
     pub fn advance(&mut self, repeat: Repeat, natural_end: bool) -> bool {
+        let next = self.next_index(repeat, natural_end, |_| false);
+        next.is_some_and(|index| self.select(index))
+    }
+    /// The track an automatic advance selects, passing over tracks `skip` rejects.
+    /// Repeat One replays the current track at its natural end, even a skipped one.
+    pub fn next_index(
+        &self,
+        repeat: Repeat,
+        natural_end: bool,
+        skip: impl Fn(&Track) -> bool,
+    ) -> Option<usize> {
         let Some(current) = self.index else {
-            return self.select(0);
+            return (0..self.tracks.len()).find(|&i| !skip(&self.tracks[i]));
         };
         if natural_end && repeat == Repeat::One {
-            return true;
+            return Some(current);
         }
-        if self.select(current + 1) {
-            return true;
-        }
-        !self.incomplete && repeat != Repeat::Off && self.select(0)
+        let wrap = !self.incomplete && repeat != Repeat::Off;
+        (current + 1..self.tracks.len())
+            .chain((0..=current).filter(|_| wrap))
+            .find(|&i| !skip(&self.tracks[i]))
     }
     pub fn advance_with_autoplay(
         &mut self,
@@ -160,14 +172,17 @@ impl Queue {
         natural_end: bool,
         autoplay: bool,
         recommendations: &mut VecDeque<Track>,
+        skip: impl Fn(&Track) -> bool,
     ) -> bool {
-        if self.advance(repeat, natural_end) {
-            return true;
+        if let Some(index) = self.next_index(repeat, natural_end, &skip) {
+            return self.select(index);
         }
         if self.incomplete || !autoplay {
             return false;
         }
-        let Some(track) = recommendations.pop_front() else {
+        let Some(track) =
+            std::iter::from_fn(|| recommendations.pop_front()).find(|track| !skip(track))
+        else {
             return false;
         };
         self.index = Some(self.tracks.len());
@@ -512,14 +527,16 @@ mod tests {
                 Repeat::Off,
                 natural,
                 autoplay,
-                &mut recommendations
+                &mut recommendations,
+                |_| false
             ));
             assert_eq!(library.queue.index, Some(1));
             assert!(!library.queue.advance_with_autoplay(
                 Repeat::Off,
                 natural,
                 autoplay,
-                &mut recommendations
+                &mut recommendations,
+                |_| false
             ));
             assert_eq!(library.queue.tracks.len(), 2);
             assert_eq!(recommendations.front().unwrap().id, "music");
@@ -527,7 +544,8 @@ mod tests {
                 Repeat::All,
                 natural,
                 autoplay,
-                &mut recommendations
+                &mut recommendations,
+                |_| false
             ));
             assert_eq!(library.queue.index, Some(0));
         }
@@ -760,7 +778,8 @@ mod tests {
                 Repeat::Off,
                 natural_end,
                 false,
-                &mut recommendations
+                &mut recommendations,
+                |_| false
             ));
             assert_eq!(queue.tracks, before.tracks);
             assert_eq!(queue.index, before.index);
@@ -774,11 +793,15 @@ mod tests {
         queue.replace(vec![track("playing")], 0);
         let mut recommendations = VecDeque::from([track("recommended")]);
         queue.tracks.push(track("enqueued"));
-        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert!(
+            queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations, |_| false)
+        );
         assert_eq!(queue.current().unwrap().id, "enqueued");
         assert_eq!(queue.tracks.len(), 2);
         assert_eq!(recommendations.len(), 1);
-        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert!(
+            queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations, |_| false)
+        );
         assert_eq!(queue.current().unwrap().id, "recommended");
         assert!(recommendations.is_empty());
     }
@@ -789,21 +812,41 @@ mod tests {
         queue.replace(vec![track("duplicate")], 0);
         let mut recommendations = VecDeque::from([track("duplicate"), track("later")]);
         for (repeat, natural_end) in [(Repeat::One, true), (Repeat::All, false)] {
-            assert!(queue.advance_with_autoplay(repeat, natural_end, true, &mut recommendations));
+            assert!(queue.advance_with_autoplay(
+                repeat,
+                natural_end,
+                true,
+                &mut recommendations,
+                |_| false
+            ));
             assert_eq!(queue.index, Some(0));
             assert_eq!(queue.tracks.len(), 1);
             assert_eq!(recommendations.len(), 2);
         }
-        assert!(queue.advance_with_autoplay(Repeat::Off, false, true, &mut recommendations));
+        assert!(queue.advance_with_autoplay(
+            Repeat::Off,
+            false,
+            true,
+            &mut recommendations,
+            |_| false
+        ));
         assert_eq!(queue.index, Some(1));
         assert_eq!(queue.current().unwrap().id, "duplicate");
         assert_eq!(queue.tracks.len(), 2);
         assert_eq!(recommendations.len(), 1);
-        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert!(
+            queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations, |_| false)
+        );
         assert_eq!(queue.index, Some(2));
         assert_eq!(queue.current().unwrap().id, "later");
         assert!(recommendations.is_empty());
-        assert!(!queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert!(!queue.advance_with_autoplay(
+            Repeat::Off,
+            true,
+            true,
+            &mut recommendations,
+            |_| false
+        ));
         assert_eq!(queue.index, Some(2));
         assert_eq!(queue.tracks.len(), 3);
     }
@@ -870,6 +913,72 @@ mod tests {
         assert_eq!(q.current().unwrap().id, "c");
         assert!(q.remove(0));
         assert!(q.current().is_none());
+    }
+
+    #[test]
+    fn automatic_advances_pass_over_skipped_tracks_and_stop_when_none_remain() {
+        let disliked = |track: &Track| track.id.starts_with("disliked");
+        let mut queue = Queue::default();
+        queue.replace(
+            vec![
+                track("a"),
+                track("disliked 1"),
+                track("b"),
+                track("disliked 2"),
+            ],
+            0,
+        );
+        let mut recommendations = VecDeque::from([track("disliked 3"), track("c")]);
+        assert!(queue.advance_with_autoplay(
+            Repeat::Off,
+            true,
+            true,
+            &mut recommendations,
+            disliked
+        ));
+        assert_eq!(queue.current().unwrap().id, "b");
+        assert!(queue.advance_with_autoplay(
+            Repeat::Off,
+            false,
+            true,
+            &mut recommendations,
+            disliked
+        ));
+        assert_eq!(queue.current().unwrap().id, "c");
+        assert!(recommendations.is_empty());
+
+        queue.replace(vec![track("a"), track("disliked 1"), track("b")], 2);
+        assert!(queue.advance_with_autoplay(
+            Repeat::All,
+            true,
+            false,
+            &mut recommendations,
+            disliked
+        ));
+        assert_eq!(queue.current().unwrap().id, "a");
+
+        queue.replace(vec![track("disliked 1"), track("disliked 2")], 0);
+        let mut recommendations = VecDeque::from([track("disliked 3")]);
+        assert!(!queue.advance_with_autoplay(
+            Repeat::All,
+            false,
+            true,
+            &mut recommendations,
+            disliked
+        ));
+        assert_eq!(queue.index, Some(0));
+        assert!(recommendations.is_empty());
+
+        // Repeat One replays a disliked song that was clicked explicitly.
+        queue.replace(vec![track("disliked 1"), track("b")], 0);
+        assert!(queue.advance_with_autoplay(
+            Repeat::One,
+            true,
+            true,
+            &mut recommendations,
+            disliked
+        ));
+        assert_eq!(queue.index, Some(0));
     }
 
     #[test]

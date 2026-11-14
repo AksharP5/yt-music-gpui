@@ -181,10 +181,17 @@ impl Music {
             intent.natural,
             autoplay,
             &mut self.autoplay_tracks,
+            |track| is_disliked(&self.ratings, track),
         ) {
             self.autoplay_waiting = None;
             self.follow_queue_selection(intent.playback, cx);
-        } else if self.radio_loading || self.watch_pending.is_some() {
+            return;
+        }
+        // A page of only disliked recommendations moves on to the next page.
+        if !self.radio_loading && self.watch_pending.is_none() && self.radio.is_some() {
+            self.extend_autoplay(cx);
+        }
+        if self.radio_loading || self.watch_pending.is_some() {
             self.playback = Playback::Loading {
                 paused: intent.playback.is_paused(),
                 retried: false,
@@ -654,14 +661,17 @@ impl Music {
         ) && self
             .library
             .queue
-            .index
-            .is_none_or(|index| index + 1 >= self.library.queue.tracks.len()));
+            .next_index(Repeat::Off, false, |track| {
+                is_disliked(&self.ratings, track)
+            })
+            .is_none());
         if !wait_for_queue
             && self.library.queue.advance_with_autoplay(
                 self.library.repeat,
                 intent.natural,
                 autoplay,
                 &mut self.autoplay_tracks,
+                |track| is_disliked(&self.ratings, track),
             )
         {
             self.follow_queue_selection(intent.playback, cx);

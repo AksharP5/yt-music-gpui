@@ -131,7 +131,7 @@ Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only r
 
 1. Set the release version in `Cargo.toml`, bumping it for subsequent releases, and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
 2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.
-3. The Release workflow builds with `--locked`, checks the installed artifact in Ubuntu and Fedora containers, and publishes the tarball, SHA-256 checksum, `install.sh` and dependency report to a GitHub Release.
+3. The Release workflow builds with `--locked`, checks the script-installed artifact in Ubuntu and Fedora containers, checks the `.deb` and `.rpm` with `packaging/test-package.sh` in Ubuntu, Debian, Fedora and openSUSE containers, and publishes the tarball, packages, their SHA-256 checksums, `install.sh` and dependency report to a GitHub Release.
 
 Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the same read-only release build workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
 
@@ -147,4 +147,4 @@ rm -r -- "$home"
 
 Keep the matching `.tar.gz.sha256` beside the local tarball. The app and helpers still need their normal runtime libraries; the installer still downloads its pinned yt-dlp and optional Deno over HTTPS. Use the isolated desktop recipe above to test playback, with the installed binary and a muted library. Container `--version` checks do not establish working graphics, audio or sign-in on those desktops.
 
-`src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256 plus the fallback Deno version, archive SHA-256 and download size. Packaging copies them into `runtime-pins.json`; the installer has no independent version pins. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.
+`src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256 plus the fallback Deno version, archive SHA-256 and download size. Packaging copies them into `runtime-pins.json`, and the release build uses them to download and verify the yt-dlp and Deno bundled in the `.deb` and `.rpm`; neither the installer nor the packages have independent version pins. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.

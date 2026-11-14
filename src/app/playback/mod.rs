@@ -412,24 +412,18 @@ impl Music {
 
     fn prepare_upcoming(&mut self) {
         let queue = &self.library.queue;
+        let skip = |track: &Track| is_disliked(&self.ratings, track);
         let next = (self.active_id.is_some() && self.playback != Playback::Stopped)
             .then(|| {
-                let index = queue.index?;
-                if self.library.repeat == Repeat::One {
-                    return queue.current();
-                }
-                queue.tracks.get(index + 1).or_else(|| {
-                    if queue.incomplete {
-                        return None;
-                    }
-                    if self.library.repeat == Repeat::All {
-                        return queue.tracks.first();
-                    }
-                    self.library
+                queue.index?;
+                match queue.next_index(self.library.repeat, true, skip) {
+                    Some(index) => queue.tracks.get(index),
+                    None => self
+                        .library
                         .music_autoplay()
-                        .then(|| self.autoplay_tracks.front())
-                        .flatten()
-                })
+                        .then(|| self.autoplay_tracks.iter().find(|track| !skip(track)))
+                        .flatten(),
+                }
             })
             .flatten();
         if let Some(player) = &self.player

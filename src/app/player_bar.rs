@@ -124,12 +124,7 @@ impl Music {
                     .into_any_element(),
             };
             let liked = self.is_liked(&track);
-            let disliked = self
-                .ratings
-                .get(&track.id)
-                .copied()
-                .or(track.details.rating)
-                == Some(Rating::Dislike);
+            let disliked = is_disliked(&self.ratings, &track);
             let subtitle = match self.playback {
                 Playback::Loading { .. } => "Loading track…".into(),
                 Playback::Loaded {

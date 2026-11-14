@@ -958,7 +958,8 @@ mod tests {
                     Repeat::Off,
                     natural,
                     autoplay,
-                    &mut recommendations
+                    &mut recommendations,
+                    |_| false
                 ));
                 assert_eq!(queue.index, Some(1));
                 for repeat in [Repeat::Off, Repeat::All] {
@@ -966,7 +967,8 @@ mod tests {
                         repeat,
                         natural,
                         autoplay,
-                        &mut recommendations
+                        &mut recommendations,
+                        |_| false
                     ));
                     assert_eq!(queue.index, Some(1));
                     assert_eq!(recommendations.len(), 1);
@@ -995,7 +997,8 @@ mod tests {
                         Repeat::Off,
                         natural,
                         autoplay,
-                        &mut recommendations
+                        &mut recommendations,
+                        |_| false
                     ));
                     assert_eq!(queue.index, Some(index));
                     assert_eq!(recommendations.len(), 1);
@@ -1005,7 +1008,8 @@ mod tests {
                         Repeat::Off,
                         natural,
                         autoplay,
-                        &mut recommendations
+                        &mut recommendations,
+                        |_| false
                     ),
                     autoplay
                 );
@@ -1042,7 +1046,8 @@ mod tests {
             library.repeat,
             true,
             library.autoplay,
-            &mut recommendations
+            &mut recommendations,
+            |_| false
         ));
         assert_eq!(library.queue.index, Some(1));
         worker.load(None, false).unwrap();
@@ -1060,7 +1065,8 @@ mod tests {
                 library.repeat,
                 true,
                 library.autoplay,
-                &mut recommendations
+                &mut recommendations,
+                |_| false
             ));
             assert_eq!(library.queue.index, Some(index));
         }
@@ -1240,14 +1246,22 @@ mod tests {
                 .is_err()
         );
         let mut recommendations = VecDeque::from([track("recommended")]);
-        assert!(!queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert!(!queue.advance_with_autoplay(
+            Repeat::Off,
+            true,
+            true,
+            &mut recommendations,
+            |_| false
+        ));
         assert_eq!(recommendations.len(), 1);
         assert!(worker.load(None, false).is_err());
         worker.load(None, true).unwrap();
         worker
             .apply(completed.recv_blocking().unwrap(), &mut queue, None)
             .unwrap();
-        assert!(queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations));
+        assert!(
+            queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations, |_| false)
+        );
         assert_eq!(queue.current().unwrap().id, "tail");
         assert_eq!(recommendations.len(), 1);
     }
@@ -1345,7 +1359,13 @@ mod tests {
         assert!(restored.source_id.is_none());
         restored.select(restored.tracks.len() - 1);
         let mut recommendations = VecDeque::from([track("recommended")]);
-        assert!(!restored.advance_with_autoplay(Repeat::All, true, true, &mut recommendations));
+        assert!(!restored.advance_with_autoplay(
+            Repeat::All,
+            true,
+            true,
+            &mut recommendations,
+            |_| false
+        ));
         let session = worker.source.as_ref().unwrap().session.clone();
         worker.load(session.as_ref(), false).unwrap();
         worker
@@ -1511,7 +1531,8 @@ mod tests {
                 Repeat::All,
                 false,
                 true,
-                &mut VecDeque::from([track("radio")])
+                &mut VecDeque::from([track("radio")]),
+                |_| false
             ));
         }
     }

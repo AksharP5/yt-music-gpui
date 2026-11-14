@@ -26,3 +26,13 @@ The official yt-dlp zipapp must match both its upstream checksum and the hash re
 Signed-in and some guest playback runs YouTube's player JavaScript through Deno with yt-dlp's flags, which grant no file, process, network or environment permissions; only Deno's own cache and storage area are writable. This is Deno's permission sandbox, not an operating-system sandbox: a bug in Deno's JavaScript engine could give that code your user's access. Keep a system Deno updated; the private copy updates when you re-run the installer.
 
 The installer refuses root, asks before running any package command with sudo, rejects archive paths and links, and anchors destination writes to checked directory descriptors. The app only prefers private tools whose file and parent directories through `HOME` belong to the current user and are not writable by group or others. This does not defend against root or another process already running as your user. Uninstall checks its manifest and file hashes; it keeps modified files, library data, settings and saved accounts.
+
+## Packages
+
+The `.deb` and `.rpm` come from the same release build and binary as the tarball and trust the same sources, plus the nFPM packaging tool, pinned by version and SHA-256. The build downloads the yt-dlp zipapp and Deno and fails unless both match the reviewed hashes in `src/ytdlp_account.py`, then ships them in `/usr/lib/yt-music-gpui`.
+
+The packages are not signed. Their `.sha256` files come from the same GitHub Release, so they detect corrupted downloads, not a compromised maintainer account or release. Installing a local package as root runs no package scripts from this project. The bundled yt-dlp and Deno change only when you install a newer package; your distribution does not update them, so Deno security fixes reach packaged installs only through a new app release.
+
+The app uses the packaged helpers only when each file and every directory up to `/` belongs to root and is not writable by group or others. The packaged app prefers them over installer copies in your home folder; the script-installed app and source builds prefer their own.
+
+Each release build installs the `.deb` in clean Ubuntu 24.04 and Debian 13 containers and the `.rpm` in clean Fedora 43 and openSUSE Tumbleweed containers. It checks that dependencies resolve, the packaged app prefers the bundled helpers over a trusted copy in HOME while a copy outside `/usr/bin` prefers the HOME copy, the app refuses the bundled helpers once their directory is writable by others, yt-dlp accepts the bundled Deno, and removal leaves none of the package's files. It does not test graphics, audio, sign-in or playback.

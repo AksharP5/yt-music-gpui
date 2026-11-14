@@ -110,11 +110,13 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 assert!(!view.is_liked(&track));
                 assert_eq!(view.error.as_deref(),Some("Synthetic save failure"));
                 assert_eq!(view.rows.len(),500);
-                view.library.queue.replace(vec![track.clone(),view.page.tracks()[451].clone()],0);
+                let disliked = view.page.tracks()[451].clone();
+                view.ratings.insert(disliked.id.clone(),Rating::Dislike);
+                view.library.queue.replace(vec![track.clone(),disliked,view.page.tracks()[452].clone()],0);
                 view.active_id = Some(77);
                 view.playback = crate::app::Playback::Loaded { paused:false,buffering:false };
                 assert!(view.mutate(Mutation::RateSong { track:track.clone(),rating:Rating::Dislike },cx));
-                assert_eq!(view.library.queue.index,Some(1),"Disliking the current song skips immediately");
+                assert_eq!(view.library.queue.index,Some(2),"Disliking the current song skips it and other disliked songs");
                 while commands.try_recv().is_ok() {}
                 view.error = None;
                 let add = Mutation::AddToPlaylist { id:"VLsynthetic".into(),video_ids:vec![track.id.clone()],duplicates:false };
