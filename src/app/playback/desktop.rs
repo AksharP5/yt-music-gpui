@@ -6,9 +6,7 @@ impl Music {
     pub(in crate::app) fn publish_desktop(&self) {
         let Some(service) = &self.mpris else { return };
         let queue = &self.library.queue;
-        let loaded_next = queue.index.map_or(!queue.tracks.is_empty(), |index| {
-            index + 1 < queue.tracks.len()
-        });
+        let skip = |track: &Track| is_disliked(&self.ratings, track);
         let seed_available = !self.autoplay_seeded
             && self.now_playing.as_ref().is_some_and(|watch| {
                 watch
@@ -20,7 +18,7 @@ impl Music {
                         index + 1 < watch.queue.len() || watch.continuation.is_some()
                     })
             });
-        let can_go_next = loaded_next
+        let can_go_next = queue.next_index(self.library.repeat, false, skip).is_some()
             || matches!(
                 &self.watch_pending,
                 Some(
@@ -32,11 +30,8 @@ impl Music {
                 )
             )
             || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
-            || (!queue.incomplete
-                && self.library.repeat != Repeat::Off
-                && !queue.tracks.is_empty())
             || (self.library.music_autoplay()
-                && (!self.autoplay_tracks.is_empty()
+                && (self.autoplay_tracks.iter().any(|track| !skip(track))
                     || self.radio.is_some()
                     || self.watch_pending.is_some()
                     || self.radio_loading

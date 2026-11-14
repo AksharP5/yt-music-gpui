@@ -759,12 +759,7 @@ impl Music {
                                 view.connect_account(window, cx);
                                 return;
                             }
-                            let disliked = view
-                                .ratings
-                                .get(&track.id)
-                                .copied()
-                                .or(track.details.rating)
-                                == Some(Rating::Dislike);
+                            let disliked = is_disliked(&view.ratings, &track);
                             view.mutate(
                                 Mutation::RateSong {
                                     track: track.clone(),

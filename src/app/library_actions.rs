@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Automatic advances pass over disliked songs. Guests cannot dislike, and
+/// account changes clear both rating sources.
+pub(super) fn is_disliked(ratings: &HashMap<String, Rating>, track: &Track) -> bool {
+    ratings.get(&track.id).copied().or(track.details.rating) == Some(Rating::Dislike)
+}
+
 impl Music {
     pub(super) fn set_rating(&mut self, id: &str, rating: Option<Rating>) {
         if let Some(rating) = rating {
