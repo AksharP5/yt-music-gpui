@@ -351,7 +351,8 @@ PY
             apt-get:GLESv2) pkg=libgles2 ;;
             pacman:X11) pkg=libx11 ;; apt-get:X11) pkg=libx11-6 ;; dnf:X11) pkg=libX11 ;; zypper:X11) pkg=libX11-6 ;;
             pacman:Xext) pkg=libxext ;; apt-get:Xext) pkg=libxext6 ;; dnf:Xext) pkg=libXext ;; zypper:Xext) pkg=libXext6 ;;
-            pacman:wayland-*|dnf:wayland-*) pkg=wayland ;;
+            pacman:wayland-*) pkg=wayland ;;
+            dnf:wayland-client) pkg=libwayland-client ;; dnf:wayland-egl) pkg=libwayland-egl ;;
             apt-get:wayland-client|zypper:wayland-client) pkg=libwayland-client0 ;; apt-get:wayland-egl|zypper:wayland-egl) pkg=libwayland-egl1 ;;
             pacman:xcb|dnf:xcb) pkg=libxcb ;; apt-get:xcb|zypper:xcb) pkg=libxcb1 ;;
             pacman:xkbcommon|dnf:xkbcommon) pkg=libxkbcommon ;; apt-get:xkbcommon|zypper:xkbcommon) pkg=libxkbcommon0 ;;

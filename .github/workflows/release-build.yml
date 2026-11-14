@@ -90,7 +90,7 @@ jobs:
               apt-get update -qq
               apt-get install -y --no-install-recommends ca-certificates curl python3 libmpv2 libegl1 libgles2 libwayland-egl1 libxkbcommon-x11-0 libsecret-tools xdg-utils libvulkan1
             else
-              dnf install -y shadow-utils util-linux ca-certificates curl python3 mpv-libs libglvnd-egl libglvnd-gles wayland libxkbcommon-x11 libsecret xdg-utils vulkan-loader
+              dnf install -y shadow-utils util-linux ca-certificates curl python3 mpv-libs libglvnd-egl libglvnd-gles libwayland-client libwayland-egl libxkbcommon-x11 libsecret xdg-utils vulkan-loader
             fi
             if sh /dist/install.sh --check-deps; then echo "Root must be refused"; exit 1; fi
             useradd -m music
