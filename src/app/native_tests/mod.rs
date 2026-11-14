@@ -5,6 +5,7 @@ mod navigation;
 mod playback;
 pub(in crate::app) mod render;
 mod restart;
+mod resume;
 mod sync;
 
 use anyhow::{Context as _, Result, ensure};

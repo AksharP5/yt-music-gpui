@@ -44,9 +44,14 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         self.finish_listening(false);
-        let start = self.library.queue.current().map_or(0., |track| {
-            self.library.positions.get(&self.listening_scope(), track)
-        });
+        let current = self.library.queue.current();
+        let start = self
+            .listening
+            .take_restored(current)
+            .or_else(|| {
+                current.map(|track| self.library.positions.get(&self.listening_scope(), track))
+            })
+            .unwrap_or(0.);
         self.play_current_at(start, paused, mode, cx);
         self.listening.resume_candidate = self
             .library
@@ -188,9 +193,17 @@ impl Music {
     pub(in crate::app) fn finish_listening(&mut self, completed: bool) {
         if let Some(active) = &self.listening.active {
             // Saved only when listening ends, including on quit, to keep periodic writes rare.
-            self.library.last_position = (!completed).then(|| LastPosition {
+            // Podcasts and long videos keep their own resume positions.
+            let seconds = crate::listening::normalize(
+                active.position,
+                (self.duration > 0.).then_some(self.duration),
+            );
+            self.library.last_position = (!completed
+                && seconds > 0.
+                && !crate::listening::resumable(&active.track))
+            .then(|| LastPosition {
                 track_id: active.track.id.clone(),
-                seconds: active.position,
+                seconds,
             });
             if !self.checkpoint_listening(completed) {
                 self.save_positions();
@@ -199,5 +212,29 @@ impl Music {
         self.report_listening(true);
         self.listening.active = None;
         self.listening.resume_candidate = None;
+    }
+
+    /// Stop means forget: Play after Stop, or after a restart, starts from the beginning.
+    pub(in crate::app) fn forget_last_position(&mut self) {
+        self.listening.restored = None;
+        if self.library.last_position.take().is_some() {
+            self.save_positions();
+        }
+    }
+
+    /// Moves the restored position while nothing is loaded, so a seek before Play sticks.
+    pub(in crate::app) fn seek_restored(&mut self, seconds: f64) -> bool {
+        let current = self.library.queue.current();
+        let Some(restored) = self
+            .listening
+            .restored
+            .as_mut()
+            .filter(|last| current.is_some_and(|track| track.id == last.track_id))
+        else {
+            return false;
+        };
+        restored.seconds = seconds.max(0.);
+        self.position = restored.seconds;
+        true
     }
 }

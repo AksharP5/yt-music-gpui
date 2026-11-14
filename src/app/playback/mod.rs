@@ -209,6 +209,9 @@ impl Music {
             return;
         }
         let Some(track_id) = self.active_id else {
+            if self.seek_restored(seconds) {
+                self.notify_playback(cx);
+            }
             return;
         };
         if matches!(self.playback, Playback::Loading { .. }) {
@@ -690,15 +693,13 @@ impl Music {
                 self.library.queue.select(0);
             }
             self.player_open |= self.library.video;
-            match self.listening.take_restored(self.library.queue.current()) {
-                Some(start) => self.play_current_at(start, false, WatchMode::Details, cx),
-                None => self.play_current(cx),
-            }
+            self.play_current(cx);
         }
     }
 
     pub(in crate::app) fn stop_playback(&mut self, cx: &mut Context<Self>) {
         self.finish_listening(false);
+        self.forget_last_position();
         if let Some(resume) = self
             .account_operation
             .as_mut()

@@ -76,7 +76,7 @@ Use `--guest` to start without restoring the saved account. Guest likes and save
 ### Staying in sync
 
 - Songs you play show up in your YouTube Music history, and listening time is reported the way the web player reports it.
-- Podcast episodes and long videos resume where you left off, including progress saved by YouTube Music. After a restart, Play also continues the song you were on from where you closed the app.
+- Podcast episodes and long videos resume where you left off, including progress saved by YouTube Music. After a restart, Play also continues the song you were on from where you closed the app. Stopping playback forgets that spot. The position is saved when you quit or change songs, so a crash or a forced kill loses it.
 - Likes and dislikes apply immediately and revert if YouTube Music rejects them. Playlist edits wait for confirmation.
 - Pages you visited in the last three minutes open instantly; older ones show right away and refresh in place. After any edit you make, the next visit loads fresh, and History refreshes after each play. Back restores your scroll position and loaded rows.
 - When you return to the window after three minutes or more, the current page picks up changes made elsewhere in YouTube Music's order, without losing your scroll position. Ctrl R reloads the page right away.
