@@ -15,15 +15,29 @@ This is an independent client using YouTube Music's unofficial API. Account supp
 
 ## Install
 
-On x86_64 Linux:
+On x86_64 Linux with glibc 2.39 or newer, Linux 5.3 or newer and a working Vulkan driver. That fits Ubuntu 24.04+, Debian 13+, recent Fedora, openSUSE Tumbleweed and Arch. Container checks on every release install the packages on Ubuntu 24.04, Debian 13, Fedora 43 and openSUSE Tumbleweed, and the script on Ubuntu 24.04 and Fedora 43. They verify dependencies, library loading and `--version`; desktop playback is verified on Arch only. Sign-in also needs a browser and a running Secret Service keyring.
+
+### Ubuntu, Debian, Fedora and openSUSE
+
+Download the `.deb` or `.rpm` from the [latest release](https://github.com/AksharP5/yt-music-gpui/releases/latest), then install it from the download folder:
+
+```sh
+sudo apt install ./yt-music-gpui_*_amd64.deb                         # Ubuntu, Debian
+sudo dnf install ./yt-music-gpui-*.x86_64.rpm                         # Fedora
+sudo zypper install --allow-unsigned-rpm ./yt-music-gpui-*.x86_64.rpm # openSUSE
+```
+
+Your package manager installs libmpv and the other libraries the app needs. The package includes the reviewed yt-dlp and a pinned Deno in `/usr/lib/yt-music-gpui`, so signed-in playback needs no extra setup. YouTube's player JavaScript runs only in Deno's permission sandbox; see [SECURITY.md](SECURITY.md). The packages are not signed and there is no package repository: to upgrade, install the newer package the same way. Remove it with `sudo apt remove yt-music-gpui`, `sudo dnf remove yt-music-gpui` or `sudo zypper remove yt-music-gpui`; library data, settings and saved accounts stay. Use either a package or the install script, not both.
+
+### Install script
+
+On any distribution:
 
 ```sh
 curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/install.sh | sh
 ```
 
-Requires glibc 2.39 or newer, Linux 5.3 or newer, libmpv.so.2 and a working Vulkan driver. These requirements fit Ubuntu 24.04+, Debian 13+, recent Fedora and Arch. Ubuntu 24.04 and Fedora 43 container checks verify library loading and `--version`; desktop playback is verified on Arch only. Other distributions and desktop sessions have not been tested.
-
-The script checks runtime libraries, Python 3.10+, `xdg-open` and `secret-tool`. It prints the exact missing-package command for pacman, apt, dnf or zypper and asks before running sudo. Sign-in also needs a browser and a running Secret Service keyring.
+The script checks runtime libraries, Python 3.10+, `xdg-open` and `secret-tool`. It prints the exact missing-package command for pacman, apt, dnf or zypper and asks before running sudo.
 
 It installs the app to `~/.local/bin`, and the launcher, icon and licenses under `${XDG_DATA_HOME:-~/.local/share}`. The reviewed yt-dlp zipapp stays in `~/.local/share/yt-music-gpui`. Signed-in playback runs YouTube's player JavaScript through Deno, inside Deno's permission sandbox with no access to your files, other programs or the network (Deno's own small cache and storage area excepted). That is not an operating-system sandbox; see [SECURITY.md](SECURITY.md). If no supported Deno is installed, the installer adds a pinned private copy there. Node, Bun and QuickJS are not used, because they would give that code access to your files or network. Neither helper is added to PATH. Re-run the command to upgrade. Existing files from another installation method must be removed first.
 
