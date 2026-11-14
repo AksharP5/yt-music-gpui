@@ -5796,7 +5796,7 @@ PYTHON
     #[ignore = "measures /proc actor wakeups and latency with libmpv, null audio and synthetic silence"]
     fn local_actor_wakeups_and_latency() {
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
+        let path = silent_audio(directory.path(), 120);
         let player = Player::new(PlayerOptions {
             volume: 0.,
             audio_output: Some("null".into()),
@@ -5896,9 +5896,9 @@ PYTHON
         }
     }
 
-    fn silent_audio(directory: &Path) -> PathBuf {
+    fn silent_audio(directory: &Path, seconds: u32) -> PathBuf {
         let path = directory.join("silence.wav");
-        let sample_bytes = 120_u32 * 8000 * 2;
+        let sample_bytes = seconds * 8000 * 2;
         let mut file = File::create(&path).unwrap();
         file.write_all(b"RIFF").unwrap();
         file.write_all(&(36 + sample_bytes).to_le_bytes()).unwrap();
@@ -5918,48 +5918,115 @@ PYTHON
     }
 
     #[test]
-    #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
+    #[ignore = "requires libmpv; uses local silent audio, null audio and no network"]
     fn plays_with_the_installed_libmpv() {
-        // CI runs this against the oldest libmpv the packages accept, so
-        // options and commands from newer mpv releases cannot break playback.
+        // Release builds run this in each distribution the packages target,
+        // against its own libmpv, so options and commands from newer mpv
+        // releases cannot break playback there. It uses the player's own
+        // startup options and load commands, then reads back what mpv applied.
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
-        let extractor = directory.path().join("extractor");
-        fs::write(&extractor, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
-        let player = Player::with_extractor(
-            PlayerOptions {
+        let path = silent_audio(directory.path(), 5)
+            .to_string_lossy()
+            .into_owned();
+        let socket_path = directory.path().join("mpv.sock");
+        let _core = MpvCore::new(
+            &PlayerOptions {
                 volume: 0.,
                 audio_output: Some("null".into()),
                 ..Default::default()
             },
-            extractor,
+            &socket_path,
         )
         .unwrap();
-        let track_id = player
-            .play_url(
-                path.to_string_lossy().into_owned(),
-                "Synthetic silence",
-                PlayOptions::default(),
-            )
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(Instant::now() < deadline, "the local file never started");
-            match player.try_recv() {
-                Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
-                Some(PlayerEvent::Started { track_id: id, .. }) if id == track_id => break,
-                Some(_) => {}
-                None => thread::sleep(Duration::from_millis(5)),
+        // mpv creates its IPC socket on a thread of its own.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            match UnixStream::connect(&socket_path) {
+                Ok(socket) => break socket,
+                Err(error) if Instant::now() < deadline => {
+                    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+                    assert!(
+                        matches!(error.kind(), NotFound | ConnectionRefused),
+                        "{error}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
             }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut next_id = 0;
+        let mut request = |command: Value| {
+            next_id += 1;
+            write_command(&mut socket, command, Some(json!(next_id))).unwrap();
+            loop {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                let reply: Value = serde_json::from_str(&line).unwrap();
+                if reply["request_id"] == next_id {
+                    break reply;
+                }
+            }
+        };
+        let options = PlayOptions {
+            start: 2.5,
+            paused: true,
+            ..Default::default()
+        };
+        let reply = request(load_command(&path, "Synthetic silence", -2.29, options));
+        assert_eq!(reply["error"], "success", "{reply}");
+        let mut next = load_command(&path, "Prepared silence", 0., PlayOptions::default());
+        next["flags"] = json!("append");
+        let reply = request(next);
+        assert_eq!(reply["error"], "success", "{reply}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let position = loop {
+            let reply = request(json!(["get_property", "time-pos"]));
+            if let Some(seconds) = reply["data"].as_f64() {
+                break seconds;
+            }
+            assert!(Instant::now() < deadline, "the local file never loaded");
+            thread::sleep(Duration::from_millis(20));
+        };
+        let version = request(json!(["get_property", "mpv-version"]))["data"].clone();
+        assert!(
+            (position - 2.5).abs() < 0.1,
+            "{version}: started at {position}"
+        );
+        assert_eq!(
+            request(json!(["get_property", "pause"]))["data"],
+            true,
+            "{version}"
+        );
+        assert_eq!(
+            request(json!(["get_property", "media-title"]))["data"],
+            "Synthetic silence",
+            "{version}"
+        );
+        assert_eq!(
+            request(json!(["get_property", "playlist-count"]))["data"],
+            2,
+            "{version}"
+        );
+        // mpv 0.37 has no volume-gain and plays unlevelled; any release that
+        // has it must apply the per-file value.
+        let gain = request(json!(["get_property", "volume-gain"]));
+        if request(json!(["get_property", "option-info/volume-gain/name"]))["error"] == "success" {
+            let gain = gain["data"].as_f64().unwrap();
+            assert!((gain + 2.29).abs() < 1e-6, "{version}: volume-gain {gain}");
         }
+        eprintln!("{version}: start, pause, title, append and loudness applied");
     }
 
     #[test]
     #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
     fn paused_actor_refreshes_expired_preparation_and_writes_pending_seek() {
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
+        let path = silent_audio(directory.path(), 120);
         let extractor = directory.path().join("extractor");
         fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
@@ -6028,7 +6095,7 @@ PYTHON
     #[ignore = "requires installed mpv and yt-dlp; uses only private synthetic local audio"]
     fn local_seek_completion_handles_rapid_no_op_and_end_of_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
+        let path = silent_audio(directory.path(), 120);
         let player = Player::new(PlayerOptions {
             audio_output: Some("null".into()),
             ..Default::default()

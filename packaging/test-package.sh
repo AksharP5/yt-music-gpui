@@ -1,7 +1,10 @@
 #!/bin/sh
 # Installs the release .deb or .rpm from /dist in a clean distribution
-# container, checks it, then removes it. Run as root inside the container:
+# container, checks it, plays audio through the distribution's libmpv with the
+# test binary from `cargo test --release --no-run`, then removes it. Run as
+# root inside the container:
 #   docker run --rm -e YTDLP_VERSION=X -v "$PWD/dist:/dist:ro" \
+#     -v "$PWD/player-test:/player-test:ro" \
 #     -v "$PWD/packaging/test-package.sh:/test-package.sh:ro" ubuntu:24.04 sh /test-package.sh
 set -eu
 : "${YTDLP_VERSION:?Set YTDLP_VERSION to the reviewed yt-dlp version}"
@@ -23,6 +26,11 @@ fi
 printf 'Installed:\n%s\n' "$files"
 
 if ldd /usr/bin/yt-music-gpui | grep 'not found'; then exit 1; fi
+
+# The package's dependencies must bring a libmpv that accepts the player's
+# startup options and per-file load options.
+(cd /tmp && /player-test/yt-music-gpui-tests --ignored --exact \
+    player::tests::plays_with_the_installed_libmpv --nocapture)
 
 # Run as an ordinary user, the way the app runs. Command substitution makes a
 # crash or non-zero exit fail the script.
