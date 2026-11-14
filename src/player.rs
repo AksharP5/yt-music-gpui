@@ -943,12 +943,35 @@ fn write_pause(socket: &mut UnixStream, paused: bool, revision: u64) -> Result<(
     )
 }
 
-fn load_command(url: &str, title: &str, options: PlayOptions) -> Value {
+/// YouTube Music's loudness normalization, as its web player computes it
+/// (base.js for youtube.player.web_20261110): a track louder than the target
+/// is turned down to it, a quieter one is never boosted. The selected format's
+/// values take precedence over the response's audioConfig. Stateful
+/// normalization (applyStatefulNormalization) is off in the responses we get,
+/// so it is not modelled. Returns the gain in dB, never above 0.
+fn normalization_gain(audio_config: &Value, format: &Value) -> f64 {
+    let number = |value: &Value| value.as_f64().filter(|value| value.is_finite());
+    let field = |name| number(&format[name]).or_else(|| number(&audio_config[name]));
+    let gain = match field("trackAbsoluteLoudnessLkfs") {
+        Some(lkfs) => {
+            number(&audio_config["loudnessTargetLkfs"]).map_or(0., |target| target - lkfs)
+        }
+        None => field("loudnessDb").map_or(0., |loudness| -loudness),
+    };
+    // mpv rejects a volume-gain below its default minimum.
+    gain.clamp(-96., 0.)
+}
+
+fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOptions) -> Value {
     json!(["loadfile", url, "replace", -1, {
         "force-media-title": title,
         "ytdl": "no",
         "start": options.start.to_string(),
         "pause": if options.paused { "yes" } else { "no" },
+        // A file-local option: it applies to this entry only, including when
+        // mpv reaches a prepared entry on its own, and sits on top of the
+        // user's volume instead of changing it.
+        "volume-gain": gain_db.to_string(),
     }])
 }
 
@@ -1157,11 +1180,12 @@ struct PreparedTarget {
 struct ResolvedStream {
     key: StreamKey,
     url: String,
+    gain_db: f64,
     expires: SystemTime,
 }
 
 impl ResolvedStream {
-    fn parse(key: StreamKey, bytes: &[u8], now: SystemTime) -> Result<Self> {
+    fn parse(key: StreamKey, bytes: &[u8], gain_db: f64, now: SystemTime) -> Result<Self> {
         let text = std::str::from_utf8(bytes)?;
         let urls = text
             .lines()
@@ -1201,7 +1225,12 @@ impl ResolvedStream {
                 urls[1]
             )
         };
-        Ok(Self { key, url, expires })
+        Ok(Self {
+            key,
+            url,
+            gain_db,
+            expires,
+        })
     }
 
     fn matches(&self, key: &StreamKey) -> bool {
@@ -1330,8 +1359,15 @@ fn exit_with_parent(command: &mut Command) {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ResolverResponse {
-    Ready { ready: bool },
-    Stream { urls: Option<Vec<String>> },
+    Ready {
+        ready: bool,
+    },
+    Stream {
+        urls: Option<Vec<String>>,
+        // The selected audio format's loudness fields, see ytdlp_resolver.py.
+        #[serde(default)]
+        loudness: Value,
+    },
 }
 
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1387,13 +1423,17 @@ impl WarmResolver {
         Ok(())
     }
 
-    fn read(&mut self) -> Result<Option<Option<Vec<String>>>> {
+    fn read(&mut self) -> Result<Option<Option<native::Selection>>> {
         loop {
             if let Some(end) = self.bytes.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.bytes.drain(..=end).collect();
                 match serde_json::from_slice(&line)? {
                     ResolverResponse::Ready { ready: true } if !self.ready => self.ready = true,
-                    ResolverResponse::Stream { urls } if self.ready => return Ok(Some(urls)),
+                    ResolverResponse::Stream { urls, loudness } if self.ready => {
+                        let gain_db =
+                            normalization_gain(&loudness["audioConfig"], &loudness["format"]);
+                        return Ok(Some(urls.map(|urls| native::Selection { urls, gain_db })));
+                    }
                     _ => bail!("Invalid resolver response"),
                 }
             } else {
@@ -1468,8 +1508,13 @@ impl NativeResolver {
                         .query_pairs()
                         .find_map(|(name, value)| (name == "v").then(|| value.into_owned()))
                         .context("Missing video ID")?;
-                    let urls = lookup.lookup(&id, key.quality, key.video)?;
-                    ResolvedStream::parse(key, urls.join("\n").as_bytes(), SystemTime::now())
+                    let selection = lookup.lookup(&id, key.quality, key.video)?;
+                    ResolvedStream::parse(
+                        key,
+                        selection.urls.join("\n").as_bytes(),
+                        selection.gain_db,
+                        SystemTime::now(),
+                    )
                 })();
                 if sender.send((generation, result)).is_ok() {
                     signal_player(&wake);
@@ -1699,10 +1744,11 @@ impl StreamResolver {
                 Ok(Some(urls)) => {
                     if let Some(target) = &self.target {
                         result = Some(urls.context("Could not resolve the stream").and_then(
-                            |urls| {
+                            |selection| {
                                 ResolvedStream::parse(
                                     target.key.clone(),
-                                    urls.join("\n").as_bytes(),
+                                    selection.urls.join("\n").as_bytes(),
+                                    selection.gain_db,
                                     SystemTime::now(),
                                 )
                             },
@@ -1808,7 +1854,8 @@ impl StreamPreparation {
             .take(16 * 1024 + 1)
             .read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 16 * 1024, "Oversized prepared stream");
-        ResolvedStream::parse(self.target.key.clone(), &bytes, SystemTime::now()).map(Some)
+        // The CLI fallback prints only URLs, so these streams play unnormalized.
+        ResolvedStream::parse(self.target.key.clone(), &bytes, 0., SystemTime::now()).map(Some)
     }
 }
 
@@ -2024,7 +2071,7 @@ fn run(
                             resolver.cancel();
                             write_command(
                                 &mut socket,
-                                load_command(&url, &title, options),
+                                load_command(&url, &title, 0., options),
                                 Some(json!(track_id)),
                             )?;
                             continue;
@@ -2036,7 +2083,7 @@ fn run(
                             resolver.cancel();
                             write_command(
                                 &mut socket,
-                                load_command(&stream.url, &title, options),
+                                load_command(&stream.url, &title, stream.gain_db, options),
                                 Some(json!(track_id)),
                             )?;
                             continue;
@@ -2191,7 +2238,7 @@ fn run(
                         };
                         write_command(
                             &mut socket,
-                            load_command(&stream.url, &play.title, options),
+                            load_command(&stream.url, &play.title, stream.gain_db, options),
                             Some(json!(target.track_id)),
                         )?;
                         if let Some(target) = next_target.clone()
@@ -2226,6 +2273,7 @@ fn run(
             let mut command = load_command(
                 &stream.url,
                 "",
+                stream.gain_db,
                 PlayOptions {
                     quality: target.key.quality,
                     video: target.key.video,
@@ -3244,7 +3292,8 @@ YtMusicAccountIE._real_extract = extract
                 directory.join("started").display()
             )
         } else {
-            "printf '%s\\n' '{\"urls\":[\"https://rr1.googlevideo.com/full\"]}'".into()
+            // The loudness shape ytdlp_resolver.py reported for fJ9rUzIMcZQ.
+            "printf '%s\\n' '{\"urls\":[\"https://rr1.googlevideo.com/full\"],\"loudness\":{\"audioConfig\":{\"trackAbsoluteLoudnessLkfs\":-11.71,\"loudnessTargetLkfs\":-14},\"format\":{\"loudnessDb\":2.29,\"trackAbsoluteLoudnessLkfs\":-11.71}}}'".into()
         };
         fs::write(&interpreter, format!("#!/bin/sh\nprintf '%s\\n' '{{\"ready\":true}}'\nwhile IFS= read -r request; do {response}; done\n")).unwrap();
         fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3358,6 +3407,7 @@ YtMusicAccountIE._real_extract = extract
             resolver.start(target,None).unwrap();
             let stream = resolved(&mut resolver,None);
             assert!(stream.url.ends_with("/full"));
+            assert!((stream.gain_db + 2.29).abs() < 1e-9, "{}", stream.gain_db);
             assert_eq!(resolver.warm.as_ref().unwrap().child.id(),pid);
             server.join().unwrap();
         }
@@ -3375,6 +3425,7 @@ YtMusicAccountIE._real_extract = extract
         let stream = ResolvedStream::parse(
             target.key.clone(),
             b"https://rr1.googlevideo.com/obsolete",
+            0.,
             SystemTime::now(),
         )
         .unwrap();
@@ -3683,6 +3734,7 @@ YtMusicAccountIE._real_extract = extract
         let stream = ResolvedStream::parse(
             key.clone(),
             format!("https://rr1.googlevideo.com/videoplayback?expire={expiry}&id=x\n").as_bytes(),
+            0.,
             now,
         )
         .unwrap();
@@ -3699,6 +3751,7 @@ YtMusicAccountIE._real_extract = extract
             ResolvedStream::parse(
                 key.clone(),
                 b"https://rr1.googlevideo.com/videoplayback?expire=1",
+                0.,
                 now
             )
             .is_err()
@@ -3708,11 +3761,12 @@ YtMusicAccountIE._real_extract = extract
             "https://example.com/x",
             "file:///tmp/private",
         ] {
-            assert!(ResolvedStream::parse(key.clone(), url.as_bytes(), now).is_err());
+            assert!(ResolvedStream::parse(key.clone(), url.as_bytes(), 0., now).is_err());
         }
         let video = ResolvedStream::parse(
             key,
             b"https://rr1.googlevideo.com/video\nhttps://rr1.googlevideo.com/audio\n",
+            0.,
             now,
         )
         .unwrap();
@@ -4516,20 +4570,22 @@ YtMusicAccountIE._real_extract = extract
             panic!("play must enqueue a single load with its options");
         };
         assert_eq!(track_id, first);
-        let command = load_command(&url, &title, options);
+        let command = load_command(&url, &title, -2.29, options);
         assert_eq!(command[0], "loadfile");
         assert_eq!(command[1], "https://music.youtube.com/watch?v=csILUDfmtqM");
         assert_eq!(command[2], "replace");
         assert_eq!(command[4]["start"], "32.5");
         assert_eq!(command[4]["pause"], "yes");
         assert_eq!(command[4]["ytdl"], "no");
-        let defaults = load_command("unused", "Track", PlayOptions::default());
+        assert_eq!(command[4]["volume-gain"], "-2.29");
+        let defaults = load_command("unused", "Track", 0., PlayOptions::default());
         assert_eq!(defaults[4]["start"], "0");
         assert_eq!(defaults[4]["pause"], "no");
         assert_eq!(defaults[4]["ytdl"], "no");
         let video = load_command(
             "unused",
             "Track",
+            0.,
             PlayOptions {
                 video: Some(VideoQuality::P720),
                 ..options
@@ -4538,6 +4594,54 @@ YtMusicAccountIE._real_extract = extract
         assert_eq!(video[4]["ytdl"], "no");
         assert_eq!(video[4]["start"], "32.5");
         assert_eq!(video[4]["pause"], "yes");
+    }
+
+    #[test]
+    fn loudness_normalization_matches_the_youtube_music_web_player() {
+        // audioConfig as a cookie-free player response sends it (fJ9rUzIMcZQ).
+        let config = json!({
+            "perceptualLoudnessDb": -11.71,
+            "enablePerFormatLoudness": true,
+            "trackAbsoluteLoudnessLkfs": -11.71,
+            "loudnessTargetLkfs": -14,
+            "loudnessNormalizationConfig": {
+                "applyStatefulNormalization": false,
+                "preserveStatefulLoudnessTarget": true,
+                "maxStatefulTimeThresholdSec": 300,
+                "minimumLoudnessTargetLkfs": -31
+            }
+        });
+        for (config, format, expected) in [
+            // A loud track is turned down to the -14 LKFS target.
+            (
+                &config,
+                json!({"itag": 251, "loudnessDb": 2.29, "trackAbsoluteLoudnessLkfs": -11.71}),
+                -2.29,
+            ),
+            // The selected format's measurement wins over the track's.
+            (
+                &config,
+                json!({"itag": 251, "loudnessDb": 3.4, "trackAbsoluteLoudnessLkfs": -10.6}),
+                -3.4,
+            ),
+            // Muxed formats carry no loudness, so the track's applies.
+            (&config, json!({"itag": 18}), -2.29),
+            // A quiet track is never boosted.
+            (
+                &config,
+                json!({"loudnessDb": -6.5, "trackAbsoluteLoudnessLkfs": -20.5}),
+                0.,
+            ),
+            // Older responses carry only loudnessDb, relative to the target.
+            (&json!({"loudnessDb": 5.}), json!({}), -5.),
+            (&json!({"loudnessDb": -3.}), json!({}), 0.),
+            // An absolute loudness without a target leaves the track alone.
+            (&json!({"trackAbsoluteLoudnessLkfs": -8.}), json!({}), 0.),
+            (&Value::Null, Value::Null, 0.),
+        ] {
+            let gain = normalization_gain(config, &format);
+            assert!((gain - expected).abs() < 1e-9, "{format}: {gain}");
+        }
     }
 
     #[test]
