@@ -16,7 +16,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -140,14 +140,29 @@ impl Session {
             .stdin(Stdio::null());
         let output =
             AccountProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
+        Self::from_lookup(&output, saved_account_marker().as_deref())
+    }
+    /// Without a keyring service, a lookup fails even for people who never signed in.
+    /// The marker tells a failure that may hide a saved account apart from that.
+    fn from_lookup(output: &Output, marker: Option<&Path>) -> Result<Option<Self>> {
         if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+            // The keyring has no account, for example after deleting it in a keyring app.
+            if let Some(marker) = marker {
+                let _ = forget_saved_account(marker);
+            }
+            return Ok(None);
+        }
+        if !output.status.success() && !marker.is_some_and(Path::exists) {
             return Ok(None);
         }
         ensure!(
             output.status.success(),
             "Could not unlock the saved YouTube Music account"
         );
-        Self::from_keyring(&output.stdout).map(Some)
+        let session = Self::from_keyring(&output.stdout)?;
+        // Accounts saved before the marker existed get it on their next start.
+        record_saved_account(marker);
+        Ok(Some(session))
     }
     fn from_keyring(value: &[u8]) -> Result<Self> {
         let decoded;
@@ -191,10 +206,12 @@ impl Session {
             process.wait(Duration::from_secs(30), None)?.success(),
             "The OS keyring could not save the account. No plaintext fallback is used."
         );
+        record_saved_account(saved_account_marker().as_deref());
         Ok(())
     }
     pub fn disconnect() -> Result<()> {
-        clear_keyring(&KEYRING_ATTRIBUTES)
+        clear_keyring(&KEYRING_ATTRIBUTES)?;
+        saved_account_marker().map_or(Ok(()), |marker| forget_saved_account(&marker))
     }
     pub(crate) fn resume_scope(&self) -> String {
         format!("{:x}", Sha1::digest(self.data_sync_id.as_bytes()))
@@ -452,6 +469,39 @@ pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
 }
 
 struct AccountProcess(Child);
+
+/// An empty, non-secret file recording that the keyring holds an account.
+fn saved_account_marker() -> Option<PathBuf> {
+    crate::library::user_directory("XDG_DATA_HOME", ".local/share")
+        .map(|base| base.join("yt-music-gpui/account-saved"))
+}
+
+/// Best effort: a missing marker only hides a later keyring error, so it never fails sign-in.
+fn record_saved_account(marker: Option<&Path>) {
+    let Some(marker) = marker else {
+        return;
+    };
+    // create_new refuses an existing path, including a planted symlink, in one step.
+    let _ = marker
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker)
+                .map(drop)
+        });
+}
+
+fn forget_saved_account(marker: &Path) -> Result<()> {
+    match fs::remove_file(marker) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).context("Could not forget the saved account")
+        }
+        _ => Ok(()),
+    }
+}
 
 fn clear_keyring(attributes: &[&str]) -> Result<()> {
     let mut command = Command::new("/usr/bin/secret-tool");
@@ -1219,6 +1269,65 @@ mod tests {
         assert!(Session::from_keyring(b"yt-music-session-v1:invalid!").is_err());
         expected.playback_cookie = "x".repeat(8192);
         assert!(expected.keyring_value().is_err());
+    }
+    #[test]
+    fn keyring_failures_report_a_locked_account_only_after_one_was_saved() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code: i32, stdout: &[u8], stderr: &[u8]| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("yt-music-gpui/account-saved");
+        let no_service = output(
+            1,
+            b"",
+            b"secret-tool: The name org.freedesktop.secrets was not provided by any .service files\n",
+        );
+        assert!(
+            Session::from_lookup(&no_service, Some(&marker))
+                .unwrap()
+                .is_none(),
+            "Someone who never signed in has no account to unlock"
+        );
+        assert!(
+            Session::from_lookup(&output(1, b"", b""), Some(&marker))
+                .unwrap()
+                .is_none()
+        );
+
+        let saved = session("SAPISID=synthetic").keyring_value().unwrap();
+        assert!(
+            Session::from_lookup(&output(0, &saved, b""), Some(&marker))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            marker.exists(),
+            "A readable saved account records the marker"
+        );
+        assert_eq!(
+            Session::from_lookup(&no_service, Some(&marker))
+                .err()
+                .map(|error| error.to_string())
+                .as_deref(),
+            Some("Could not unlock the saved YouTube Music account")
+        );
+        assert!(
+            Session::from_lookup(&output(1, b"", b""), Some(&marker))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !marker.exists(),
+            "An account deleted outside the app forgets the marker"
+        );
+
+        let target = directory.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        record_saved_account(Some(&marker));
+        assert!(!target.exists(), "The marker never follows a symlink");
     }
     #[test]
     fn saved_profile_consent_round_trips_and_legacy_entries_have_no_source() {
