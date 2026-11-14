@@ -54,7 +54,7 @@ impl Lookup {
         video_id: &str,
         audio: AudioQuality,
         video: Option<VideoQuality>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Selection> {
         let deadline = Instant::now() + BUDGET;
         let epoch = {
             let visitor = self.visitor.lock().unwrap();
@@ -240,6 +240,7 @@ fn visitor_data(mut page: impl Read) -> Result<String> {
 }
 
 struct Format<'a> {
+    raw: &'a Value,
     url: Option<&'a str>,
     id: String,
     audio: bool,
@@ -443,6 +444,7 @@ impl<'a> Format<'a> {
         // hasaud, id. Protocol is identical for these direct HTTPS formats.
         let unknown = f64::NEG_INFINITY;
         Some(Self {
+            raw,
             url,
             id: format!("{itag}{}", if drc { "-drc" } else { "" }),
             audio,
@@ -504,11 +506,16 @@ impl<'a> Format<'a> {
     }
 }
 
+pub(super) struct Selection {
+    pub(super) urls: Vec<String>,
+    pub(super) gain_db: f64,
+}
+
 pub(super) fn select(
     player: &Value,
     audio: AudioQuality,
     video: Option<VideoQuality>,
-) -> Result<Vec<String>> {
+) -> Result<Selection> {
     ensure!(
         player["playabilityStatus"]["status"] == "OK",
         "Native player is unplayable"
@@ -558,6 +565,10 @@ pub(super) fn select(
         }
         AudioQuality::High => audio_only.last().copied(),
     };
+    let selection = |urls, audio: &Format| Selection {
+        urls,
+        gain_db: super::normalization_gain(&player["playerConfig"]["audioConfig"], audio.raw),
+    };
     if let Some(video) = video {
         if let Some(video) = formats.iter().rev().find(|format| {
             format.video
@@ -567,25 +578,25 @@ pub(super) fn select(
                     .is_some_and(|height| height <= u64::from(video.height()))
         }) && let Some(audio) = selected_audio
         {
-            return Ok(vec![video.url()?, audio.url()?]);
+            return Ok(selection(vec![video.url()?, audio.url()?], audio));
         }
     } else if let Some(audio) = selected_audio {
-        return Ok(vec![audio.url()?]);
+        return Ok(selection(vec![audio.url()?], audio));
     }
-    let progressive = formats.iter().rev().find(|format| {
-        format.audio
-            && format.video
-            && video.is_none_or(|video| {
-                format
-                    .height
-                    .is_some_and(|height| height <= u64::from(video.height()))
-            })
-    });
-    Ok(vec![
-        progressive
-            .context("No native format matches this quality")?
-            .url()?,
-    ])
+    let progressive = formats
+        .iter()
+        .rev()
+        .find(|format| {
+            format.audio
+                && format.video
+                && video.is_none_or(|video| {
+                    format
+                        .height
+                        .is_some_and(|height| height <= u64::from(video.height()))
+                })
+        })
+        .context("No native format matches this quality")?;
+    Ok(selection(vec![progressive.url()?], progressive))
 }
 
 #[cfg(test)]
@@ -601,8 +612,10 @@ pub(super) mod tests {
         serde_json::from_str(include_str!("native_formats.json")).unwrap()
     }
 
-    fn itags(urls: &[String]) -> Vec<String> {
-        urls.iter()
+    fn itags(selection: &Selection) -> Vec<String> {
+        selection
+            .urls
+            .iter()
             .map(|url| {
                 reqwest::Url::parse(url)
                     .unwrap()
@@ -686,6 +699,36 @@ pub(super) mod tests {
                 ["18"]
             );
         }
+    }
+
+    #[test]
+    fn gain_follows_the_selected_audio_format() {
+        let mut player = fixture();
+        player["playerConfig"]["audioConfig"] =
+            json!({"trackAbsoluteLoudnessLkfs": -10.5, "loudnessTargetLkfs": -14});
+        for format in player["streamingData"]["adaptiveFormats"]
+            .as_array_mut()
+            .unwrap()
+        {
+            match format["itag"].as_u64() {
+                Some(249) => format["trackAbsoluteLoudnessLkfs"] = json!(-12.),
+                Some(141) => format["trackAbsoluteLoudnessLkfs"] = json!(-11.),
+                _ => {}
+            }
+        }
+        for (audio, video, expected) in [
+            (AudioQuality::Low, None, -2.),
+            (AudioQuality::High, None, -3.),
+            (AudioQuality::High, Some(VideoQuality::P720), -3.),
+        ] {
+            let selection = select(&player, audio, video).unwrap();
+            assert_eq!(selection.gain_db, expected, "{:?}", itags(&selection));
+        }
+        // The muxed fallback has no loudness of its own.
+        player["streamingData"]["adaptiveFormats"] = json!([]);
+        let selection = select(&player, AudioQuality::High, None).unwrap();
+        assert_eq!(itags(&selection), ["18"]);
+        assert_eq!(selection.gain_db, -3.5);
     }
 
     #[test]
@@ -885,7 +928,7 @@ pub(super) mod tests {
             [None].into_iter().chain(VideoQuality::ALL.map(Some)).map(move |video| {
                 json!({
                     "selector": video.map_or_else(|| audio.selector().to_owned(), |video| video.selector(audio)),
-                    "itags": select(player,audio,video).ok().map(|urls| itags(&urls))
+                    "itags": select(player,audio,video).ok().map(|selection| itags(&selection))
                 })
             })
         }).collect();
@@ -949,9 +992,9 @@ print('27 selectors matched')
             compare_ytdlp(&player);
             let mut checked = std::collections::HashSet::new();
             for audio in AudioQuality::ALL {
-                let urls = select(&player, audio, Some(VideoQuality::P1080)).unwrap();
-                eprintln!("{id} {} 1080p: {:?}", audio.label(), itags(&urls));
-                for url in urls {
+                let selection = select(&player, audio, Some(VideoQuality::P1080)).unwrap();
+                eprintln!("{id} {} 1080p: {:?}", audio.label(), itags(&selection));
+                for url in selection.urls {
                     let parsed = reqwest::Url::parse(&url).unwrap();
                     let itag = parsed
                         .query_pairs()

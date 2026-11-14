@@ -249,6 +249,11 @@ def no_network(*args, **kwargs):
 
 yt_dlp.YoutubeDL.urlopen = no_network
 YoutubeIE._real_initialize = lambda self: None
+# Only the first request sees a player response, so loudness must not carry over.
+YoutubeIE._extract_player_responses = lambda self, *args, **kwargs: ([{
+    'streamingData': {'adaptiveFormats': [{'itag': 251, 'loudnessDb': 2.5}]},
+    'playerConfig': {'audioConfig': {'loudnessDb': float('nan'), 'loudnessTargetLkfs': -14}},
+}], None)
 
 def extract(self, url):
     self.calls = getattr(self, 'calls', 0) + 1
@@ -261,8 +266,10 @@ def extract(self, url):
         self._verify_server_identity({'DATASYNC_ID': 'other||account'})
     if not url.endswith('unconfirmed'):
         self._verify_server_identity({'DATASYNC_ID': 'brand||user'})
+    if self.calls == 1:
+        self._extract_player_responses()
     return {'id': 'abcdefghijk', 'title': 'Synthetic', 'formats': [
-        {'format_id':'audio', 'url':f'https://rr1.googlevideo.com/audio?call={self.calls}',
+        {'format_id':'251', 'url':f'https://rr1.googlevideo.com/audio?itag=251&call={self.calls}',
          'ext':'webm', 'vcodec':'none', 'acodec':'opus'},
         {'format_id':'video', 'url':'https://rr1.googlevideo.com/video',
          'ext':'webm', 'vcodec':'vp9', 'acodec':'none', 'height':720}]}
@@ -297,9 +304,12 @@ exec(sys.argv.pop(1))
         stdout, stderr = server.communicate(''.join(json.dumps(request) + '\n' for request in requests), timeout=15)
         self.assertEqual(server.returncode, 0, stderr)
         self.assertEqual([json.loads(line) for line in stdout.splitlines()], [
-            {'ready': True}, {'urls': ['https://rr1.googlevideo.com/audio?call=1']},
+            {'ready': True},
+            {'urls': ['https://rr1.googlevideo.com/audio?itag=251&call=1'],
+             'loudness': {'audioConfig': {'loudnessTargetLkfs': -14.0}, 'format': {'loudnessDb': 2.5}}},
             {'urls': None}, {'urls': None},
-            {'urls': ['https://rr1.googlevideo.com/video', 'https://rr1.googlevideo.com/audio?call=4']},
+            {'urls': ['https://rr1.googlevideo.com/video', 'https://rr1.googlevideo.com/audio?itag=251&call=4'],
+             'loudness': None},
         ])
         self.assertNotIn('INVENTED_COOKIE', stdout)
         self.assertNotIn('other||account', stdout)
