@@ -86,7 +86,7 @@ jobs:
           [ "$(zipinfo -1 tools/deno.zip)" = deno ]
           unzip -q tools/deno.zip deno -d dist/helpers
           chmod 755 dist/helpers/yt-dlp dist/helpers/deno
-          cp dist/stage/LICENSE* dist/stage/NOTICE dist/stage/OFL.txt packaging/LICENSE-DENO packaging/LICENSE-YT-DLP dist/licenses/
+          cp dist/stage/LICENSE* dist/stage/NOTICE dist/stage/OFL.txt packaging/LICENSE-DENO packaging/LICENSE-V8 packaging/NOTICE-DENO packaging/LICENSE-YT-DLP dist/licenses/
           for packager in deb rpm; do tools/nfpm package --config packaging/nfpm.yaml --packager "$packager" --target dist/; done
           (cd dist && for package in *.deb *.rpm; do sha256sum "$package" > "$package.sha256"; done)
           rm -r dist/stage dist/helpers dist/licenses tools
@@ -149,6 +149,6 @@ jobs:
         env:
           DISTRO: ${{ matrix.distro }}
         run: |
-          YTDLP_VERSION=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          YTDLP_VERSION=$(tar -xzOf dist/yt-music-gpui-*-x86_64-linux.tar.gz runtime-pins.json | jq -r .ytdlp_version)
           docker run --rm -e "YTDLP_VERSION=$YTDLP_VERSION" -v "$PWD/dist:/dist:ro" \
             -v "$PWD/packaging/test-package.sh:/test-package.sh:ro" "$DISTRO" sh /test-package.sh

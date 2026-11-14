@@ -1919,9 +1919,7 @@ pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
         PathBuf::from("/"),
         0,
     );
-    let packaged =
-        std::env::current_exe().is_ok_and(|exe| exe == Path::new("/usr/bin/yt-music-gpui"));
-    let candidates = if packaged {
+    let candidates = if std::env::current_exe().is_ok_and(|exe| packaged_exe(&exe)) {
         [Some(package), installer]
     } else {
         [installer, Some(package)]
@@ -1931,6 +1929,14 @@ pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
         .flatten()
         .find(|(path, top, owner)| trusted_tool(path, top, *owner))
         .map(|(path, ..)| path)
+}
+
+// After a package upgrade replaces the running binary, Linux reports its old
+// path with a " (deleted)" suffix.
+fn packaged_exe(exe: &Path) -> bool {
+    let exe = exe.as_os_str().as_encoded_bytes();
+    let exe = exe.strip_suffix(b" (deleted)").unwrap_or(exe);
+    exe == b"/usr/bin/yt-music-gpui"
 }
 
 pub(crate) fn find_ytdlp() -> Result<PathBuf> {
@@ -2921,7 +2927,21 @@ mod tests {
         assert!(!trusted_tool(&tool, &directory.join("other-home"), uid));
         // Packaged copies must be root-owned all the way up from /.
         assert!(!trusted_tool(&tool, Path::new("/"), 0));
-        assert!(trusted_tool(Path::new("/usr/bin/env"), Path::new("/"), 0));
+        // NixOS, Guix and rootless builds have no root-owned /usr/bin/env.
+        let env = fs::symlink_metadata("/usr/bin/env");
+        if env.is_ok_and(|env| env.is_file() && env.uid() == 0) {
+            assert!(trusted_tool(Path::new("/usr/bin/env"), Path::new("/"), 0));
+        }
+    }
+
+    #[test]
+    fn packaged_binary_is_recognised_after_an_upgrade_replaces_it() {
+        assert!(packaged_exe(Path::new("/usr/bin/yt-music-gpui")));
+        assert!(packaged_exe(Path::new("/usr/bin/yt-music-gpui (deleted)")));
+        assert!(!packaged_exe(Path::new("/usr/local/bin/yt-music-gpui")));
+        assert!(!packaged_exe(Path::new(
+            "/home/me/.local/bin/yt-music-gpui"
+        )));
     }
 
     #[test]

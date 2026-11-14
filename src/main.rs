@@ -71,9 +71,17 @@ fn main() {
                 println!("yt-music-gpui {}", env!("CARGO_PKG_VERSION"));
                 // Which helpers passed the trust checks, for bug reports and package tests.
                 let ytdlp = player::find_ytdlp().map(|path| path.display().to_string());
-                let deno = player::private_tool("deno").map(|path| path.display().to_string());
+                // yt-dlp looks for Deno on PATH unless the app passes a trusted copy.
+                let deno = player::private_tool("deno").or_else(|| {
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                        .map(|directory| directory.join("deno"))
+                        .find(|path| path.is_file())
+                });
                 println!("yt-dlp: {}", ytdlp.as_deref().unwrap_or("not found"));
-                println!("deno: {}", deno.as_deref().unwrap_or("from PATH"));
+                match deno {
+                    Some(path) => println!("deno: {}", path.display()),
+                    None => println!("deno: not found"),
+                }
                 return;
             }
             _ => {

@@ -10,7 +10,7 @@ description: |-
   Native YouTube Music client for Linux, built with GPUI.
   Includes the reviewed yt-dlp zipapp and Deno it uses for signed-in playback.
 homepage: https://github.com/AksharP5/yt-music-gpui
-license: MIT AND Apache-2.0 AND ISC AND OFL-1.1 AND Unlicense
+license: MIT AND Apache-2.0 AND ISC AND OFL-1.1 AND BSD-3-Clause AND Unlicense
 section: sound
 
 contents:
@@ -95,8 +95,6 @@ overrides:
       - python3 >= 3.10
       - /usr/bin/secret-tool
       - /usr/bin/xdg-open
-    recommends:
-      - mesa-vulkan-drivers
 
 deb:
   compression: zstd:19
