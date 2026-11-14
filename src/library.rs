@@ -953,6 +953,17 @@ mod tests {
         ));
         assert_eq!(queue.index, Some(0));
         assert!(recommendations.is_empty());
+
+        // Repeat One replays a disliked song that was clicked explicitly.
+        queue.replace(vec![track("disliked 1"), track("b")], 0);
+        assert!(queue.advance_with_autoplay(
+            Repeat::One,
+            true,
+            true,
+            &mut recommendations,
+            disliked
+        ));
+        assert_eq!(queue.index, Some(0));
     }
 
     #[test]
