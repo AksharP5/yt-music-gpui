@@ -33,6 +33,9 @@ impl Repeat {
 #[serde(default)]
 pub struct Library {
     pub positions: crate::listening::ResumePositions,
+    /// Where the current song stopped when listening last ended, for Play after a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_position: Option<LastPosition>,
     pub liked: Vec<Track>,
     pub recent: Vec<Track>,
     pub saved: Vec<Collection>,
@@ -50,6 +53,7 @@ impl Default for Library {
     fn default() -> Self {
         Self {
             positions: crate::listening::ResumePositions::default(),
+            last_position: None,
             liked: Vec::new(),
             recent: Vec::new(),
             saved: Vec::new(),
@@ -92,6 +96,12 @@ impl Library {
         self.recent.insert(0, track.clone());
         self.recent.truncate(100);
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LastPosition {
+    pub track_id: String,
+    pub seconds: f64,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -311,7 +321,7 @@ enum SaveRequest {
 #[derive(Default)]
 struct LibraryUpdate {
     preferences: Option<Preferences>,
-    positions: Option<crate::listening::ResumePositions>,
+    positions: Option<(crate::listening::ResumePositions, Option<LastPosition>)>,
 }
 
 impl LibraryUpdate {
@@ -319,8 +329,9 @@ impl LibraryUpdate {
         if let Some(preferences) = self.preferences {
             preferences.apply(library);
         }
-        if let Some(positions) = self.positions {
+        if let Some((positions, last_position)) = self.positions {
             library.positions = positions;
+            library.last_position = last_position;
         }
     }
 }
@@ -463,9 +474,9 @@ impl LibraryWriter {
         });
     }
 
-    pub fn save_positions(&self, positions: &crate::listening::ResumePositions) {
+    pub fn save_positions(&self, library: &Library) {
         self.update(LibraryUpdate {
-            positions: Some(positions.clone()),
+            positions: Some((library.positions.clone(), library.last_position.clone())),
             ..Default::default()
         });
     }
@@ -604,7 +615,7 @@ mod tests {
                 library
                     .positions
                     .set("guest", &episode, f64::from(seconds), 3600., false);
-                writer.save_positions(&library.positions);
+                writer.save_positions(&library);
                 library.volume = f64::from(seconds % 100);
                 writer.save_preferences(&library);
             }
@@ -642,7 +653,11 @@ mod tests {
                 library
                     .positions
                     .set("guest", &episode, f64::from(100 + n), 3600., false);
-                writer.save_positions(&library.positions);
+                library.last_position = Some(LastPosition {
+                    track_id: format!("{round}-{n}"),
+                    seconds: f64::from(n),
+                });
+                writer.save_positions(&library);
             }
             drop(writer);
             assert!(errors.is_empty());
@@ -685,7 +700,7 @@ mod tests {
             library
                 .positions
                 .set("guest", &episode, f64::from(seconds), 3600., false);
-            writer.save_positions(&library.positions);
+            writer.save_positions(&library);
         }
         let checkpoint = start.elapsed().as_secs_f64() * 1000. / 20.;
         drop(writer);

@@ -209,6 +209,9 @@ impl Music {
             return;
         }
         let Some(track_id) = self.active_id else {
+            if self.seek_restored(seconds) {
+                self.notify_playback(cx);
+            }
             return;
         };
         if matches!(self.playback, Playback::Loading { .. }) {
@@ -247,6 +250,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         self.finish_listening(false);
+        self.listening.restored = None;
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -614,10 +618,14 @@ impl Music {
             if let Some(intent) = resume {
                 intent.toggle_pause();
             } else {
+                let position = self
+                    .listening
+                    .take_restored(self.library.queue.current())
+                    .unwrap_or(0.);
                 *resume = self.library.queue.current().map(|track| {
                     PlaybackIntent::Track(PlaybackResume {
                         video_id: track.id.clone(),
-                        position: 0.,
+                        position,
                         paused: false,
                         mode: WatchMode::Details,
                         watch: track.details.watch.clone(),
@@ -685,6 +693,7 @@ impl Music {
 
     pub(in crate::app) fn stop_playback(&mut self, cx: &mut Context<Self>) {
         self.finish_listening(false);
+        self.forget_last_position();
         if let Some(resume) = self
             .account_operation
             .as_mut()

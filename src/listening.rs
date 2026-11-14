@@ -73,7 +73,7 @@ pub fn resumable(track: &Track) -> bool {
     track.details.episode.is_some() || track.details.resume_seconds.is_some()
 }
 
-fn normalize(seconds: f64, duration: Option<f64>) -> f64 {
+pub fn normalize(seconds: f64, duration: Option<f64>) -> f64 {
     if !seconds.is_finite()
         || seconds < 0.
         || duration.is_some_and(|duration| seconds >= duration - 5.)
