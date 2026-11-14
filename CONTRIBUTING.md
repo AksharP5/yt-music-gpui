@@ -127,7 +127,7 @@ Never commit cookies, account data or keyring contents. Use synthetic values in 
 
 ## Release
 
-Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything.
+Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything. Releases are immutable once published, and only repository admins can create or move `v*` tags; the release build also refuses a tag whose commit is not on `main`.
 
 1. Set the release version in `Cargo.toml`, bumping it for subsequent releases, and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
 2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.

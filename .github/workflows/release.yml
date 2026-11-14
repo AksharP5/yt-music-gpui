@@ -28,4 +28,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes dist/*
+        # Releases are immutable once published: attach every file to a draft,
+        # then publish it in one step.
+        run: |
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes dist/*
+          gh release edit "$TAG" --draft=false
