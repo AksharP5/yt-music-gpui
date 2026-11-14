@@ -1,0 +1,7 @@
+The bundled Deno binary is MIT-licensed (LICENSE-DENO). It statically links
+V8, licensed under BSD-3-Clause (LICENSE-V8), and Rust crates under MIT,
+Apache-2.0 and other permissive licenses. The crates and their versions are
+listed in Cargo.lock at the matching release tag of
+https://github.com/denoland/deno.
+
+The bundled yt-dlp zipapp is released into the public domain (LICENSE-YT-DLP).

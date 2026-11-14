@@ -1876,17 +1876,16 @@ fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
 }
 
 // Account cookies may reach these tools. Refuse a redirected or writable path,
-// including every directory through HOME, before preferring an installer copy.
-fn trusted_private_tool(path: &Path, home: &Path) -> bool {
-    if !home.is_absolute() || !path.starts_with(home) {
+// including every directory through `top`, before preferring a private copy.
+fn trusted_tool(path: &Path, top: &Path, owner: u32) -> bool {
+    if !top.is_absolute() || !path.starts_with(top) {
         return false;
     }
-    let uid = unsafe { libc::geteuid() };
     for entry in path.ancestors() {
         let Ok(metadata) = fs::symlink_metadata(entry) else {
             return false;
         };
-        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        if metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
             return false;
         }
         if entry == path {
@@ -1896,20 +1895,51 @@ fn trusted_private_tool(path: &Path, home: &Path) -> bool {
         } else if !metadata.is_dir() {
             return false;
         }
-        if entry == home {
+        if entry == top {
             return true;
         }
     }
     false
 }
 
-fn private_tool(name: &str) -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let path = home.join(".local/share/yt-music-gpui").join(name);
-    trusted_private_tool(&path, &home).then_some(path)
+// The release installer's copies live in HOME; .deb and .rpm packages ship
+// root-owned copies. Each install prefers its own, whose versions it pins.
+pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
+    let installer = std::env::var_os("HOME").map(|home| {
+        let home = PathBuf::from(home);
+        let uid = unsafe { libc::geteuid() };
+        (
+            home.join(".local/share/yt-music-gpui").join(name),
+            home,
+            uid,
+        )
+    });
+    let package = (
+        Path::new("/usr/lib/yt-music-gpui").join(name),
+        PathBuf::from("/"),
+        0,
+    );
+    let candidates = if std::env::current_exe().is_ok_and(|exe| packaged_exe(&exe)) {
+        [Some(package), installer]
+    } else {
+        [installer, Some(package)]
+    };
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|(path, top, owner)| trusted_tool(path, top, *owner))
+        .map(|(path, ..)| path)
 }
 
-fn find_ytdlp() -> Result<PathBuf> {
+// After a package upgrade replaces the running binary, Linux reports its old
+// path with a " (deleted)" suffix.
+fn packaged_exe(exe: &Path) -> bool {
+    let exe = exe.as_os_str().as_encoded_bytes();
+    let exe = exe.strip_suffix(b" (deleted)").unwrap_or(exe);
+    exe == b"/usr/bin/yt-music-gpui"
+}
+
+pub(crate) fn find_ytdlp() -> Result<PathBuf> {
     private_tool("yt-dlp")
         .into_iter()
         .chain(
@@ -2883,17 +2913,35 @@ mod tests {
         let tool = directory.join("yt-dlp");
         fs::write(&tool, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(trusted_private_tool(&tool, home.path()));
+        let uid = unsafe { libc::geteuid() };
+        assert!(trusted_tool(&tool, home.path(), uid));
         for path in [&tool, &directory, home.path()] {
             let mode = fs::metadata(path).unwrap().permissions().mode();
             fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o020)).unwrap();
-            assert!(!trusted_private_tool(&tool, home.path()));
+            assert!(!trusted_tool(&tool, home.path(), uid));
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
         }
         let link = directory.join("deno");
         std::os::unix::fs::symlink(&tool, &link).unwrap();
-        assert!(!trusted_private_tool(&link, home.path()));
-        assert!(!trusted_private_tool(&tool, &directory.join("other-home")));
+        assert!(!trusted_tool(&link, home.path(), uid));
+        assert!(!trusted_tool(&tool, &directory.join("other-home"), uid));
+        // Packaged copies must be root-owned all the way up from /.
+        assert!(!trusted_tool(&tool, Path::new("/"), 0));
+        // NixOS, Guix and rootless builds have no root-owned /usr/bin/env.
+        let env = fs::symlink_metadata("/usr/bin/env");
+        if env.is_ok_and(|env| env.is_file() && env.uid() == 0) {
+            assert!(trusted_tool(Path::new("/usr/bin/env"), Path::new("/"), 0));
+        }
+    }
+
+    #[test]
+    fn packaged_binary_is_recognised_after_an_upgrade_replaces_it() {
+        assert!(packaged_exe(Path::new("/usr/bin/yt-music-gpui")));
+        assert!(packaged_exe(Path::new("/usr/bin/yt-music-gpui (deleted)")));
+        assert!(!packaged_exe(Path::new("/usr/local/bin/yt-music-gpui")));
+        assert!(!packaged_exe(Path::new(
+            "/home/me/.local/bin/yt-music-gpui"
+        )));
     }
 
     #[test]
