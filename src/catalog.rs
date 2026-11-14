@@ -1387,11 +1387,22 @@ pub(crate) fn parse_item(value: &Value) -> Option<Item> {
             })
             .and_then(|r| r["text"].as_str())
             .map(str::to_owned);
+        // A duration is never a link, but an album such as JAY-Z's "4:44" can look like one.
+        let linked = |run: &Value| run.get("navigationEndpoint").is_some();
         let duration = runs
             .iter()
-            .filter_map(|r| r["text"].as_str().and_then(duration))
-            .next()
-            .or_else(|| metadata.iter().find_map(|value| duration(&text(value))))
+            .filter(|r| !linked(r))
+            .find_map(|r| r["text"].as_str().and_then(duration))
+            .or_else(|| {
+                metadata
+                    .iter()
+                    .filter(|value| {
+                        !value["runs"]
+                            .as_array()
+                            .is_some_and(|runs| runs.iter().any(linked))
+                    })
+                    .find_map(|value| duration(&text(value)))
+            })
             .or_else(|| duration(&text(&row["lengthText"])))
             .or_else(|| {
                 episode
@@ -4144,6 +4155,46 @@ mod tests {
             json!("invalid-video-id");
         assert!(parse_item(&invalid).is_none());
         assert!(parse_item(&json!({})).is_none());
+    }
+
+    #[test]
+    fn song_duration_ignores_an_album_titled_like_a_time() {
+        let row = json!({"musicResponsiveListItemRenderer":{
+            "playlistItemData":{"videoId":"abcdefghijk"},
+            "flexColumns":[
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Caught Their Eyes"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+                    {"text":"JAY-Z","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}},
+                    {"text":" • "},
+                    {"text":"4:44","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}},
+                    {"text":" • "},
+                    {"text":"3:27"}
+                ]}}}
+            ]
+        }});
+        let Some(Item::Track(track)) = parse_item(&row) else {
+            panic!("expected a song")
+        };
+        assert_eq!(track.album.as_deref(), Some("4:44"));
+        assert_eq!(track.duration, Some(207));
+
+        let playlist_row = json!({"musicResponsiveListItemRenderer":{
+            "playlistItemData":{"videoId":"abcdefghijk"},
+            "flexColumns":[
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Caught Their Eyes"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+                    {"text":"JAY-Z","navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}
+                ]}}},
+                {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+                    {"text":"4:44","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}}
+                ]}}}
+            ],
+            "fixedColumns":[{"musicResponsiveListItemFixedColumnRenderer":{"text":{"simpleText":"3:27"}}}]
+        }});
+        let Some(Item::Track(track)) = parse_item(&playlist_row) else {
+            panic!("expected a song")
+        };
+        assert_eq!(track.duration, Some(207));
     }
 
     #[test]
