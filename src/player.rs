@@ -1240,12 +1240,10 @@ fn extractor_arguments(
         // Extraction must not persist account data or signed URLs in a disk cache.
         "--no-cache-dir",
     ]);
-    // Bun is excluded: yt-dlp runs it without a sandbox, so YouTube's player
-    // code would get file and network access. Deno, Node's permission model and
-    // plain QuickJS do not grant that.
-    for runtime in ["deno", "node", "quickjs"] {
-        command.args(["--js-runtimes", runtime]);
-    }
+    // Only Deno: yt-dlp runs it with no file, process or network permissions.
+    // Bun and QuickJS get full access, and Node's permission model can still
+    // be escaped by player code, so YouTube's player JavaScript never runs there.
+    command.args(["--js-runtimes", "deno"]);
     if let Some(deno) = private_tool("deno") {
         command
             .arg("--js-runtimes")
@@ -2848,6 +2846,28 @@ mod tests {
         std::os::unix::fs::symlink(&tool, &link).unwrap();
         assert!(!trusted_private_tool(&link, home.path()));
         assert!(!trusted_private_tool(&tool, &directory.join("other-home")));
+    }
+
+    #[test]
+    fn youtube_player_code_only_runs_in_sandboxed_deno() {
+        let mut command = Command::new("yt-dlp");
+        extractor_arguments(&mut command, None).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let runtimes: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--js-runtimes")
+            .map(|pair| pair[1].clone())
+            .collect();
+        assert!(!runtimes.is_empty());
+        assert!(
+            runtimes
+                .iter()
+                .all(|runtime| runtime == "deno" || runtime.starts_with("deno:")),
+            "{runtimes:?}"
+        );
     }
 
     #[test]

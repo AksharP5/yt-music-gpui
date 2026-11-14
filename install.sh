@@ -226,10 +226,10 @@ try:
             copy.write_bytes(read_file(zipapp))
             zipapp = copy
         sys.path.insert(0, str(zipapp))
-        from yt_dlp.utils._jsruntime import DenoJsRuntime, NodeJsRuntime, QuickJsRuntime
-        # Bun is left out: yt-dlp runs it without a sandbox, while Deno, Node's
-        # permission model and plain QuickJS keep YouTube's player code off the disk.
-        runtimes = [DenoJsRuntime(), NodeJsRuntime(), QuickJsRuntime()]
+        from yt_dlp.utils._jsruntime import DenoJsRuntime
+        # Only Deno sandboxes YouTube's player code as yt-dlp runs it; Bun, Node
+        # and QuickJS can reach files, processes or the network.
+        runtimes = [DenoJsRuntime()]
         try:
             read_file(private / 'deno')
             installed = DenoJsRuntime(str(private / 'deno'))
