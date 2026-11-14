@@ -626,7 +626,7 @@ impl Music {
                 continue;
             }
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
-            let carousel = browse_sections
+            let carousel = (browse_sections && !shelf.title.is_empty())
                 || sectioned
                     && matches!(
                         shelf.layout,
@@ -911,16 +911,18 @@ impl Music {
                     self.sync.page_coverage.continued = true;
                     let first_shelf = self.page.shelves.len();
                     let previous_rows = self.list_rows.len();
+                    let was_grouped = self.grouped_rows();
                     self.page.continuation = page.continuation;
                     self.page.shelves.extend(page.shelves);
-                    if self.history_groups() {
+                    // A second titled shelf can turn a plain list into sections.
+                    if self.history_groups() || self.grouped_rows() != was_grouped {
                         self.rebuild_rows();
                     } else {
                         self.append_rows(first_shelf);
-                    }
-                    if self.grouped_rows() && !self.history_groups() {
-                        self.detail_list
-                            .append_rows(self.list_rows.len() - previous_rows);
+                        if was_grouped {
+                            self.detail_list
+                                .append_rows(self.list_rows.len() - previous_rows);
+                        }
                     }
                 } else {
                     self.sync.page_coverage = sync::PageCoverage {

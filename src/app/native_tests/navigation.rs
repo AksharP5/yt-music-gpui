@@ -367,10 +367,12 @@ fn stale_forward_revisit_replaces_loaded_tail_and_continuation() -> Result<()> {
 fn explore_pages_keep_their_titled_shelves() -> Result<()> {
     check_cache(|view, _, cx| {
         use crate::app::ListRow;
-        let sections = crate::app::sync::tests::response(
+        use crate::app::sync::tests::response;
+        let sections = response(
             &[
                 ("Video charts", (0..4).collect()),
                 ("Top songs", (4..8).collect()),
+                ("", (8..10).collect()),
             ],
             None,
             false,
@@ -383,15 +385,45 @@ fn explore_pages_keep_their_titled_shelves() -> Result<()> {
         assert!(
             matches!(
                 view.list_rows.as_slice(),
-                [ListRow::Shelf(0), ListRow::Shelf(1)]
+                [
+                    ListRow::Shelf(0),
+                    ListRow::Shelf(1),
+                    ListRow::Item(8),
+                    ListRow::Item(9)
+                ]
             ),
-            "Charts and mood pages show each titled shelf, not one merged list"
+            "Titled shelves show as sections and an untitled one as plain rows"
         );
         view.navigate(Route::Browse(BrowseLink::new("FEmusic_more", "More")), cx);
         reply(view, page("More", "more-tail"), cx);
         assert!(
             !view.grouped_rows(),
             "A single shelf keeps the plain list or grid"
+        );
+        let token = view.page.continuation.clone().unwrap();
+        view.request(
+            Query::More {
+                token,
+                search: None,
+            },
+            cx,
+        );
+        reply(
+            view,
+            response(&[("Albums", (100..104).collect())], None, false),
+            cx,
+        );
+        assert!(
+            matches!(
+                view.list_rows.as_slice(),
+                [ListRow::Shelf(0), ListRow::Shelf(1)]
+            ),
+            "A continuation that adds a second titled shelf regroups the whole page"
+        );
+        assert_eq!(
+            view.detail_list.state.item_count(),
+            view.list_rows.len(),
+            "The section list must hold every regrouped row"
         );
     })
 }
