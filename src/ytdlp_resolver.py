@@ -58,17 +58,25 @@ def report_loudness(ydl):
     The returned function also forgets the request, and returns None when the
     fields are missing or this yt-dlp version extracts differently.
     """
+    import math
     from urllib.parse import parse_qs, urlsplit
 
-    from yt_dlp.extractor.youtube import YoutubeIE
+    try:
+        from yt_dlp.extractor.youtube import YoutubeIE
+        extract_player_responses = YoutubeIE._extract_player_responses
+    except (ImportError, AttributeError):
+        # Another yt-dlp layout only loses levelling, never the warm resolver.
+        return lambda: None
 
     responses, selected = [], []
-    extract_player_responses = YoutubeIE._extract_player_responses
     process_info = ydl.process_info
 
     def remember_responses(self, *args, **kwargs):
         result = extract_player_responses(self, *args, **kwargs)
-        responses[:] = result[0]
+        try:
+            responses[:] = result[0]
+        except Exception:
+            responses.clear()
         return result
 
     def remember_selection(info):
@@ -79,7 +87,10 @@ def report_loudness(ydl):
     ydl.process_info = remember_selection
 
     def pick(fields, names):
-        return {name: fields[name] for name in names if isinstance(fields.get(name), (int, float))}
+        # NaN or Infinity would make the protocol line invalid JSON.
+        return {name: float(fields[name]) for name in names
+                if isinstance(fields.get(name), (int, float)) and not isinstance(fields[name], bool)
+                and math.isfinite(fields[name])}
 
     def loudness():
         try:
