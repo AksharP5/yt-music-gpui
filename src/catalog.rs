@@ -1855,7 +1855,9 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         .and_then(|header| header.pointer("/subscriptionButton/subscribeButtonRenderer"))
         .filter(|button| ArtistSubscription::from_button(button).is_ok());
     let subscribed = subscription_button.and_then(|button| button["subscribed"].as_bool());
+    // Pages behind a shelf's More button name the shelf only in a plain title header.
     let title = header
+        .or_else(|| data.pointer("/header/musicHeaderRenderer"))
         .map(|header| text(&header["title"]))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback_title.to_owned());
@@ -4166,6 +4168,26 @@ mod tests {
             panic!("expected a song")
         };
         assert_eq!(track.duration, None);
+    }
+
+    #[test]
+    fn shelf_more_pages_take_the_shelf_title_from_their_header() {
+        let page = parse_page(
+            &json!({
+                "header":{"musicHeaderRenderer":{"title":{"runs":[{"text":"Coffee shop blends"}]}}},
+                "contents":[{"gridRenderer":{"items":[{"musicTwoRowItemRenderer":{
+                    "title":{"runs":[{"text":"A playlist"}]},
+                    "navigationEndpoint":{"browseEndpoint":{"browseId":"VLplaylist"}}
+                }}]}}]
+            }),
+            "More",
+        )
+        .unwrap();
+        assert_eq!(page.title, "Coffee shop blends");
+        assert!(
+            page.header.is_none(),
+            "A titled grid is not an album-style page"
+        );
     }
 
     #[test]
