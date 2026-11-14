@@ -4662,7 +4662,9 @@ YtMusicAccountIE._real_extract = extract
         let selectors = AudioQuality::ALL.map(AudioQuality::selector);
         let output = Command::new(python)
             .args(["-B", "-c", r#"
-import json, sys
+import json, os, sys
+if zipapp := os.environ.get('YT_DLP_TEST_ZIPAPP'):
+    sys.path.insert(0, zipapp)
 from yt_dlp import YoutubeDL
 
 selectors = json.loads(sys.argv[1])

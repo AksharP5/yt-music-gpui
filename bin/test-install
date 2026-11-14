@@ -77,6 +77,16 @@ class InstallerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('SHA-256 mismatch', result.stderr)
 
+    def test_upstream_ytdlp_sum_must_also_match_the_pin(self):
+        asset = self.root / 'yt-dlp'
+        asset.write_bytes(b'reviewed fixture')
+        checksum = hashlib.sha256(asset.read_bytes()).hexdigest()
+        sums = self.root / 'SHA2-256SUMS'
+        sums.write_text('0' * 64 + '  yt-dlp\n')
+        result = self.helper_run('verify', asset, checksum, sums, 'yt-dlp')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Upstream checksum differs', result.stderr)
+
     def test_truncated_pipe_does_no_work(self):
         for end in [len(SCRIPT) // 2, SCRIPT.rindex('\ninstall_main')]:
             result = subprocess.run(['sh'], input=SCRIPT[:end], text=True, env=self.env,

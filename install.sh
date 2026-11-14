@@ -51,6 +51,16 @@ install_main() {
             printf '%s\n' 'Python 3.10 or newer is required.' >&2; exit 1;
         }
     fi
+    if [ "$action" != uninstall ]; then
+    python3 -I - <<'PYGLIBC'
+import ctypes
+libc = ctypes.CDLL('libc.so.6')
+libc.gnu_get_libc_version.restype = ctypes.c_char_p
+version = libc.gnu_get_libc_version().decode()
+if tuple(map(int, version.split('.'))) < (2, 39):
+    raise SystemExit(f'glibc 2.39 or newer is required; found {version}. Build from source on older distributions.')
+PYGLIBC
+    fi
     umask 077
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
@@ -336,21 +346,22 @@ PY
     while IFS= read -r dep; do
         case "$manager:$dep" in
             pacman:mpv) pkg=mpv ;; apt-get:mpv|zypper:mpv) pkg=libmpv2 ;; dnf:mpv) pkg=mpv-libs ;;
-            pacman:EGL|pacman:GLESv2|dnf:EGL|dnf:GLESv2) pkg=libglvnd ;; apt-get:EGL|zypper:EGL) pkg=libegl1 ;;
-            apt-get:GLESv2|zypper:GLESv2) pkg=libgles2 ;;
-            pacman:X11) pkg=libx11 ;; apt-get:X11) pkg=libx11-6 ;; dnf:X11|zypper:X11) pkg=libX11 ;;
-            pacman:Xext) pkg=libxext ;; apt-get:Xext) pkg=libxext6 ;; dnf:Xext|zypper:Xext) pkg=libXext ;;
-            pacman:wayland-*|dnf:wayland-*|zypper:wayland-*) pkg=wayland ;;
-            apt-get:wayland-client) pkg=libwayland-client0 ;; apt-get:wayland-egl) pkg=libwayland-egl1 ;;
-            pacman:xcb|dnf:xcb|zypper:xcb) pkg=libxcb ;; apt-get:xcb) pkg=libxcb1 ;;
-            pacman:xkbcommon|dnf:xkbcommon|zypper:xkbcommon) pkg=libxkbcommon ;; apt-get:xkbcommon) pkg=libxkbcommon0 ;;
-            pacman:xkbcommon-x11|dnf:xkbcommon-x11|zypper:xkbcommon-x11) pkg=libxkbcommon-x11 ;;
-            apt-get:xkbcommon-x11) pkg=libxkbcommon-x11-0 ;;
+            pacman:EGL|pacman:GLESv2|zypper:EGL|zypper:GLESv2) pkg=libglvnd ;;
+            dnf:EGL) pkg=libglvnd-egl ;; dnf:GLESv2) pkg=libglvnd-gles ;; apt-get:EGL) pkg=libegl1 ;;
+            apt-get:GLESv2) pkg=libgles2 ;;
+            pacman:X11) pkg=libx11 ;; apt-get:X11) pkg=libx11-6 ;; dnf:X11) pkg=libX11 ;; zypper:X11) pkg=libX11-6 ;;
+            pacman:Xext) pkg=libxext ;; apt-get:Xext) pkg=libxext6 ;; dnf:Xext) pkg=libXext ;; zypper:Xext) pkg=libXext6 ;;
+            pacman:wayland-*|dnf:wayland-*) pkg=wayland ;;
+            apt-get:wayland-client|zypper:wayland-client) pkg=libwayland-client0 ;; apt-get:wayland-egl|zypper:wayland-egl) pkg=libwayland-egl1 ;;
+            pacman:xcb|dnf:xcb) pkg=libxcb ;; apt-get:xcb|zypper:xcb) pkg=libxcb1 ;;
+            pacman:xkbcommon|dnf:xkbcommon) pkg=libxkbcommon ;; apt-get:xkbcommon|zypper:xkbcommon) pkg=libxkbcommon0 ;;
+            pacman:xkbcommon-x11|dnf:xkbcommon-x11) pkg=libxkbcommon-x11 ;;
+            apt-get:xkbcommon-x11|zypper:xkbcommon-x11) pkg=libxkbcommon-x11-0 ;;
             pacman:fontconfig|dnf:fontconfig|zypper:fontconfig) pkg=fontconfig ;; apt-get:fontconfig) pkg=libfontconfig1 ;;
-            pacman:freetype) pkg=freetype2 ;; apt-get:freetype) pkg=libfreetype6 ;; dnf:freetype|zypper:freetype) pkg=freetype ;;
+            pacman:freetype|zypper:freetype) pkg=freetype2 ;; apt-get:freetype) pkg=libfreetype6 ;; dnf:freetype) pkg=freetype ;;
             pacman:vulkan) pkg=vulkan-icd-loader ;; apt-get:vulkan|zypper:vulkan) pkg=libvulkan1 ;; dnf:vulkan) pkg=vulkan-loader ;;
             *:xdg-open) pkg=xdg-utils ;;
-            pacman:secret-tool) pkg=libsecret ;; apt-get:secret-tool) pkg=libsecret-tools ;; dnf:secret-tool|zypper:secret-tool) pkg=libsecret ;;
+            pacman:secret-tool) pkg=libsecret ;; apt-get:secret-tool) pkg=libsecret-tools ;; dnf:secret-tool) pkg=libsecret ;; zypper:secret-tool) pkg=secret-tool ;;
             *) printf 'Missing runtime library: %s\n' "$dep" >&2; exit 1 ;;
         esac
         case " $* " in *" $pkg "*) ;; *) set -- "$@" "$pkg" ;; esac
@@ -372,6 +383,12 @@ PY
     fi
     if [ "$action" = check ]; then printf '%s\n' 'Runtime dependencies found.'; exit 0; fi
     helper install "$work/stage" "$work/yt-dlp" "$work/deno"
+    if ! ldd "$HOME/.local/bin/yt-music-gpui" > "$work/ldd" 2>&1; then
+        cat "$work/ldd" >&2
+        exit 1
+    fi
+    if grep -q 'not found' "$work/ldd"; then cat "$work/ldd" >&2; exit 1; fi
+    "$HOME/.local/bin/yt-music-gpui" --version
     desktop_update
     printf '%s\n' 'YouTube Music is installed. Launch it from your app launcher.'
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) printf 'For terminal use, add %s/.local/bin to PATH.\n' "$HOME" ;; esac

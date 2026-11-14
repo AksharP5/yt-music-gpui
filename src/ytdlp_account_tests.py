@@ -16,6 +16,10 @@ import urllib.response
 from email.message import Message
 from unittest.mock import patch
 
+zipapp = os.environ.get('YT_DLP_TEST_ZIPAPP')
+if zipapp:
+    sys.path.insert(0, zipapp)
+
 import yt_dlp
 from yt_dlp.extractor.youtube import YoutubeIE
 from yt_dlp.globals import plugin_dirs
@@ -233,6 +237,9 @@ class WarmServerContract(unittest.TestCase):
         # verifies each response, and must be discovered by the server's CLI setup.
         code = r"""
 import sys
+zipapp = sys.argv.pop(1)
+if zipapp:
+    sys.path.insert(0, zipapp)
 import yt_dlp
 from yt_dlp.extractor.youtube import YoutubeIE
 from yt_dlp.utils import DownloadError
@@ -264,7 +271,7 @@ YoutubeIE._real_extract = extract
 exec(sys.argv.pop(1))
 """
         server = subprocess.Popen([sys.executable, '-I', '-B', '-u', '-c', code,
-                                   server_script, 'unused-script', '--ignore-config', '--get-url',
+                                   zipapp or '', server_script, zipapp or 'unused-script', '--ignore-config', '--get-url',
                                    '--no-cache-dir', '--quiet', '--no-warnings', '--no-playlist',
                                    '--cookies', f'/proc/{os.getpid()}/fd/{cookies}',
                                    '--config-locations', f'/proc/{os.getpid()}/fd/{config}'],
