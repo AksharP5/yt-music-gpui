@@ -7,10 +7,29 @@ Bug reports, fixes and focused features are welcome. For a larger change, open a
 You need stable Rust, a C compiler, pkg-config, and development files for libmpv, EGL, GLES, Wayland, X11, Xext, xcb, xkbcommon, fontconfig and freetype. On Arch:
 
 ```sh
-sudo pacman -S --needed rust base-devel mpv yt-dlp libglvnd wayland libx11 libxext libxcb libxkbcommon-x11 fontconfig freetype2
+sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland libx11 libxext libxcb libxkbcommon-x11 fontconfig freetype2
 ```
 
 On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the packages to install. Sign-in also needs Python 3, xdg-utils, libsecret's `secret-tool` and a running Secret Service keyring.
+
+## Build and install from source
+
+```sh
+git clone https://github.com/AksharP5/yt-music-gpui
+cd yt-music-gpui
+bin/build
+bin/install
+```
+
+`bin/install` copies the app to `~/.local/bin` and the launcher, icon and licenses under `${XDG_DATA_HOME:-~/.local/share}`. It does not install dependencies or the reviewed yt-dlp; with any other yt-dlp version, signed-in lookups fall back to guest extraction. Signed-in playback also needs Deno; Node, Bun and QuickJS are never used (see [SECURITY.md](SECURITY.md)).
+
+## How playback works
+
+A clicked song first uses a native, cookie-free player request that skips the watch page and doesn't wait on yt-dlp. The next song is prepared in the background; when signed in with High audio quality, that uses your account through yt-dlp to keep Premium audio. Video above 1080p also uses yt-dlp. If the native request fails or needs JavaScript to decode a stream URL, the same play falls back to yt-dlp, and a stream that fails to open retries through yt-dlp.
+
+Account playback uses an extractor reviewed against one yt-dlp release, pinned in `src/ytdlp_account.py`. A weekly CI job tests each new yt-dlp release so the pin can be bumped.
+
+Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR`, removed on normal shutdown, SIGTERM and SIGINT. The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json`. To sample CPU and memory of a running release build, use `bin/profile APP_PID 30`.
 
 ## Validate
 
