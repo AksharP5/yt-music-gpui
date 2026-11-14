@@ -14,6 +14,7 @@ You'll get a reply within a week. Fixes land on `main`; there are no maintained 
 - It never writes cookies to disk in plaintext. Signed-in playback hands credentials to yt-dlp through sealed in-memory files.
 - Playback runtime files (the mpv socket and the extractor script) live in a private directory under `$XDG_RUNTIME_DIR`, and core dumps are disabled so credentials can't end up in one.
 - Signing out or switching accounts removes the saved session from the keyring.
+- An empty `account-saved` file in the app's data folder records that the keyring holds an account, so a keyring that can't be read is reported only to people who signed in. It holds no account data, and signing out removes it.
 
 In scope: anything that exposes, persists or sends the session somewhere other than YouTube; local privilege or file-permission problems; code execution through crafted service responses. Out of scope: YouTube's own services, and anything that requires an already-compromised user account on your machine.
 
