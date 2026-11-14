@@ -22,8 +22,8 @@ install_main() {
     esac
     [ "$#" -eq 0 ] || { printf '%s\n' 'Unknown option. Use --help.' >&2; exit 1; }
     : "${HOME:?HOME must be set}"
-    data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
-    private_dir=$HOME/.local/share/yt-music-gpui
+    data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+    private_dir="$HOME/.local/share/yt-music-gpui"
     manager=unknown
     for candidate in pacman apt-get dnf zypper; do
         if command -v "$candidate" >/dev/null 2>&1; then manager=$candidate; break; fi
@@ -62,7 +62,7 @@ if tuple(map(int, version.split('.'))) < (2, 39):
 PYGLIBC
     fi
     umask 077
-    work=$(mktemp -d)
+    work="$(mktemp -d)"
     trap 'rm -rf -- "$work"' EXIT
     trap 'exit 1' HUP INT TERM
     cat > "$work/helper.py" <<'PY'
@@ -315,17 +315,17 @@ PY
         if [ -n "$archive" ]; then
             cp -- "$archive" "$work/$(basename -- "$archive")"
             cp -- "$archive.sha256" "$work/archive.sha256"
-            archive=$work/$(basename -- "$archive")
+            archive="$work/$(basename -- "$archive")"
         else
             # Resolve latest once, so a release published mid-install cannot mix assets.
-            effective=$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
-                https://github.com/AksharP5/yt-music-gpui/releases/latest)
-            tag=${effective##*/}
-            version=${tag#v}
+            effective="$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
+                https://github.com/AksharP5/yt-music-gpui/releases/latest)"
+            tag="${effective##*/}"
+            version="${tag#v}"
             case "$version" in ''|*[!0-9.]*) printf '%s\n' 'Invalid latest release version.' >&2; exit 1 ;; esac
-            name=yt-music-gpui-$version-x86_64-linux.tar.gz
-            url=https://github.com/AksharP5/yt-music-gpui/releases/download/$tag
-            archive=$work/$name
+            name="yt-music-gpui-$version-x86_64-linux.tar.gz"
+            url="https://github.com/AksharP5/yt-music-gpui/releases/download/$tag"
+            archive="$work/$name"
             download "$url/$name" "$archive"
             download "$url/$name.sha256" "$work/archive.sha256"
         fi
@@ -334,9 +334,9 @@ PY
         download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/yt-dlp" "$work/yt-dlp"
         download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/SHA2-256SUMS" "$work/ytdlp-sums"
         helper verify "$work/yt-dlp" "$ytdlp_hash" "$work/ytdlp-sums" yt-dlp
-        runtime_zip=$work/yt-dlp
+        runtime_zip="$work/yt-dlp"
     else
-        runtime_zip=$private_dir/yt-dlp
+        runtime_zip="$private_dir/yt-dlp"
     fi
     helper libraries > "$work/missing"
     for tool in xdg-open secret-tool; do

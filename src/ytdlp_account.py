@@ -21,9 +21,9 @@ from yt_dlp.version import __version__
 REVIEWED_VERSION = "2026.08.19"
 REVIEWED_SHA256 = "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6"
 
-DENO_VERSION = "2.5.6"
-DENO_SHA256 = "fd4f6abc1b6a134fa9a4dba56519f1631f44c88e04e4e3e9a8ff5975dfa66e1a"
-DENO_SIZE = 45849694
+DENO_VERSION = "2.9.8"
+DENO_SHA256 = "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609"
+DENO_SIZE = 41963064
 
 # Some portable CPython builds omit these stable Linux fcntl ABI constants.
 _F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
