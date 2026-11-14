@@ -430,6 +430,57 @@ fn explore_pages_keep_their_titled_shelves() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn mouse_back_button_goes_back() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let back = |window: gpui::WindowHandle<Music>, cx: &mut gpui::AsyncApp| {
+            cx.update_window(window.into(), |_, window, cx| {
+                let position = point(px(640.), px(400.));
+                let button = gpui::MouseButton::Navigate(gpui::NavigationDirection::Back);
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        };
+        let playlist = Route::Browse(BrowseLink::new("VLback", "Back target"));
+        window
+            .update(cx, |view, _, cx| {
+                view.navigate(playlist.clone(), cx);
+                reply(view, page("Back target", "back-tail"), cx);
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        back(window, cx);
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    matches!(view.route, Route::Explore),
+                    "The mouse's Back button returns to the previous page"
+                );
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn liking_a_song_refetches_cached_library_songs() -> Result<()> {
     check_cache(|view, window, cx| {
         let songs = Route::Library(Section::Songs);
