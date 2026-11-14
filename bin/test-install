@@ -36,12 +36,13 @@ class InstallerTests(unittest.TestCase):
                  'runtime-pins.json', 'NOTICE', 'OFL.txt', *[p.name for p in ROOT.glob('LICENSE*')]]
         with tarfile.open(archive, 'w:gz') as tar:
             for name in names:
+                if extra and name == 'yt-music-gpui':
+                    tar.addfile(extra)
+                    continue
                 entry = tarfile.TarInfo(name)
                 content = b'fixture'
                 entry.size = len(content)
                 tar.addfile(entry, io.BytesIO(content))
-            if extra:
-                tar.addfile(extra)
         sums = Path(str(archive) + '.sha256')
         sums.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
         return archive, sums
@@ -56,7 +57,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_traversal_absolute_paths_and_links_are_rejected_before_extraction(self):
         for name, kind in [('../escape', tarfile.REGTYPE), ('/escape', tarfile.REGTYPE),
-                           ('yt-dlp', tarfile.SYMTYPE), ('yt-dlp', tarfile.LNKTYPE)]:
+                           ('yt-music-gpui', tarfile.SYMTYPE), ('yt-music-gpui', tarfile.LNKTYPE)]:
             with self.subTest(name=name, kind=kind):
                 entry = tarfile.TarInfo(name)
                 entry.type = kind

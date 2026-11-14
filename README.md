@@ -20,7 +20,7 @@ On x86_64 Linux:
 curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/install.sh | sh
 ```
 
-The download will become available with the first GitHub Release. Requires glibc 2.39 or newer, Linux 5.3 or newer, libmpv.so.2 and a working Vulkan driver. This covers Ubuntu 24.04+, Debian 13+, recent Fedora and Arch. Container checks verify library loading and `--version`; desktop playback is verified on Arch only.
+The download will become available with the first GitHub Release. Requires glibc 2.39 or newer, Linux 5.3 or newer, libmpv.so.2 and a working Vulkan driver. These requirements fit Ubuntu 24.04+, Debian 13+, recent Fedora and Arch. Ubuntu 24.04 and Fedora 43 container checks verify library loading and `--version`; desktop playback is verified on Arch only. Other distributions and desktop sessions have not been tested.
 
 The script checks runtime libraries, Python 3.10+, `xdg-open` and `secret-tool`. It prints the exact missing-package command for pacman, apt, dnf or zypper and asks before running sudo. Sign-in also needs a browser and a running Secret Service keyring.
 
