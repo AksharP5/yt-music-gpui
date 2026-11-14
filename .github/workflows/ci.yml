@@ -26,13 +26,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: bin/test
+      - run: bin/test-install
       - uses: actions/setup-python@v7
         id: python
         with:
           python-version: "3.x"
       - name: Install the reviewed yt-dlp
         run: |
-          version=$(grep -oP '__version__ != "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          version=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
           python -m pip install --quiet "yt-dlp==$version"
       - name: Test yt-dlp contracts
         env:
@@ -41,3 +42,7 @@ jobs:
           bin/test -- --ignored --exact
           player::tests::quality_selectors_respect_audio_classes_and_video_caps
           player::tests::embedded_extractor_binds_the_selected_account
+
+  release-test:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/release-build.yml

@@ -17,6 +17,14 @@ from yt_dlp.utils import DownloadError
 from yt_dlp.utils.traversal import traverse_obj
 from yt_dlp.version import __version__
 
+# Installer downloads are pinned here with the reviewed extractor version.
+REVIEWED_VERSION = "2026.08.19"
+REVIEWED_SHA256 = "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6"
+
+DENO_VERSION = "2.9.8"
+DENO_SHA256 = "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609"
+DENO_SIZE = 41963064
+
 # Some portable CPython builds omit these stable Linux fcntl ABI constants.
 _F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
 _REQUIRED_SEALS = 0x0f
@@ -43,8 +51,8 @@ class YtMusicAccountIE(YoutubeIE):
 
     @functools.cached_property
     def _account(self):
-        if __version__ != "2026.08.19":
-            raise DownloadError("Account playback requires yt-dlp 2026.08.19; the installed version has not been reviewed")
+        if __version__ != REVIEWED_VERSION:
+            raise DownloadError(f"Account playback requires yt-dlp {REVIEWED_VERSION}; the installed version has not been reviewed")
         paths = self._configuration_arg("context", ie_key="ytmusicaccount", casesense=True)
         try:
             if len(paths) != 1 or not re.fullmatch(r"/proc/[0-9]+/fd/[0-9]+", paths[0]):

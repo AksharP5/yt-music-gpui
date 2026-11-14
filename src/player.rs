@@ -11,7 +11,7 @@ use std::{
     fs::{self, File},
     io::{self, ErrorKind, Read, Seek, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -1104,7 +1104,7 @@ fn replace_playback_credentials(
     Ok(())
 }
 
-const REVIEWED_YTDLP: &str = "2026.08.19";
+const REVIEWED_YTDLP: &str = env!("REVIEWED_YTDLP");
 
 fn account_playback_supported(ytdlp: &Path) -> bool {
     Command::new(ytdlp)
@@ -1240,6 +1240,15 @@ fn extractor_arguments(
         // Extraction must not persist account data or signed URLs in a disk cache.
         "--no-cache-dir",
     ]);
+    // Only Deno: yt-dlp runs it without file, process or network permissions.
+    // Bun and QuickJS get full access, and Node's permission model can still
+    // be escaped by player code, so YouTube's player JavaScript never runs there.
+    command.args(["--js-runtimes", "deno"]);
+    if let Some(deno) = private_tool("deno") {
+        command
+            .arg("--js-runtimes")
+            .arg(format!("deno:{}", deno.display()));
+    }
     let cookies = credentials
         .map(|credentials| writable_playback_cookies(credentials.cookies.try_clone()?))
         .transpose()?;
@@ -1819,12 +1828,53 @@ fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
         .context("Could not create the private playback directory")
 }
 
+// Account cookies may reach these tools. Refuse a redirected or writable path,
+// including every directory through HOME, before preferring an installer copy.
+fn trusted_private_tool(path: &Path, home: &Path) -> bool {
+    if !home.is_absolute() || !path.starts_with(home) {
+        return false;
+    }
+    let uid = unsafe { libc::geteuid() };
+    for entry in path.ancestors() {
+        let Ok(metadata) = fs::symlink_metadata(entry) else {
+            return false;
+        };
+        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+            return false;
+        }
+        if entry == path {
+            if !metadata.is_file() || metadata.mode() & 0o100 == 0 {
+                return false;
+            }
+        } else if !metadata.is_dir() {
+            return false;
+        }
+        if entry == home {
+            return true;
+        }
+    }
+    false
+}
+
+fn private_tool(name: &str) -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let path = home.join(".local/share/yt-music-gpui").join(name);
+    trusted_private_tool(&path, &home).then_some(path)
+}
+
 fn find_ytdlp() -> Result<PathBuf> {
-    std::env::var_os("PATH")
+    private_tool("yt-dlp")
         .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|path| path.join("yt-dlp"))
-        .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/yt-dlp")))
+        .chain(
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+                .map(|path| path.join("yt-dlp"))
+                .chain(
+                    std::env::var_os("HOME")
+                        .map(|home| PathBuf::from(home).join(".local/bin/yt-dlp")),
+                ),
+        )
         .find(|path| path.is_file())
         .context("Could not find yt-dlp. Install it, then restart the app.")
 }
@@ -2776,6 +2826,49 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_tools_require_owned_non_writable_parents_and_regular_executables() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".local/share/yt-music-gpui");
+        fs::create_dir_all(&directory).unwrap();
+        let tool = directory.join("yt-dlp");
+        fs::write(&tool, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(trusted_private_tool(&tool, home.path()));
+        for path in [&tool, &directory, home.path()] {
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o020)).unwrap();
+            assert!(!trusted_private_tool(&tool, home.path()));
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let link = directory.join("deno");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        assert!(!trusted_private_tool(&link, home.path()));
+        assert!(!trusted_private_tool(&tool, &directory.join("other-home")));
+    }
+
+    #[test]
+    fn youtube_player_code_only_runs_in_sandboxed_deno() {
+        let mut command = Command::new("yt-dlp");
+        extractor_arguments(&mut command, None).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let runtimes: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--js-runtimes")
+            .map(|pair| pair[1].clone())
+            .collect();
+        assert!(!runtimes.is_empty());
+        assert!(
+            runtimes
+                .iter()
+                .all(|runtime| runtime == "deno" || runtime.starts_with("deno:")),
+            "{runtimes:?}"
+        );
+    }
 
     #[test]
     fn playback_runtime_stays_private_under_the_desktop_runtime_and_cleans_up() {
@@ -4592,7 +4685,9 @@ YtMusicAccountIE._real_extract = extract
         let selectors = AudioQuality::ALL.map(AudioQuality::selector);
         let output = Command::new(python)
             .args(["-B", "-c", r#"
-import json, sys
+import json, os, sys
+if zipapp := os.environ.get('YT_DLP_TEST_ZIPAPP'):
+    sys.path.insert(0, zipapp)
 from yt_dlp import YoutubeDL
 
 selectors = json.loads(sys.argv[1])

@@ -18,6 +18,7 @@ On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 bin/test
+bin/test-install
 ```
 
 CI runs the same checks on every pull request. `bin/build` and `bin/test` use two jobs unless `CARGO_BUILD_JOBS` is set.
@@ -30,7 +31,7 @@ Tests that need the network, libmpv, yt-dlp, a keyring or a desktop session are 
 bin/test -- --ignored --exact player::tests::embedded_extractor_binds_the_selected_account
 ```
 
-- **yt-dlp contract tests** (`quality_selectors_respect_audio_classes_and_video_caps`, `embedded_extractor_binds_the_selected_account`) run offline but need a Python with the yt-dlp version pinned in `src/ytdlp_account.py`. Point `YT_DLP_TEST_PYTHON` at that interpreter if `python3` has a different version. CI runs both on every pull request, and a weekly job runs them against the latest yt-dlp release. The account contract also exercises the resident resolver with synthetic responses, including extractor selection and per-request identity checks. `warm_resolver_reuses_requests_and_supersession_kills_the_process_group` and `warm_credential_change_respawns_with_new_identity_and_revokes_old_files` additionally test process reuse, cancellation and credential revocation with the installed `yt-dlp` interpreter, without network access.
+- **yt-dlp contract tests** (`quality_selectors_respect_audio_classes_and_video_caps`, `embedded_extractor_binds_the_selected_account`) run offline but need a Python with the yt-dlp version pinned in `src/ytdlp_account.py`. Point `YT_DLP_TEST_PYTHON` at that interpreter if `python3` has a different version. CI runs both on every pull request, and a weekly job runs them against the latest yt-dlp release. Set `YT_DLP_TEST_ZIPAPP` to an absolute official zipapp path to run both contracts against its bundled package, including resident subprocesses, instead of a pip installation. The account contract also exercises the resident resolver with synthetic responses, including extractor selection and per-request identity checks. `warm_resolver_reuses_requests_and_supersession_kills_the_process_group` and `warm_credential_change_respawns_with_new_identity_and_revokes_old_files` additionally test process reuse, cancellation and credential revocation with the installed `yt-dlp` interpreter, without network access.
 - **`live_*` tests** call public YouTube Music endpoints without an account. Some player tests named `live_*` use only a synthetic local extractor, as their ignore reason says.
 - **Keyring and browser tests** (`live_keyring_removal_is_idempotent`, `live_default_browser_profile_resolves_omarchy_launcher`) use your desktop session. They create only a synthetic keyring entry and read only browser profile metadata.
 
@@ -123,3 +124,27 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with
 Keep each pull request to one change. Say what was broken or missing from a user's point of view, how you fixed it, and how you checked it in the running app. Include a screenshot or recording for UI changes.
 
 Never commit cookies, account data or keyring contents. Use synthetic values in tests, as the existing ones do.
+
+## Release
+
+Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything. Releases are immutable once published, and only repository admins can create or move `v*` tags; the release build also refuses a tag whose commit is not on `main`.
+
+1. Set the release version in `Cargo.toml`, bumping it for subsequent releases, and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
+2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.
+3. The Release workflow builds with `--locked`, checks the installed artifact in Ubuntu and Fedora containers, and publishes the tarball, SHA-256 checksum, `install.sh` and dependency report to a GitHub Release.
+
+Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the same read-only release build workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
+
+Download the artifact and test the installer without touching an existing installation:
+
+```sh
+home=$(mktemp -d)
+HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --archive /absolute/path/yt-music-gpui-X.Y.Z-x86_64-linux.tar.gz
+HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --check-deps
+HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --uninstall
+rm -r -- "$home"
+```
+
+Keep the matching `.tar.gz.sha256` beside the local tarball. The app and helpers still need their normal runtime libraries; the installer still downloads its pinned yt-dlp and optional Deno over HTTPS. Use the isolated desktop recipe above to test playback, with the installed binary and a muted library. Container `--version` checks do not establish working graphics, audio or sign-in on those desktops.
+
+`src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256 plus the fallback Deno version, archive SHA-256 and download size. Packaging copies them into `runtime-pins.json`; the installer has no independent version pins. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.

@@ -16,3 +16,13 @@ You'll get a reply within a week. Fixes land on `main`; there are no maintained 
 - Signing out or switching accounts removes the saved session from the keyring.
 
 In scope: anything that exposes, persists or sends the session somewhere other than YouTube; local privilege or file-permission problems; code execution through crafted service responses. Out of scope: YouTube's own services, and anything that requires an already-compromised user account on your machine.
+
+## Release installer
+
+The installer trusts this repository's release build, its build dependencies, GitHub's HTTPS service and your distribution's package repositories. The app tarball and checksum come from the same GitHub Release. That checksum detects corrupted or partial downloads, not a compromised maintainer account or release.
+
+The official yt-dlp zipapp must match both its upstream checksum and the hash reviewed in `src/ytdlp_account.py`. The optional private Deno archive must match its reviewed hash too. These pins reject changed upstream assets; they cannot protect against a compromised app release that changes the pins. Updating helpers requires a new reviewed app release and re-running the installer. The app never downloads tools or JavaScript solver scripts.
+
+Signed-in and some guest playback runs YouTube's player JavaScript through Deno with yt-dlp's flags, which grant no file, process, network or environment permissions; only Deno's own cache and storage area are writable. This is Deno's permission sandbox, not an operating-system sandbox: a bug in Deno's JavaScript engine could give that code your user's access. Keep a system Deno updated; the private copy updates when you re-run the installer.
+
+The installer refuses root, asks before running any package command with sudo, rejects archive paths and links, and anchors destination writes to checked directory descriptors. The app only prefers private tools whose file and parent directories through `HOME` belong to the current user and are not writable by group or others. This does not defend against root or another process already running as your user. Uninstall checks its manifest and file hashes; it keeps modified files, library data, settings and saved accounts.

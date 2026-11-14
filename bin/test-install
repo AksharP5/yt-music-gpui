@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Offline installer failure-path tests; no sudo, accounts or real HOME writes."""
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = (ROOT / 'install.sh').read_text()
+HELPER = SCRIPT.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+
+
+class InstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='yt-music-install-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.home = self.root / 'home'
+        self.home.mkdir(mode=0o700)
+        self.env = {**os.environ, 'HOME': str(self.home), 'XDG_DATA_HOME': str(self.home / 'data')}
+        self.helper = self.root / 'helper.py'
+        self.helper.write_text(HELPER)
+
+    def helper_run(self, *args):
+        return subprocess.run(['python3', '-I', '-B', str(self.helper), *map(str, args)],
+                              env=self.env, capture_output=True, text=True, check=False)
+
+    def archive(self, extra=None):
+        archive = self.root / 'yt-music-gpui-0.1.0-x86_64-linux.tar.gz'
+        names = ['yt-music-gpui', 'yt-music-gpui.desktop', 'yt-music-gpui.svg',
+                 'runtime-pins.json', 'NOTICE', 'OFL.txt', *[p.name for p in ROOT.glob('LICENSE*')]]
+        with tarfile.open(archive, 'w:gz') as tar:
+            for name in names:
+                if extra and name == 'yt-music-gpui':
+                    tar.addfile(extra)
+                    continue
+                entry = tarfile.TarInfo(name)
+                content = b'fixture'
+                entry.size = len(content)
+                tar.addfile(entry, io.BytesIO(content))
+        sums = Path(str(archive) + '.sha256')
+        sums.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
+        return archive, sums
+
+    def test_bad_release_checksum_is_rejected_before_extraction(self):
+        archive, sums = self.archive()
+        sums.write_text('0' * 64 + '  ' + archive.name + '\n')
+        result = self.helper_run('unpack', archive, sums, self.root / 'stage')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('SHA-256 mismatch', result.stderr)
+        self.assertFalse((self.root / 'stage').exists())
+
+    def test_traversal_absolute_paths_and_links_are_rejected_before_extraction(self):
+        for name, kind in [('../escape', tarfile.REGTYPE), ('/escape', tarfile.REGTYPE),
+                           ('yt-music-gpui', tarfile.SYMTYPE), ('yt-music-gpui', tarfile.LNKTYPE)]:
+            with self.subTest(name=name, kind=kind):
+                entry = tarfile.TarInfo(name)
+                entry.type = kind
+                entry.linkname = '../escape'
+                archive, sums = self.archive(entry)
+                result = self.helper_run('unpack', archive, sums, self.root / 'stage')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Unsafe release archive', result.stderr)
+                self.assertFalse((self.root / 'stage').exists())
+        self.assertFalse((self.root / 'escape').exists())
+
+    def test_changed_ytdlp_and_deno_assets_are_rejected(self):
+        for name in ['yt-dlp', 'deno.zip']:
+            with self.subTest(name=name):
+                asset = self.root / name
+                asset.write_bytes(b'changed upstream asset')
+                result = self.helper_run('verify', asset, '0' * 64, '-', name)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('SHA-256 mismatch', result.stderr)
+
+    def test_upstream_ytdlp_sum_must_also_match_the_pin(self):
+        asset = self.root / 'yt-dlp'
+        asset.write_bytes(b'reviewed fixture')
+        checksum = hashlib.sha256(asset.read_bytes()).hexdigest()
+        sums = self.root / 'SHA2-256SUMS'
+        sums.write_text('0' * 64 + '  yt-dlp\n')
+        result = self.helper_run('verify', asset, checksum, sums, 'yt-dlp')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Upstream checksum differs', result.stderr)
+
+    def test_truncated_pipe_does_no_work(self):
+        invocation = SCRIPT.rindex('\n(install_main')
+        for end in [len(SCRIPT) // 2, *range(invocation, len(SCRIPT.rstrip()))]:
+            result = subprocess.run(['sh'], input=SCRIPT[:end], text=True, env=self.env,
+                                    capture_output=True, check=False)
+            self.assertEqual(list(self.home.iterdir()), [])
+            self.assertNotIn('Missing dependencies', result.stdout)
+
+    def test_install_upgrade_uninstall_preserves_library_and_refuses_parent_symlink(self):
+        stage = self.root / 'stage'
+        stage.mkdir()
+        for path in ['yt-music-gpui', 'yt-music-gpui.desktop', 'yt-music-gpui.svg',
+                     'NOTICE', 'OFL.txt', *[p.name for p in ROOT.glob('LICENSE*')]]:
+            (stage / path).write_text('fixture')
+        (stage / 'yt-dlp').write_text('fixture extractor')
+        (stage / 'deno').write_text('fixture runtime')
+        args = ['install', stage, stage / 'yt-dlp', stage / 'deno']
+        result = self.helper_run(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        binary = self.home / '.local/bin/yt-music-gpui'
+        self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+        library = self.home / 'data/yt-music-gpui/library.json'
+        library.parent.mkdir()
+        library.write_text('{"volume":0}')
+        private = self.home / '.local/share/yt-music-gpui'
+        saved = json.loads((private / 'install-manifest.json').read_text())
+        self.assertIn('deno', saved)
+        # Leaf links are replaced atomically without writing through the link.
+        elsewhere = self.root / 'unrelated'
+        elsewhere.write_text('keep')
+        binary.unlink()
+        binary.symlink_to(elsewhere)
+        result = self.helper_run(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(binary.is_symlink())
+        self.assertEqual(elsewhere.read_text(), 'keep')
+        result = self.helper_run('uninstall')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(library.is_file())
+        self.assertFalse(binary.exists())
+        self.assertFalse((private / 'deno').exists())
+        self.assertFalse((private / 'install-manifest.json').exists())
+        (self.home / '.local/bin').rmdir()
+        (self.home / '.local/bin').symlink_to(self.root)
+        result = self.helper_run(*args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'yt-music-gpui').exists())
+
+    def test_local_archive_cannot_replace_the_installer_helper(self):
+        # A local "archive" named helper.py must not run before its checksum fails.
+        marker = self.root / 'ran'
+        payload = self.root / 'input' / 'helper.py'
+        payload.parent.mkdir()
+        payload.write_text(f"open({str(marker)!r}, 'w').close()\n")
+        (payload.parent / 'helper.py.sha256').write_text('0' * 64 + '  helper.py\n')
+        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--archive', str(payload)],
+                                env=self.env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_check_deps_imports_nothing_from_an_unsafe_private_ytdlp(self):
+        # Another user who can write the private copy must not get code execution.
+        import zipfile
+        marker = self.root / 'ran'
+        private = self.home / '.local/share/yt-music-gpui'
+        private.mkdir(parents=True)
+        zipapp = private / 'yt-dlp'
+        with zipfile.ZipFile(zipapp, 'w') as z:
+            for module in ['yt_dlp/__init__.py', 'yt_dlp/utils/__init__.py',
+                           'yt_dlp/utils/_jsruntime.py']:
+                z.writestr(module, f"open({str(marker)!r}, 'w').close()\n")
+        zipapp.chmod(0o664)
+        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--check-deps'],
+                                env=self.env, capture_output=True, text=True, check=False)
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+
+    def test_uninstall_rejects_manifest_paths_outside_known_targets(self):
+        private = self.home / '.local/share/yt-music-gpui'
+        private.mkdir(parents=True)
+        other = self.home / 'important.txt'
+        other.write_text('keep')
+        (private / 'install-manifest.json').write_text(json.dumps({
+            'yt-dlp': {'path': str(other), 'sha256': hashlib.sha256(other.read_bytes()).hexdigest()}
+        }))
+        result = self.helper_run('uninstall')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(other.read_text(), 'keep')
+
+
+if __name__ == '__main__':
+    unittest.main()

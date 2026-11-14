@@ -12,27 +12,49 @@ A native YouTube Music client for Linux, built with Rust and GPUI. Audio and vid
 
 This is an independent client using YouTube Music's unofficial API. Account support is experimental, and service changes can break playback or account features.
 
-## Build and install
+## Install
 
-Requires Rust, a C compiler, pkg-config and Linux 5.3 or newer for extractor exit notifications. On Arch:
+On x86_64 Linux:
 
 ```sh
-sudo pacman -S --needed git rust base-devel mpv yt-dlp libglvnd wayland libx11 libxext libxcb libxkbcommon libxkbcommon-x11 fontconfig freetype2 vulkan-driver
+curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/install.sh | sh
+```
+
+The download will become available with the first GitHub Release. Requires glibc 2.39 or newer, Linux 5.3 or newer, libmpv.so.2 and a working Vulkan driver. These requirements fit Ubuntu 24.04+, Debian 13+, recent Fedora and Arch. Ubuntu 24.04 and Fedora 43 container checks verify library loading and `--version`; desktop playback is verified on Arch only. Other distributions and desktop sessions have not been tested.
+
+The script checks runtime libraries, Python 3.10+, `xdg-open` and `secret-tool`. It prints the exact missing-package command for pacman, apt, dnf or zypper and asks before running sudo. Sign-in also needs a browser and a running Secret Service keyring.
+
+It installs the app to `~/.local/bin`, and the launcher, icon and licenses under `${XDG_DATA_HOME:-~/.local/share}`. The reviewed yt-dlp zipapp stays in `~/.local/share/yt-music-gpui`. Signed-in playback runs YouTube's player JavaScript through Deno, inside Deno's permission sandbox with no access to your files, other programs or the network (Deno's own small cache and storage area excepted). That is not an operating-system sandbox; see [SECURITY.md](SECURITY.md). If no supported Deno is installed, the installer adds a pinned private copy there. Node, Bun and QuickJS are not used, because they would give that code access to your files or network. Neither helper is added to PATH. Re-run the command to upgrade. Existing files from another installation method must be removed first.
+
+Downloads use HTTPS and SHA-256 checks. The app checksum detects corrupted or partial downloads; it does not protect against a compromised GitHub account. yt-dlp and optional Deno additionally have reviewed hashes pinned in this repository. See [SECURITY.md](SECURITY.md).
+
+Uninstall with the same script:
+
+```sh
+curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/install.sh | sh -s -- --uninstall
+```
+
+Only manifest-listed, unmodified installed files are removed. Library data, settings and saved accounts stay. Use the same `XDG_DATA_HOME` for installing and uninstalling. `sh install.sh --check-deps` checks dependencies without installing packages.
+
+## Build from source
+
+Requires Rust, a C compiler, pkg-config and the development libraries listed in [CONTRIBUTING.md](CONTRIBUTING.md). On Arch:
+
+```sh
+sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland libx11 libxext libxcb libxkbcommon libxkbcommon-x11 fontconfig freetype2 vulkan-driver
 git clone https://github.com/AksharP5/yt-music-gpui
 cd yt-music-gpui
 bin/build
 bin/install
 ```
 
-Launch YouTube Music from your app launcher, or run `target/release/yt-music-gpui` directly. The installer uses `~/.local/bin` and `~/.local/share`, respecting `XDG_DATA_HOME`, and copies the license files alongside. It does not install dependencies.
-
-Builds default to two jobs. Set `CARGO_BUILD_JOBS` to change that.
+`bin/install` uses `~/.local/bin` and `~/.local/share`, respecting `XDG_DATA_HOME`, and copies licenses alongside. It does not install dependencies or the reviewed extractor. Build defaults to two jobs; set `CARGO_BUILD_JOBS` to change that. Launch YouTube Music from your app launcher or run `target/release/yt-music-gpui` directly.
 
 On Arch, `packaging/PKGBUILD` builds the `yt-music-gpui-git` package from the latest commit on GitHub. Copy it anywhere and run `makepkg -si`.
 
 ## Connect your account
 
-Connection requires Python 3, xdg-utils, libsecret's `secret-tool` and a running Secret Service keyring.
+Connection requires Python 3.10+, xdg-utils, libsecret's `secret-tool` and a running Secret Service keyring.
 
 1. Choose **Sign in**, or launch with `--connect`.
 2. Sign in to YouTube Music in your default browser. Zen, Firefox, Chromium, Google Chrome and Brave are supported, including Omarchy's default-browser launcher.
@@ -42,7 +64,7 @@ The app reads YouTube cookies from your default browser profile and saves the co
 
 Clicked songs first use a native, cookie-free player request that skips the watch page and runs independently of yt-dlp. A background lookup cannot hold up that request. The next song is prepared in the background; when signed in with High audio quality, that preparation uses your account to keep Premium audio. Video above 1080p also uses yt-dlp. If the native request fails or needs JavaScript to decode a stream URL, the same play falls back to yt-dlp. If a stream fails to open, the automatic retry uses yt-dlp.
 
-Account playback uses an extractor reviewed against one yt-dlp release, pinned in `src/ytdlp_account.py` (currently **2026.08.19**). With any other yt-dlp version, the full extractor plays as a guest instead. A weekly CI job tests each new yt-dlp release so the pin can be bumped promptly.
+Account playback uses an extractor reviewed against one yt-dlp release, pinned in `src/ytdlp_account.py` (currently **2026.08.19**). The release installer supplies this reviewed version, preferring its private copy over system yt-dlp. With any other yt-dlp version, the full extractor plays as a guest instead. A weekly CI job tests each new yt-dlp release so the pin can be bumped promptly.
 
 Once connected, the browser can stay closed. The app restores your saved account and can renew rejected sessions from its confirmed profile. Google can still revoke a sign-in. Older saved connections need one reconnect to enable renewal.
 
