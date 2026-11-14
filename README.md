@@ -70,7 +70,7 @@ The app copies your browser's YouTube session into your desktop keyring, so the 
 | Q | Open or close the player page |
 | F | Video fullscreen |
 | Ctrl R | Reload the page |
-| Alt Left | Back |
+| Alt Left or the mouse Back button | Back |
 | Escape | Close a dialog, fullscreen, the player page or search |
 | ? | All shortcuts |
 | Ctrl Q | Quit |

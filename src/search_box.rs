@@ -50,6 +50,8 @@ pub struct SearchBox {
     input: Entity<SearchInput>,
     session: Option<Arc<Session>>,
     suggestions: Vec<Suggestion>,
+    /// The row reached with the arrow keys. Enter opens it instead of the typed text;
+    /// the pointer only highlights rows, like the web.
     selected: Option<usize>,
     artwork: Option<ArtworkLookup>,
     error: Option<String>,
@@ -149,6 +151,20 @@ impl SearchBox {
         self.invalidate(cx);
         self.input
             .update(cx, |input, cx| input.set_value(query, cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_suggestions(&mut self, queries: &[&str], cx: &mut Context<Self>) {
+        self.suggestions = queries
+            .iter()
+            .map(|query| Suggestion::Query {
+                query: (*query).into(),
+                label: (*query).into(),
+                bold: Vec::new(),
+                history: false,
+            })
+            .collect();
+        cx.notify();
     }
 
     pub fn set_artwork(&mut self, lookup: ArtworkLookup) {
@@ -261,13 +277,8 @@ impl SearchBox {
             .when(self.selected == Some(index), |row| {
                 row.bg(gpui::white().opacity(0.1))
             })
+            .hover(|row| row.bg(gpui::white().opacity(0.1)))
             .cursor_pointer()
-            .on_mouse_move(cx.listener(move |view, _, _, cx| {
-                if view.selected != Some(index) {
-                    view.selected = Some(index);
-                    cx.notify();
-                }
-            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, _, _, cx| {

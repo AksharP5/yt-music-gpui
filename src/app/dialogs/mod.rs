@@ -500,7 +500,7 @@ impl Music {
         if matches!(kind, Overlay::Help) {
             for (key, action) in [
                 ("/ or Ctrl K", "Search"),
-                ("Alt ←", "Go back"),
+                ("Alt ← or mouse Back", "Go back"),
                 ("Space", "Play or pause"),
                 ("Ctrl → / Ctrl ←", "Next / previous song"),
                 ("→ / ←", "Seek 5 seconds"),
