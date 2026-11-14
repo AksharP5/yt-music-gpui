@@ -42,7 +42,8 @@ install_main() {
         if [ -r /dev/tty ] && [ -w /dev/tty ]; then
             { printf 'Run it now? [y/N] ' > /dev/tty; read -r answer < /dev/tty; } 2>/dev/null || answer=n
         fi
-        case "$answer" in y|Y|yes|YES) sudo "$@" ;; *) return 1 ;; esac
+        # Under curl | sh, stdin is the script; package managers prompt on the terminal.
+        case "$answer" in y|Y|yes|YES) sudo "$@" < /dev/tty ;; *) return 1 ;; esac
     }
     if ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
         case "$manager" in pacman) python_package=python ;; *) python_package=python3 ;; esac
@@ -73,6 +74,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import stat
 import sys
 import tarfile
@@ -119,7 +121,7 @@ def directory(path, create=False):
             if info.st_uid not in (0, os.geteuid()) or (
                 info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
             ):
-                raise ValueError(f'Unsafe install directory: {path}')
+                raise ValueError(f'Unsafe install directory: {path}. If it is yours, run: chmod go-w {shlex.quote(str(path))}')
         return fd
     except BaseException:
         os.close(fd)

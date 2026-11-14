@@ -17,7 +17,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # Release builds start clean: other jobs, including the weekly test of
+      # unreviewed yt-dlp releases, share the build cache.
       - uses: ./.github/actions/setup
+        with:
+          cache: 'false'
       - name: Check release version
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -27,6 +32,11 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           if [[ "$REF_TYPE" == tag && "$REF_NAME" != "v$version" ]]; then
             echo 'Tag must match the Cargo.toml version.' >&2
+            exit 1
+          fi
+          # Only reviewed code ships: the tagged commit must already be on main.
+          if [[ "$REF_TYPE" == tag ]] && ! git merge-base --is-ancestor HEAD origin/main; then
+            echo 'Release tags must point at a commit on main.' >&2
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
