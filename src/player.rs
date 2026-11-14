@@ -838,6 +838,8 @@ unsafe extern "C" {
 
 struct MpvCore(NonNull<c_void>);
 
+const MPV_ERROR_OPTION_NOT_FOUND: c_int = -5;
+
 impl MpvCore {
     fn new(options: &PlayerOptions, socket: &Path) -> Result<Self> {
         let core = Self(NonNull::new(unsafe { mpv_create() }).context("Could not create mpv")?);
@@ -845,15 +847,6 @@ impl MpvCore {
             (c"terminal", "no"),
             (c"config", "no"),
             (c"load-scripts", "no"),
-            // mpv also starts a Lua VM for each built-in script. This player is
-            // controlled only over IPC, so none of them has any use.
-            (c"load-auto-profiles", "no"),
-            (c"load-commands", "no"),
-            (c"load-console", "no"),
-            (c"load-context-menu", "no"),
-            (c"load-positioning", "no"),
-            (c"load-select", "no"),
-            (c"load-stats-overlay", "no"),
             (c"idle", "yes"),
             (c"vid", "no"),
             (c"vo", "libmpv"),
@@ -872,6 +865,26 @@ impl MpvCore {
             (c"ytdl", "no"),
         ] {
             core.set_option(name, value)?;
+        }
+        // mpv also starts a Lua VM for each built-in script. This player is
+        // controlled only over IPC, so none of them has any use. Older mpv
+        // releases lack some of these scripts, and so their switches.
+        for name in [
+            c"load-auto-profiles",
+            c"load-commands",
+            c"load-console",
+            c"load-context-menu",
+            c"load-positioning",
+            c"load-select",
+            c"load-stats-overlay",
+        ] {
+            let result =
+                unsafe { mpv_set_option_string(core.0.as_ptr(), name.as_ptr(), c"no".as_ptr()) };
+            ensure!(
+                result >= 0 || result == MPV_ERROR_OPTION_NOT_FOUND,
+                "Could not set mpv startup option {} ({result})",
+                name.to_string_lossy()
+            );
         }
         core.set_option(c"volume", &options.volume.clamp(0., 100.).to_string())?;
         core.set_option(c"speed", &f64::from(options.speed).to_string())?;
@@ -963,16 +976,19 @@ fn normalization_gain(audio_config: &Value, format: &Value) -> f64 {
 }
 
 fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOptions) -> Value {
-    json!(["loadfile", url, "replace", -1, {
+    // Named arguments, because mpv 0.38 inserted an index argument before the
+    // options; positional ones work with only one side of that change.
+    json!({"name": "loadfile", "url": url, "flags": "replace", "options": {
         "force-media-title": title,
         "ytdl": "no",
         "start": options.start.to_string(),
         "pause": if options.paused { "yes" } else { "no" },
         // A file-local option: it applies to this entry only, including when
         // mpv reaches a prepared entry on its own, and sits on top of the
-        // user's volume instead of changing it.
+        // user's volume instead of changing it. mpv before 0.38 ignores it,
+        // so songs play unlevelled there.
         "volume-gain": gain_db.to_string(),
-    }])
+    }})
 }
 
 fn writable_playback_cookies(mut source: File) -> Result<File> {
@@ -2310,7 +2326,7 @@ fn run(
                     ..Default::default()
                 },
             );
-            command[2] = json!("append");
+            command["flags"] = json!("append");
             state.upcoming = Some(target.track_id);
             write_command(
                 &mut socket,
@@ -4619,17 +4635,20 @@ YtMusicAccountIE._real_extract = extract
         };
         assert_eq!(track_id, first);
         let command = load_command(&url, &title, -2.29, options);
-        assert_eq!(command[0], "loadfile");
-        assert_eq!(command[1], "https://music.youtube.com/watch?v=csILUDfmtqM");
-        assert_eq!(command[2], "replace");
-        assert_eq!(command[4]["start"], "32.5");
-        assert_eq!(command[4]["pause"], "yes");
-        assert_eq!(command[4]["ytdl"], "no");
-        assert_eq!(command[4]["volume-gain"], "-2.29");
+        assert_eq!(command["name"], "loadfile");
+        assert_eq!(
+            command["url"],
+            "https://music.youtube.com/watch?v=csILUDfmtqM"
+        );
+        assert_eq!(command["flags"], "replace");
+        assert_eq!(command["options"]["start"], "32.5");
+        assert_eq!(command["options"]["pause"], "yes");
+        assert_eq!(command["options"]["ytdl"], "no");
+        assert_eq!(command["options"]["volume-gain"], "-2.29");
         let defaults = load_command("unused", "Track", 0., PlayOptions::default());
-        assert_eq!(defaults[4]["start"], "0");
-        assert_eq!(defaults[4]["pause"], "no");
-        assert_eq!(defaults[4]["ytdl"], "no");
+        assert_eq!(defaults["options"]["start"], "0");
+        assert_eq!(defaults["options"]["pause"], "no");
+        assert_eq!(defaults["options"]["ytdl"], "no");
         let video = load_command(
             "unused",
             "Track",
@@ -4639,9 +4658,9 @@ YtMusicAccountIE._real_extract = extract
                 ..options
             },
         );
-        assert_eq!(video[4]["ytdl"], "no");
-        assert_eq!(video[4]["start"], "32.5");
-        assert_eq!(video[4]["pause"], "yes");
+        assert_eq!(video["options"]["ytdl"], "no");
+        assert_eq!(video["options"]["start"], "32.5");
+        assert_eq!(video["options"]["pause"], "yes");
     }
 
     #[test]
@@ -5777,7 +5796,7 @@ PYTHON
     #[ignore = "measures /proc actor wakeups and latency with libmpv, null audio and synthetic silence"]
     fn local_actor_wakeups_and_latency() {
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
+        let path = silent_audio(directory.path(), 120);
         let player = Player::new(PlayerOptions {
             volume: 0.,
             audio_output: Some("null".into()),
@@ -5877,9 +5896,9 @@ PYTHON
         }
     }
 
-    fn silent_audio(directory: &Path) -> PathBuf {
+    fn silent_audio(directory: &Path, seconds: u32) -> PathBuf {
         let path = directory.join("silence.wav");
-        let sample_bytes = 120_u32 * 8000 * 2;
+        let sample_bytes = seconds * 8000 * 2;
         let mut file = File::create(&path).unwrap();
         file.write_all(b"RIFF").unwrap();
         file.write_all(&(36 + sample_bytes).to_le_bytes()).unwrap();
@@ -5899,10 +5918,120 @@ PYTHON
     }
 
     #[test]
+    #[ignore = "requires libmpv; uses local silent audio, null audio and no network"]
+    fn plays_with_the_installed_libmpv() {
+        // Release builds run this in each distribution the packages target,
+        // against its own libmpv, so options and commands from newer mpv
+        // releases cannot break playback there. It uses the player's own
+        // startup options and load commands, then reads back what mpv applied.
+        let directory = tempfile::tempdir().unwrap();
+        let path = silent_audio(directory.path(), 5)
+            .to_string_lossy()
+            .into_owned();
+        let socket_path = directory.path().join("mpv.sock");
+        let _core = MpvCore::new(
+            &PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            &socket_path,
+        )
+        .unwrap();
+        // mpv creates its IPC socket on a thread of its own.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            match UnixStream::connect(&socket_path) {
+                Ok(socket) => break socket,
+                Err(error) if Instant::now() < deadline => {
+                    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+                    assert!(
+                        matches!(error.kind(), NotFound | ConnectionRefused),
+                        "{error}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut next_id = 0;
+        let mut request = |command: Value| {
+            next_id += 1;
+            write_command(&mut socket, command, Some(json!(next_id))).unwrap();
+            loop {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                let reply: Value = serde_json::from_str(&line).unwrap();
+                if reply["request_id"] == next_id {
+                    break reply;
+                }
+            }
+        };
+        let options = PlayOptions {
+            start: 2.5,
+            paused: true,
+            ..Default::default()
+        };
+        let reply = request(load_command(&path, "Synthetic silence", -2.29, options));
+        assert_eq!(reply["error"], "success", "{reply}");
+        let mut next = load_command(&path, "Prepared silence", 0., PlayOptions::default());
+        next["flags"] = json!("append");
+        let reply = request(next);
+        assert_eq!(reply["error"], "success", "{reply}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let position = loop {
+            let reply = request(json!(["get_property", "time-pos"]));
+            if let Some(seconds) = reply["data"].as_f64() {
+                break seconds;
+            }
+            assert!(Instant::now() < deadline, "the local file never loaded");
+            thread::sleep(Duration::from_millis(20));
+        };
+        let version = request(json!(["get_property", "mpv-version"]))["data"].clone();
+        assert!(
+            (position - 2.5).abs() < 0.1,
+            "{version}: started at {position}"
+        );
+        assert_eq!(
+            request(json!(["get_property", "pause"]))["data"],
+            true,
+            "{version}"
+        );
+        assert_eq!(
+            request(json!(["get_property", "media-title"]))["data"],
+            "Synthetic silence",
+            "{version}"
+        );
+        assert_eq!(
+            request(json!(["get_property", "playlist-count"]))["data"],
+            2,
+            "{version}"
+        );
+        // mpv 0.37 has no volume-gain and plays unlevelled; any release that
+        // has it must apply the per-file value.
+        let levelled =
+            request(json!(["get_property", "option-info/volume-gain/name"]))["error"] == "success";
+        if levelled {
+            let gain = request(json!(["get_property", "volume-gain"]))["data"].clone();
+            assert!(
+                gain.as_f64().is_some_and(|gain| (gain + 2.29).abs() < 1e-6),
+                "{version}: volume-gain {gain}"
+            );
+        }
+        let loudness = if levelled { "applied" } else { "unsupported" };
+        eprintln!("{version}: start, pause, title and append applied; loudness {loudness}");
+    }
+
+    #[test]
     #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
     fn paused_actor_refreshes_expired_preparation_and_writes_pending_seek() {
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
+        let path = silent_audio(directory.path(), 120);
         let extractor = directory.path().join("extractor");
         fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
@@ -5971,7 +6100,7 @@ PYTHON
     #[ignore = "requires installed mpv and yt-dlp; uses only private synthetic local audio"]
     fn local_seek_completion_handles_rapid_no_op_and_end_of_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = silent_audio(directory.path());
+        let path = silent_audio(directory.path(), 120);
         let player = Player::new(PlayerOptions {
             audio_output: Some("null".into()),
             ..Default::default()

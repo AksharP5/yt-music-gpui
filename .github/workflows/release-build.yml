@@ -41,6 +41,17 @@ jobs:
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - run: cargo build --release --locked
+      # Each package container runs this against its own libmpv.
+      - name: Build the libmpv playback test
+        run: |
+          test=$(cargo test --release --locked --no-run --message-format=json |
+            jq -r 'select(.profile.test == true and .executable != null) | .executable')
+          install -D -m755 "$test" player-test/yt-music-gpui-tests
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: player-test
+          path: player-test/yt-music-gpui-tests
+          if-no-files-found: error
       - name: Package the app and reviewed runtime pins
         run: |
           mkdir -p dist/stage
@@ -145,10 +156,16 @@ jobs:
         with:
           name: linux-x86_64
           path: dist
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: player-test
+          path: player-test
       - name: Install, check and remove the package in a clean container
         env:
           DISTRO: ${{ matrix.distro }}
         run: |
           YTDLP_VERSION=$(tar -xzOf dist/yt-music-gpui-*-x86_64-linux.tar.gz runtime-pins.json | jq -r .ytdlp_version)
+          chmod 755 player-test/yt-music-gpui-tests
           docker run --rm -e "YTDLP_VERSION=$YTDLP_VERSION" -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/player-test:/player-test:ro" \
             -v "$PWD/packaging/test-package.sh:/test-package.sh:ro" "$DISTRO" sh /test-package.sh
