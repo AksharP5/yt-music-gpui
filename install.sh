@@ -107,8 +107,10 @@ def directory(path, create=False):
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError('Install directories must be absolute and contain no ..')
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    current = Path('/')
     try:
         for part in path.parts[1:]:
+            current /= part
             if create:
                 try:
                     os.mkdir(part, 0o755, dir_fd=fd)
@@ -121,7 +123,7 @@ def directory(path, create=False):
             if info.st_uid not in (0, os.geteuid()) or (
                 info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
             ):
-                raise ValueError(f'Unsafe install directory: {path}. If it is yours, run: chmod go-w {shlex.quote(str(path))}')
+                raise ValueError(f'Unsafe install directory: {current}. If it is yours, run: chmod go-w {shlex.quote(str(current))}')
         return fd
     except BaseException:
         os.close(fd)
