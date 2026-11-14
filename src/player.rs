@@ -5900,6 +5900,44 @@ PYTHON
 
     #[test]
     #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
+    fn plays_with_the_installed_libmpv() {
+        // CI runs this against the oldest libmpv the packages accept, so
+        // options and commands from newer mpv releases cannot break playback.
+        let directory = tempfile::tempdir().unwrap();
+        let path = silent_audio(directory.path());
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let player = Player::with_extractor(
+            PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            extractor,
+        )
+        .unwrap();
+        let track_id = player
+            .play_url(
+                path.to_string_lossy().into_owned(),
+                "Synthetic silence",
+                PlayOptions::default(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "the local file never started");
+            match player.try_recv() {
+                Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                Some(PlayerEvent::Started { track_id: id, .. }) if id == track_id => break,
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
     fn paused_actor_refreshes_expired_preparation_and_writes_pending_seek() {
         let directory = tempfile::tempdir().unwrap();
         let path = silent_audio(directory.path());

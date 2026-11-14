@@ -27,6 +27,9 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: bin/test
       - run: bin/test-install
+      # Ubuntu 24.04 ships the oldest libmpv the packages accept (0.37).
+      - name: Play through the distro libmpv
+        run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
       - uses: actions/setup-python@v7
         id: python
         with:
