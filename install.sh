@@ -218,9 +218,18 @@ try:
                 raise ValueError('Unsafe Deno archive')
             output.write_bytes(z.read(entries[0]))
     elif action == 'runtime':
-        sys.path.insert(0, args[0])
-        from yt_dlp.utils._jsruntime import DenoJsRuntime, NodeJsRuntime, BunJsRuntime, QuickJsRuntime
-        runtimes = [DenoJsRuntime(), NodeJsRuntime(), BunJsRuntime(), QuickJsRuntime()]
+        zipapp = Path(args[0])
+        if zipapp == targets['yt-dlp']:
+            # Import nothing from the installed copy until it passes the same
+            # ownership checks as the app; then import a private copy of it.
+            copy = Path(__file__).parent / 'installed-yt-dlp'
+            copy.write_bytes(read_file(zipapp))
+            zipapp = copy
+        sys.path.insert(0, str(zipapp))
+        from yt_dlp.utils._jsruntime import DenoJsRuntime, NodeJsRuntime, QuickJsRuntime
+        # Bun is left out: yt-dlp runs it without a sandbox, while Deno, Node's
+        # permission model and plain QuickJS keep YouTube's player code off the disk.
+        runtimes = [DenoJsRuntime(), NodeJsRuntime(), QuickJsRuntime()]
         try:
             read_file(private / 'deno')
             installed = DenoJsRuntime(str(private / 'deno'))
@@ -233,7 +242,7 @@ try:
             pass
         for runtime in runtimes:
             info = runtime.info
-            if info and info.supported and not (info.name == 'bun' and info.version_tuple > (1, 3, 14)):
+            if info and info.supported:
                 print(f'Using {info.name} {info.version}')
                 break
         else:
@@ -319,9 +328,13 @@ PY
     if [ "$action" = install ]; then
         command -v curl >/dev/null 2>&1 || { packages curl || exit 1; }
         if [ -n "$archive" ]; then
-            cp -- "$archive" "$work/$(basename -- "$archive")"
+            # Inputs live apart from the installer's own files, so a local archive
+            # named like one of them cannot replace it before verification.
+            mkdir -m 700 "$work/input"
+            input="$work/input/$(basename -- "$archive")"
+            cp -- "$archive" "$input"
             cp -- "$archive.sha256" "$work/archive.sha256"
-            archive="$work/$(basename -- "$archive")"
+            archive="$input"
         else
             # Resolve latest once, so a release published mid-install cannot mix assets.
             effective="$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \

@@ -1240,7 +1240,10 @@ fn extractor_arguments(
         // Extraction must not persist account data or signed URLs in a disk cache.
         "--no-cache-dir",
     ]);
-    for runtime in ["deno", "node", "bun", "quickjs"] {
+    // Bun is excluded: yt-dlp runs it without a sandbox, so YouTube's player
+    // code would get file and network access. Deno, Node's permission model and
+    // plain QuickJS do not grant that.
+    for runtime in ["deno", "node", "quickjs"] {
         command.args(["--js-runtimes", runtime]);
     }
     if let Some(deno) = private_tool("deno") {

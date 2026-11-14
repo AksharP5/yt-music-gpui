@@ -136,6 +136,34 @@ class InstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / 'yt-music-gpui').exists())
 
+    def test_local_archive_cannot_replace_the_installer_helper(self):
+        # A local "archive" named helper.py must not run before its checksum fails.
+        marker = self.root / 'ran'
+        payload = self.root / 'input' / 'helper.py'
+        payload.parent.mkdir()
+        payload.write_text(f"open({str(marker)!r}, 'w').close()\n")
+        (payload.parent / 'helper.py.sha256').write_text('0' * 64 + '  helper.py\n')
+        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--archive', str(payload)],
+                                env=self.env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_check_deps_imports_nothing_from_an_unsafe_private_ytdlp(self):
+        # Another user who can write the private copy must not get code execution.
+        import zipfile
+        marker = self.root / 'ran'
+        private = self.home / '.local/share/yt-music-gpui'
+        private.mkdir(parents=True)
+        zipapp = private / 'yt-dlp'
+        with zipfile.ZipFile(zipapp, 'w') as z:
+            for module in ['yt_dlp/__init__.py', 'yt_dlp/utils/__init__.py',
+                           'yt_dlp/utils/_jsruntime.py']:
+                z.writestr(module, f"open({str(marker)!r}, 'w').close()\n")
+        zipapp.chmod(0o664)
+        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--check-deps'],
+                                env=self.env, capture_output=True, text=True, check=False)
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+
     def test_uninstall_rejects_manifest_paths_outside_known_targets(self):
         private = self.home / '.local/share/yt-music-gpui'
         private.mkdir(parents=True)
