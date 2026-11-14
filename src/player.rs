@@ -6014,12 +6014,17 @@ PYTHON
         );
         // mpv 0.37 has no volume-gain and plays unlevelled; any release that
         // has it must apply the per-file value.
-        let gain = request(json!(["get_property", "volume-gain"]));
-        if request(json!(["get_property", "option-info/volume-gain/name"]))["error"] == "success" {
-            let gain = gain["data"].as_f64().unwrap();
-            assert!((gain + 2.29).abs() < 1e-6, "{version}: volume-gain {gain}");
+        let levelled =
+            request(json!(["get_property", "option-info/volume-gain/name"]))["error"] == "success";
+        if levelled {
+            let gain = request(json!(["get_property", "volume-gain"]))["data"].clone();
+            assert!(
+                gain.as_f64().is_some_and(|gain| (gain + 2.29).abs() < 1e-6),
+                "{version}: volume-gain {gain}"
+            );
         }
-        eprintln!("{version}: start, pause, title, append and loudness applied");
+        let loudness = if levelled { "applied" } else { "unsupported" };
+        eprintln!("{version}: start, pause, title and append applied; loudness {loudness}");
     }
 
     #[test]
