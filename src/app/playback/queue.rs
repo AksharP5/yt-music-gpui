@@ -181,6 +181,7 @@ impl Music {
             intent.natural,
             autoplay,
             &mut self.autoplay_tracks,
+            |track| is_disliked(&self.ratings, track),
         ) {
             self.autoplay_waiting = None;
             self.follow_queue_selection(intent.playback, cx);
@@ -662,6 +663,7 @@ impl Music {
                 intent.natural,
                 autoplay,
                 &mut self.autoplay_tracks,
+                |track| is_disliked(&self.ratings, track),
             )
         {
             self.follow_queue_selection(intent.playback, cx);
