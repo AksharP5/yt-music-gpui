@@ -146,6 +146,10 @@ impl Session {
     /// The marker tells a failure that may hide a saved account apart from that.
     fn from_lookup(output: &Output, marker: Option<&Path>) -> Result<Option<Self>> {
         if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+            // The keyring has no account, for example after deleting it in a keyring app.
+            if let Some(marker) = marker {
+                let _ = forget_saved_account(marker);
+            }
             return Ok(None);
         }
         if !output.status.success() && !marker.is_some_and(Path::exists) {
@@ -207,15 +211,7 @@ impl Session {
     }
     pub fn disconnect() -> Result<()> {
         clear_keyring(&KEYRING_ATTRIBUTES)?;
-        if let Some(marker) = saved_account_marker() {
-            match fs::remove_file(&marker) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error).context("Could not forget the saved account");
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        saved_account_marker().map_or(Ok(()), |marker| forget_saved_account(&marker))
     }
     pub(crate) fn resume_scope(&self) -> String {
         format!("{:x}", Sha1::digest(self.data_sync_id.as_bytes()))
@@ -482,13 +478,28 @@ fn saved_account_marker() -> Option<PathBuf> {
 
 /// Best effort: a missing marker only hides a later keyring error, so it never fails sign-in.
 fn record_saved_account(marker: Option<&Path>) {
-    if let Some(marker) = marker
-        && !marker.exists()
-    {
-        let _ = marker
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| File::create(marker).map(drop));
+    let Some(marker) = marker else {
+        return;
+    };
+    // create_new refuses an existing path, including a planted symlink, in one step.
+    let _ = marker
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker)
+                .map(drop)
+        });
+}
+
+fn forget_saved_account(marker: &Path) -> Result<()> {
+    match fs::remove_file(marker) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).context("Could not forget the saved account")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1303,6 +1314,20 @@ mod tests {
                 .as_deref(),
             Some("Could not unlock the saved YouTube Music account")
         );
+        assert!(
+            Session::from_lookup(&output(1, b"", b""), Some(&marker))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !marker.exists(),
+            "An account deleted outside the app forgets the marker"
+        );
+
+        let target = directory.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        record_saved_account(Some(&marker));
+        assert!(!target.exists(), "The marker never follows a symlink");
     }
     #[test]
     fn saved_profile_consent_round_trips_and_legacy_entries_have_no_source() {
