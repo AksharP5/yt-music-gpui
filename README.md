@@ -1,25 +1,27 @@
 # YouTube Music GPUI
 
-A native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv and yt-dlp. It runs on Wayland and X11 with YouTube Music's dark interface.
+A fast, native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv.
 
 ![Home page with Quick picks and playlist shelves](docs/screenshot.webp)
 
-- Browse Home, Explore, charts, artists, albums and playlists, with search suggestions and category filters.
-- Play audio and video with a persistent, drag-to-reorder queue, shuffle, repeat, radio and autoplay. Click the player bar to open the player page with Up next, lyrics, read-only comments and related music.
-- Even out loudness between songs like the YouTube Music website: loud tracks are turned down to YouTube's target and quiet ones play as they are.
-- Read lyrics and credits, and browse podcasts with episode descriptions and chapters.
-- Connect your account to access your library, edit playlists and record playback history.
-- Control playback with keyboard shortcuts, media keys and MPRIS desktop controls.
+- Home, Explore, charts, artists, albums, playlists, podcasts and search, with YouTube Music's layout.
+- Audio and video playback with a drag-to-reorder queue, shuffle, repeat, radio and autoplay.
+- Player page with Up next, lyrics, credits, comments and related music.
+- Sign in to use your library, edit playlists and keep your YouTube Music history in sync.
+- Volume levelled between songs like the YouTube Music website.
+- Autoplay and Next skip songs the app knows you disliked.
+- Picks up the last song where you left off after a restart.
+- Keyboard shortcuts, media keys and MPRIS desktop controls.
 
-This is an independent client using YouTube Music's unofficial API. Account support is experimental, and service changes can break playback or account features.
+Songs start about 0.2 s after a click, and playback uses around 1% CPU (measured on Arch).
+
+This is an independent client using YouTube Music's unofficial API. YouTube changes can break playback or account features.
 
 ## Install
 
-On x86_64 Linux with glibc 2.39 or newer, Linux 5.3 or newer and a working Vulkan driver. That fits Ubuntu 24.04+, Debian 13+, recent Fedora, openSUSE Tumbleweed and Arch. Container checks on every release install the packages on Ubuntu 24.04, Debian 13, Fedora 43 and openSUSE Tumbleweed, and the script on Ubuntu 24.04 and Fedora 43. They verify dependencies, library loading and `--version`; desktop playback is verified on Arch only. Sign-in also needs a browser and a running Secret Service keyring.
+Requires x86_64 Linux with glibc 2.39 or newer and a working Vulkan driver: Ubuntu 24.04+, Debian 13+, Fedora, openSUSE Tumbleweed or Arch.
 
-### Ubuntu, Debian, Fedora and openSUSE
-
-Download the `.deb` or `.rpm` from the [latest release](https://github.com/AksharP5/yt-music-gpui/releases/latest), then install it from the download folder:
+**Ubuntu, Debian, Fedora, openSUSE:** download the `.deb` or `.rpm` from the [latest release](https://github.com/AksharP5/yt-music-gpui/releases/latest) and install it:
 
 ```sh
 sudo apt install ./yt-music-gpui_*_amd64.deb                         # Ubuntu, Debian
@@ -27,103 +29,58 @@ sudo dnf install ./yt-music-gpui-*.x86_64.rpm                         # Fedora
 sudo zypper install --allow-unsigned-rpm ./yt-music-gpui-*.x86_64.rpm # openSUSE
 ```
 
-Your package manager installs libmpv and the other libraries the app needs. The package includes the reviewed yt-dlp and a pinned Deno in `/usr/lib/yt-music-gpui`, so signed-in playback needs no extra setup. YouTube's player JavaScript runs only in Deno's permission sandbox; see [SECURITY.md](SECURITY.md). The packages are not signed and there is no package repository: to upgrade, install the newer package the same way. Remove it with `sudo apt remove yt-music-gpui`, `sudo dnf remove yt-music-gpui` or `sudo zypper remove yt-music-gpui`; library data, settings and saved accounts stay. Use either a package or the install script, not both.
+To upgrade, install the newer package the same way. Remove it with your package manager.
 
-### Install script
-
-On any distribution:
+**Any distribution:**
 
 ```sh
 curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/install.sh | sh
 ```
 
-The script checks runtime libraries, Python 3.10+, `xdg-open` and `secret-tool`. It prints the exact missing-package command for pacman, apt, dnf or zypper and asks before running sudo.
-
-It installs the app to `~/.local/bin`, and the launcher, icon and licenses under `${XDG_DATA_HOME:-~/.local/share}`. The reviewed yt-dlp zipapp stays in `~/.local/share/yt-music-gpui`. Signed-in playback runs YouTube's player JavaScript through Deno, inside Deno's permission sandbox with no access to your files, other programs or the network (Deno's own small cache and storage area excepted). That is not an operating-system sandbox; see [SECURITY.md](SECURITY.md). If no supported Deno is installed, the installer adds a pinned private copy there. Node, Bun and QuickJS are not used, because they would give that code access to your files or network. Neither helper is added to PATH. Re-run the command to upgrade. Existing files from another installation method must be removed first.
-
-Downloads use HTTPS and SHA-256 checks. The app checksum detects corrupted or partial downloads; it does not protect against a compromised GitHub account. yt-dlp and optional Deno additionally have reviewed hashes pinned in this repository. See [SECURITY.md](SECURITY.md).
-
-Uninstall with the same script:
+The script installs into your home folder, tells you which system packages are missing and asks before using sudo. Run it again to upgrade. To remove the app:
 
 ```sh
 curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/install.sh | sh -s -- --uninstall
 ```
 
-Only manifest-listed, unmodified installed files are removed. Library data, settings and saved accounts stay. Use the same `XDG_DATA_HOME` for installing and uninstalling. `sh install.sh --check-deps` checks dependencies without installing packages.
+Use either a package or the script, not both. Uninstalling keeps your library, settings and saved account. See [SECURITY.md](SECURITY.md) for what each method checks and trusts.
 
-## Build from source
+**Arch, from source:** `packaging/PKGBUILD` builds the latest commit. Copy it anywhere and run `makepkg -si`.
 
-Requires Rust, a C compiler, pkg-config and the development libraries listed in [CONTRIBUTING.md](CONTRIBUTING.md). On Arch:
+## Sign in
 
-```sh
-sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland libx11 libxext libxcb libxkbcommon libxkbcommon-x11 fontconfig freetype2 vulkan-driver
-git clone https://github.com/AksharP5/yt-music-gpui
-cd yt-music-gpui
-bin/build
-bin/install
-```
+Sign-in needs a running Secret Service keyring (GNOME Keyring or KWallet) and a supported default browser: Zen, Firefox, Chromium, Google Chrome or Brave.
 
-`bin/install` uses `~/.local/bin` and `~/.local/share`, respecting `XDG_DATA_HOME`, and copies licenses alongside. It does not install dependencies or the reviewed extractor. Build defaults to two jobs; set `CARGO_BUILD_JOBS` to change that. Launch YouTube Music from your app launcher or run `target/release/yt-music-gpui` directly.
+1. Choose **Sign in**.
+2. Sign in to YouTube Music in your browser.
+3. Return to the app. Your account is verified and saved automatically.
 
-On Arch, `packaging/PKGBUILD` builds the `yt-music-gpui-git` package from the latest commit on GitHub. Copy it anywhere and run `makepkg -si`.
+The app copies your browser's YouTube session into your desktop keyring, so the browser can stay closed afterwards. It has the same access to YouTube as that browser session. Private windows and browser containers aren't supported. Start with `--guest` to skip the saved account.
 
-## Connect your account
-
-Connection requires Python 3.10+, xdg-utils, libsecret's `secret-tool` and a running Secret Service keyring.
-
-1. Choose **Sign in**, or launch with `--connect`.
-2. Sign in to YouTube Music in your default browser. Zen, Firefox, Chromium, Google Chrome and Brave are supported, including Omarchy's default-browser launcher.
-3. Return to Music. Your account is verified and saved automatically.
-
-The app reads YouTube cookies from your default browser profile and saves the confirmed session in your desktop keyring. For Chromium, Chrome and Brave that is the profile you used last, and the cookies are decrypted with the browser's own Safe Storage key from the same keyring. The app uses your browser session rather than OAuth, so it has that session's YouTube access. It creates no persistent plaintext cookie export. Private windows, containers and partitioned sessions are unsupported.
-
-Clicked songs first use a native, cookie-free player request that skips the watch page and runs independently of yt-dlp. A background lookup cannot hold up that request. The next song is prepared in the background; when signed in with High audio quality, that preparation uses your account to keep Premium audio. Video above 1080p also uses yt-dlp. If the native request fails or needs JavaScript to decode a stream URL, the same play falls back to yt-dlp. If a stream fails to open, the automatic retry uses yt-dlp.
-
-Account playback uses an extractor reviewed against one yt-dlp release, pinned in `src/ytdlp_account.py` (currently **2026.08.19**). The release installer supplies this reviewed version, preferring its private copy over system yt-dlp. With any other yt-dlp version, the full extractor plays as a guest instead. A weekly CI job tests each new yt-dlp release so the pin can be bumped promptly.
-
-Once connected, the browser can stay closed. The app restores your saved account and can renew rejected sessions from its confirmed profile. Google can still revoke a sign-in. Older saved connections need one reconnect to enable renewal.
-
-Your profile menu shows the connected name and handle. Use **Switch account** to connect another account. Closing the sign-in dialog cancels an unfinished connection.
-
-Use `--guest` to start without restoring the saved account. Guest likes and saved collections stay local and are not uploaded when you connect.
-
-### Staying in sync
-
-- Songs you play show up in your YouTube Music history, and listening time is reported the way the web player reports it.
-- Podcast episodes and long videos resume where you left off, including progress saved by YouTube Music. After a restart, Play also continues the song you were on from where you closed the app. Stopping playback forgets that spot. The position is saved when you quit or change songs, so a crash or a forced kill loses it.
-- Likes and dislikes apply immediately and revert if YouTube Music rejects them. Playlist edits wait for confirmation.
-- When a song ends or you press Next, the queue skips songs it knows you disliked: songs you disliked while the app was open, and songs a page listed with your dislike. Disliking the playing song skips it too, and clicking a disliked song plays it anyway. Ratings aren't saved locally, so after a restart the queue only knows dislikes it sees again.
-- Pages you visited in the last three minutes open instantly; older ones show right away and refresh in place. After any edit you make, the next visit loads fresh, and History refreshes after each play. Back restores your scroll position and loaded rows.
-- When you return to the window after three minutes or more, the current page picks up changes made elsewhere in YouTube Music's order, without losing your scroll position. Ctrl R reloads the page right away.
-
-## Controls
+## Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
 | / or Ctrl K | Search |
-| Ctrl R | Reload the current page |
-| Alt Left | Go back |
 | Space | Play or pause |
 | Ctrl Right / Ctrl Left | Next / previous song |
 | Right / Left | Seek 5 seconds |
-| Up / Down | Adjust volume |
+| Up / Down | Volume |
 | L | Like the current song |
 | Q | Open or close the player page |
-| F | Toggle video fullscreen |
-| Escape | Dismiss a dialog or leave fullscreen, the player page or search |
-| ? | Keyboard help |
+| F | Video fullscreen |
+| Ctrl R | Reload the page |
+| Alt Left | Back |
+| Escape | Close a dialog, fullscreen, the player page or search |
+| ? | All shortcuts |
 | Ctrl Q | Quit |
 
-Tab and Shift+Tab move through every control, arrow keys move through open menus, and right-clicking a song, card or collection opens its menu.
+Right-click a song, card or collection for its menu.
 
-Settings includes playback speed, audio quality and video resolution limits. The song menu has mix, queue, playlist, sharing and credits actions when available, in the same order as YouTube Music.
+## Contributing
 
-## Development
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building from source, tests and running a development build next to your installed app. Report security issues privately as described in [SECURITY.md](SECURITY.md).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, validation, integration tests and running an isolated instance next to your installed app. To sample CPU and memory for a running release build, use `bin/profile APP_PID 30`.
+## License
 
-Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR`. Normal shutdown, SIGTERM and SIGINT remove it. Repeating the same signal forces termination if cleanup hangs.
-
-Local preferences, queue and guest library data live in `$XDG_DATA_HOME/yt-music-gpui/library.json`, defaulting to `~/.local/share/yt-music-gpui/library.json`.
-
-MIT licensed. Third-party attributions and licenses are listed in [NOTICE](NOTICE).
+MIT. Third-party attributions are in [NOTICE](NOTICE).
