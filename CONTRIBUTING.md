@@ -18,6 +18,7 @@ On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 bin/test
+bin/test-install
 ```
 
 CI runs the same checks on every pull request. `bin/build` and `bin/test` use two jobs unless `CARGO_BUILD_JOBS` is set.
@@ -123,3 +124,27 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with
 Keep each pull request to one change. Say what was broken or missing from a user's point of view, how you fixed it, and how you checked it in the running app. Include a screenshot or recording for UI changes.
 
 Never commit cookies, account data or keyring contents. Use synthetic values in tests, as the existing ones do.
+
+## Release
+
+Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything.
+
+1. Bump the package version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check --locked` after updating the root package entry. Merge the reviewed version change.
+2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.
+3. The Release workflow builds with `--locked`, checks the installed artifact in Ubuntu and Fedora containers, and publishes the tarball, SHA-256 checksum, `install.sh` and dependency report to a GitHub Release.
+
+Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the Release workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
+
+Download the artifact and test the installer without touching an existing installation:
+
+```sh
+home=$(mktemp -d)
+HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --archive /absolute/path/yt-music-gpui-X.Y.Z-x86_64-linux.tar.gz
+HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --check-deps
+HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --uninstall
+rm -r -- "$home"
+```
+
+Keep the matching `.tar.gz.sha256` beside the local tarball. The app and helpers still need their normal runtime libraries; the installer still downloads its pinned yt-dlp and optional Deno over HTTPS. Use the isolated desktop recipe above to test playback, with the installed binary and a muted library. Container `--version` checks do not establish working graphics, audio or sign-in on those desktops.
+
+`src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256 plus the fallback Deno version, archive SHA-256 and download size. Packaging copies them into `runtime-pins.json`; the installer has no independent version pins. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.

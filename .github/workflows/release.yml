@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  # CI can dispatch this build before the workflow exists on the default branch.
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Check release version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$REF_TYPE" == tag && "$REF_NAME" != "v$version" ]]; then
+            echo 'Tag must match the Cargo.toml version.' >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked
+      - name: Package the app and reviewed runtime pins
+        run: |
+          mkdir -p dist/stage
+          install -m755 target/release/yt-music-gpui dist/stage/
+          install -m644 packaging/yt-music-gpui.desktop packaging/yt-music-gpui.svg \
+            LICENSE* NOTICE assets/fonts/OFL.txt dist/stage/
+          python3 - <<'PY'
+          import ast, json
+          from pathlib import Path
+          source = ast.parse(Path('src/ytdlp_account.py').read_text())
+          pins = {node.targets[0].id: ast.literal_eval(node.value) for node in source.body
+                  if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)}
+          Path('dist/stage/runtime-pins.json').write_text(json.dumps({
+              'ytdlp_version': pins['REVIEWED_VERSION'], 'ytdlp_sha256': pins['REVIEWED_SHA256'],
+              'deno_version': pins['DENO_VERSION'], 'deno_sha256': pins['DENO_SHA256'],
+              'deno_size': pins['DENO_SIZE'],
+          }) + '\n')
+          PY
+          name="yt-music-gpui-$VERSION-x86_64-linux.tar.gz"
+          tar -czf "dist/$name" -C dist/stage -- $(find dist/stage -type f -printf '%f\n' | sort)
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          install -m755 install.sh dist/install.sh
+          {
+            echo 'Direct dynamic dependencies:'
+            readelf -d target/release/yt-music-gpui | grep NEEDED
+            echo 'Required glibc symbol versions (highest is the compatibility floor):'
+            readelf --dyn-syms --wide target/release/yt-music-gpui | grep -o 'GLIBC_[0-9.]*' | sort -Vu
+            echo 'ldd on Ubuntu 24.04:'
+            ldd target/release/yt-music-gpui
+          } | tee dist/dependencies.txt
+          rm -r dist/stage
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  compatibility:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu:24.04, fedora:43]
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Check binary and installer in a different distribution
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" "$DISTRO" sh -ec '
+            if command -v apt-get >/dev/null; then
+              apt-get update -qq
+              apt-get install -y --no-install-recommends ca-certificates curl python3 libmpv2 libegl1 libgles2 libwayland-egl1 libxkbcommon-x11-0 libsecret-tools xdg-utils libvulkan1
+            else
+              dnf install -y ca-certificates curl python3 mpv-libs libglvnd-egl libglvnd-gles wayland libxkbcommon-x11 libsecret xdg-utils vulkan-loader
+            fi
+            if sh /dist/install.sh --check-deps; then echo "Root must be refused"; exit 1; fi
+            useradd -m music
+            su -s /bin/sh music -c "sh /dist/install.sh --archive /dist/yt-music-gpui-*.tar.gz"
+            su -s /bin/sh music -c "sh /dist/install.sh --check-deps"
+            ldd /home/music/.local/bin/yt-music-gpui
+            su -s /bin/sh music -c "/home/music/.local/bin/yt-music-gpui --version"
+            su -s /bin/sh music -c "sh /dist/install.sh --uninstall"
+          '
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [build, compatibility]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Create the tagged GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes dist/*

@@ -27,14 +27,14 @@ jobs:
       - name: Install the latest yt-dlp
         id: yt-dlp
         run: |
-          pinned=$(grep -oP '__version__ != "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          pinned=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
           python -m pip install --quiet --upgrade yt-dlp
           latest=$(python -c 'from yt_dlp.version import __version__; print(__version__)')
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
           # Test the latest release as if the pin were already bumped.
-          sed -i "s/__version__ != \"$pinned\"/__version__ != \"$latest\"/" src/ytdlp_account.py
-          grep -qF "__version__ != \"$latest\"" src/ytdlp_account.py
+          sed -i "s/REVIEWED_VERSION = \"$pinned\"/REVIEWED_VERSION = \"$latest\"/" src/ytdlp_account.py
+          grep -qF "REVIEWED_VERSION = \"$latest\"" src/ytdlp_account.py
       - name: Test yt-dlp contracts
         env:
           YT_DLP_TEST_PYTHON: ${{ steps.python.outputs.python-path }}
