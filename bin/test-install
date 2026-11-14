@@ -88,7 +88,8 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('Upstream checksum differs', result.stderr)
 
     def test_truncated_pipe_does_no_work(self):
-        for end in [len(SCRIPT) // 2, SCRIPT.rindex('\ninstall_main')]:
+        invocation = SCRIPT.rindex('\n(install_main')
+        for end in [len(SCRIPT) // 2, *range(invocation, len(SCRIPT.rstrip()))]:
             result = subprocess.run(['sh'], input=SCRIPT[:end], text=True, env=self.env,
                                     capture_output=True, check=False)
             self.assertEqual(list(self.home.iterdir()), [])

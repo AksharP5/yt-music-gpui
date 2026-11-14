@@ -393,4 +393,4 @@ PY
     printf '%s\n' 'YouTube Music is installed. Launch it from your app launcher.'
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) printf 'For terminal use, add %s/.local/bin to PATH.\n' "$HOME" ;; esac
 }
-install_main "$@"
+(install_main "$@")
