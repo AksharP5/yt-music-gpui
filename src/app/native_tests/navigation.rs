@@ -364,6 +364,40 @@ fn stale_forward_revisit_replaces_loaded_tail_and_continuation() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn explore_pages_keep_their_titled_shelves() -> Result<()> {
+    check_cache(|view, _, cx| {
+        use crate::app::ListRow;
+        let sections = crate::app::sync::tests::response(
+            &[
+                ("Video charts", (0..4).collect()),
+                ("Top songs", (4..8).collect()),
+            ],
+            None,
+            false,
+        );
+        view.navigate(
+            Route::Browse(BrowseLink::new("FEmusic_charts", "Charts")),
+            cx,
+        );
+        reply(view, sections, cx);
+        assert!(
+            matches!(
+                view.list_rows.as_slice(),
+                [ListRow::Shelf(0), ListRow::Shelf(1)]
+            ),
+            "Charts and mood pages show each titled shelf, not one merged list"
+        );
+        view.navigate(Route::Browse(BrowseLink::new("FEmusic_more", "More")), cx);
+        reply(view, page("More", "more-tail"), cx);
+        assert!(
+            !view.grouped_rows(),
+            "A single shelf keeps the plain list or grid"
+        );
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn liking_a_song_refetches_cached_library_songs() -> Result<()> {
     check_cache(|view, window, cx| {
         let songs = Route::Library(Section::Songs);

@@ -272,8 +272,22 @@ impl Music {
         matches!(self.route, Route::Recent | Route::Library(Section::History))
     }
 
+    /// Explore pages such as Charts and moods arrive as titled shelves, shown like Home's.
+    pub(in crate::app) fn browse_sections(&self) -> bool {
+        self.page.header.is_none()
+            && matches!(self.route, Route::Browse(_))
+            && self
+                .page
+                .shelves
+                .iter()
+                .filter(|shelf| !shelf.title.is_empty())
+                .nth(1)
+                .is_some()
+    }
+
     pub(in crate::app) fn grouped_rows(&self) -> bool {
         self.page.header.is_some()
+            || self.browse_sections()
             || self.history_groups()
             || matches!(self.route, Route::Search(_))
     }

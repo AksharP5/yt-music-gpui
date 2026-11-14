@@ -617,6 +617,7 @@ impl Music {
 
     pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) {
         let sectioned = self.page.header.is_some();
+        let browse_sections = self.browse_sections();
         let search_all =
             matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
         for (index, shelf) in self.page.shelves.iter().enumerate().skip(first_shelf) {
@@ -625,14 +626,15 @@ impl Music {
                 continue;
             }
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
-            let carousel = sectioned
-                && matches!(
-                    shelf.layout,
-                    ShelfLayout::Cards
-                        | ShelfLayout::SmallCards
-                        | ShelfLayout::Videos
-                        | ShelfLayout::Episodes
-                );
+            let carousel = browse_sections
+                || sectioned
+                    && matches!(
+                        shelf.layout,
+                        ShelfLayout::Cards
+                            | ShelfLayout::SmallCards
+                            | ShelfLayout::Videos
+                            | ShelfLayout::Episodes
+                    );
             if featured {
                 self.list_rows.push(ListRow::Featured(index));
             } else if carousel {
