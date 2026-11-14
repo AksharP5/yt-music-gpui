@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 helper = {"__name__": "browser_session"}
@@ -37,6 +38,14 @@ Default=release
             (root / "installs.ini").write_text("[123]\nDefault=release\n[456]\nDefault=legacy\n")
             with self.assertRaisesRegex(ValueError, "unambiguous"):
                 helper["default_profile"]("zen.desktop", home, home / ".config")
+
+    def test_empty_or_relative_config_home_falls_back_to_home(self):
+        home = Path("/home/listener")
+        for value in ("", "relative"):
+            with unittest.mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": value}):
+                self.assertEqual(helper["config_home"](home), home / ".config")
+        with unittest.mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom"}):
+            self.assertEqual(helper["config_home"](home), Path("/custom"))
 
     def test_live_wal_read_is_limited_to_normal_youtube_store(self):
         with tempfile.TemporaryDirectory() as temporary:
