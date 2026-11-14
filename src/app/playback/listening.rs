@@ -6,6 +6,18 @@ use crate::{history::Watchtime, listening::ListeningTime};
 pub(in crate::app) struct ListeningState {
     active: Option<ActiveListening>,
     pub(super) resume_candidate: Option<(String, Instant)>,
+    /// Where the restored current song stopped before the restart, until playback starts.
+    pub(in crate::app) restored: Option<LastPosition>,
+}
+
+impl ListeningState {
+    /// Where Play should start `current`: where it stopped before the restart.
+    pub(in crate::app) fn take_restored(&mut self, current: Option<&Track>) -> Option<f64> {
+        self.restored
+            .take()
+            .filter(|last| current.is_some_and(|track| track.id == last.track_id))
+            .map(|last| last.seconds)
+    }
 }
 
 struct ActiveListening {
@@ -111,9 +123,10 @@ impl Music {
         }
     }
 
-    pub(in crate::app) fn checkpoint_listening(&mut self, completed: bool) {
+    /// Saves a changed resume position and returns whether it saved.
+    pub(in crate::app) fn checkpoint_listening(&mut self, completed: bool) -> bool {
         let Some(active) = &mut self.listening.active else {
-            return;
+            return false;
         };
         let saved = self.library.positions.set(
             &active.scope,
@@ -123,8 +136,15 @@ impl Music {
             completed,
         );
         active.checkpoint = Instant::now();
-        if saved && let Some(store) = &self.store {
-            store.save_positions(&self.library.positions);
+        if saved {
+            self.save_positions();
+        }
+        saved
+    }
+
+    fn save_positions(&self) {
+        if let Some(store) = &self.store {
+            store.save_positions(&self.library);
         }
     }
 
@@ -166,7 +186,16 @@ impl Music {
     }
 
     pub(in crate::app) fn finish_listening(&mut self, completed: bool) {
-        self.checkpoint_listening(completed);
+        if let Some(active) = &self.listening.active {
+            // Saved only when listening ends, including on quit, to keep periodic writes rare.
+            self.library.last_position = (!completed).then(|| LastPosition {
+                track_id: active.track.id.clone(),
+                seconds: active.position,
+            });
+            if !self.checkpoint_listening(completed) {
+                self.save_positions();
+            }
+        }
         self.report_listening(true);
         self.listening.active = None;
         self.listening.resume_candidate = None;

@@ -9,7 +9,7 @@ use crate::{
         Rating, Shelf, ShelfLayout, Track, WatchTarget,
     },
     country_picker::{CountryPicker, CountryPickerEvent},
-    library::{Library, LibraryWriter, Queue, Repeat, Store},
+    library::{LastPosition, Library, LibraryWriter, Queue, Repeat, Store},
     mpris,
     player::{
         AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions,

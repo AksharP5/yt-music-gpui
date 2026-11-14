@@ -25,6 +25,12 @@ impl Music {
             Ok((s, l)) => (Some(s), l, None),
             Err(e) => (None, Library::new(), Some(format!("{e:#}"))),
         };
+        let current = library.queue.current();
+        let restored = library.last_position.clone().filter(|last| {
+            last.seconds > 0. && current.is_some_and(|track| track.id == last.track_id)
+        });
+        let duration = current.and_then(|track| track.duration).unwrap_or(0) as f64;
+        let position = restored.as_ref().map_or(0., |last| last.seconds);
         let store = store.map(|store| {
             let (writer, errors) = LibraryWriter::new(store);
             cx.spawn_in(window, async move |view, cx| {
@@ -354,9 +360,9 @@ impl Music {
             history_track: None,
             listening: playback::listening::ListeningState::default(),
             playback: Playback::Stopped,
-            position: 0.,
+            position,
             pending_seek: None,
-            duration: 0.,
+            duration,
             player_page: PlayerPage::start(window, cx),
             overlay: (startup == Startup::Connect).then_some(Overlay::SignIn),
             settings_section: SettingsSection::General,
@@ -373,6 +379,7 @@ impl Music {
             drag_position: None,
             _subscriptions: vec![subscription, activation, focus_lost],
         };
+        view.listening.restored = restored;
         view.notify_playback(cx);
         window.focus(&view.focus, cx);
         if startup != Startup::Restore || !auth::ACCOUNT_LOGIN_ENABLED {

@@ -247,6 +247,7 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         self.finish_listening(false);
+        self.listening.restored = None;
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -620,10 +621,14 @@ impl Music {
             if let Some(intent) = resume {
                 intent.toggle_pause();
             } else {
+                let position = self
+                    .listening
+                    .take_restored(self.library.queue.current())
+                    .unwrap_or(0.);
                 *resume = self.library.queue.current().map(|track| {
                     PlaybackIntent::Track(PlaybackResume {
                         video_id: track.id.clone(),
-                        position: 0.,
+                        position,
                         paused: false,
                         mode: WatchMode::Details,
                         watch: track.details.watch.clone(),
@@ -685,7 +690,10 @@ impl Music {
                 self.library.queue.select(0);
             }
             self.player_open |= self.library.video;
-            self.play_current(cx);
+            match self.listening.take_restored(self.library.queue.current()) {
+                Some(start) => self.play_current_at(start, false, WatchMode::Details, cx),
+                None => self.play_current(cx),
+            }
         }
     }
 

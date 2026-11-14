@@ -495,3 +495,27 @@ fn displayed_durations_round_to_the_nearest_second() {
         assert_eq!(super::clock(seconds), expected);
     }
 }
+
+#[test]
+fn the_restored_position_applies_once_and_only_to_its_song() {
+    let track = |id: &str| Track {
+        id: id.into(),
+        title: id.into(),
+        artist: String::new(),
+        album: None,
+        duration: Some(200),
+        thumbnail: None,
+        details: Default::default(),
+    };
+    let restored = || crate::library::LastPosition {
+        track_id: "stopped".into(),
+        seconds: 42.,
+    };
+    let mut listening = super::playback::listening::ListeningState::default();
+    listening.restored = Some(restored());
+    assert_eq!(listening.take_restored(Some(&track("other"))), None);
+    assert_eq!(listening.take_restored(Some(&track("stopped"))), None);
+    listening.restored = Some(restored());
+    assert_eq!(listening.take_restored(Some(&track("stopped"))), Some(42.));
+    assert_eq!(listening.take_restored(Some(&track("stopped"))), None);
+}
