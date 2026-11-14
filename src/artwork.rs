@@ -230,9 +230,7 @@ fn load(
 }
 
 fn cache_directory() -> Option<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    crate::library::user_directory("XDG_CACHE_HOME", ".cache")
         .map(|base| base.join("yt-music-gpui/artwork"))
 }
 

@@ -276,12 +276,18 @@ def youtube_cookies(browser, profile, snapshot):
     return read(snapshot_database(database, Path(snapshot)), mode="rw")
 
 
+def config_home(home):
+    # The XDG spec says to ignore empty or relative values.
+    config = Path(os.environ.get("XDG_CONFIG_HOME", ""))
+    return config if config.is_absolute() else home / ".config"
+
+
 def main():
     try:
         mode, *arguments = sys.argv[1:]
         if mode == "profile":
             home = Path.home()
-            result = default_profile(*arguments, home, Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")))
+            result = default_profile(*arguments, home, config_home(home))
         elif mode == "cookies":
             result = youtube_cookies(*arguments)
         else:
