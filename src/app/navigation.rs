@@ -617,6 +617,7 @@ impl Music {
 
     pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) {
         let sectioned = self.page.header.is_some();
+        let browse_sections = self.browse_sections();
         let search_all =
             matches!(&self.route, Route::Search(search) if search.filter == SearchFilter::All);
         for (index, shelf) in self.page.shelves.iter().enumerate().skip(first_shelf) {
@@ -625,14 +626,15 @@ impl Music {
                 continue;
             }
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
-            let carousel = sectioned
-                && matches!(
-                    shelf.layout,
-                    ShelfLayout::Cards
-                        | ShelfLayout::SmallCards
-                        | ShelfLayout::Videos
-                        | ShelfLayout::Episodes
-                );
+            let carousel = (browse_sections && !shelf.title.is_empty())
+                || sectioned
+                    && matches!(
+                        shelf.layout,
+                        ShelfLayout::Cards
+                            | ShelfLayout::SmallCards
+                            | ShelfLayout::Videos
+                            | ShelfLayout::Episodes
+                    );
             if featured {
                 self.list_rows.push(ListRow::Featured(index));
             } else if carousel {
@@ -909,16 +911,18 @@ impl Music {
                     self.sync.page_coverage.continued = true;
                     let first_shelf = self.page.shelves.len();
                     let previous_rows = self.list_rows.len();
+                    let was_grouped = self.grouped_rows();
                     self.page.continuation = page.continuation;
                     self.page.shelves.extend(page.shelves);
-                    if self.history_groups() {
+                    // A second titled shelf can turn a plain list into sections.
+                    if self.history_groups() || self.grouped_rows() != was_grouped {
                         self.rebuild_rows();
                     } else {
                         self.append_rows(first_shelf);
-                    }
-                    if self.grouped_rows() && !self.history_groups() {
-                        self.detail_list
-                            .append_rows(self.list_rows.len() - previous_rows);
+                        if was_grouped {
+                            self.detail_list
+                                .append_rows(self.list_rows.len() - previous_rows);
+                        }
                     }
                 } else {
                     self.sync.page_coverage = sync::PageCoverage {
