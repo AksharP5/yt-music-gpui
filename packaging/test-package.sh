@@ -24,15 +24,20 @@ printf 'Installed:\n%s\n' "$files"
 if ldd /usr/bin/yt-music-gpui | grep 'not found'; then exit 1; fi
 # Check as an ordinary user, the way the app runs.
 version() {
-    setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp yt-music-gpui --version | tee /tmp/version
+    python3 -I -c '
+import os
+os.setgroups([]); os.setgid(65534); os.setuid(65534)
+os.environ["HOME"] = "/tmp"
+os.execvp("yt-music-gpui", ["yt-music-gpui", "--version"])
+' | tee /tmp/version
 }
 version
 grep -qx 'yt-dlp: /usr/lib/yt-music-gpui/yt-dlp' /tmp/version
 grep -qx 'deno: /usr/lib/yt-music-gpui/deno' /tmp/version
 chmod o+w /usr/lib/yt-music-gpui
 version
-grep -qx 'yt-dlp: not found' /tmp/version
-grep -qx 'deno: from PATH' /tmp/version
+# Distribution packages may pull in their own yt-dlp; the bundled copies must not be used.
+if grep -q /usr/lib/yt-music-gpui /tmp/version; then exit 1; fi
 chmod o-w /usr/lib/yt-music-gpui
 
 [ "$(/usr/lib/yt-music-gpui/yt-dlp --version)" = "$YTDLP_VERSION" ]
