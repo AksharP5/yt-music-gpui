@@ -129,7 +129,7 @@ Never commit cookies, account data or keyring contents. Use synthetic values in 
 
 Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything.
 
-1. Bump the package version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
+1. Set the release version in `Cargo.toml`, bumping it for subsequent releases, and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
 2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.
 3. The Release workflow builds with `--locked`, checks the installed artifact in Ubuntu and Fedora containers, and publishes the tarball, SHA-256 checksum, `install.sh` and dependency report to a GitHub Release.
 

@@ -223,7 +223,12 @@ try:
         runtimes = [DenoJsRuntime(), NodeJsRuntime(), BunJsRuntime(), QuickJsRuntime()]
         try:
             read_file(private / 'deno')
-            runtimes.insert(0, DenoJsRuntime(str(private / 'deno')))
+            installed = DenoJsRuntime(str(private / 'deno'))
+            wanted = args[1] if len(args) > 1 else ''
+            if wanted and (not installed.info or installed.info.version != wanted):
+                print("The private Deno runtime needs this release's pinned update.")
+                sys.exit(1)
+            runtimes.insert(0, installed)
         except (OSError, ValueError):
             pass
         for runtime in runtimes:
@@ -232,6 +237,7 @@ try:
                 print(f'Using {info.name} {info.version}')
                 break
         else:
+            print('No supported JavaScript runtime found.')
             sys.exit(1)
     elif action == 'libraries':
         for name in ['mpv.so.2', 'EGL.so.1', 'GLESv2.so.2', 'X11.so.6', 'Xext.so.6',
@@ -372,12 +378,12 @@ PY
         helper libraries > "$work/missing"
         [ ! -s "$work/missing" ] && command -v xdg-open >/dev/null && command -v secret-tool >/dev/null || exit 1
     fi
-    if ! helper runtime "$runtime_zip"; then
+    if ! helper runtime "$runtime_zip" "${deno_version:-}"; then
         if [ "$action" = check ]; then
             printf '%s\n' 'No supported JavaScript runtime. Re-run the installer to add private Deno.' >&2
             exit 1
         fi
-        printf 'No supported JavaScript runtime found. Installing private Deno %s (%s bytes download).\n' "$deno_version" "$deno_size"
+        printf 'Installing private Deno %s (%s bytes download).\n' "$deno_version" "$deno_size"
         download "https://github.com/denoland/deno/releases/download/v$deno_version/deno-x86_64-unknown-linux-gnu.zip" "$work/deno.zip"
         helper verify "$work/deno.zip" "$deno_hash" - deno
         helper deno "$work/deno.zip" "$work/deno"
