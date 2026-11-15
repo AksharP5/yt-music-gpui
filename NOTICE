@@ -21,8 +21,8 @@ Only its intrinsic size is changed to 71 by 24 pixels.
 Icons in assets/icons from Google Material Icons, Copyright Google LLC,
 licensed under Apache License 2.0 (LICENSE-APACHE).
 Source: https://github.com/google/material-design-icons
-  Unmodified: album, description, link, logout, playlist-add, radio,
-  switch-account, and play-next (Material "playlist_play").
+  Unmodified: album, description, link, playlist-add, radio and play-next
+  (Material "playlist_play").
   Adapted: menu, person, thumb-up and thumb-up-filled (Material "thumb_up"),
   and thumb-down (thumb-up rotated).
 
@@ -41,7 +41,7 @@ licensed under the MIT License (LICENSE-FEATHER).
 Source: https://github.com/feathericons/feather
   heart and heart-filled ("heart"), music, fullscreen ("maximize"),
   exit-fullscreen ("minimize"), next ("skip-forward"), previous
-  ("skip-back"), home, help ("help-circle"), more ("more-vertical"),
+  ("skip-back"), home, more ("more-vertical"),
   mute ("volume-x") and volume ("volume-2").
 
 assets/icons/repeat.svg is adapted from Lucide's "repeat", Copyright Lucide
@@ -75,6 +75,9 @@ Source: https://github.com/google/material-design-icons
   thumb-down-filled ("thumb_down"). new-releases combines the "new_releases"
   badge outline with a scaled "music_note".
   These entries replace any earlier source listed above for the same files.
+  Also from Material Symbols (Rounded), unmodified at weight 400 and their
+  original viewBox: settings ("settings"), help ("help"), logout ("logout")
+  and switch-account ("switch_account").
 
 The rounded voting glyphs in assets/icons/thumb-up.svg, thumb-down.svg and
 thumb-up-filled.svg are from the icons rendered by https://music.youtube.com/.
