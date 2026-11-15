@@ -1,4 +1,8 @@
-use crate::auth::{PlaybackCredentials, private_runtime, sealed_file};
+use crate::auth::{PlaybackCredentials, private_runtime};
+use crate::os::{
+    Waker, exit_fd, exit_with_parent, kill_group, private_file, sealed_file, set_nonblocking,
+    wait_readable,
+};
 use crate::video::NativeVideo;
 use anyhow::{Context, Result, bail, ensure};
 use gpui::{AnyWindowHandle, App, BackgroundExecutor, Bounds, Pixels, Subscription, Window};
@@ -9,8 +13,8 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File},
-    io::{self, ErrorKind, Read, Seek, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    io::{ErrorKind, Read, Seek, Write},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
@@ -294,16 +298,11 @@ enum PlayerCommand {
 #[derive(Clone)]
 struct CommandSender {
     sender: Sender<PlayerCommand>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Waker>,
 }
 
 fn command_channel() -> Result<(CommandSender, Receiver<PlayerCommand>)> {
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error())
-            .context("Could not create the player command wakeup");
-    }
-    let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    let wake = Arc::new(Waker::new().context("Could not create the player command wakeup")?);
     let (sender, receiver) = mpsc::channel();
     Ok((CommandSender { sender, wake }, receiver))
 }
@@ -311,97 +310,27 @@ fn command_channel() -> Result<(CommandSender, Receiver<PlayerCommand>)> {
 impl CommandSender {
     fn send(&self, command: PlayerCommand) -> Result<(), mpsc::SendError<PlayerCommand>> {
         self.sender.send(command)?;
-        signal_player(&self.wake);
+        self.wake.wake();
         Ok(())
-    }
-}
-
-fn signal_player(wake: &OwnedFd) {
-    let increment = 1_u64.to_ne_bytes();
-    loop {
-        let result =
-            unsafe { libc::write(wake.as_raw_fd(), increment.as_ptr().cast(), increment.len()) };
-        if result == increment.len() as isize {
-            return;
-        }
-        let error = io::Error::last_os_error();
-        match error.kind() {
-            ErrorKind::Interrupted => continue,
-            // A saturated eventfd is already readable, so no wakeup is lost.
-            ErrorKind::WouldBlock => return,
-            _ => unreachable!("The owned player wakeup must remain writable: {error}"),
-        }
     }
 }
 
 fn wait_for_player_input(
     socket: &UnixStream,
-    wake: &OwnedFd,
-    resolver_fd: Option<c_int>,
+    wake: &Waker,
+    resolver: Option<BorrowedFd>,
     deadline: Option<Instant>,
 ) -> Result<bool> {
-    let mut descriptors = [
-        libc::pollfd {
-            fd: socket.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: resolver_fd.unwrap_or(-1),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        let timeout = deadline.map(|deadline| {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            libc::timespec {
-                tv_sec: remaining.as_secs() as _,
-                tv_nsec: remaining.subsec_nanos() as _,
-            }
-        });
-        let result = unsafe {
-            libc::ppoll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as _,
-                timeout.as_ref().map_or(std::ptr::null(), |timeout| timeout),
-                std::ptr::null(),
-            )
-        };
-        if result >= 0 {
-            break;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != ErrorKind::Interrupted {
-            return Err(error).context("Could not wait for the player");
-        }
+    let [socket_ready, woken, _] = wait_readable(
+        [Some(socket.as_fd()), Some(wake.as_fd()), resolver],
+        deadline,
+    )
+    .context("Could not wait for the player")?;
+    if woken {
+        wake.drain()
+            .context("Could not read the player command wakeup")?;
     }
-    ensure!(
-        descriptors[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0,
-        "The player command wakeup stopped"
-    );
-    if descriptors[1].revents & libc::POLLIN != 0 {
-        let mut count = [0_u8; 8];
-        loop {
-            let result =
-                unsafe { libc::read(wake.as_raw_fd(), count.as_mut_ptr().cast(), count.len()) };
-            if result == count.len() as isize {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                ErrorKind::Interrupted => continue,
-                ErrorKind::WouldBlock => break,
-                _ => return Err(error).context("Could not read the player command wakeup"),
-            }
-        }
-    }
-    Ok(descriptors[0].revents != 0)
+    Ok(socket_ready)
 }
 
 pub struct Player {
@@ -998,10 +927,7 @@ fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOptions) -> V
 
 fn writable_playback_cookies(mut source: File) -> Result<File> {
     // yt-dlp rewrites its cookie jar on exit, so give it a disposable RAM copy.
-    let fd = unsafe { libc::memfd_create(c"yt-music-playback".as_ptr(), libc::MFD_CLOEXEC) };
-    ensure!(fd >= 0, "Could not create private playback credentials");
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut file = private_file()?;
     source.rewind()?;
     std::io::copy(&mut source, &mut file)?;
     Ok(file)
@@ -1382,24 +1308,6 @@ fn python_interpreter(ytdlp: &Path) -> Result<Command> {
     Ok(command)
 }
 
-/// An extractor holds account cookies in memory. Its own process group keeps it
-/// out of terminal signals, so ask the kernel to kill it if the player thread dies
-/// without running its destructors (for example when the app is killed).
-fn exit_with_parent(command: &mut Command) {
-    let parent = std::process::id() as libc::pid_t;
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent
-            {
-                return Err(io::Error::other(
-                    "The player exited before its extractor started",
-                ));
-            }
-            Ok(())
-        });
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ResolverResponse {
@@ -1438,7 +1346,9 @@ impl WarmResolver {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(0);
-        exit_with_parent(&mut command);
+        // An extractor holds account cookies in memory. Its own process group keeps
+        // it out of terminal signals, so it must not outlive the player thread.
+        exit_with_parent(&mut command, libc::SIGKILL);
         let mut child = command.spawn()?;
         let resolver = Self {
             input: child.stdin.take().unwrap(),
@@ -1449,12 +1359,8 @@ impl WarmResolver {
             started: Instant::now(),
             _cookies: cookies,
         };
-        let fd = resolver.output.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        ensure!(
-            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
-            "Could not read resolver output asynchronously"
-        );
+        set_nonblocking(resolver.output.as_fd())
+            .context("Could not read resolver output asynchronously")?;
         Ok(resolver)
     }
 
@@ -1498,14 +1404,14 @@ impl WarmResolver {
 impl Drop for WarmResolver {
     fn drop(&mut self) {
         // The group can still contain a JS runtime after Python has exited.
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        kill_group(&self.child);
         let _ = self.child.wait();
     }
 }
 
 struct NativeResolver {
     lookup: native::Lookup,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Waker>,
     sender: Sender<(u64, Result<ResolvedStream>)>,
     receiver: Receiver<(u64, Result<ResolvedStream>)>,
     target: Option<PreparedTarget>,
@@ -1514,7 +1420,7 @@ struct NativeResolver {
 }
 
 impl NativeResolver {
-    fn new(lookup: native::Lookup, wake: Arc<OwnedFd>) -> Self {
+    fn new(lookup: native::Lookup, wake: Arc<Waker>) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
             lookup,
@@ -1561,7 +1467,7 @@ impl NativeResolver {
                     )
                 })();
                 if sender.send((generation, result)).is_ok() {
-                    signal_player(&wake);
+                    wake.wake();
                 }
             })?;
         self.started = Instant::now();
@@ -1613,11 +1519,11 @@ impl StreamResolver {
         }
     }
 
-    fn fd(&self) -> Option<c_int> {
+    fn fd(&self) -> Option<BorrowedFd<'_>> {
         self.warm
             .as_ref()
-            .map(|warm| warm.output.as_raw_fd())
-            .or_else(|| self.one_shot.as_ref().map(|job| job.exited.as_raw_fd()))
+            .map(|warm| warm.output.as_fd())
+            .or_else(|| self.one_shot.as_ref().map(|job| job.exited.as_fd()))
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -1858,7 +1764,7 @@ impl StreamPreparation {
         credentials: Option<&ExtractorCredentials>,
     ) -> Result<Self> {
         // Keep signed URLs and any extractor output in anonymous RAM, never disk.
-        let output = writable_playback_cookies(sealed_file(b"")?)?;
+        let output = private_file()?;
         let mut command = Command::new(ytdlp);
         let cookies = extractor_arguments(&mut command, credentials)?;
         command
@@ -1868,21 +1774,22 @@ impl StreamPreparation {
             .stdout(output.try_clone()?)
             .stderr(Stdio::null());
         command.process_group(0).arg(&target.key.url);
-        exit_with_parent(&mut command);
+        exit_with_parent(&mut command, libc::SIGKILL);
         let mut child = command.spawn()?;
         // stdout is a memfd, so watch process exit instead of polling try_wait.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.wait();
-            return Err(error).context("Could not watch the stream extractor");
-        }
+        let exited = match exit_fd(&child) {
+            Ok(exited) => exited,
+            Err(error) => {
+                kill_group(&child);
+                let _ = child.wait();
+                return Err(error).context("Could not watch the stream extractor");
+            }
+        };
         Ok(Self {
             target,
             child,
             output,
-            exited: unsafe { OwnedFd::from_raw_fd(fd as _) },
+            exited,
             _cookies: cookies,
         })
     }
@@ -1906,7 +1813,7 @@ impl StreamPreparation {
 impl Drop for StreamPreparation {
     fn drop(&mut self) {
         // yt-dlp can start a JS runtime. Cancel its process group as well.
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        kill_group(&self.child);
         let _ = self.child.wait();
     }
 }
@@ -2003,7 +1910,7 @@ pub(crate) fn find_ytdlp() -> Result<PathBuf> {
 fn run(
     mut options: PlayerOptions,
     commands: Receiver<PlayerCommand>,
-    wake: &Arc<OwnedFd>,
+    wake: &Arc<Waker>,
     events: &async_channel::Sender<PlayerEvent>,
     ytdlp: &Path,
     lookup: Option<native::Lookup>,
@@ -3375,8 +3282,7 @@ YtMusicAccountIE._real_extract = extract
         output.write_all(b"{\"ready\":true}\n").unwrap();
         let start = Instant::now();
         assert!(
-            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_raw_fd()), None)
-                .unwrap()
+            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_fd()), None).unwrap()
         );
         assert!(
             start.elapsed() < Duration::from_millis(60),
@@ -4153,7 +4059,7 @@ YtMusicAccountIE._real_extract = extract
             Ok(PlayerCommand::Pause(true))
         ));
         let mut wake = libc::pollfd {
-            fd: commands.wake.as_raw_fd(),
+            fd: commands.wake.as_fd().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -5064,25 +4970,13 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
     }
 
     fn sealed_cookies(value: &str) -> File {
-        let fd = unsafe {
-            libc::memfd_create(
-                c"yt-music-synthetic".as_ptr(),
-                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        sealed_file(
+            format!(
+                "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tYT_MUSIC_SYNTHETIC\t{value}\n"
             )
-        };
-        assert!(fd >= 0);
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .unwrap();
-        write!(
-            file,
-            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tYT_MUSIC_SYNTHETIC\t{value}\n"
+            .as_bytes(),
         )
-        .unwrap();
-        let seals =
-            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) }, 0);
-        file
+        .unwrap()
     }
 
     fn synthetic_credentials(value: &str) -> PlaybackCredentials {

@@ -1,9 +1,10 @@
+use crate::os::Waker;
 use anyhow::{Context, Result, ensure};
 use gpui::{Bounds, Pixels, Window};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use std::{
     ffi::{c_ulong, c_void},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd},
     ptr::NonNull,
     sync::{Mutex, TryLockError},
 };
@@ -131,11 +132,11 @@ impl NativeVideo {
         Ok(video)
     }
 
-    pub(crate) fn start(&self, core: *mut c_void, wake: &OwnedFd) -> Result<()> {
+    pub(crate) fn start(&self, core: *mut c_void, wake: &Waker) -> Result<()> {
         let handle = self.handle.lock().unwrap();
         let handle = handle.context("The video surface was detached")?;
         ensure!(
-            unsafe { video_start(handle.as_ptr(), core, wake.as_raw_fd()) } != 0,
+            unsafe { video_start(handle.as_ptr(), core, wake.as_fd().as_raw_fd()) } != 0,
             "Could not attach the video renderer"
         );
         Ok(())

@@ -1,3 +1,4 @@
+use crate::os::{exit_with_parent, private_file, sealed_file};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::header::HeaderValue;
@@ -9,11 +10,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            process::CommandExt,
-        },
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
@@ -485,30 +483,6 @@ impl Session {
     }
 }
 
-fn private_file() -> Result<File> {
-    let fd = unsafe {
-        libc::memfd_create(
-            c"yt-music-session".as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
-    ensure!(fd >= 0, "Could not create private account storage");
-    let file = unsafe { File::from_raw_fd(fd) };
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
-}
-
-pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
-    let mut file = private_file()?;
-    file.write_all(bytes)?;
-    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-    ensure!(
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } >= 0,
-        "Could not protect playback credentials"
-    );
-    Ok(file)
-}
-
 struct AccountProcess(Child);
 
 /// An empty, non-secret file recording that the keyring holds an account.
@@ -674,18 +648,7 @@ impl AccountProcess {
         })
     }
     fn spawn(command: &mut Command) -> Result<Self> {
-        let parent = std::process::id() as libc::pid_t;
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    libc::_exit(0);
-                }
-                Ok(())
-            });
-        }
+        exit_with_parent(command, libc::SIGTERM);
         Ok(Self(
             command
                 .spawn()
