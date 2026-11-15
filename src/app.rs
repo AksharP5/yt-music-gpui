@@ -125,6 +125,7 @@ pub struct Music {
     list_id: usize,
     error: Option<String>,
     notice: Option<String>,
+    toast: Option<Toast>,
     catalog_requests: CatalogRequests,
     playback_jobs: async_channel::Sender<PlaybackJob>,
     pending_playback_jobs: async_channel::Receiver<PlaybackJob>,

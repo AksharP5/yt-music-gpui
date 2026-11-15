@@ -171,20 +171,17 @@ fn issued_queue_adoption_preserves_manual_edits_and_the_selected_occurrence() {
 }
 
 #[test]
-fn page_refresh_preserves_sidebar_and_picker_requests() {
+fn page_refresh_preserves_sidebar_requests() {
     let mut requests = CatalogRequests::new();
     requests.request(Query::Home, 0, 0, 0, None).unwrap();
     let old_page = requests.generations[CatalogTarget::Page as usize]
         .load(std::sync::atomic::Ordering::Relaxed);
     requests
-        .request(Query::PlaylistChoices, 0, 0, 0, None)
-        .unwrap();
-    requests
         .request(Query::SidebarPlaylists, 0, 0, 0, None)
         .unwrap();
     requests.request(Query::Explore, 0, 0, 0, None).unwrap();
     let pending = std::iter::from_fn(|| requests.pending.try_recv().ok()).collect::<Vec<_>>();
-    assert_eq!(pending.len(), 3);
+    assert_eq!(pending.len(), 2);
     for target in CatalogTarget::ALL {
         assert_eq!(
             pending
@@ -212,47 +209,26 @@ fn carousel_only_renders_nearby_cards_and_clamps_after_a_shorter_refresh() {
 }
 
 #[test]
-fn page_refresh_keeps_the_pending_playlist_picker_and_rejects_older_pages() {
+fn page_refresh_keeps_the_pending_sidebar_and_rejects_older_pages() {
     let mut requests = CatalogRequests::new();
     requests.request(Query::Home, 0, 0, 0, None).unwrap();
     let old_page = requests.pending.try_recv().unwrap();
     requests
-        .request(Query::PlaylistChoices, 0, 0, 0, None)
+        .request(Query::SidebarPlaylists, 0, 0, 0, None)
         .unwrap();
     requests.request(Query::Explore, 1, 0, 0, None).unwrap();
-    let picker = requests.pending.try_recv().unwrap();
+    let sidebar = requests.pending.try_recv().unwrap();
     let page = requests.pending.try_recv().unwrap();
-    assert!(matches!(picker.query, Query::PlaylistChoices));
+    assert!(matches!(sidebar.query, Query::SidebarPlaylists));
     assert!(matches!(page.query, Query::Explore));
     assert!(requests.pending.try_recv().is_err());
     assert!(!requests.finish(CatalogTarget::Page, old_page.id));
     assert!(requests.is_loading(CatalogTarget::Page));
     assert!(requests.finish(CatalogTarget::Page, page.id));
-    assert!(requests.is_loading(CatalogTarget::PlaylistPicker));
-    assert!(requests.finish(CatalogTarget::PlaylistPicker, picker.id));
+    assert!(requests.is_loading(CatalogTarget::Sidebar));
+    assert!(requests.finish(CatalogTarget::Sidebar, sidebar.id));
     assert!(!requests.is_loading(CatalogTarget::Page));
-    assert!(!requests.is_loading(CatalogTarget::PlaylistPicker));
-}
-
-#[test]
-fn opening_or_closing_a_picker_does_not_cancel_navigation() {
-    let mut requests = CatalogRequests::new();
-    requests.request(Query::Home, 0, 0, 0, None).unwrap();
-    requests
-        .request(Query::PlaylistChoices, 0, 0, 0, None)
-        .unwrap();
-    requests
-        .request(Query::PlaylistChoices, 0, 0, 0, None)
-        .unwrap();
-    let page = requests.pending.try_recv().unwrap();
-    let picker = requests.pending.try_recv().unwrap();
-    assert!(matches!(page.query, Query::Home));
-    assert!(matches!(picker.query, Query::PlaylistChoices));
-    assert!(requests.pending.try_recv().is_err());
-    requests.cancel(CatalogTarget::PlaylistPicker);
-    assert!(!requests.finish(CatalogTarget::PlaylistPicker, picker.id));
-    assert!(requests.is_loading(CatalogTarget::Page));
-    assert!(requests.finish(CatalogTarget::Page, page.id));
+    assert!(!requests.is_loading(CatalogTarget::Sidebar));
 }
 
 #[test]
