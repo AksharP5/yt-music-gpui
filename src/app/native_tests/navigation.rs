@@ -1301,3 +1301,132 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn clicking_a_queued_row_plays_it_and_dragging_reorders() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+    check_cache_window(async |window, cx| {
+        let ids = window
+            .update(cx, |view, _, cx| {
+                view.account = None;
+                view.player = Some(
+                    crate::player::Player::new(crate::player::PlayerOptions {
+                        volume: 0.,
+                        audio_output: Some("null".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+                view.library
+                    .queue
+                    .replace(view.page.tracks()[..6].to_vec(), 0);
+                view.player_open = true;
+                cx.notify();
+                view.library
+                    .queue
+                    .tracks
+                    .iter()
+                    .map(|track| track.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let queue = window
+            .update(cx, |view, _, _| view.player_page.queue_bounds.get())
+            .unwrap();
+        // A 57 px row whose 32 px artwork starts 8 px in, followed by the title.
+        let row = |index: usize, x: f32| {
+            point(
+                queue.left() + px(x),
+                queue.top() + px(57. * index as f32 + 28.),
+            )
+        };
+        let down = |position| {
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            })
+        };
+        let up = |position| {
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            })
+        };
+        let hover = |position, pressed_button| {
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button,
+                modifiers: Default::default(),
+            })
+        };
+        let order = |view: &Music| {
+            view.library
+                .queue
+                .tracks
+                .iter()
+                .map(|track| track.id.clone())
+                .collect::<Vec<_>>()
+        };
+        for (index, x) in [(2, 24.), (4, 80.)] {
+            let position = row(index, x);
+            for event in [hover(position, None), down(position), up(position)] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(event, cx)
+                })
+                .unwrap();
+                wait_for_presented_frame(window, cx).await;
+            }
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(
+                        view.library.queue.index,
+                        Some(index),
+                        "Clicking row {index} at x={x} must select it"
+                    );
+                    assert!(
+                        view.active_id.is_some() && view.playback != crate::app::Playback::Stopped,
+                        "Clicking row {index} at x={x} must start playing it"
+                    );
+                    assert_eq!(order(view), ids, "A click must not reorder the queue");
+                })
+                .unwrap();
+        }
+        let (start, end) = (row(1, 24.), row(3, 24.));
+        let held = Some(MouseButton::Left);
+        for event in [
+            hover(start, None),
+            down(start),
+            hover(row(2, 24.), held),
+            hover(end, held),
+            up(end),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        }
+        window
+            .update(cx, |view, _, _| {
+                let dropped = [0, 2, 3, 1, 4, 5].map(|index| ids[index].clone());
+                assert_eq!(
+                    order(view),
+                    dropped,
+                    "Dragging row 1 onto row 3 must reorder the queue"
+                );
+                assert_eq!(
+                    view.library.queue.index,
+                    Some(4),
+                    "A drag must not change the playing song"
+                );
+            })
+            .unwrap();
+    })
+}

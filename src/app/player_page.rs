@@ -54,6 +54,8 @@ pub(in crate::app) struct PlayerPage {
     pub(in crate::app) hovered_row: Option<usize>,
     /// The pointer while reordering Up next, kept for edge auto-scroll between moves.
     pub(in crate::app) drag_pointer: Point<Pixels>,
+    /// Where a queue row was pressed, until the pointer moves far enough to drag it.
+    pub(in crate::app) press: Option<Point<Pixels>>,
     pub(in crate::app) autoscrolling: bool,
     pub(in crate::app) video_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
@@ -97,6 +99,7 @@ impl PlayerPage {
             reorder: None,
             hovered_row: None,
             drag_pointer: Point::default(),
+            press: None,
             autoscrolling: false,
             video_bounds: Rc::new(Cell::new(None)),
         }

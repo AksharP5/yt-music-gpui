@@ -268,6 +268,7 @@ impl Music {
                             to: index,
                         });
                         view.player_page.drag_pointer = event.position;
+                        view.player_page.press = Some(event.position);
                         view.drag = Some(Drag::Queue);
                         cx.notify();
                     }),
@@ -310,15 +311,17 @@ impl Music {
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(move |view, _, _, cx| {
-            if view.library.queue.index == Some(index) {
-                view.toggle_play(cx);
-            } else {
-                view.library.queue.select(index);
-                view.play_current(cx);
-            }
-        }))
+        .on_click(cx.listener(move |view, _, _, cx| view.play_queue_row(index, cx)))
         .into_any_element()
+    }
+
+    fn play_queue_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.library.queue.index == Some(index) {
+            self.toggle_play(cx);
+        } else {
+            self.library.queue.select(index);
+            self.play_current(cx);
+        }
     }
 
     fn open_queue_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -521,6 +524,13 @@ impl Music {
         if self.player_page.reorder.is_none() {
             return;
         }
+        if let Some(press) = self.player_page.press {
+            let moved = position - press;
+            if f32::from(moved.x).hypot(f32::from(moved.y)) < 4. {
+                return;
+            }
+            self.player_page.press = None;
+        }
         self.player_page.drag_pointer = position;
         self.retarget_queue_row(cx);
         if self.queue_edge_speed() != 0. && !self.player_page.autoscrolling {
@@ -610,6 +620,11 @@ impl Music {
         let Some(Reorder { from, to }) = self.player_page.reorder.take() else {
             return;
         };
+        // The handle covers the artwork, so a press that never became a drag is a click.
+        if self.player_page.press.take().is_some() {
+            self.play_queue_row(from, cx);
+            return;
+        }
         if self.library.queue.move_track(from, to) {
             self.queue_changed(cx);
         }
