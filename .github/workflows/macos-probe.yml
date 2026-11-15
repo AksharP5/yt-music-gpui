@@ -1,0 +1,63 @@
+# TEMPORARY: macOS ground-truth probe for PR #72. Removed before merge.
+name: macOS probe
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: brew install yt-dlp deno
+      - run: cargo build --locked
+      - name: Player integration tests
+        continue-on-error: true
+        run: >-
+          bin/test -- --ignored --exact --test-threads=1
+          player::tests::plays_with_the_installed_libmpv
+          player::tests::headless_worker_shuts_down_after_ipc_controls
+          player::tests::paused_actor_refreshes_expired_preparation_and_writes_pending_seek
+          player::tests::pausing_an_expired_stream_asks_for_a_reload_unless_mpv_buffered_it_to_the_end
+          player::tests::local_seek_completion_handles_rapid_no_op_and_end_of_file
+          player::tests::live_credential_replacement_and_clear_reap_extractors_before_completion
+          player::tests::live_immediate_play_then_clear_credentials_does_not_leave_an_extractor
+          player::tests::live_player_drop_and_fatal_exit_revoke_extractor_credentials
+          player::tests::warm_resolver_reuses_requests_and_supersession_kills_the_process_group
+          player::tests::warm_credential_change_respawns_with_the_new_account
+      - name: Live guest playback
+        continue-on-error: true
+        run: bin/test -- --ignored --exact --nocapture player::tests::live_playback player::tests::live_prepared_next_latency
+      - name: Run the app and play a restored song
+        continue-on-error: true
+        run: |
+          set -x
+          echo "TMPDIR=$TMPDIR"; ls -ld "$TMPDIR"
+          data="$HOME/Library/Application Support/yt-music-gpui"
+          mkdir -p "$data" shots
+          cat > "$data/library.json" <<'JSON'
+          {"volume":0,"queue":{"tracks":[{"id":"csILUDfmtqM","title":"Hold Me Up (Thank You)","artist":"Khruangbin","album":null,"duration":226,"thumbnail":null}],"index":0}}
+          JSON
+          target/debug/yt-music-gpui --version
+          target/debug/yt-music-gpui --guest > shots/app.log 2>&1 &
+          pid=$!
+          sleep 25
+          screencapture -x shots/1-home.png || true
+          ls -l "$TMPDIR" | grep yt-music || true
+          osascript -e 'tell application "System Events" to keystroke space' || true
+          sleep 20
+          screencapture -x shots/2-after-space.png || true
+          osascript -e 'tell application "System Events" to keystroke "p"' || true
+          sleep 3
+          screencapture -x shots/3-player.png || true
+          kill -0 $pid && echo "app still running"
+          lsof -p $pid | grep -iE "mpv|sock|coreaudio" | head -20 || true
+          kill -TERM $pid; sleep 3; kill -0 $pid 2>/dev/null && echo "app ignored SIGTERM" || echo "app exited on SIGTERM"
+          ls -l "$TMPDIR" | grep yt-music || true
+          cat shots/app.log
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: macos-shots
+          path: shots
