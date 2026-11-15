@@ -1853,41 +1853,43 @@ fn trusted_tool(path: &Path, top: &Path, owner: u32) -> bool {
     false
 }
 
-// The release installer's copies live in HOME; .deb and .rpm packages ship
-// root-owned copies. Each install prefers its own, whose versions it pins.
+// .deb and .rpm packages ship their root-owned helpers here.
+const PACKAGE_HELPERS: &str = "/usr/lib/yt-music-gpui";
+
+// Each install prefers the helpers it shipped, whose versions it pins: the
+// release installer's copies in HOME, or the copies bundled with the running
+// executable. Builds without bundled helpers fall back to the package's.
 pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
     let installer = std::env::var_os("HOME").map(|home| {
         let home = PathBuf::from(home);
         let uid = unsafe { libc::geteuid() };
-        (
-            home.join(".local/share/yt-music-gpui").join(name),
-            home,
-            uid,
-        )
+        (home.join(".local/share/yt-music-gpui"), home, uid)
     });
-    let package = (
-        Path::new("/usr/lib/yt-music-gpui").join(name),
-        PathBuf::from("/"),
-        0,
-    );
-    let candidates = if std::env::current_exe().is_ok_and(|exe| packaged_exe(&exe)) {
-        [Some(package), installer]
-    } else {
-        [installer, Some(package)]
+    // Bundled helpers must be root-owned all the way up from /.
+    let root = |directory| Some((directory, PathBuf::from("/"), 0));
+    let candidates = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| bundled_helpers(&exe))
+    {
+        Some(bundled) => [root(bundled), installer],
+        None => [installer, root(PathBuf::from(PACKAGE_HELPERS))],
     };
     candidates
         .into_iter()
         .flatten()
+        .map(|(directory, top, owner)| (directory.join(name), top, owner))
         .find(|(path, top, owner)| trusted_tool(path, top, *owner))
         .map(|(path, ..)| path)
 }
 
-// After a package upgrade replaces the running binary, Linux reports its old
-// path with a " (deleted)" suffix.
-fn packaged_exe(exe: &Path) -> bool {
+// Where the running executable's own helpers live, by platform layout. On
+// Linux only the package binary has bundled helpers: /usr/bin/yt-music-gpui
+// uses /usr/lib/yt-music-gpui. After a package upgrade replaces the running
+// binary, Linux reports its old path with a " (deleted)" suffix.
+fn bundled_helpers(exe: &Path) -> Option<PathBuf> {
     let exe = exe.as_os_str().as_encoded_bytes();
     let exe = exe.strip_suffix(b" (deleted)").unwrap_or(exe);
-    exe == b"/usr/bin/yt-music-gpui"
+    (exe == b"/usr/bin/yt-music-gpui").then(|| PathBuf::from(PACKAGE_HELPERS))
 }
 
 pub(crate) fn find_ytdlp() -> Result<PathBuf> {
@@ -2928,13 +2930,24 @@ mod tests {
     }
 
     #[test]
-    fn packaged_binary_is_recognised_after_an_upgrade_replaces_it() {
-        assert!(packaged_exe(Path::new("/usr/bin/yt-music-gpui")));
-        assert!(packaged_exe(Path::new("/usr/bin/yt-music-gpui (deleted)")));
-        assert!(!packaged_exe(Path::new("/usr/local/bin/yt-music-gpui")));
-        assert!(!packaged_exe(Path::new(
-            "/home/me/.local/bin/yt-music-gpui"
-        )));
+    fn only_the_package_binary_uses_bundled_helpers_even_after_an_upgrade_replaces_it() {
+        let package = Some(PathBuf::from("/usr/lib/yt-music-gpui"));
+        assert_eq!(
+            bundled_helpers(Path::new("/usr/bin/yt-music-gpui")),
+            package
+        );
+        assert_eq!(
+            bundled_helpers(Path::new("/usr/bin/yt-music-gpui (deleted)")),
+            package
+        );
+        for exe in [
+            "/usr/local/bin/yt-music-gpui",
+            "/home/me/.local/bin/yt-music-gpui",
+            "/home/me/yt-music-gpui/target/release/yt-music-gpui",
+            "/usr/bin/yt-music-gpui-old",
+        ] {
+            assert_eq!(bundled_helpers(Path::new(exe)), None, "{exe}");
+        }
     }
 
     #[test]
