@@ -79,6 +79,31 @@ impl Music {
         cx.notify();
     }
 
+    pub(in crate::app) fn toggle_dislike(
+        &mut self,
+        track: &Track,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Guests are asked to sign in, as on the web.
+        if self.account.is_none() {
+            self.connect_account(window, cx);
+            return;
+        }
+        let rating = if is_disliked(&self.ratings, track) {
+            Rating::Indifferent
+        } else {
+            Rating::Dislike
+        };
+        self.mutate(
+            Mutation::RateSong {
+                track: track.clone(),
+                rating,
+            },
+            cx,
+        );
+    }
+
     pub(in crate::app) fn save_collection(
         &mut self,
         collection: Collection,

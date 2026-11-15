@@ -2,6 +2,7 @@
 use super::navigation::check_cache_window;
 use super::render::wait_for_presented_frame;
 use crate::app::{Music, Route};
+use crate::library::Repeat;
 use gpui::{AppContext, AsyncApp, Focusable, PlatformInput, WindowHandle, point, px};
 
 async fn press(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
@@ -33,6 +34,32 @@ fn searched(window: WindowHandle<Music>, cx: &mut AsyncApp) -> String {
             _ => String::new(),
         })
         .unwrap()
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn letter_shortcuts_work_outside_search_and_type_inside_it() -> anyhow::Result<()> {
+    check_cache_window(async |window, cx| {
+        let repeat = |cx: &mut AsyncApp| window.update(cx, |music, _, _| music.library.repeat);
+        window
+            .update(cx, |music, window, cx| window.focus(&music.focus, cx))
+            .unwrap();
+        assert_eq!(repeat(cx).unwrap(), Repeat::Off);
+        press(window, cx, "r").await;
+        assert_eq!(repeat(cx).unwrap(), Repeat::All);
+        press(window, cx, "r").await;
+        assert_eq!(repeat(cx).unwrap(), Repeat::One);
+
+        window
+            .update(cx, |music, window, cx| {
+                window.focus(&music.search.focus_handle(cx), cx)
+            })
+            .unwrap();
+        press(window, cx, "r").await;
+        press(window, cx, "enter").await;
+        assert_eq!(searched(window, cx), "r");
+        assert_eq!(repeat(cx).unwrap(), Repeat::One);
+    })
 }
 
 #[test]

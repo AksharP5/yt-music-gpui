@@ -62,17 +62,24 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | Key | Action |
 | --- | --- |
 | / or Ctrl K | Search |
-| Space | Play or pause |
-| Ctrl Right / Ctrl Left | Next / previous song |
-| Right / Left | Seek 5 seconds |
-| Up / Down | Volume |
-| L | Like the current song |
+| Space or ; | Play or pause |
+| J, Shift N or Ctrl → | Next song |
+| K, Shift P or Ctrl ← | Previous song |
+| → / ← | Seek 5 seconds |
+| L / H or Shift → / Shift ← | Seek 10 seconds |
+| Shift L / Shift H or Ctrl Shift → / ← | Seek 1 second |
+| ↑ / ↓ or = / - | Volume up / down |
+| M | Mute |
+| R | Repeat: off, all, one |
+| S | Shuffle upcoming songs |
+| + | Like the current song |
+| _ | Dislike the current song |
 | Q | Open or close the player page |
 | F | Video fullscreen |
 | Ctrl R | Reload the page |
-| Alt Left or the mouse Back button | Back |
+| Alt ← or mouse Back | Back |
 | Escape | Close a dialog, fullscreen, the player page or search |
-| ? | All shortcuts |
+| ? | Keyboard shortcuts |
 | Ctrl Q | Quit |
 
 Right-click a song, card or collection for its menu.

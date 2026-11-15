@@ -546,19 +546,7 @@ impl Music {
         let mut actions = Vec::new();
         let mut menu_extra = 0.;
         if matches!(kind, Overlay::Help) {
-            for (key, action) in [
-                ("/ or Ctrl K", "Search"),
-                ("Alt ← or mouse Back", "Go back"),
-                ("Space", "Play or pause"),
-                ("Ctrl → / Ctrl ←", "Next / previous song"),
-                ("→ / ←", "Seek 5 seconds"),
-                ("↑ / ↓", "Adjust volume"),
-                ("L", "Like the current song"),
-                ("Q", "Open or close the player page"),
-                ("F", "Toggle video fullscreen"),
-                ("?", "Keyboard shortcuts"),
-                ("Ctrl Q", "Quit"),
-            ] {
+            for &(key, action) in super::interaction::SHORTCUTS {
                 body = body.child(
                     div()
                         .py(px(9.))
