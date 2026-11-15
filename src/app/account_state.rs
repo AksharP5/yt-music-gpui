@@ -979,13 +979,21 @@ impl Music {
                     }
                 }
             }
-            account::Event::Persisted { session, result } => {
-                if self
+            account::Event::Persisted {
+                session,
+                result,
+                keyring_unavailable,
+            } => {
+                if !self
                     .account
                     .as_ref()
                     .is_some_and(|connection| Arc::ptr_eq(&connection.session, &session))
-                    && let Err(error) = result
                 {
+                    return;
+                }
+                if keyring_unavailable {
+                    self.overlay = Some(Overlay::NoKeyring(session));
+                } else if let Err(error) = result {
                     self.error = Some(format!(
                         "Connected for this session, but the account was not saved: {error}"
                     ));

@@ -304,6 +304,8 @@ pub enum Command {
         playback: Result<Option<async_channel::Receiver<Result<(), String>>>, String>,
     },
     Persist(Arc<Session>),
+    /// The user chose an owner-only session file because no keyring is running.
+    SaveWithoutKeyring(Arc<Session>),
     ReportPlayback {
         session: Arc<Session>,
         video_id: String,
@@ -345,6 +347,7 @@ pub enum Event {
     Persisted {
         session: Arc<Session>,
         result: Result<(), String>,
+        keyring_unavailable: bool,
     },
     PlaybackReported {
         session: Arc<Session>,
@@ -459,12 +462,17 @@ pub fn start(
                         let result = result.map_err(|error| format!("{error:#}"));
                         Event::Applied { session: expected, mutation, result, session_rejected }
                     }
+                    Command::Persist(expected) | Command::SaveWithoutKeyring(expected) if !auth::ACCOUNT_LOGIN_ENABLED => {
+                        Event::Persisted { session: expected, result: Err("Account connection is disabled until the security review is complete.".into()), keyring_unavailable: false }
+                    }
                     Command::Persist(expected) => {
-                        let result = (|| {
-                            ensure!(auth::ACCOUNT_LOGIN_ENABLED, "Account connection is disabled until the security review is complete.");
-                            persist_current_session(&session, &expected, || expected.save(), Session::disconnect)
-                        })().map_err(|error| format!("{error:#}"));
-                        Event::Persisted { session: expected, result }
+                        let result = persist_current_session(&session, &expected, || expected.save(), Session::disconnect);
+                        let keyring_unavailable = result.as_ref().is_err_and(|error| error.is::<auth::KeyringUnavailable>());
+                        Event::Persisted { session: expected, result: result.map_err(|error| format!("{error:#}")), keyring_unavailable }
+                    }
+                    Command::SaveWithoutKeyring(expected) => {
+                        let result = persist_current_session(&session, &expected, || expected.save_without_keyring(), Session::disconnect);
+                        Event::Persisted { session: expected, result: result.map_err(|error| format!("{error:#}")), keyring_unavailable: false }
                     }
                     Command::ReportPlayback { session: expected, video_id, playback_id } => {
                         playback_tracking = None;

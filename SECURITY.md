@@ -11,9 +11,10 @@ You'll get a reply within a week. Fixes land on `main`; there are no maintained 
 ## What the app does with your session
 
 - It reads YouTube cookies from your default browser profile only when you connect an account, and saves the confirmed session in your desktop keyring through Secret Service.
-- It never writes cookies to disk in plaintext. Signed-in playback hands credentials to yt-dlp through sealed in-memory files.
+- If no Secret Service is running, it saves nothing until you choose **Save without a keyring**. That stores the session unencrypted in `account-session` in the app's data folder (`$XDG_DATA_HOME/yt-music-gpui`, usually `~/.local/share/yt-music-gpui`), with mode 0600. The file is written to a new private temporary file and renamed into place, and the app refuses to read it if it is a link, belongs to another user or is readable by anyone else. Firefox, and Chromium-family browsers without a keyring, keep the same cookies unencrypted in your home folder. While the file exists, a renewed session is written back to it; once a keyring saves the account, the file is deleted.
+- Without that choice it never writes cookies to disk in plaintext. Signed-in playback hands credentials to yt-dlp through sealed in-memory files.
 - Playback runtime files (the mpv socket and the extractor script) live in a private directory under `$XDG_RUNTIME_DIR`, and core dumps are disabled so credentials can't end up in one.
-- Signing out or switching accounts removes the saved session from the keyring.
+- Signing out removes the saved session from the keyring and deletes the session file. Switching accounts replaces it.
 - An empty `account-saved` file in the app's data folder records that the keyring holds an account, so a keyring that can't be read is reported only to people who signed in. It holds no account data, and signing out removes it.
 
 In scope: anything that exposes, persists or sends the session somewhere other than YouTube; local privilege or file-permission problems; code execution through crafted service responses. Out of scope: YouTube's own services, and anything that requires an already-compromised user account on your machine.

@@ -1261,3 +1261,44 @@ fn rejected_early_read_discards_both_results_before_verification() -> Result<()>
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn missing_keyring_offers_to_save_the_session_in_a_file() -> Result<()> {
+    startup_window(Startup::Guest, async |window, commands, cx| {
+        let current = session("no-keyring");
+        window
+            .update(cx, |view, window, cx| {
+                *view.session.write().unwrap() = Some(current.clone());
+                view.account = Some(connection(current.clone()));
+                view.account_event(
+                    account::Event::Persisted {
+                        session: current.clone(),
+                        result: Err("No desktop keyring is running".into()),
+                        keyring_unavailable: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    matches!(&view.overlay, Some(Overlay::NoKeyring(offered)) if Arc::ptr_eq(offered, &current))
+                );
+                assert!(view.error.is_none());
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        for key in ["tab", "tab", "enter"] {
+            super::render::key(window, cx, key).await;
+        }
+        window
+            .update(cx, |view, _, _| {
+                let Ok(account::Command::SaveWithoutKeyring(saved)) = commands.try_recv() else {
+                    panic!("Choosing a file must save without a keyring")
+                };
+                assert!(Arc::ptr_eq(&saved, &current));
+                assert!(commands.is_empty());
+                assert!(view.overlay.is_none());
+            })
+            .unwrap();
+    })
+}

@@ -61,6 +61,24 @@ impl std::fmt::Display for RejectedSession {
 
 impl std::error::Error for RejectedSession {}
 
+/// No Secret Service answers on the session bus, so nothing can be saved in a keyring.
+#[derive(Debug)]
+pub(crate) struct KeyringUnavailable;
+
+impl std::fmt::Display for KeyringUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("No desktop keyring is running")
+    }
+}
+
+impl std::error::Error for KeyringUnavailable {}
+
+/// secret-tool names the Secret Service bus name only when it cannot reach that service.
+fn secret_service_missing(output: &Output) -> bool {
+    !output.status.success()
+        && String::from_utf8_lossy(&output.stderr).contains("org.freedesktop.secrets")
+}
+
 pub(crate) fn session_was_rejected(error: &anyhow::Error) -> bool {
     error.is::<RejectedSession>()
         || error.chain().any(|cause| {
@@ -140,7 +158,17 @@ impl Session {
             .stdin(Stdio::null());
         let output =
             AccountProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
-        Self::from_lookup(&output, saved_account_marker().as_deref())
+        Self::from_storage(&output, account_directory().as_deref())
+    }
+    /// The keyring wins; the session file is read only when the keyring has no account.
+    fn from_storage(lookup: &Output, directory: Option<&Path>) -> Result<Option<Self>> {
+        let Some(directory) = directory else {
+            return Self::from_lookup(lookup, None);
+        };
+        match Self::from_lookup(lookup, Some(&directory.join(MARKER)))? {
+            Some(session) => Ok(Some(session)),
+            None => read_session_file(&directory.join(SESSION_FILE)),
+        }
     }
     /// Without a keyring service, a lookup fails even for people who never signed in.
     /// The marker tells a failure that may hide a saved account apart from that.
@@ -148,7 +176,7 @@ impl Session {
         if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
             // The keyring has no account, for example after deleting it in a keyring app.
             if let Some(marker) = marker {
-                let _ = forget_saved_account(marker);
+                let _ = remove_if_present(marker);
             }
             return Ok(None);
         }
@@ -159,12 +187,12 @@ impl Session {
             output.status.success(),
             "Could not unlock the saved YouTube Music account"
         );
-        let session = Self::from_keyring(&output.stdout)?;
+        let session = Self::from_saved(&output.stdout)?;
         // Accounts saved before the marker existed get it on their next start.
         record_saved_account(marker);
         Ok(Some(session))
     }
-    fn from_keyring(value: &[u8]) -> Result<Self> {
+    fn from_saved(value: &[u8]) -> Result<Self> {
         let decoded;
         let value = if let Some(encoded) = value.strip_prefix(KEYRING_PREFIX) {
             decoded = STANDARD
@@ -175,11 +203,11 @@ impl Session {
             value
         };
         let session: Self = serde_json::from_slice(value)
-            .context("The keyring session is unreadable. Connect your account again.")?;
+            .context("The saved account is unreadable. Connect your account again.")?;
         session.validate()?;
         Ok(session)
     }
-    fn keyring_value(&self) -> Result<Vec<u8>> {
+    fn saved_value(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut value = KEYRING_PREFIX.to_vec();
         value.extend_from_slice(STANDARD.encode(serde_json::to_vec(self)?).as_bytes());
@@ -190,28 +218,41 @@ impl Session {
         );
         Ok(value)
     }
+    /// Saves to the keyring. Without one, it updates a session file the user already chose.
     pub(crate) fn save(&self) -> Result<()> {
-        // A RAM stdin file cannot block on a full pipe while the keyring is locked.
-        let mut input = sealed_file(&self.keyring_value()?)?;
-        input.rewind()?;
-        let mut command = Command::new("/usr/bin/secret-tool");
-        command
-            .args(["store", "--label=YouTube Music GPUI"])
-            .args(KEYRING_ATTRIBUTES)
-            .stdin(Stdio::from(input))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut process = AccountProcess::spawn(&mut command)?;
-        ensure!(
-            process.wait(Duration::from_secs(30), None)?.success(),
-            "The OS keyring could not save the account. No plaintext fallback is used."
-        );
-        record_saved_account(saved_account_marker().as_deref());
-        Ok(())
+        let value = self.saved_value()?;
+        let directory = account_directory();
+        match store_in_keyring(&value) {
+            Ok(()) => {
+                let Some(directory) = directory else {
+                    return Ok(());
+                };
+                record_saved_account(Some(&directory.join(MARKER)));
+                remove_if_present(&directory.join(SESSION_FILE)).context(
+                    "Saved the account in the keyring, but could not remove the session file",
+                )
+            }
+            Err(error)
+                if error.is::<KeyringUnavailable>()
+                    && directory.as_ref().is_some_and(|directory| {
+                        fs::symlink_metadata(directory.join(SESSION_FILE)).is_ok()
+                    }) =>
+            {
+                self.save_without_keyring()
+            }
+            Err(error) => Err(error),
+        }
+    }
+    /// Only after the user explicitly chose a file over the missing keyring.
+    pub(crate) fn save_without_keyring(&self) -> Result<()> {
+        let directory = account_directory().context("Could not find your user data directory")?;
+        write_session_file(&directory.join(SESSION_FILE), &self.saved_value()?)?;
+        // The marker means the keyring holds the account; it no longer does.
+        remove_if_present(&directory.join(MARKER)).context("Could not forget the saved account")
     }
     pub fn disconnect() -> Result<()> {
         clear_keyring(&KEYRING_ATTRIBUTES)?;
-        saved_account_marker().map_or(Ok(()), |marker| forget_saved_account(&marker))
+        account_directory().map_or(Ok(()), |directory| forget_saved(&directory))
     }
     pub(crate) fn resume_scope(&self) -> String {
         format!("{:x}", Sha1::digest(self.data_sync_id.as_bytes()))
@@ -471,9 +512,97 @@ pub(crate) fn sealed_file(bytes: &[u8]) -> Result<File> {
 struct AccountProcess(Child);
 
 /// An empty, non-secret file recording that the keyring holds an account.
-fn saved_account_marker() -> Option<PathBuf> {
+const MARKER: &str = "account-saved";
+/// The session, only when the user chose to save it without a keyring.
+const SESSION_FILE: &str = "account-session";
+
+fn account_directory() -> Option<PathBuf> {
     crate::library::user_directory("XDG_DATA_HOME", ".local/share")
-        .map(|base| base.join("yt-music-gpui/account-saved"))
+        .map(|base| base.join("yt-music-gpui"))
+}
+
+fn store_in_keyring(value: &[u8]) -> Result<()> {
+    // A RAM stdin file cannot block on a full pipe while the keyring is locked.
+    let mut input = sealed_file(value)?;
+    input.rewind()?;
+    let mut command = Command::new("/usr/bin/secret-tool");
+    command
+        .args(["store", "--label=YouTube Music GPUI"])
+        .args(KEYRING_ATTRIBUTES)
+        .stdin(Stdio::from(input));
+    let output = AccountProcess::output(&mut command, None, Duration::from_secs(30))?;
+    if secret_service_missing(&output) {
+        return Err(KeyringUnavailable.into());
+    }
+    ensure!(
+        output.status.success(),
+        "The desktop keyring could not save the account"
+    );
+    Ok(())
+}
+
+/// Replaces the file atomically, so it is never readable by others or half written.
+fn write_session_file(path: &Path, value: &[u8]) -> Result<()> {
+    let directory = path.parent().context("Missing data directory")?;
+    fs::create_dir_all(directory).context("Could not create the music data directory")?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "{} is not a regular file. Remove it and sign in again.",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Could not check the saved account file"),
+    }
+    // A new temporary file is created exclusively with 0600, then renamed over the path.
+    // rename replaces the path itself and never follows a link planted there later.
+    let mut file = tempfile::Builder::new()
+        .prefix(".account-session-")
+        .permissions(fs::Permissions::from_mode(0o600))
+        .tempfile_in(directory)
+        .context("Could not create the saved account file")?;
+    file.write_all(value)?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .context("Could not save the account file")?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn read_session_file(path: &Path) -> Result<Option<Session>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        file => file.context("Could not open the saved account file")?,
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "{} must be a file only you can read. Remove it and sign in again.",
+        path.display()
+    );
+    let mut value = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut value)?;
+    Session::from_saved(&value).map(Some)
+}
+
+/// Removes everything the app saved about the account outside the keyring.
+fn forget_saved(directory: &Path) -> Result<()> {
+    remove_if_present(&directory.join(SESSION_FILE))
+        .context("Could not remove the saved account file")?;
+    remove_if_present(&directory.join(MARKER)).context("Could not forget the saved account")
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// Best effort: a missing marker only hides a later keyring error, so it never fails sign-in.
@@ -494,22 +623,15 @@ fn record_saved_account(marker: Option<&Path>) {
         });
 }
 
-fn forget_saved_account(marker: &Path) -> Result<()> {
-    match fs::remove_file(marker) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).context("Could not forget the saved account")
-        }
-        _ => Ok(()),
-    }
-}
-
 fn clear_keyring(attributes: &[&str]) -> Result<()> {
     let mut command = Command::new("/usr/bin/secret-tool");
     command.arg("clear").args(attributes).stdin(Stdio::null());
     let output = AccountProcess::output(&mut command, None, Duration::from_secs(30))?;
     // secret-tool returns a silent status 1 when a previous cleanup removed the item.
-    let absent =
-        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
+    // Without a Secret Service there is no keyring item to remove.
+    let absent = output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && (output.stderr.is_empty() || secret_service_missing(&output));
     ensure!(
         output.status.success() || absent,
         "Could not remove the saved account from the keyring"
@@ -1190,7 +1312,7 @@ mod tests {
             clear_keyring(&attributes)?;
             let mut expected = session("SAPISID=synthetic-keyring-cookie");
             expected.playback_cookie = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsynthetic-keyring-cookie\n".into();
-            let encoded = expected.keyring_value()?;
+            let encoded = expected.saved_value()?;
             ensure!(
                 !encoded.contains(&b'\n') && !encoded.contains(&b'\t'),
                 "Session JSON must escape control characters"
@@ -1217,7 +1339,7 @@ mod tests {
                 output.status.success() && output.stdout == encoded,
                 "Synthetic lookup failed"
             );
-            let decoded = Session::from_keyring(&output.stdout)?;
+            let decoded = Session::from_saved(&output.stdout)?;
             ensure!(
                 decoded.playback_cookie == expected.playback_cookie,
                 "Playback cookies did not survive keyring storage"
@@ -1254,7 +1376,7 @@ mod tests {
     fn saved_session_encoding_preserves_cookie_bytes_and_reads_legacy_json() {
         let mut expected = session("SAPISID=synthetic");
         expected.playback_cookie = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsynthetic\\value\n".into();
-        let encoded = expected.keyring_value().unwrap();
+        let encoded = expected.saved_value().unwrap();
         assert!(
             !encoded
                 .iter()
@@ -1262,13 +1384,13 @@ mod tests {
         );
         let legacy = serde_json::to_vec(&expected).unwrap();
         for value in [&encoded, &legacy] {
-            let restored = Session::from_keyring(value).unwrap();
+            let restored = Session::from_saved(value).unwrap();
             assert_eq!(restored.playback_cookie, expected.playback_cookie);
             assert_eq!(restored.cookie, expected.cookie);
         }
-        assert!(Session::from_keyring(b"yt-music-session-v1:invalid!").is_err());
+        assert!(Session::from_saved(b"yt-music-session-v1:invalid!").is_err());
         expected.playback_cookie = "x".repeat(8192);
-        assert!(expected.keyring_value().is_err());
+        assert!(expected.saved_value().is_err());
     }
     #[test]
     fn keyring_failures_report_a_locked_account_only_after_one_was_saved() {
@@ -1297,7 +1419,7 @@ mod tests {
                 .is_none()
         );
 
-        let saved = session("SAPISID=synthetic").keyring_value().unwrap();
+        let saved = session("SAPISID=synthetic").saved_value().unwrap();
         assert!(
             Session::from_lookup(&output(0, &saved, b""), Some(&marker))
                 .unwrap()
@@ -1330,11 +1452,91 @@ mod tests {
         assert!(!target.exists(), "The marker never follows a symlink");
     }
     #[test]
+    fn session_file_is_owner_only_and_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("yt-music-gpui").join(SESSION_FILE);
+        for cookie in ["SAPISID=first", "SAPISID=rotated"] {
+            write_session_file(&path, &session(cookie).saved_value().unwrap()).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+            let restored = read_session_file(&path).unwrap().unwrap();
+            assert_eq!(restored.cookie, cookie);
+        }
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "No temporary file is left behind"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_session_file(&path).is_err(),
+            "A readable file is refused"
+        );
+    }
+    #[test]
+    fn session_file_never_follows_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SESSION_FILE);
+        let target = directory.path().join("elsewhere");
+        fs::write(&target, session("SAPISID=planted").saved_value().unwrap()).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_session_file(&path).is_err());
+        assert!(write_session_file(&path, &session("SAPISID=new").saved_value().unwrap()).is_err());
+        assert!(
+            fs::read(&target).unwrap() == session("SAPISID=planted").saved_value().unwrap(),
+            "The link target is untouched"
+        );
+    }
+    #[test]
+    fn signing_out_removes_the_session_file_and_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        write_session_file(
+            &directory.path().join(SESSION_FILE),
+            &session("SAPISID=synthetic").saved_value().unwrap(),
+        )
+        .unwrap();
+        record_saved_account(Some(&directory.path().join(MARKER)));
+        forget_saved(directory.path()).unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        forget_saved(directory.path()).unwrap();
+    }
+    #[test]
+    fn a_keyring_account_wins_over_the_session_file() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code: i32, stdout: &[u8], stderr: &[u8]| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        write_session_file(
+            &directory.path().join(SESSION_FILE),
+            &session("SAPISID=file").saved_value().unwrap(),
+        )
+        .unwrap();
+        let keyring = session("SAPISID=keyring").saved_value().unwrap();
+        let no_service = output(
+            1,
+            b"",
+            b"secret-tool: The name org.freedesktop.secrets was not provided by any .service files\n",
+        );
+        for (lookup, expected) in [
+            (no_service, "SAPISID=file"),
+            (output(1, b"", b""), "SAPISID=file"),
+            (output(0, &keyring, b""), "SAPISID=keyring"),
+        ] {
+            let restored = Session::from_storage(&lookup, Some(directory.path()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.cookie, expected);
+        }
+    }
+    #[test]
     fn saved_profile_consent_round_trips_and_legacy_entries_have_no_source() {
         let mut expected = session("SAPISID=synthetic");
         let legacy = serde_json::to_vec(&expected).unwrap();
         assert!(
-            Session::from_keyring(&legacy)
+            Session::from_saved(&legacy)
                 .unwrap()
                 .source_profile
                 .is_none()
@@ -1345,7 +1547,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        let restored = Session::from_keyring(&expected.keyring_value().unwrap()).unwrap();
+        let restored = Session::from_saved(&expected.saved_value().unwrap()).unwrap();
         let source = restored.source_profile.unwrap();
         assert_eq!(source.browser, "Zen");
         assert_eq!(source.name, "Confirmed profile");
