@@ -29,9 +29,6 @@ pub(in crate::app) enum Overlay {
     PlaylistPicker {
         /// One song from its menu, or the whole queue from Up next's Save.
         tracks: Vec<Track>,
-        page: Option<Box<Page>>,
-        duplicates: bool,
-        error: Option<String>,
     },
     AlreadyAdded {
         id: String,
@@ -130,15 +127,55 @@ impl Music {
         cx.notify();
     }
 
+    /// Save to playlist lists the guide's playlists, which are already loaded and kept in
+    /// sync, so it opens at once instead of waiting on another library read.
     pub(in crate::app) fn playlist_picker(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
         self.error = None;
-        self.overlay = Some(Overlay::PlaylistPicker {
-            tracks,
-            page: None,
-            duplicates: false,
-            error: None,
+        self.overlay = Some(Overlay::PlaylistPicker { tracks });
+        if self.sidebar_playlists.is_empty()
+            && !self.catalog_requests.is_loading(CatalogTarget::Sidebar)
+        {
+            self.request(Query::SidebarPlaylists, cx);
+        }
+        cx.notify();
+    }
+
+    /// The covers the Save to playlist dialog shows first, warmed while its menu is open.
+    fn prefetch_playlist_covers(&mut self) {
+        for url in self
+            .sidebar_playlists
+            .iter()
+            .filter(|playlist| playlist.details.editable)
+            .filter_map(|playlist| playlist.thumbnail.as_deref())
+            .take(PICKER_PREFETCH)
+        {
+            self.artwork.get(url);
+        }
+    }
+
+    /// The toast YouTube Music shows above the player bar, replacing any toast still showing.
+    pub(in crate::app) fn show_toast(
+        &mut self,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self
+            .toast
+            .as_ref()
+            .map_or(0, |toast| toast.id.wrapping_add(1));
+        let dismiss = cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(TOAST_DURATION).await;
+            let _ = view.update(cx, |view, cx| {
+                view.toast = None;
+                cx.notify();
+            });
         });
-        self.request(Query::PlaylistChoices, cx);
+        self.toast = Some(Toast {
+            id,
+            text: text.into(),
+            _dismiss: dismiss,
+        });
+        cx.notify();
     }
 
     pub(in crate::app) fn country_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -175,6 +212,9 @@ impl Music {
         window.focus(&self.overlay_focus, cx);
         self.overlay_anchor = Some(window.mouse_position());
         self.overlay_button = None;
+        if self.account.is_some() {
+            self.prefetch_playlist_covers();
+        }
         self.overlay = Some(Overlay::Track {
             track,
             index,
@@ -272,7 +312,6 @@ impl Music {
         if matches!(self.overlay, Some(Overlay::SignIn)) {
             self.cancel_connection(cx);
         }
-        self.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
         self.song_text.cancel();
         self.overlay = None;
         self.settings_menu = None;
@@ -420,6 +459,9 @@ impl Music {
             Overlay::Account => unreachable!("Account artwork is prepared by the renderer"),
             Overlay::SignIn => return self.sign_in_dialog(cx),
             Overlay::Settings => return self.settings_dialog(window, cx),
+            Overlay::PlaylistPicker { tracks } => {
+                return self.playlist_picker_dialog(tracks.len() == 1, window, cx);
+            }
             _ => {}
         }
         if let Overlay::CountryPicker(picker) = kind {
@@ -470,14 +512,16 @@ impl Music {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(match kind {
                                 Overlay::Help => "Keyboard shortcuts".to_owned(),
-                                Overlay::Settings | Overlay::Account | Overlay::SignIn => {
+                                Overlay::Settings
+                                | Overlay::Account
+                                | Overlay::SignIn
+                                | Overlay::PlaylistPicker { .. } => {
                                     unreachable!()
                                 }
                                 Overlay::Description { .. } => "Description".into(),
                                 Overlay::Chapters(_) => "Chapters".into(),
                                 Overlay::Track { track, .. } => track.title.clone(),
                                 Overlay::Collection(collection) => collection.title.clone(),
-                                Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::AlreadyAdded { .. } => "Already added".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::NoKeyring(_) => "No keyring found".into(),
@@ -974,131 +1018,6 @@ impl Music {
                     }
                 }
             }
-        } else if let Overlay::PlaylistPicker {
-            tracks,
-            page,
-            duplicates,
-            error,
-        } = kind
-        {
-            // A new playlist starts from one song, so it is offered for single songs only.
-            if let [song] = tracks.as_slice() {
-                let song = song.clone();
-                body = body.child(self.menu_action(
-                    "create-from-picker",
-                    "New playlist",
-                    cx,
-                    move |view, window, cx| {
-                        view.playlist_form(false, Some(song.clone()), window, cx)
-                    },
-                ));
-            }
-            body = body.child(self.menu_action(
-                "allow-duplicates",
-                if *duplicates {
-                    "Allow duplicates: on"
-                } else {
-                    "Allow duplicates: off"
-                },
-                cx,
-                |view, _, cx| {
-                    if let Some(Overlay::PlaylistPicker { duplicates, .. }) = &mut view.overlay {
-                        *duplicates = !*duplicates;
-                        cx.notify();
-                    }
-                },
-            ));
-            if let Some(page) = page {
-                let choices = page
-                    .shelves
-                    .iter()
-                    .flat_map(|shelf| &shelf.items)
-                    .filter_map(|item| match item {
-                        Item::Collection(collection) if collection.details.editable => {
-                            Some(collection)
-                        }
-                        _ => None,
-                    });
-                let mut list = div()
-                    .id("playlist-choices")
-                    .max_h(px(360.))
-                    .overflow_y_scroll();
-                for (index, playlist) in choices.enumerate() {
-                    let id = playlist.id.clone();
-                    let video_ids = tracks
-                        .iter()
-                        .map(|track| track.id.clone())
-                        .collect::<Vec<_>>();
-                    let duplicates = *duplicates;
-                    list = list.child(self.menu_action(
-                        ("playlist-choice", index),
-                        playlist.title.clone(),
-                        cx,
-                        move |view, _, cx| {
-                            view.overlay = None;
-                            view.mutate(
-                                Mutation::AddToPlaylist {
-                                    id: id.clone(),
-                                    video_ids: video_ids.clone(),
-                                    duplicates,
-                                },
-                                cx,
-                            );
-                        },
-                    ));
-                }
-                body = body.child(list);
-                if let Some(token) = &page.continuation {
-                    let token = token.clone();
-                    body = body.child(
-                        self.menu_action(
-                            "more-playlist-choices",
-                            if self
-                                .catalog_requests
-                                .is_loading(CatalogTarget::PlaylistPicker)
-                            {
-                                "Loading…"
-                            } else {
-                                "More playlists"
-                            },
-                            cx,
-                            move |view, _, cx| {
-                                if !view
-                                    .catalog_requests
-                                    .is_loading(CatalogTarget::PlaylistPicker)
-                                {
-                                    view.request(Query::PlaylistChoicesMore(token.clone()), cx);
-                                }
-                            },
-                        ),
-                    );
-                }
-            } else if self
-                .catalog_requests
-                .is_loading(CatalogTarget::PlaylistPicker)
-            {
-                body = body.child(
-                    div()
-                        .p(px(12.))
-                        .text_color(self.theme.muted)
-                        .child("Loading playlists…"),
-                );
-            } else {
-                body = body.child(self.menu_action(
-                    "retry-playlist-choices",
-                    "Retry",
-                    cx,
-                    |view, _, cx| view.request(Query::PlaylistChoices, cx),
-                ));
-            }
-            if let Some(error) = error {
-                body = body.child(
-                    div()
-                        .mt(px(12.))
-                        .text_color(rgb(0xf1a6ae))
-                        .child(error.clone()),
-                );
-            }
         } else if let Overlay::AlreadyAdded { id, video_ids } = kind {
             body = body.child(
                 div()
@@ -1230,6 +1149,281 @@ impl Music {
         }
         self.backdrop(body.into_any_element(), cx)
     }
+}
+
+impl Music {
+    /// YouTube Music's Save to playlist dialog: covers, titles and bylines under "All
+    /// playlists", with New playlist floating over the list's end.
+    fn playlist_picker_dialog(
+        &self,
+        single_song: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let divider = gpui::white().opacity(0.1);
+        let count = picker_choices(&self.sidebar_playlists).count();
+        let viewport: f32 = window.viewport_size().height.into();
+        let list_height = (count as f32 * PICKER_ROW + PICKER_LIST_TOP + PICKER_ROW)
+            .min(viewport * 0.75 - PICKER_HEADING);
+        let mut body = div()
+            .id("overlay-body")
+            .relative()
+            .w(px(384.))
+            .flex()
+            .flex_col()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(divider)
+            .rounded(px(2.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .min_h(px(64.))
+                    .pl(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(divider)
+                    .child(
+                        div()
+                            .text_size(px(24.))
+                            .line_height(px(29.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Save to playlist"),
+                    )
+                    .child(
+                        tinted_button("close-overlay", "close", rgb(0xaaaaaa), theme)
+                            .mr(px(17.))
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.close_overlay(window, cx)),
+                            ),
+                    ),
+            );
+        if count > 0 {
+            body = body
+                .child(
+                    div()
+                        .mt(px(20.))
+                        .ml(px(24.))
+                        .text_size(px(14.))
+                        .line_height(px(17.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("All playlists"),
+                )
+                .child(
+                    uniform_list(
+                        "playlist-choices",
+                        count,
+                        cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
+                            let choices: Vec<usize> =
+                                picker_choices(&view.sidebar_playlists).collect();
+                            if range.end.saturating_add(5) >= choices.len()
+                                && !view.catalog_requests.is_loading(CatalogTarget::Sidebar)
+                                && view.sidebar_error.is_none()
+                                && let Some(token) = view.sync.sidebar_continuation.clone()
+                            {
+                                view.request(Query::SidebarMore(token), cx);
+                            }
+                            range
+                                .filter_map(|index| {
+                                    choices.get(index).map(|&choice| (index, choice))
+                                })
+                                .map(|(index, choice)| {
+                                    let playlist = &view.sidebar_playlists[choice];
+                                    let cover = playlist
+                                        .thumbnail
+                                        .as_deref()
+                                        .and_then(|url| view.artwork.get(url));
+                                    let id = playlist.id.clone();
+                                    div()
+                                        .id(("playlist-choice", index))
+                                        .keyboard_control(view.theme)
+                                        .h(px(PICKER_ROW))
+                                        .px(px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .hover(|row| row.bg(gpui::white().opacity(0.05)))
+                                        .child(
+                                            div()
+                                                .size(px(44.))
+                                                .mr(px(16.))
+                                                .flex_shrink_0()
+                                                .rounded(px(2.))
+                                                .overflow_hidden()
+                                                .bg(view.theme.raised)
+                                                .children(cover.map(|image| {
+                                                    img(image)
+                                                        .size_full()
+                                                        .object_fit(ObjectFit::Cover)
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(4.))
+                                                .text_size(px(14.))
+                                                .line_height(px(20.))
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(playlist.title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_color(gpui::white().opacity(0.7))
+                                                        .child(playlist.subtitle.clone()),
+                                                ),
+                                        )
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            let Some(Overlay::PlaylistPicker { tracks }) =
+                                                &view.overlay
+                                            else {
+                                                return;
+                                            };
+                                            let video_ids = tracks
+                                                .iter()
+                                                .map(|track| track.id.clone())
+                                                .collect();
+                                            view.close_overlay(window, cx);
+                                            view.mutate(
+                                                Mutation::AddToPlaylist {
+                                                    id: id.clone(),
+                                                    video_ids,
+                                                    duplicates: false,
+                                                },
+                                                cx,
+                                            );
+                                        }))
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .h(px(list_height))
+                    .pt(px(PICKER_LIST_TOP))
+                    .pb(px(PICKER_ROW)),
+                );
+        } else {
+            body = body.child(div().h(px(PICKER_ROW)));
+        }
+        if let Some(error) = &self.sidebar_error {
+            body = body.child(
+                div()
+                    .px(px(24.))
+                    .pb(px(PICKER_ROW))
+                    .text_color(theme.muted)
+                    .child(error.clone())
+                    .child(self.menu_action(
+                        "retry-playlist-choices",
+                        "Retry",
+                        cx,
+                        |view, _, cx| view.request(Query::SidebarPlaylists, cx),
+                    )),
+            );
+        }
+        // A new playlist starts from one song, so it is offered for single songs only.
+        if single_song {
+            body = body.child(
+                div()
+                    .id("create-from-picker")
+                    .keyboard_control(theme)
+                    .absolute()
+                    .bottom(px(17.))
+                    .right(px(17.))
+                    .h(px(36.))
+                    .pl(px(12.))
+                    .pr(px(16.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded_full()
+                    .bg(rgb(0xf1f1f1))
+                    .text_color(rgb(0x0f0f0f))
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .hover(|button| button.bg(rgb(0xd9d9d9)))
+                    .child(icon("plus", 24., rgb(0x0f0f0f).into()))
+                    .child("New playlist")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        let Some(Overlay::PlaylistPicker { tracks }) = &view.overlay else {
+                            return;
+                        };
+                        let song = tracks.first().cloned();
+                        view.playlist_form(false, song, window, cx);
+                    })),
+            );
+        }
+        self.backdrop(body.into_any_element(), cx)
+    }
+}
+
+pub(in crate::app) struct Toast {
+    id: u64,
+    pub(in crate::app) text: SharedString,
+    _dismiss: Task<()>,
+}
+
+impl Toast {
+    /// YouTube Music's light toast, 16 px from the left and above the player bar, rising
+    /// into place over 300 ms like the web's paper toast.
+    pub(in crate::app) fn render(&self, bottom: f32, width: f32) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(px(16.))
+            .min_w(px(288.))
+            .max_w(px(width - 32.))
+            .min_h(px(48.))
+            .p(px(12.))
+            .flex()
+            .items_center()
+            .rounded(px(8.))
+            .bg(rgb(0xf1f1f1))
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(0.), gpui::black().opacity(0.1)).blur_radius(px(24.)),
+            ])
+            .text_color(rgb(0x0f0f0f))
+            .text_size(px(14.))
+            .line_height(px(20.))
+            .child(self.text.clone())
+            .with_animation(
+                ElementId::NamedInteger("toast".into(), self.id),
+                Animation::new(Duration::from_millis(300)).with_easing(ease_in_out),
+                move |toast, delta| {
+                    toast
+                        .opacity(delta)
+                        .bottom(px(bottom - 100. * (1. - delta)))
+                },
+            )
+    }
+}
+
+/// On music.youtube.com a toast without an action button closes after four seconds.
+const TOAST_DURATION: Duration = Duration::from_secs(4);
+/// The web's `--ytmusic-playlist-item-height`.
+const PICKER_ROW: f32 = 64.;
+/// The gap above the first playlist.
+const PICKER_LIST_TOP: f32 = 7.;
+/// The "All playlists" heading with its top margin.
+const PICKER_HEADING: f32 = 37.;
+/// Enough covers to fill the dialog's first screen.
+const PICKER_PREFETCH: usize = 8;
+
+/// Indices of the guide playlists a song can be saved to.
+fn picker_choices(playlists: &[Collection]) -> impl Iterator<Item = usize> + '_ {
+    playlists
+        .iter()
+        .enumerate()
+        .filter(|(_, playlist)| playlist.details.editable)
+        .map(|(index, _)| index)
 }
 
 /// The song menu's width on music.youtube.com, including its 1 px border.

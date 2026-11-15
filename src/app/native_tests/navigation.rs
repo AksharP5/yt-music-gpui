@@ -191,6 +191,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                         }),
                         result: Ok(Effect::PlaylistAdded {
                             additions: vec![(track.id.clone(), "added-occurrence".into())],
+                            toast: None,
                         }),
                         session_rejected: false,
                     },
@@ -248,6 +249,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                                 (track.id.clone(), "another-occurrence".into()),
                                 ("missing-song".into(), "missing-occurrence".into()),
                             ],
+                            toast: None,
                         }),
                         session_rejected: false,
                     },
@@ -277,6 +279,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                         }),
                         result: Ok(Effect::PlaylistAdded {
                             additions: vec![("missing-song".into(), "inactive-occurrence".into())],
+                            toast: None,
                         }),
                         session_rejected: false,
                     },
@@ -1150,5 +1153,150 @@ fn route_revalidation_forgets_the_previous_sort() -> Result<()> {
             matches!(job.query, Query::Library(Section::Songs)),
             "A stale revisit must refresh in the order last shown"
         );
+    })
+}
+
+const COVERS: [(&str, &str, &str); 5] = [
+    (
+        "Road trip",
+        "Synthetic account • 42 songs",
+        "https://yt3.googleusercontent.com/xmMiZ8JLzb6np1_Ax5DdLNK9RaSmkQynVbiVApVbmfC-2fb8-9WErSRKOjeE2eDITYYlhaR9Vo9h=s192",
+    ),
+    (
+        "Late night",
+        "Synthetic account • 18 songs",
+        "https://yt3.googleusercontent.com/utMZxtgiJjr_Gz-dHQv551OQC8L4LqjHT3zY92H28i1sEU0gsMjbLX6A0GAhnK5bSwTFX93tGlw=s192",
+    ),
+    (
+        "Focus",
+        "Synthetic account • 7 songs",
+        "https://yt3.googleusercontent.com/9E2BdLFXxqJtwG4DvuTUjYVZXB-B4EC-ZcVvLRdRH3ynbYO89O-dAdjXDRmBdo3skeJN_OLD8Zn-=s192",
+    ),
+    (
+        "Gym",
+        "Synthetic account • 63 songs",
+        "https://yt3.ggpht.com/jzUumXHKi5NJg8DSfKxI1s4WZsglrXlY4Iu-5KmfkuEIx6ZZh1v1aBA-iwEIDuVVm37jvzSqY8Q=s192",
+    ),
+    (
+        "Sunday morning",
+        "Synthetic account • 12 songs",
+        "https://i.ytimg.com/vi/lRaXPHFEbKA/hqdefault.jpg?sqp=-oaymwEWCJADEOEBIAQqCggAEOADGC0guwJIWg&rs=AMzJL3mXdC-OEXtSBi5e2TMREUfH2T8JxQ",
+    ),
+];
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; public artwork; synthetic accounts only"]
+fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let urls: Vec<&str> = COVERS.iter().map(|(_, _, url)| *url).collect();
+        window
+            .update(cx, |view, _, cx| {
+                view.sidebar_playlists = COVERS
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, (title, subtitle, url))| crate::catalog::Collection {
+                            id: format!("VLsynthetic{index}"),
+                            title: (*title).into(),
+                            subtitle: (*subtitle).into(),
+                            thumbnail: Some((*url).into()),
+                            details: crate::catalog::CollectionDetails {
+                                editable: true,
+                                ..Default::default()
+                            },
+                        },
+                    )
+                    .collect();
+                let track = view.page.tracks()[0].clone();
+                while view.catalog_requests.pending.try_recv().is_ok() {}
+                view.playlist_picker(vec![track], cx);
+                assert!(
+                    view.catalog_requests.pending.is_empty(),
+                    "Save to playlist must open from the loaded playlists without another read"
+                );
+            })
+            .unwrap();
+        for attempt in 0..250 {
+            wait_for_presented_frame(window, cx).await;
+            let loaded = window
+                .update(cx, |view, _, _| {
+                    urls.iter().all(|url| view.artwork.get(url).is_some())
+                })
+                .unwrap();
+            if loaded {
+                break;
+            }
+            assert!(attempt < 249, "Playlist covers must load");
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-picker");
+            })
+            .unwrap();
+        let saved = |toast: Option<&'static str>| {
+            move |view: &mut Music, window: &mut Window, cx: &mut Context<Music>| {
+                let track = view.page.tracks()[0].clone();
+                view.overlay = None;
+                view.account_event(
+                    account::Event::Applied {
+                        session: view.account.as_ref().unwrap().session.clone(),
+                        mutation: Box::new(Mutation::AddToPlaylist {
+                            id: "synthetic0".into(),
+                            video_ids: vec![track.id.clone()],
+                            duplicates: false,
+                        }),
+                        result: Ok(Effect::PlaylistAdded {
+                            additions: vec![(track.id.clone(), "occurrence".into())],
+                            toast: toast.map(str::to_owned),
+                        }),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(view.notice, None, "The toast replaces the page notice");
+                view.toast.as_ref().unwrap().text.to_string()
+            }
+        };
+        let text = window.update(cx, saved(None)).unwrap();
+        assert_eq!(text, "Saved to Road trip");
+        let text = window
+            .update(cx, saved(Some("Saved to Road trip (from YouTube)")))
+            .unwrap();
+        assert_eq!(
+            text, "Saved to Road trip (from YouTube)",
+            "YouTube's own text wins"
+        );
+        window
+            .update(cx, |view, _, cx| {
+                // A current song shows the player bar, which the toast sits above.
+                let track = view.page.tracks()[0].clone();
+                view.library.queue.replace(vec![track], 0);
+                cx.notify();
+            })
+            .unwrap();
+        window.update(cx, saved(None)).unwrap();
+        cx.background_executor()
+            .timer(Duration::from_millis(400))
+            .await;
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-saved");
+            })
+            .unwrap();
+        cx.background_executor()
+            .timer(Duration::from_millis(4000))
+            .await;
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.toast.is_none(), "The toast closes after four seconds")
+            })
+            .unwrap();
     })
 }
