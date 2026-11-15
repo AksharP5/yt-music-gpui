@@ -46,7 +46,7 @@ impl Music {
             .when(stacked, |d| d.w_full().items_center().text_center());
         if let Some(header) = header {
             let avatar = header.artist_thumbnail.as_deref().and_then(|url| {
-                self.artwork.get(url).map(|image| {
+                self.artwork.get(url, size(px(16.), px(16.))).map(|image| {
                     img(image)
                         .size(px(16.))
                         .flex_shrink_0()
@@ -76,7 +76,7 @@ impl Music {
                 }
             });
             if let Some(url) = header.thumbnail {
-                cover = Some(match self.artwork.get(&url) {
+                cover = Some(match self.artwork.get(&url, size(px(edge), px(edge))) {
                     Some(image) => img(image)
                         .size(px(edge))
                         .flex_shrink_0()

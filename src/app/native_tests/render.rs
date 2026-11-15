@@ -1053,8 +1053,10 @@ async fn scrolled_artist_survives_tab(
     for attempt in 0..100 {
         let loaded = window
             .update(cx, |music, _, _| {
-                urls.iter().all(|url| music.artwork.get(url).is_some())
-                    && music.artwork.get_hero(&urls[0]).is_some()
+                music.artwork.is_idle()
+                    && urls
+                        .iter()
+                        .all(|url| music.artwork.get(url, size(px(96.), px(96.))).is_some())
             })
             .unwrap();
         if loaded {
@@ -1364,7 +1366,7 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
             assert!(
                 music
                     .artwork
-                    .get_hero(
+                    .get(
                         music
                             .page
                             .header
@@ -1372,7 +1374,8 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
                             .unwrap()
                             .thumbnail
                             .as_ref()
-                            .unwrap()
+                            .unwrap(),
+                        size(px(96.), px(96.))
                     )
                     .is_some()
             );

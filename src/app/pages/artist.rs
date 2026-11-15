@@ -297,7 +297,6 @@ impl Music {
         }
         // The hero spans the header and the artist heading in list row 0.
         let url = self.page.header.as_ref()?.thumbnail.clone()?;
-        let image = self.artwork.get_hero(&url)?;
         let Some(heading) = self.detail_list.state.bounds_for_item(0) else {
             // Cached artwork has no completion event to redraw the content
             // after the new list measures its heading in this frame.
@@ -313,6 +312,7 @@ impl Music {
         if scrolled <= -hero {
             return None;
         }
+        let image = self.artwork.get(&url, size(px(width), px(hero)))?;
         // The mini guide shares the hero; the expanded guide covers its left edge.
         // Keep the photo's position while revealing it behind the mini guide.
         let size = image.size(0);

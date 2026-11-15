@@ -17,7 +17,8 @@ impl Music {
         wide: bool,
         group: &'static str,
     ) -> AnyElement {
-        let image = url.and_then(|url| self.artwork.get(url));
+        let height = if wide { edge * 9. / 16. } else { edge };
+        let image = url.and_then(|url| self.artwork.get(url, size(px(edge), px(height))));
         let radius = match shape {
             ArtworkShape::Square => 4.,
             ArtworkShape::Circle => edge / 2.,
@@ -32,7 +33,7 @@ impl Music {
         let art = match image {
             Some(image) => img(image)
                 .w(px(edge))
-                .h(px(if wide { edge * 9. / 16. } else { edge }))
+                .h(px(height))
                 .rounded(px(radius))
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
@@ -277,7 +278,14 @@ impl Music {
             Item::Collection(collection) => collection.details.explicit,
             Item::Navigation(_) => false,
         };
-        let image = item.thumbnail().and_then(|url| self.artwork.get(url));
+        let height = if layout == ShelfLayout::Videos {
+            width * 9. / 16.
+        } else {
+            width
+        };
+        let image = item
+            .thumbnail()
+            .and_then(|url| self.artwork.get(url, size(px(width), px(height))));
         let artist =
             matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
         let play = match &item {
@@ -288,11 +296,7 @@ impl Music {
         let mut art = div()
             .relative()
             .w(px(width))
-            .h(px(if layout == ShelfLayout::Videos {
-                width * 9. / 16.
-            } else {
-                width
-            }))
+            .h(px(height))
             .rounded(px(8.))
             .when(artist, |d| d.rounded_full())
             .overflow_hidden()

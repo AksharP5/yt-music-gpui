@@ -979,49 +979,6 @@ pub(crate) fn thumbnail(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn banner_thumbnail(value: &Value) -> Option<String> {
-    let url = find(value, "thumbnails")?
-        .as_array()?
-        .iter()
-        .filter(|entry| {
-            entry["url"]
-                .as_str()
-                .is_some_and(|url| url.starts_with("https://"))
-        })
-        .max_by_key(|entry| entry["width"].as_u64().unwrap_or(0))?["url"]
-        .as_str()?;
-    let parsed = reqwest::Url::parse(url).ok()?;
-    if !parsed.host_str().is_some_and(|host| {
-        host.ends_with(".googleusercontent.com") || host.ends_with(".ggpht.com")
-    }) {
-        return Some(url.to_owned());
-    }
-    let Some((base, parameters)) = url.rsplit_once('=') else {
-        return Some(url.to_owned());
-    };
-    if parsed.query().is_some() {
-        return Some(url.to_owned());
-    }
-    // Keep the web's 2.4:1 crop (it asks for w1080-h450) at sharper pixels.
-    let parameters = parameters
-        .split('-')
-        .map(|part| match part.as_bytes().split_first() {
-            Some((b'w', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
-                "w1920"
-            }
-            Some((b'h', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
-                "h800"
-            }
-            Some((b's', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
-                "s1920"
-            }
-            _ => part,
-        })
-        .collect::<Vec<_>>()
-        .join("-");
-    Some(format!("{base}={parameters}"))
-}
-
 pub(crate) fn duration(s: &str) -> Option<u64> {
     let parts: Vec<_> = s.trim().split(':').collect();
     if !(2..=3).contains(&parts.len()) {
@@ -1938,11 +1895,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
                     });
                 details
             },
-            thumbnail: if artist_header.is_some() {
-                banner_thumbnail(&header["thumbnail"])
-            } else {
-                thumbnail(&header["thumbnail"])
-            },
+            thumbnail: thumbnail(&header["thumbnail"]),
             artist: {
                 let artist = text(&header["straplineTextOne"]);
                 (!artist.is_empty()).then(|| {
@@ -2473,27 +2426,6 @@ mod tests {
             .unwrap();
         assert_eq!(tail.tracks()[0].artist, "Khruangbin");
         assert_eq!(tail.tracks()[0].thumbnail, track.thumbnail);
-    }
-
-    #[test]
-    fn artist_banners_request_large_pixels_without_upscaling_song_thumbnails() {
-        let value = json!({"thumbnails":[
-            {"url":"https://lh3.googleusercontent.com/banner=w360-h180-l90-rj", "width":360},
-            {"url":"https://lh3.googleusercontent.com/banner=w960-h540-l90-rj", "width":960}
-        ]});
-        assert_eq!(
-            thumbnail(&value).as_deref(),
-            Some("https://lh3.googleusercontent.com/banner=w360-h180-l90-rj")
-        );
-        assert_eq!(
-            banner_thumbnail(&value).as_deref(),
-            Some("https://lh3.googleusercontent.com/banner=w1920-h800-l90-rj")
-        );
-        let page = parse_page(&json!({"header":{"musicImmersiveHeaderRenderer":{"title":{"simpleText":"Artist"},"thumbnail":value}},"contents":[]}), "Artist").unwrap();
-        assert_eq!(
-            page.header.unwrap().thumbnail.as_deref(),
-            Some("https://lh3.googleusercontent.com/banner=w1920-h800-l90-rj")
-        );
     }
 
     #[test]
@@ -4589,8 +4521,8 @@ mod tests {
             .into_dimensions()
             .unwrap();
         assert!(
-            width >= 1600,
-            "artist banners need full-width source pixels"
+            width > 2 * height,
+            "artist headers use the web's wide banner crop"
         );
         println!("artist_banner_pixels={width}x{height}");
         let album = catalog

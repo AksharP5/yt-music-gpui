@@ -456,8 +456,7 @@ impl Music {
         self.player_page.video_bounds.set(None);
         let image = self
             .current_thumbnail()
-            .map(|url| large_artwork(&url))
-            .and_then(|url| self.artwork.get_hero(&url));
+            .and_then(|url| self.artwork.get(&url, size(px(edge), px(edge))));
         div()
             .size(px(edge))
             .flex_shrink_0()
@@ -1059,17 +1058,6 @@ fn related_message(text: String, theme: Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// Ask Google's image service for a player-page sized cover instead of the list thumbnail.
-fn large_artwork(url: &str) -> String {
-    let resizable = url.starts_with("https://lh3.googleusercontent.com/")
-        || url.starts_with("https://yt3.googleusercontent.com/")
-        || url.contains(".ggpht.com/");
-    match url.rsplit_once('=') {
-        Some((base, _)) if resizable => format!("{base}=w900-h900-l90-rj"),
-        _ => url.to_owned(),
-    }
-}
-
 fn paint_around(
     bounds: Bounds<Pixels>,
     hole: Option<Bounds<Pixels>>,
@@ -1100,7 +1088,7 @@ fn paint_around(
 
 #[cfg(test)]
 mod tests {
-    use super::{Details, PlayerPage, large_artwork};
+    use super::{Details, PlayerPage};
     use crate::{
         auth::Session,
         song_text::{self, Content, Lyrics},
@@ -1157,15 +1145,5 @@ mod tests {
         page.lyrics = Some(pending());
         assert_eq!(page.complete(rejected_lyrics(7), Some(&first)), Some(true));
         assert!(page.lyrics.as_ref().unwrap().result.is_some());
-    }
-
-    #[test]
-    fn player_page_artwork_requests_a_large_cover_only_from_resizable_hosts() {
-        assert_eq!(
-            large_artwork("https://lh3.googleusercontent.com/abc=w120-h120-l90-rj"),
-            "https://lh3.googleusercontent.com/abc=w900-h900-l90-rj"
-        );
-        let video = "https://i.ytimg.com/vi/abc/hqdefault.jpg?sqp=a=b";
-        assert_eq!(large_artwork(video), video);
     }
 }
