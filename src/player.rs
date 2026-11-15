@@ -4254,6 +4254,10 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    /// Reads one request as a fake mpv. A fake mpv thread returns its end of
+    /// the socket instead of dropping it, so it hangs up only after the test
+    /// joins it: macOS refuses to set a read timeout once the peer has hung
+    /// up, even with replies still unread, while mpv itself never does.
     fn socket_message(socket: &mut IpcStream) -> Value {
         let mut line = Vec::new();
         loop {
@@ -4290,7 +4294,7 @@ YtMusicAccountIE._real_extract = extract
                 json!({"request_id":second_id,"error":"property unavailable"})
             )
             .unwrap();
-            (first_id, second_id)
+            (first_id, second_id, mpv)
         });
         let mut pending = Vec::new();
         let first = request(
@@ -4305,7 +4309,7 @@ YtMusicAccountIE._real_extract = extract
             json!(["set_property", "vid", "no"]),
             |_| {},
         );
-        let (first_id, second_id) = worker.join().unwrap();
+        let (first_id, second_id, _mpv) = worker.join().unwrap();
         for result in [first, second] {
             assert_eq!(
                 result.unwrap_err().to_string(),
@@ -5246,6 +5250,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                     .unwrap();
                 writeln!(server, "{}", json!({"event":"end-file"})).unwrap();
             }
+            server
         });
         let mut pending = Vec::new();
         let mut state = PlaybackState::default();
@@ -5298,6 +5303,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                     writeln!(server, "{message}").unwrap();
                 }
                 reply_to_credential_barrier(&mut server);
+                server
             });
             let (events, _) = async_channel::unbounded();
             replace_playback_credentials(
