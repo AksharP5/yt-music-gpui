@@ -236,6 +236,11 @@ pub enum PlayerEvent {
     Ended {
         track_id: u64,
     },
+    /// The paused song's stream URL is about to expire before mpv buffered
+    /// the rest of it. Reload it in place before playback resumes.
+    StreamExpiring {
+        track_id: u64,
+    },
     Stopped {
         track_id: u64,
     },
@@ -1254,6 +1259,26 @@ impl ResolvedStream {
     }
 }
 
+/// When a paused stream needs a fresh URL: five minutes before the earliest
+/// `expire` of its googlevideo URLs. Video plays an EDL of two URLs.
+fn stream_refresh_time(path: &str) -> Option<SystemTime> {
+    path.match_indices("expire=")
+        .filter(|(index, _)| {
+            index
+                .checked_sub(1)
+                .is_some_and(|before| matches!(path.as_bytes()[before], b'?' | b'&'))
+        })
+        .filter_map(|(index, name)| {
+            let value = &path[index + name.len()..];
+            let end = value
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(value.len());
+            value[..end].parse::<u64>().ok()
+        })
+        .min()
+        .map(|expiry| UNIX_EPOCH + Duration::from_secs(expiry.saturating_sub(5 * 60)))
+}
+
 impl StreamKey {
     fn lane(&self, preparing: bool, signed_in: bool) -> ResolverLane {
         if self.video.is_some_and(|video| video.height() > 1080)
@@ -2002,6 +2027,8 @@ fn run(
     let mut pending_play: Option<PendingPlay> = None;
     let mut next_target: Option<PreparedTarget> = None;
     let mut prepared: Option<(PreparedTarget, ResolvedStream)> = None;
+    // The paused song and when its stream must be refreshed, once per pause.
+    let mut paused_stream: Option<(u64, Option<SystemTime>)> = None;
     // Every actor exit frees the renderer before destroying the core.
     let mut video: Option<AttachedVideo> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2389,16 +2416,56 @@ fn run(
         let _ = &credentials;
         state.write_seek(&mut socket)?;
         ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
-        // Only queued streams need refreshing; the current stream is already open.
+        // mpv reconnects a dropped stream with the same URL, which fails once
+        // the URL expires, and the song then ends where its buffer runs out.
+        // A paused song can outlive its URL, so before that ask the app to
+        // reload it, still paused, at the same position.
+        let paused_track = state.current.filter(|id| {
+            state.paused && state.loaded && state.desired == Some(*id) && pending_play.is_none()
+        });
+        if paused_track != paused_stream.map(|(id, _)| id) {
+            paused_stream = paused_track.map(|id| {
+                let path = request(
+                    &mut socket,
+                    &mut pending,
+                    json!(["get_property", "path"]),
+                    |value| state.message(value, events),
+                );
+                let refresh = path
+                    .ok()
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .and_then(stream_refresh_time);
+                (id, refresh)
+            });
+        }
+        if let Some((track_id, Some(refresh))) = paused_stream
+            && SystemTime::now() >= refresh
+        {
+            paused_stream = Some((track_id, None));
+            let buffered_to_end = request(
+                &mut socket,
+                &mut pending,
+                json!(["get_property", "demuxer-cache-state"]),
+                |value| state.message(value, events),
+            )
+            .is_ok_and(|cache| cache["eof"] == true);
+            if !buffered_to_end {
+                let _ = events.send_blocking(PlayerEvent::StreamExpiring { track_id });
+            }
+        }
         // Expiry is wall-clock time, which a monotonic wait doesn't follow across
         // clock changes or suspend, so recheck it at least once a minute.
         let expiry = prepared
             .as_ref()
             .filter(|(target, _)| state.current != Some(target.track_id))
-            .map(|(_, stream)| {
+            .map(|(_, stream)| stream.expires)
+            .into_iter()
+            .chain(paused_stream.and_then(|(_, refresh)| refresh))
+            .min()
+            .map(|expires| {
                 Instant::now()
-                    + stream
-                        .expires
+                    + expires
                         .duration_since(SystemTime::now())
                         .unwrap_or_default()
                         .min(Duration::from_secs(60))
@@ -3784,6 +3851,34 @@ YtMusicAccountIE._real_extract = extract
             &events,
         );
         assert!(!state.entries.contains_key(&12));
+    }
+
+    #[test]
+    fn paused_streams_refresh_five_minutes_before_their_earliest_url_expires() {
+        let at = |seconds| Some(UNIX_EPOCH + Duration::from_secs(seconds));
+        assert_eq!(
+            stream_refresh_time(
+                "https://rr1.googlevideo.com/videoplayback?expire=1800000000&sparams=expire%2Cei&id=x"
+            ),
+            at(1_800_000_000 - 300)
+        );
+        // Video plays separate audio and video URLs; the first to lapse decides.
+        let video = "https://rr1.googlevideo.com/v?id=x&expire=1800000600";
+        let audio = "https://rr1.googlevideo.com/a?expire=1800000000&id=y";
+        assert_eq!(
+            stream_refresh_time(&format!(
+                "edl://%{}%{video};!new_stream;%{}%{audio}",
+                video.len(),
+                audio.len()
+            )),
+            at(1_800_000_000 - 300)
+        );
+        for path in [
+            "/tmp/silence.wav",
+            "https://rr1.googlevideo.com/videoplayback?sparams=expire%2Cei&noexpire=1",
+        ] {
+            assert_eq!(stream_refresh_time(path), None);
+        }
     }
 
     #[test]
@@ -6025,6 +6120,62 @@ PYTHON
         }
         let loudness = if levelled { "applied" } else { "unsupported" };
         eprintln!("{version}: start, pause, title and append applied; loudness {loudness}");
+    }
+
+    #[test]
+    #[ignore = "requires libmpv; uses local silent audio, null audio and no network"]
+    fn pausing_an_expired_stream_asks_for_a_reload_unless_mpv_buffered_it_to_the_end() {
+        let directory = tempfile::tempdir().unwrap();
+        // mpv reports the path it opened, so a local name can carry a lapsed expiry.
+        let path = directory.path().join("silence?expire=1.wav");
+        fs::rename(silent_audio(directory.path(), 120), &path).unwrap();
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, "#!/bin/sh\necho 2026.08.19\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let player = Player::with_extractor(
+            PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            extractor,
+        )
+        .unwrap();
+        // The 1.9 MB file fits the default buffer but not a 64 KiB one.
+        for (buffer, reload) in [("32MiB", false), ("64KiB", true)] {
+            player
+                .command(json!(["set_property", "demuxer-max-bytes", buffer]))
+                .unwrap();
+            let track_id = player
+                .play_url(
+                    path.to_string_lossy().into_owned(),
+                    "Synthetic silence",
+                    PlayOptions::default(),
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(player.try_recv(), Some(PlayerEvent::Started { track_id: id, .. }) if id == track_id)
+            {
+                assert!(Instant::now() < deadline, "the local file did not start");
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Let mpv read ahead as far as its buffer allows before pausing.
+            thread::sleep(Duration::from_millis(500));
+            player.pause(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requested = false;
+            while Instant::now() < deadline {
+                match player.try_recv() {
+                    Some(PlayerEvent::StreamExpiring { track_id: id }) if id == track_id => {
+                        requested = true;
+                    }
+                    Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            assert_eq!(requested, reload, "buffer {buffer}");
+        }
     }
 
     #[test]

@@ -863,6 +863,14 @@ impl Music {
                 self.playback = self.playback.with_buffering(buffering);
                 self.sample_listening();
             }
+            PlayerEvent::StreamExpiring { track_id }
+                if Some(track_id) == self.active_id
+                    && matches!(self.playback, Playback::Loaded { paused: true, .. }) =>
+            {
+                if let Err(error) = self.reload_stream() {
+                    self.error = Some(error.to_string());
+                }
+            }
             PlayerEvent::Ended { track_id } if Some(track_id) == self.active_id => {
                 self.next(true, cx);
                 return;
