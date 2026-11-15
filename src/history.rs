@@ -7,8 +7,6 @@ use anyhow::{Context, Result, ensure};
 use reqwest::{StatusCode, Url};
 use serde_json::{Value, json};
 use std::{
-    fs::File,
-    io::Read,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -291,9 +289,7 @@ fn watchtime_params(cpn: &str, report: &Watchtime) -> Result<Vec<(&'static str, 
 fn playback_nonce() -> Result<String> {
     const ALPHABET: &[u8; 64] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
     let mut bytes = [0; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut bytes))
-        .context("Could not create a playback history request ID")?;
+    getrandom::fill(&mut bytes).context("Could not create a playback history request ID")?;
     Ok(bytes
         .into_iter()
         .map(|byte| ALPHABET[(byte & 63) as usize] as char)

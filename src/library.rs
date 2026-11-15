@@ -255,25 +255,15 @@ impl Queue {
     }
 }
 
-/// Resolves an XDG base directory. The spec says to ignore empty or relative
-/// values, which would otherwise put user data under the launch directory.
-pub(crate) fn user_directory(variable: &str, fallback: &str) -> Option<PathBuf> {
-    std::env::var_os(variable)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback)))
-}
-
 pub struct Store {
     path: PathBuf,
 }
 
 impl Store {
     pub fn load() -> Result<(Self, Library)> {
-        let base = user_directory("XDG_DATA_HOME", ".local/share")
-            .context("Could not find your user data directory")?;
+        let directory = crate::dirs::data().context("Could not find your user data directory")?;
         let store = Self {
-            path: base.join("yt-music-gpui/library.json"),
+            path: directory.join("library.json"),
         };
         let mut library: Library = match fs::read(&store.path) {
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {

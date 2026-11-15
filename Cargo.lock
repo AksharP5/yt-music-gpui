@@ -6843,6 +6843,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "cc",
+ "getrandom 0.4.3",
  "gpui-pre",
  "gpui-pre-platform",
  "image",

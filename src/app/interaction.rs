@@ -55,12 +55,8 @@ impl Music {
     ) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        let control = modifiers.control
-            && !modifiers.alt
-            && !modifiers.platform
-            && !modifiers.function
-            && !modifiers.shift;
-        if control && key == "q" {
+        let secondary = modifiers == Modifiers::secondary_key();
+        if secondary && key == "q" {
             cx.quit();
             return;
         }
@@ -96,7 +92,7 @@ impl Music {
             cx.stop_propagation();
             return;
         }
-        if (control && key == "k")
+        if (secondary && key == "k")
             || (key == "/"
                 && !modifiers.modified()
                 && !self.search.focus_handle(cx).is_focused(window))
@@ -108,7 +104,7 @@ impl Music {
             cx.stop_propagation();
             return;
         }
-        if control && key == "r" {
+        if secondary && key == "r" {
             self.reload_current_page(cx);
             return;
         }
@@ -128,7 +124,7 @@ impl Music {
         if key == "space" && !self.focus.is_focused(window) {
             return;
         }
-        if control {
+        if secondary {
             match key {
                 "right" => self.next(false, cx),
                 "left" => self.previous(cx),
