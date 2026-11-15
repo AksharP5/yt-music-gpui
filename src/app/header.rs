@@ -8,7 +8,7 @@ impl Music {
             .account
             .as_ref()
             .and_then(|connection| connection.account.thumbnail.as_deref());
-        let image = thumbnail.and_then(|url| self.artwork.get(url));
+        let image = thumbnail.and_then(|url| self.artwork.get(url, size(px(edge), px(edge))));
         let initial = self
             .account
             .as_ref()

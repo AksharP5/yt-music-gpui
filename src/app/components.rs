@@ -285,7 +285,7 @@ impl Music {
             ArtworkShape::Square => 5.,
             ArtworkShape::Circle => edge / 2.,
         };
-        let image = url.and_then(|url| self.artwork.get(url));
+        let image = url.and_then(|url| self.artwork.get(url, size(px(edge), px(edge))));
         let mut element = div()
             .size(px(edge))
             .flex_shrink_0()

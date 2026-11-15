@@ -340,7 +340,7 @@ impl Music {
         let image = track
             .thumbnail
             .as_deref()
-            .and_then(|url| self.artwork.get(url));
+            .and_then(|url| self.artwork.get(url, size(px(120.), px(68.))));
         let frame = div()
             .relative()
             .w(px(120.))

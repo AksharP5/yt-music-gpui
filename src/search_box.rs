@@ -23,7 +23,7 @@ pub enum SearchBoxEvent {
 }
 
 /// Looks up a cached thumbnail, requesting it when missing.
-pub type ArtworkLookup = Box<dyn Fn(&str, &mut App) -> Option<Arc<RenderImage>>>;
+pub type ArtworkLookup = Box<dyn Fn(&str, Size<Pixels>, &mut App) -> Option<Arc<RenderImage>>>;
 
 /// The web's search box: 480px wide, with the dropdown joined beneath it.
 pub(crate) const WIDTH: f32 = 480.;
@@ -339,9 +339,10 @@ impl SearchBox {
                     _ => item.subtitle().to_owned(),
                 };
                 let round = matches!(item.as_ref(), Item::Collection(collection) if collection.id.starts_with("UC"));
-                let radius = if round { 16. } else { 2. };
+                let edge = 32.;
+                let radius = if round { edge / 2. } else { 2. };
                 let image = match (item.thumbnail().map(str::to_owned), &self.artwork) {
-                    (Some(url), Some(lookup)) => lookup(&url, cx),
+                    (Some(url), Some(lookup)) => lookup(&url, size(px(edge), px(edge)), cx),
                     _ => None,
                 };
                 row.h(px(56.))
@@ -350,7 +351,7 @@ impl SearchBox {
                     .gap(px(16.))
                     .child(
                         div()
-                            .size(px(32.))
+                            .size(px(edge))
                             .flex_shrink_0()
                             .rounded(px(radius))
                             .bg(theme.raised)

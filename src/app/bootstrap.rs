@@ -92,7 +92,8 @@ impl Music {
         let video = player
             .as_ref()
             .map(|player| player.video_attachment(window, cx));
-        let (artwork, loaded) = Artwork::new();
+        let (mut artwork, loaded) = Artwork::new();
+        artwork.set_scale(window.scale_factor());
         let catalog_requests = start_catalog(window, cx);
         let PlaybackChannels {
             playback_jobs,
@@ -260,11 +261,15 @@ impl Music {
             });
         let activation = cx.observe_window_activation(window, Self::window_activated);
         let focus_lost = cx.on_focus_lost(window, Self::restore_keyboard_focus);
+        // A display change rescales the window and redraws every view.
+        let rescale = cx.observe_window_bounds(window, |view, window, _| {
+            view.artwork.set_scale(window.scale_factor())
+        });
         let music = cx.entity();
         let weak = music.downgrade();
         search.update(cx, |search, _| {
-            search.set_artwork(Box::new(move |url, cx| {
-                weak.update(cx, |music, _| music.artwork.get(url))
+            search.set_artwork(Box::new(move |url, size, cx| {
+                weak.update(cx, |music, _| music.artwork.get(url, size))
                     .ok()
                     .flatten()
             }))
@@ -377,7 +382,7 @@ impl Music {
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
             drag_position: None,
-            _subscriptions: vec![subscription, activation, focus_lost],
+            _subscriptions: vec![subscription, activation, focus_lost, rescale],
         };
         view.listening.restored = restored;
         view.notify_playback(cx);

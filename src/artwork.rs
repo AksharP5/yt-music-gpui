@@ -1,4 +1,4 @@
-use gpui::RenderImage;
+use gpui::{Pixels, RenderImage, Size};
 use sha1::{Digest, Sha1};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -16,13 +16,49 @@ const DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024;
 const DISK_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CACHE_BYTES: usize = 40 * 1024 * 1024;
 const WORKERS: usize = 3;
+/// Device-pixel sizes that downloads and decodes step up to. GPUI samples
+/// textures without mipmaps, so an image drawn at under half its pixel size
+/// aliases; the steps keep that ratio under 1.5 while a window resize reuses
+/// the same image until it crosses a step.
+const STEPS: [u32; 13] = [
+    32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+];
+const WASH: u32 = 64;
+/// The widest fixed-size video still the catalog lists (`hqdefault`).
+const LISTED_STILL_WIDTH: u32 = 480;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Resolution {
-    Thumbnail,
-    Hero,
+    /// Enough device pixels to cover this box; a zero side is unconstrained.
+    Cover { width: u32, height: u32 },
     /// A small, heavily blurred copy that GPUI stretches into a page wash.
     Wash,
+}
+
+impl Resolution {
+    fn cover(size: Size<Pixels>, scale: f32) -> Self {
+        let step = |length: Pixels| {
+            let pixels = f32::from(length) * scale;
+            if pixels <= 0. {
+                return 0;
+            }
+            STEPS
+                .into_iter()
+                .find(|step| *step as f32 >= pixels)
+                .unwrap_or(STEPS[STEPS.len() - 1])
+        };
+        Self::Cover {
+            width: step(size.width),
+            height: step(size.height),
+        }
+    }
+
+    fn box_size(self) -> (u32, u32) {
+        match self {
+            Self::Cover { width, height } => (width, height),
+            Self::Wash => (WASH, WASH),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -43,6 +79,9 @@ pub struct Artwork {
     cache: HashMap<ArtworkRequest, CachedArtwork>,
     recent: VecDeque<ArtworkRequest>,
     cache_bytes: usize,
+    /// The last loaded size of each URL, drawn while a different size loads.
+    shown: HashMap<String, Resolution>,
+    scale: f32,
 }
 
 enum CachedArtwork {
@@ -108,17 +147,33 @@ impl Artwork {
                 cache: HashMap::new(),
                 recent: VecDeque::new(),
                 cache_bytes: 0,
+                shown: HashMap::new(),
+                scale: 1.,
             },
             loaded,
         )
     }
 
-    pub fn get(&mut self, url: &str) -> Option<Arc<RenderImage>> {
-        self.get_resolution(url, Resolution::Thumbnail)
+    /// The window's device pixels per logical pixel, used to size every image.
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
     }
 
-    pub fn get_hero(&mut self, url: &str) -> Option<Arc<RenderImage>> {
-        self.get_resolution(url, Resolution::Hero)
+    /// Artwork with enough pixels to cover `size` (logical pixels) on this
+    /// display. A zero side is unconstrained. Until that size loads, a size
+    /// already loaded for the URL stands in.
+    pub fn get(&mut self, url: &str, size: Size<Pixels>) -> Option<Arc<RenderImage>> {
+        let resolution = Resolution::cover(size, self.scale);
+        self.get_resolution(url, resolution).or_else(|| {
+            let shown = ArtworkRequest {
+                url: url.to_owned(),
+                resolution: *self.shown.get(url)?,
+            };
+            match self.cache.get(&shown)? {
+                CachedArtwork::Loaded { image, .. } => Some(image.clone()),
+                CachedArtwork::Failed(_) => None,
+            }
+        })
     }
 
     /// The blurred wash behind album and playlist headers, made once at decode
@@ -165,6 +220,10 @@ impl Artwork {
             evicted.push(image);
         }
         self.recent.push_back(loaded.request.clone());
+        if loaded.image.is_some() && loaded.request.resolution != Resolution::Wash {
+            self.shown
+                .insert(loaded.request.url.clone(), loaded.request.resolution);
+        }
         self.cache.insert(
             loaded.request,
             match loaded.image {
@@ -185,6 +244,9 @@ impl Artwork {
                 self.cache_bytes -= bytes;
                 evicted.push(image);
             }
+            if self.shown.get(&oldest.url) == Some(&oldest.resolution) {
+                self.shown.remove(&oldest.url);
+            }
         }
         evicted
     }
@@ -195,7 +257,102 @@ fn load(
     request: &ArtworkRequest,
     disk: &Mutex<DiskCache>,
 ) -> anyhow::Result<RenderImage> {
-    let parsed = reqwest::Url::parse(&request.url)?;
+    let sources = sources(&request.url, request.resolution);
+    let (listed, better) = sources.split_last().expect("Artwork has a source");
+    better
+        .iter()
+        .find_map(|source| load_source(client, source, request.resolution, disk).ok())
+        .map_or_else(|| load_source(client, listed, request.resolution, disk), Ok)
+}
+
+/// The URLs to try for `url` at `resolution`, best first. Google's image
+/// service sizes art on request, as the web's `=w544-h544-l90-rj` URLs do.
+/// Video stills come in fixed sizes, and the HD ones may not exist, so a
+/// frame larger than the listed still tries them before the listed one.
+fn sources(url: &str, resolution: Resolution) -> Vec<String> {
+    let (width, height) = resolution.box_size();
+    if let Some(sized) = google_sized(url, width, height) {
+        return vec![sized];
+    }
+    let still = reqwest::Url::parse(url)
+        .ok()
+        .filter(|parsed| parsed.host_str() == Some("i.ytimg.com"))
+        .and_then(
+            |parsed| match parsed.path_segments()?.collect::<Vec<_>>()[..] {
+                ["vi", id, file] => Some((id.to_owned(), file.to_owned())),
+                _ => None,
+            },
+        );
+    match still {
+        Some((id, file))
+            if width.max(height * 16 / 9) > LISTED_STILL_WIDTH
+                && ["default", "mqdefault", "hqdefault", "sddefault", "hq720"]
+                    .contains(&file.split('.').next().unwrap_or_default()) =>
+        {
+            vec![
+                format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"),
+                format!("https://i.ytimg.com/vi/{id}/sddefault.jpg"),
+                url.to_owned(),
+            ]
+        }
+        _ => vec![url.to_owned()],
+    }
+}
+
+/// Rewrites a Google image URL's size options (`w`, `h` or `s`) to cover a
+/// box of `width` by `height` pixels at the URL's own aspect ratio, keeping
+/// its crop and quality options.
+fn google_sized(url: &str, width: u32, height: u32) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if !(host.ends_with(".googleusercontent.com") || host.ends_with(".ggpht.com"))
+        || parsed.query().is_some()
+    {
+        return None;
+    }
+    let (base, options) = url.rsplit_once('=')?;
+    fn size(option: &str) -> Option<(char, u32)> {
+        let kind = option
+            .chars()
+            .next()
+            .filter(|kind| matches!(kind, 'w' | 'h' | 's'))?;
+        let size = option[1..].parse().ok().filter(|size| *size > 0)?;
+        Some((kind, size))
+    }
+    let (mut source_width, mut source_height) = (None, None);
+    for (kind, size) in options.split('-').filter_map(size) {
+        match kind {
+            'w' => source_width = Some(size),
+            'h' => source_height = Some(size),
+            _ => (source_width, source_height) = (Some(size), Some(size)),
+        }
+    }
+    let aspect = source_width? as f32 / source_height? as f32;
+    let target_width = width.max((height as f32 * aspect).ceil() as u32);
+    let target_height = (target_width as f32 / aspect).round() as u32;
+    if target_width == 0 || target_height == 0 {
+        return None;
+    }
+    let options = options
+        .split('-')
+        .map(|option| match size(option) {
+            Some(('w', _)) => format!("w{target_width}"),
+            Some(('h', _)) => format!("h{target_height}"),
+            Some(_) => format!("s{}", target_width.max(target_height)),
+            None => option.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    Some(format!("{base}={options}"))
+}
+
+fn load_source(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    resolution: Resolution,
+    disk: &Mutex<DiskCache>,
+) -> anyhow::Result<RenderImage> {
+    let parsed = reqwest::Url::parse(url)?;
     anyhow::ensure!(
         parsed.scheme() == "https"
             && parsed.host_str().is_some_and(|h| h == "i.ytimg.com"
@@ -205,10 +362,11 @@ fn load(
                 || (h == "www.gstatic.com" && parsed.path().starts_with("/youtube/media/ytm/"))),
         "Unsupported artwork host"
     );
-    let key = format!("{:x}", Sha1::digest(request.url.as_bytes()));
+    let still = parsed.host_str() == Some("i.ytimg.com");
+    let key = format!("{:x}", Sha1::digest(url.as_bytes()));
     let cached = disk.lock().unwrap().read(&key);
     if let Some(bytes) = cached {
-        if let Ok(image) = decode(bytes, request.resolution) {
+        if let Ok(image) = decode(bytes, resolution, still) {
             return Ok(image);
         }
         disk.lock().unwrap().remove(&key);
@@ -224,7 +382,7 @@ fn load(
         bytes.len() as u64 <= DOWNLOAD_BYTES,
         "Artwork response is too large"
     );
-    let image = decode(bytes.clone(), request.resolution)?;
+    let image = decode(bytes.clone(), resolution, still)?;
     disk.lock().unwrap().write(&key, &bytes);
     Ok(image)
 }
@@ -352,19 +510,36 @@ impl DiskCache {
     }
 }
 
-fn decode(bytes: Vec<u8>, resolution: Resolution) -> anyhow::Result<RenderImage> {
+/// Decodes at the requested size, never enlarging. A 4:3 video still is a
+/// 16:9 frame letterboxed in black, so it loses the bars as on the web.
+fn decode(bytes: Vec<u8>, resolution: Resolution, still: bool) -> anyhow::Result<RenderImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(4096);
     limits.max_image_height = Some(4096);
     limits.max_alloc = Some(64 * 1024 * 1024);
     reader.limits(limits);
-    let (width, height) = match resolution {
-        Resolution::Thumbnail => (320, 320),
-        Resolution::Hero => (1600, 900),
-        Resolution::Wash => (64, 64),
-    };
-    let mut pixels = reader.decode()?.thumbnail(width, height).into_rgba8();
+    let mut image = reader.decode()?;
+    if still && image.width() * 3 == image.height() * 4 {
+        let height = image.width() * 9 / 16;
+        image = image.crop_imm(0, (image.height() - height) / 2, image.width(), height);
+    }
+    let mut pixels = match resolution {
+        Resolution::Cover { width, height } => {
+            let scale =
+                (width as f32 / image.width() as f32).max(height as f32 / image.height() as f32);
+            if scale < 1. {
+                image.thumbnail_exact(
+                    ((image.width() as f32 * scale).round() as u32).max(1),
+                    ((image.height() as f32 * scale).round() as u32).max(1),
+                )
+            } else {
+                image
+            }
+        }
+        Resolution::Wash => image.thumbnail(WASH, WASH),
+    }
+    .into_rgba8();
     if resolution == Resolution::Wash {
         // About the web's 80px blur once the wash is stretched across the page.
         pixels = image::imageops::blur(&pixels, 4.);
@@ -378,6 +553,20 @@ fn decode(bytes: Vec<u8>, resolution: Resolution) -> anyhow::Result<RenderImage>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{px, size};
+
+    const ROW: Resolution = Resolution::Cover {
+        width: 48,
+        height: 48,
+    };
+    const HERO: Resolution = Resolution::Cover {
+        width: 1536,
+        height: 1536,
+    };
+
+    fn edge(pixels: f32) -> Size<Pixels> {
+        size(px(pixels), px(pixels))
+    }
 
     fn fixture() -> (Artwork, async_channel::Receiver<ArtworkRequest>) {
         let (requests, queued) = async_channel::bounded(64);
@@ -389,6 +578,8 @@ mod tests {
                 cache: HashMap::new(),
                 recent: VecDeque::new(),
                 cache_bytes: 0,
+                shown: HashMap::new(),
+                scale: 1.,
             },
             queued,
         )
@@ -438,12 +629,8 @@ mod tests {
             .build()
             .unwrap();
         let disk = Mutex::new(DiskCache::new(Some(directory.path().to_owned())));
-        let requests = ["default.jpg", "mqdefault.jpg", "hqdefault.jpg"].map(|name| {
-            request(
-                &format!("https://i.ytimg.com/vi/csILUDfmtqM/{name}"),
-                Resolution::Thumbnail,
-            )
-        });
+        let requests = ["default.jpg", "mqdefault.jpg", "hqdefault.jpg"]
+            .map(|name| request(&format!("https://i.ytimg.com/vi/csILUDfmtqM/{name}"), ROW));
         for request in &requests {
             load(&online, request, &disk).unwrap();
         }
@@ -471,30 +658,23 @@ mod tests {
         let (mut artwork, queued) = fixture();
         let mut in_flight = Vec::new();
         for index in 0..3 {
-            artwork.get(&format!("in-flight-{index}"));
+            artwork.get(&format!("in-flight-{index}"), edge(48.));
             in_flight.push(queued.try_recv().unwrap());
         }
         for index in 0..64 {
-            artwork.get(&format!("old-page-{index}"));
+            artwork.get(&format!("old-page-{index}"), edge(48.));
         }
-        artwork.get("new-page");
+        artwork.get("new-page", edge(48.));
         assert_eq!(queued.len(), 64);
-        assert!(
-            !artwork
-                .pending
-                .contains(&request("new-page", Resolution::Thumbnail))
-        );
+        assert!(!artwork.pending.contains(&request("new-page", ROW)));
 
         artwork.cancel_pending();
         assert!(queued.is_empty());
         assert_eq!(artwork.pending.len(), 3);
-        artwork.get("new-page");
-        assert_eq!(
-            queued.try_recv().unwrap(),
-            request("new-page", Resolution::Thumbnail)
-        );
+        artwork.get("new-page", edge(48.));
+        assert_eq!(queued.try_recv().unwrap(), request("new-page", ROW));
         for request in &in_flight {
-            artwork.get(&request.url);
+            artwork.get(&request.url, edge(48.));
         }
         assert!(
             queued.is_empty(),
@@ -506,21 +686,21 @@ mod tests {
             image: None,
         });
         assert!(!artwork.pending.contains(&in_flight[0]));
-        artwork.get("old-page-0");
+        artwork.get("old-page-0", edge(48.));
         assert_eq!(queued.try_recv().unwrap().url, "old-page-0");
     }
 
     #[test]
     fn failed_artwork_retries_on_access_after_its_cooldown() {
         let (mut artwork, queued) = fixture();
-        artwork.get("artwork");
+        artwork.get("artwork", edge(48.));
         let request = queued.try_recv().unwrap();
         artwork.insert(LoadedArtwork {
             request: request.clone(),
             image: None,
         });
         for _ in 0..100 {
-            assert!(artwork.get("artwork").is_none());
+            assert!(artwork.get("artwork", edge(48.)).is_none());
         }
         assert!(queued.is_empty());
 
@@ -528,8 +708,8 @@ mod tests {
             panic!("failed downloads must have a retry deadline");
         };
         *retry_at = Instant::now() - Duration::from_secs(1);
-        artwork.get("artwork");
-        artwork.get("artwork");
+        artwork.get("artwork", edge(48.));
+        artwork.get("artwork", edge(48.));
         assert_eq!(queued.try_recv().unwrap(), request);
         assert!(queued.is_empty(), "only one retry may be in flight");
 
@@ -538,7 +718,10 @@ mod tests {
             request,
             image: Some(image.clone()),
         });
-        assert!(Arc::ptr_eq(&artwork.get("artwork").unwrap(), &image));
+        assert!(Arc::ptr_eq(
+            &artwork.get("artwork", edge(48.)).unwrap(),
+            &image
+        ));
         assert!(queued.is_empty());
     }
 
@@ -546,34 +729,31 @@ mod tests {
     fn thumbnail_and_hero_requests_are_deduplicated_at_their_own_resolution() {
         let (mut artwork, queued) = fixture();
         for _ in 0..10 {
-            artwork.get("shared-url");
-            artwork.get_hero("shared-url");
+            artwork.get("shared-url", edge(48.));
+            artwork.get("shared-url", edge(1200.));
         }
         assert_eq!(artwork.pending.len(), 2);
-        assert_eq!(
-            queued.try_recv().unwrap(),
-            request("shared-url", Resolution::Thumbnail)
-        );
-        assert_eq!(
-            queued.try_recv().unwrap(),
-            request("shared-url", Resolution::Hero)
-        );
+        assert_eq!(queued.try_recv().unwrap(), request("shared-url", ROW));
+        assert_eq!(queued.try_recv().unwrap(), request("shared-url", HERO));
         assert!(queued.is_empty());
 
         let thumbnail = image(320, 180);
         let hero = image(1600, 900);
-        for (resolution, image) in [
-            (Resolution::Thumbnail, thumbnail.clone()),
-            (Resolution::Hero, hero.clone()),
-        ] {
+        for (resolution, image) in [(ROW, thumbnail.clone()), (HERO, hero.clone())] {
             artwork.insert(LoadedArtwork {
                 request: request("shared-url", resolution),
                 image: Some(image),
             });
         }
         assert!(artwork.pending.is_empty());
-        assert!(Arc::ptr_eq(&artwork.get("shared-url").unwrap(), &thumbnail));
-        assert!(Arc::ptr_eq(&artwork.get_hero("shared-url").unwrap(), &hero));
+        assert!(Arc::ptr_eq(
+            &artwork.get("shared-url", edge(48.)).unwrap(),
+            &thumbnail
+        ));
+        assert!(Arc::ptr_eq(
+            &artwork.get("shared-url", edge(1200.)).unwrap(),
+            &hero
+        ));
         assert_eq!(artwork.cache.len(), 2);
         assert!(queued.is_empty());
     }
@@ -583,21 +763,21 @@ mod tests {
         let (mut artwork, _) = fixture();
         let image = image(1, 1);
         artwork.insert(LoadedArtwork {
-            request: request("loaded", Resolution::Thumbnail),
+            request: request("loaded", ROW),
             image: Some(image.clone()),
         });
         for index in 0..CACHE_ENTRIES - 1 {
             assert!(
                 artwork
                     .insert(LoadedArtwork {
-                        request: request(&format!("failed-{index}"), Resolution::Thumbnail),
+                        request: request(&format!("failed-{index}"), ROW),
                         image: None,
                     })
                     .is_empty()
             );
         }
         let evicted = artwork.insert(LoadedArtwork {
-            request: request("new", Resolution::Thumbnail),
+            request: request("new", ROW),
             image: None,
         });
         assert_eq!(evicted.len(), 1);
@@ -614,24 +794,30 @@ mod tests {
             assert!(
                 artwork
                     .insert(LoadedArtwork {
-                        request: request(&index.to_string(), Resolution::Thumbnail),
+                        request: request(&index.to_string(), ROW),
                         image: Some(image.clone()),
                     })
                     .is_empty()
             );
         }
-        artwork.get("0");
+        artwork.get("0", edge(48.));
         let hero = image(1600, 900);
         let evicted = artwork.insert(LoadedArtwork {
-            request: request("hero", Resolution::Hero),
+            request: request("hero", HERO),
             image: Some(hero.clone()),
         });
         assert_eq!(evicted.len(), 8);
         for (evicted, expected) in evicted.iter().zip(&thumbnails[1..9]) {
             assert!(Arc::ptr_eq(evicted, expected));
         }
-        assert!(Arc::ptr_eq(&artwork.get("0").unwrap(), &thumbnails[0]));
-        assert!(Arc::ptr_eq(&artwork.get_hero("hero").unwrap(), &hero));
+        assert!(Arc::ptr_eq(
+            &artwork.get("0", edge(48.)).unwrap(),
+            &thumbnails[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &artwork.get("hero", edge(1200.)).unwrap(),
+            &hero
+        ));
         assert_eq!(artwork.cache_bytes, 88 * 320 * 320 * 4 + 1600 * 900 * 4);
         assert!(artwork.cache_bytes <= CACHE_BYTES);
         assert!(artwork.cache.len() <= CACHE_ENTRIES);
@@ -645,13 +831,13 @@ mod tests {
         assert!(
             artwork
                 .insert(LoadedArtwork {
-                    request: request("same", Resolution::Thumbnail),
+                    request: request("same", ROW),
                     image: Some(original.clone()),
                 })
                 .is_empty()
         );
         let evicted = artwork.insert(LoadedArtwork {
-            request: request("same", Resolution::Thumbnail),
+            request: request("same", ROW),
             image: Some(replacement.clone()),
         });
         assert_eq!(evicted.len(), 1);
@@ -659,23 +845,141 @@ mod tests {
         assert_eq!(artwork.cache.len(), 1);
         assert_eq!(artwork.recent.len(), 1);
         assert_eq!(artwork.cache_bytes, 160 * 160 * 4);
-        assert!(Arc::ptr_eq(&artwork.get("same").unwrap(), &replacement));
+        assert!(Arc::ptr_eq(
+            &artwork.get("same", edge(48.)).unwrap(),
+            &replacement
+        ));
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(width, height, |_, y| {
+            // A 4:3 still letterboxes its 16:9 frame in black.
+            let bar = (height - width * 9 / 16) / 2;
+            if y < bar || y >= height - bar {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([200, 100, 50, 255])
+            }
+        }))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+        bytes.into_inner()
     }
 
     #[test]
-    fn decoding_keeps_thumbnail_size_and_preserves_sharper_hero_pixels() {
-        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::new(1920, 1080));
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        source
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
-        for (resolution, expected) in [
-            (Resolution::Thumbnail, (320, 180)),
-            (Resolution::Hero, (1600, 900)),
-        ] {
-            let image = decode(bytes.get_ref().clone(), resolution).unwrap();
+    fn decoding_covers_the_shown_size_without_enlarging_or_letterboxing() {
+        let size = |bytes: Vec<u8>, resolution, still| {
+            let image = decode(bytes, resolution, still).unwrap();
             let size = image.size(0);
-            assert_eq!((size.width.0, size.height.0), expected);
-        }
+            (size.width.0, size.height.0)
+        };
+        // A square row covers its box with the frame's full height.
+        assert_eq!(size(png(1920, 1080), ROW, false), (85, 48));
+        assert_eq!(
+            size(
+                png(1920, 1080),
+                Resolution::Cover {
+                    width: 1536,
+                    height: 0
+                },
+                false
+            ),
+            (1536, 864)
+        );
+        // Small art keeps its pixels; GPUI enlarges it as cheaply as the CPU.
+        assert_eq!(size(png(120, 120), HERO, false), (120, 120));
+        let image = decode(png(480, 360), ROW, true).unwrap();
+        let size = image.size(0);
+        assert_eq!((size.width.0, size.height.0), (85, 48));
+        let pixels = image.as_bytes(0).unwrap();
+        assert!(
+            pixels.chunks(4).all(|pixel| pixel[2] > 150),
+            "a letterboxed still must lose its black bars"
+        );
+    }
+
+    #[test]
+    fn sources_ask_for_the_pixels_each_surface_shows() {
+        let cover = |edge: f32, scale| Resolution::cover(size(px(edge), px(edge)), scale);
+        assert_eq!(cover(48., 1.), ROW);
+        assert_eq!(
+            cover(48., 2.),
+            Resolution::Cover {
+                width: 96,
+                height: 96
+            }
+        );
+        assert_eq!(
+            cover(5000., 1.),
+            Resolution::Cover {
+                width: 2048,
+                height: 2048
+            }
+        );
+        let album = "https://lh3.googleusercontent.com/album=w120-h120-l90-rj";
+        assert_eq!(
+            sources(album, cover(48., 2.)),
+            ["https://lh3.googleusercontent.com/album=w96-h96-l90-rj"]
+        );
+        // A banner keeps its crop's aspect ratio at the shown width.
+        assert_eq!(
+            sources(
+                "https://lh3.googleusercontent.com/banner=w1080-h450-p-l90-rj",
+                Resolution::cover(size(px(1440.), px(400.)), 1.)
+            ),
+            ["https://lh3.googleusercontent.com/banner=w1536-h640-p-l90-rj"]
+        );
+        assert_eq!(
+            sources(
+                "https://yt3.ggpht.com/avatar=s88-c-k-c0x00ffffff-no-rj",
+                cover(36., 2.)
+            ),
+            ["https://yt3.ggpht.com/avatar=s96-c-k-c0x00ffffff-no-rj"]
+        );
+        let signed = "https://lh3.googleusercontent.com/art=w120-h120?sig=1";
+        assert_eq!(sources(signed, HERO), [signed]);
+        // Listed stills serve rows and cards; a larger frame tries the HD stills first.
+        let still = "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg?sqp=a&rs=b";
+        assert_eq!(sources(still, cover(240., 1.)), [still]);
+        assert_eq!(
+            sources(still, cover(400., 1.)),
+            [
+                "https://i.ytimg.com/vi/abcdefghijk/maxresdefault.jpg",
+                "https://i.ytimg.com/vi/abcdefghijk/sddefault.jpg",
+                still
+            ]
+        );
+        let library = "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-music.png";
+        assert_eq!(sources(library, HERO), [library]);
+    }
+
+    #[test]
+    fn a_new_size_shows_the_loaded_size_until_it_arrives() {
+        let (mut artwork, queued) = fixture();
+        artwork.get("art", edge(48.));
+        let row = image(48, 48);
+        artwork.insert(LoadedArtwork {
+            request: queued.try_recv().unwrap(),
+            image: Some(row.clone()),
+        });
+        let shown = artwork.get("art", edge(1200.)).unwrap();
+        assert!(Arc::ptr_eq(&shown, &row));
+        let hero = queued.try_recv().unwrap();
+        assert_eq!(hero, request("art", HERO));
+        let large = image(1536, 1536);
+        artwork.insert(LoadedArtwork {
+            request: hero,
+            image: Some(large.clone()),
+        });
+        assert!(Arc::ptr_eq(
+            &artwork.get("art", edge(1200.)).unwrap(),
+            &large
+        ));
+        assert!(Arc::ptr_eq(&artwork.get("art", edge(48.)).unwrap(), &row));
+        assert!(
+            artwork.get_wash("art").is_none(),
+            "a wash is never the sharp art"
+        );
     }
 }

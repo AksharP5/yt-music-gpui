@@ -108,7 +108,7 @@ impl Music {
             // The web rounds the bar's art by only 2px.
             let art = match self
                 .current_thumbnail()
-                .and_then(|url| self.artwork.get(&url))
+                .and_then(|url| self.artwork.get(&url, size(px(40.), px(40.))))
             {
                 Some(image) => img(image)
                     .size(px(40.))
