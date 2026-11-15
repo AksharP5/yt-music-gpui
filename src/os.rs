@@ -1,14 +1,21 @@
 //! Process and descriptor primitives the rest of the app builds on.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+#[cfg(target_os = "linux")]
+use anyhow::ensure;
 use std::{
     ffi::c_int,
-    fs::{self, File},
-    io::{self, ErrorKind, Write},
+    fs::File,
+    io::{self, ErrorKind},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-    os::unix::{fs::PermissionsExt, process::CommandExt},
     process::{Child, Command},
     time::Instant,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    fs,
+    io::Write,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
 };
 
 /// A crash dump must not persist reusable account credentials.
@@ -24,6 +31,7 @@ pub fn disable_core_dumps() -> io::Result<()> {
 }
 
 /// An anonymous, owner-only RAM file. Closing the last descriptor destroys it.
+#[cfg(target_os = "linux")]
 pub fn private_file() -> Result<File> {
     let fd = unsafe {
         libc::memfd_create(
@@ -37,7 +45,15 @@ pub fn private_file() -> Result<File> {
     Ok(file)
 }
 
+/// macOS has no anonymous RAM files. This one is created owner-only in the
+/// per-user temporary directory and unlinked at once, so no path reaches it.
+#[cfg(target_os = "macos")]
+pub fn private_file() -> Result<File> {
+    Ok(tempfile::tempfile()?)
+}
+
 /// A private RAM file holding `bytes` that nobody can change afterwards.
+#[cfg(target_os = "linux")]
 pub fn sealed_file(bytes: &[u8]) -> Result<File> {
     let mut file = private_file()?;
     file.write_all(bytes)?;
@@ -51,6 +67,7 @@ pub fn sealed_file(bytes: &[u8]) -> Result<File> {
 
 /// Ask the kernel to send `signal` to the child if the spawning thread dies
 /// without running its destructors (for example when the app is killed).
+#[cfg(target_os = "linux")]
 pub fn exit_with_parent(command: &mut Command, signal: c_int) {
     let parent = std::process::id() as libc::pid_t;
     unsafe {
@@ -67,18 +84,70 @@ pub fn exit_with_parent(command: &mut Command, signal: c_int) {
     }
 }
 
+/// macOS has no parent-death signal. A killed app instead closes the child's
+/// pipes: the resident resolver exits at the end of its stdin, and a one-shot
+/// extractor exits once it has written its single answer.
+#[cfg(target_os = "macos")]
+pub fn exit_with_parent(_: &mut Command, _: c_int) {}
+
 /// SIGKILL a child started with `process_group(0)` and everything it spawned.
 pub fn kill_group(child: &Child) {
     unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
 }
 
 /// A descriptor that becomes readable once `child` exits.
+#[cfg(target_os = "linux")]
 pub fn exit_fd(child: &Child) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd as _) })
+}
+
+/// A descriptor that becomes readable once `child` exits: a kqueue watching it.
+#[cfg(target_os = "macos")]
+pub fn exit_fd(child: &Child) -> io::Result<OwnedFd> {
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let event = |ident, filter, fflags| libc::kevent {
+        ident,
+        filter,
+        flags: libc::EV_ADD,
+        fflags,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let register = |event: libc::kevent| {
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    match register(event(child.id() as _, libc::EVFILT_PROC, libc::NOTE_EXIT)) {
+        // The child already exited, so the queue must report that at once.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            register(event(0, libc::EVFILT_USER, libc::NOTE_TRIGGER))?
+        }
+        result => result?,
+    }
+    Ok(queue)
 }
 
 pub fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
@@ -93,8 +162,10 @@ pub fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
 
 /// A descriptor other threads make readable to interrupt `wait_readable`.
 /// Wakeups coalesce: any number of `wake` calls before a `drain` count as one.
+#[cfg(target_os = "linux")]
 pub struct Waker(OwnedFd);
 
+#[cfg(target_os = "linux")]
 impl Waker {
     pub fn new() -> io::Result<Self> {
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -146,9 +217,77 @@ impl Waker {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl AsFd for Waker {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
+    }
+}
+
+/// macOS has no eventfd, so wakeups are bytes in a nonblocking pipe.
+#[cfg(target_os = "macos")]
+pub struct Waker {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl Waker {
+    pub fn new() -> io::Result<Self> {
+        let (read, write) = io::pipe()?;
+        let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
+        set_nonblocking(read.as_fd())?;
+        set_nonblocking(write.as_fd())?;
+        Ok(Self { read, write })
+    }
+
+    pub fn wake(&self) {
+        loop {
+            let result = unsafe { libc::write(self.write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };
+            if result == 1 {
+                return;
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                ErrorKind::Interrupted => continue,
+                // A full pipe is already readable, so no wakeup is lost.
+                ErrorKind::WouldBlock => return,
+                _ => unreachable!("The owned wakeup must remain writable: {error}"),
+            }
+        }
+    }
+
+    /// Clear pending wakeups so the next wait blocks again.
+    pub fn drain(&self) -> io::Result<()> {
+        let mut bytes = [0_u8; 64];
+        loop {
+            let result = unsafe {
+                libc::read(
+                    self.read.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if result > 0 {
+                continue;
+            }
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                ErrorKind::Interrupted => continue,
+                ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(error),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl AsFd for Waker {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.read.as_fd()
     }
 }
 
@@ -164,20 +303,36 @@ pub fn wait_readable<const N: usize>(
         revents: 0,
     });
     loop {
-        let timeout = deadline.map(|deadline| {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            libc::timespec {
-                tv_sec: remaining.as_secs() as _,
-                tv_nsec: remaining.subsec_nanos() as _,
+        #[cfg(target_os = "linux")]
+        let result = {
+            let timeout = deadline.map(|deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                libc::timespec {
+                    tv_sec: remaining.as_secs() as _,
+                    tv_nsec: remaining.subsec_nanos() as _,
+                }
+            });
+            unsafe {
+                libc::ppoll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as _,
+                    timeout.as_ref().map_or(std::ptr::null(), |timeout| timeout),
+                    std::ptr::null(),
+                )
             }
-        });
-        let result = unsafe {
-            libc::ppoll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as _,
-                timeout.as_ref().map_or(std::ptr::null(), |timeout| timeout),
-                std::ptr::null(),
-            )
+        };
+        // macOS has no ppoll. Round up so a wait never ends just before its deadline.
+        #[cfg(target_os = "macos")]
+        let result = {
+            let timeout = deadline.map_or(-1, |deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .try_into()
+                    .unwrap_or(c_int::MAX)
+            });
+            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) }
         };
         if result >= 0 {
             return Ok(descriptors.map(|descriptor| descriptor.revents != 0));

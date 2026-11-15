@@ -1,6 +1,8 @@
 //! Desktop media controls: the app publishes now-playing state and receives
 //! commands from media keys and the desktop. Each platform serves them its own
-//! way; Linux uses MPRIS over D-Bus.
+//! way; Linux uses MPRIS over D-Bus. macOS has no backend yet, so only
+//! Linux reads the published state.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use crate::{catalog::Track, library::Repeat, player::PlaybackSpeed};
 use anyhow::{Context, Result};
@@ -14,6 +16,15 @@ use std::{
 mod mpris;
 #[cfg(target_os = "linux")]
 use mpris::serve;
+
+#[cfg(not(target_os = "linux"))]
+fn serve(
+    _: Arc<Mutex<Published>>,
+    _: async_channel::Sender<Event>,
+    _: mpsc::Receiver<()>,
+) -> Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Event {

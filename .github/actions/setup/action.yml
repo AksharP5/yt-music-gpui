@@ -8,6 +8,7 @@ runs:
   using: composite
   steps:
     - name: Install system libraries
+      if: runner.os == 'Linux'
       shell: bash
       # build.rs links EGL, GLESv2, X11, Xext, Wayland and libmpv; GPUI needs xcb, xkbcommon,
       # fontconfig and freetype.
@@ -16,6 +17,10 @@ runs:
         sudo apt-get install -y --no-install-recommends \
           pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev \
           libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
+    - name: Install libmpv
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install mpv
     - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       with:
         components: rustfmt, clippy

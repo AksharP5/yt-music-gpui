@@ -46,6 +46,17 @@ jobs:
           player::tests::quality_selectors_respect_audio_classes_and_video_caps
           player::tests::embedded_extractor_binds_the_selected_account
 
+  # Builds and plays audio on Apple Silicon. Sign-in and video are Linux-only so far.
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: bin/test
+      - name: Play through Homebrew's libmpv
+        run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
+
   release-test:
     if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/release-build.yml

@@ -785,6 +785,12 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
     println!("INLINE_LINKS forward=passed reverse=passed enter=passed row_playback=unchanged");
 }
 
+#[cfg(not(target_os = "linux"))]
+fn prepare_x11_capture(_: u64) -> (u32, u32) {
+    panic!("Pixel captures need X11, so they run only on Linux")
+}
+
+#[cfg(target_os = "linux")]
 fn prepare_x11_capture(id: u64) -> (u32, u32) {
     unsafe extern "C" {
         fn XOpenDisplay(name: *const libc::c_char) -> *mut libc::c_void;

@@ -3174,7 +3174,7 @@ YtMusicAccountIE._real_extract = extract
             .start(resolver_target("abcdefghijk", 3), Some(&credentials))
             .unwrap();
         assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
+            !alive(pid),
             "superseded resolver must be reaped synchronously"
         );
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3227,7 +3227,7 @@ YtMusicAccountIE._real_extract = extract
         assert_ne!(respawned, new_pid);
         resolved(&mut resolver, Some(&credentials));
         drop(resolver);
-        assert!(!Path::new(&format!("/proc/{respawned}")).exists());
+        assert!(!alive(respawned));
     }
 
     #[test]
@@ -3248,7 +3248,7 @@ YtMusicAccountIE._real_extract = extract
         );
         let pid = resolver.warm.as_ref().unwrap().child.id();
         resolver.stop();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!alive(pid));
         let credentials = signed_in(
             synthetic_account("INVENTED_SECOND", "3", "other", "second"),
             &plugin,
@@ -3373,7 +3373,7 @@ YtMusicAccountIE._real_extract = extract
         assert!(stream.unwrap().url.contains("itag=251"));
         assert_eq!(resolver.warm.as_ref().unwrap().child.id(), pid);
         assert_eq!(resolver.target.as_ref().unwrap().track_id, 1);
-        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(alive(pid));
         server.join().unwrap();
     }
 
@@ -3564,7 +3564,12 @@ YtMusicAccountIE._real_extract = extract
         let job = StreamPreparation::start(target, &extractor, Some(&credentials)).unwrap();
         let pid = job.child.id();
         drop(job);
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!alive(pid));
+    }
+
+    /// Whether `pid` exists, including as an unreaped zombie.
+    fn alive(pid: impl Into<u64>) -> bool {
+        unsafe { libc::kill(pid.into() as libc::pid_t, 0) == 0 }
     }
 
     /// What a stub extractor saw of its own process: descriptors, argv,
@@ -3581,7 +3586,7 @@ YtMusicAccountIE._real_extract = extract
         // The stub lists its descriptors and copies its argv and environment,
         // then keeps the first line it reads: credentials, or a guest's request.
         let record = format!(
-            "cd /proc/$$/fd && ls > {report}.fds\ncat /proc/$$/cmdline /proc/$$/environ > {report}.visible\n",
+            "ls /dev/fd > {report}.fds\n{{ printf '%s\\n' \"$0\" \"$@\"; env; }} > {report}.visible\n",
             report = report.display()
         );
         let script = if warm {
@@ -3625,6 +3630,7 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn credential_writers() -> usize {
         fs::read_dir("/proc/self/task")
             .unwrap()
@@ -3681,17 +3687,17 @@ YtMusicAccountIE._real_extract = extract
             }
             // The deadline still runs on this thread and reaps the stalled extractor.
             resolver.finish(None, Some(&credentials));
-            assert!(
-                !Path::new(&format!("/proc/{pid}")).exists(),
-                "{behaviour}: extractor survived its deadline"
-            );
+            assert!(!alive(pid), "{behaviour}: extractor survived its deadline");
             drop(resolver);
         }
-        // Each writer ends once its extractor is gone.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while credential_writers() > 0 {
-            assert!(Instant::now() < deadline, "a credential writer is stuck");
-            thread::sleep(Duration::from_millis(10));
+        // Each writer ends once its extractor is gone. Only Linux lists thread names.
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while credential_writers() > 0 {
+                assert!(Instant::now() < deadline, "a credential writer is stuck");
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -5417,13 +5423,13 @@ os.kill(os.getpid(), signal.SIGSTOP)
             }
             let data: Value = serde_json::from_slice(&fs::read(ready).unwrap()).unwrap();
             let pid = data["pid"].as_u64().unwrap();
-            assert!(Path::new(&format!("/proc/{pid}")).exists());
+            assert!(alive(pid));
             Self { pid }
         }
 
         fn assert_revoked(&self) {
             assert!(
-                !Path::new(&format!("/proc/{}", self.pid)).exists(),
+                !alive(self.pid),
                 "extractor must be reaped before cleanup completes"
             );
         }
@@ -5487,10 +5493,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             if ready.exists() {
                 let data: Value = serde_json::from_slice(&fs::read(&ready).unwrap()).unwrap();
                 let pid = data["pid"].as_u64().unwrap();
-                assert!(
-                    !Path::new(&format!("/proc/{pid}")).exists(),
-                    "extractor survived immediate credential clear"
-                );
+                assert!(!alive(pid), "extractor survived immediate credential clear");
                 started += 1;
                 fs::remove_file(&ready).unwrap();
             }

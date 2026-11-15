@@ -462,6 +462,11 @@ impl Music {
     }
 
     pub(in crate::app) fn set_video_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled && !crate::video::SUPPORTED {
+            self.error = Some("Video on this system is coming soon.".into());
+            cx.notify();
+            return;
+        }
         self.player_open |= enabled;
         self.video_error = None;
         let changed = self.library.video != enabled;

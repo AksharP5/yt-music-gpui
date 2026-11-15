@@ -366,7 +366,7 @@ impl Music {
 
     pub(in crate::app) fn connect_account(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if !auth::ACCOUNT_LOGIN_ENABLED {
-            self.error = Some("Sign-in is unavailable.".into());
+            self.error = Some("Sign-in on this system is coming soon.".into());
             cx.notify();
             return;
         }
