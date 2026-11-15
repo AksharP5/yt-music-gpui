@@ -6,6 +6,7 @@ mod auth;
 mod catalog;
 mod comments;
 mod country_picker;
+mod dirs;
 mod history;
 mod input;
 mod library;

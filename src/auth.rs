@@ -156,7 +156,7 @@ impl Session {
             .stdin(Stdio::null());
         let output =
             AccountProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
-        Self::from_storage(&output, account_directory().as_deref())
+        Self::from_storage(&output, crate::dirs::data().as_deref())
     }
     /// The keyring wins; the session file is read only when the keyring has no account.
     fn from_storage(lookup: &Output, directory: Option<&Path>) -> Result<Option<Self>> {
@@ -219,7 +219,7 @@ impl Session {
     /// Saves to the keyring. Without one, it updates a session file the user already chose.
     pub(crate) fn save(&self) -> Result<()> {
         let value = self.saved_value()?;
-        let directory = account_directory();
+        let directory = crate::dirs::data();
         match store_in_keyring(&value) {
             Ok(()) => {
                 let Some(directory) = directory else {
@@ -243,14 +243,14 @@ impl Session {
     }
     /// Only after the user explicitly chose a file over the missing keyring.
     pub(crate) fn save_without_keyring(&self) -> Result<()> {
-        let directory = account_directory().context("Could not find your user data directory")?;
+        let directory = crate::dirs::data().context("Could not find your user data directory")?;
         write_session_file(&directory.join(SESSION_FILE), &self.saved_value()?)?;
         // The marker means the keyring holds the account; it no longer does.
         remove_if_present(&directory.join(MARKER)).context("Could not forget the saved account")
     }
     pub fn disconnect() -> Result<()> {
         clear_keyring(&KEYRING_ATTRIBUTES)?;
-        account_directory().map_or(Ok(()), |directory| forget_saved(&directory))
+        crate::dirs::data().map_or(Ok(()), |directory| forget_saved(&directory))
     }
     pub(crate) fn resume_scope(&self) -> String {
         format!("{:x}", Sha1::digest(self.data_sync_id.as_bytes()))
@@ -489,11 +489,6 @@ struct AccountProcess(Child);
 const MARKER: &str = "account-saved";
 /// The session, only when the user chose to save it without a keyring.
 const SESSION_FILE: &str = "account-session";
-
-fn account_directory() -> Option<PathBuf> {
-    crate::library::user_directory("XDG_DATA_HOME", ".local/share")
-        .map(|base| base.join("yt-music-gpui"))
-}
 
 fn store_in_keyring(value: &[u8]) -> Result<()> {
     // A RAM stdin file cannot block on a full pipe while the keyring is locked.

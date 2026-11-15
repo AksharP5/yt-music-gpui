@@ -71,6 +71,12 @@ version /usr/bin/yt-music-gpui /nonexistent
 expect "yt-dlp: $(command -v yt-dlp || echo 'not found')"
 expect "deno: $(command -v deno || echo 'not found')"
 chmod o-w /usr/lib/yt-music-gpui
+# Likewise once the directory belongs to anyone but root.
+chown 65534 /usr/lib/yt-music-gpui
+version /usr/bin/yt-music-gpui /nonexistent
+expect "yt-dlp: $(command -v yt-dlp || echo 'not found')"
+expect "deno: $(command -v deno || echo 'not found')"
+chown 0 /usr/lib/yt-music-gpui
 
 [ "$(/usr/lib/yt-music-gpui/yt-dlp --version)" = "$YTDLP_VERSION" ]
 cd /tmp
