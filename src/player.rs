@@ -1225,13 +1225,21 @@ fn extractor_arguments(command: &mut Command, credentials: Option<&ExtractorCred
 }
 
 /// The credentials never touch argv, the environment or a file: the extractor
-/// reads them from its own stdin pipe before its first request. The line
-/// normally fits in the pipe buffer; a larger one waits until the extractor
-/// reads it during startup, or fails once it exits.
-fn send_credentials(input: &mut ChildStdin, credentials: &ExtractorCredentials) -> Result<()> {
-    input
-        .write_all(&credentials.source.message)
-        .context("Could not hand the account to the stream extractor")
+/// reads them from its own stdin pipe before its first request.
+///
+/// The line can exceed the pipe buffer, so a short-lived thread writes it and
+/// the player thread never waits on the extractor. Killing the extractor
+/// closes the pipe's read end, which ends the write with an error.
+fn send_credentials(input: impl Into<OwnedFd>, credentials: &ExtractorCredentials) -> Result<()> {
+    let mut input = File::from(input.into());
+    let message = credentials.source.message.clone();
+    thread::Builder::new()
+        .name("credentials".into())
+        .spawn(move || {
+            let _ = input.write_all(&message);
+        })
+        .context("Could not hand the account to the stream extractor")?;
+    Ok(())
 }
 
 fn python_interpreter(ytdlp: &Path) -> Result<Command> {
@@ -1293,6 +1301,10 @@ struct WarmResolver {
     output: ChildStdout,
     bytes: Vec<u8>,
     ready: bool,
+    /// A signed-in resolver's request waits for `ready`: until then the
+    /// account's credentials may still be on their way through stdin.
+    signed_in: bool,
+    request: Option<Vec<u8>>,
     started: Instant,
 }
 
@@ -1312,28 +1324,39 @@ impl WarmResolver {
         // it out of terminal signals, so it must not outlive the player thread.
         exit_with_parent(&mut command, libc::SIGKILL);
         let mut child = command.spawn()?;
-        let mut resolver = Self {
+        let resolver = Self {
             input: child.stdin.take().unwrap(),
             output: child.stdout.take().unwrap(),
             child,
             bytes: Vec::new(),
             ready: false,
+            signed_in: credentials.is_some(),
+            request: None,
             started: Instant::now(),
         };
         set_nonblocking(resolver.output.as_fd())
             .context("Could not read resolver output asynchronously")?;
         if let Some(credentials) = credentials {
-            send_credentials(&mut resolver.input, credentials)?;
+            send_credentials(resolver.input.as_fd().try_clone_to_owned()?, credentials)?;
         }
         Ok(resolver)
     }
 
     fn send(&mut self, target: &PreparedTarget) -> Result<()> {
-        serde_json::to_writer(
-            &mut self.input,
-            &json!({"url": target.key.url, "format": target.key.selector()}),
-        )?;
-        self.input.write_all(b"\n")?;
+        let mut request =
+            serde_json::to_vec(&json!({"url": target.key.url, "format": target.key.selector()}))?;
+        request.push(b'\n');
+        self.request = Some(request);
+        if self.ready || !self.signed_in {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if let Some(request) = self.request.take() {
+            self.input.write_all(&request)?;
+        }
         Ok(())
     }
 
@@ -1342,7 +1365,10 @@ impl WarmResolver {
             if let Some(end) = self.bytes.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.bytes.drain(..=end).collect();
                 match serde_json::from_slice(&line)? {
-                    ResolverResponse::Ready { ready: true } if !self.ready => self.ready = true,
+                    ResolverResponse::Ready { ready: true } if !self.ready => {
+                        self.ready = true;
+                        self.flush()?;
+                    }
                     ResolverResponse::Stream { urls, loudness } if self.ready => {
                         let gain_db =
                             normalization_gain(&loudness["audioConfig"], &loudness["format"]);
@@ -1759,9 +1785,9 @@ impl StreamPreparation {
             output,
             exited,
         };
-        if let (Some(mut input), Some(credentials)) = (input, credentials) {
-            // Dropping the pipe closes it: the extractor gets nothing more.
-            send_credentials(&mut input, credentials)?;
+        if let (Some(input), Some(credentials)) = (input, credentials) {
+            // The writer closes the pipe afterwards: the extractor gets nothing more.
+            send_credentials(input, credentials)?;
         }
         Ok(job)
     }
@@ -3123,6 +3149,8 @@ YtMusicAccountIE._real_extract = extract
                 Instant::now() < deadline,
                 "synthetic extractor did not start"
             );
+            // Like the actor: the signed-in request goes out once the resolver is ready.
+            assert!(resolver.finish(None, Some(&credentials)).is_none());
             thread::sleep(Duration::from_millis(5));
         }
         let child = serde_json::from_slice::<Value>(&fs::read(ready).unwrap()).unwrap()["child"]
@@ -3551,7 +3579,7 @@ YtMusicAccountIE._real_extract = extract
         let directory = tempfile::tempdir().unwrap();
         let report = directory.path().join("report");
         // The stub lists its descriptors and copies its argv and environment,
-        // then keeps whatever came before the first request on stdin.
+        // then keeps the first line it reads: credentials, or a guest's request.
         let record = format!(
             "cd /proc/$$/fd && ls > {report}.fds\ncat /proc/$$/cmdline /proc/$$/environ > {report}.visible\n",
             report = report.display()
@@ -3561,7 +3589,7 @@ YtMusicAccountIE._real_extract = extract
             fs::write(
                 &interpreter,
                 format!(
-                    "#!/bin/sh\n{record}case \"$*\" in *--use-extractors*) IFS= read -r line; printf '%s\\n' \"$line\" > {report}.stdin;; esac\nprintf '%s\\n' '{{\"ready\":true}}'\nwhile IFS= read -r request; do printf '%s\\n' '{{\"urls\":[\"https://rr1.googlevideo.com/warm\"]}}'; done\n",
+                    "#!/bin/sh\n{record}case \"$*\" in *--use-extractors*) IFS= read -r line; printf '%s\\n' \"$line\" > {report}.stdin;; esac\nprintf '%s\\n' '{{\"ready\":true}}'\nwhile IFS= read -r request; do [ -e {report}.stdin ] || printf '%s\\n' \"$request\" > {report}.stdin; printf '%s\\n' '{{\"urls\":[\"https://rr1.googlevideo.com/warm\"]}}'; done\n",
                     report = report.display()
                 ),
             )
@@ -3597,6 +3625,76 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    fn credential_writers() -> usize {
+        fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter(|task| {
+                fs::read_to_string(task.as_ref().unwrap().path().join("comm"))
+                    .is_ok_and(|name| name.trim() == "credentials")
+            })
+            .count()
+    }
+
+    #[test]
+    fn an_unread_oversized_account_never_blocks_the_player_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        // Far beyond any pipe buffer.
+        let credentials = ExtractorCredentials {
+            plugin_dir: directory.path().to_owned(),
+            source: PlaybackCredentials {
+                message: vec![b'x'; 1 << 20],
+            },
+        };
+        for (warm, behaviour) in [
+            (true, "exec sleep 60"),
+            (false, "exec sleep 60"),
+            (false, "exit 0"),
+        ] {
+            let extractor = directory.path().join("extractor");
+            if warm {
+                let interpreter = directory.path().join("python3");
+                fs::write(&interpreter, format!("#!/bin/sh\n{behaviour}\n")).unwrap();
+                fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
+            } else {
+                fs::write(&extractor, format!("#!/bin/sh\n{behaviour}\n")).unwrap();
+            }
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+            let start = Instant::now();
+            let mut resolver = StreamResolver::new(&extractor, Some(&credentials));
+            assert_eq!(resolver.warm.is_some(), warm);
+            resolver
+                .start(resolver_target("abcdefghijk", 1), Some(&credentials))
+                .unwrap();
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "the player thread waited for the extractor to read its account"
+            );
+            let pid = match &resolver.warm {
+                Some(warm) => warm.child.id(),
+                None => resolver.one_shot.as_ref().unwrap().child.id(),
+            };
+            let expired = Instant::now() - RESOLVER_TIMEOUT;
+            resolver.started = expired;
+            if let Some(warm) = &mut resolver.warm {
+                warm.started = expired;
+            }
+            // The deadline still runs on this thread and reaps the stalled extractor.
+            resolver.finish(None, Some(&credentials));
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "{behaviour}: extractor survived its deadline"
+            );
+            drop(resolver);
+        }
+        // Each writer ends once its extractor is gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while credential_writers() > 0 {
+            assert!(Instant::now() < deadline, "a credential writer is stuck");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn credentials_reach_the_extractor_only_through_its_stdin() {
         let directory = tempfile::tempdir().unwrap();
@@ -3608,7 +3706,15 @@ YtMusicAccountIE._real_extract = extract
             let guest = hand_off(warm, None);
             let account = hand_off(warm, Some(&credentials));
             assert_eq!(account.received, credentials.source.message, "warm: {warm}");
-            assert!(guest.received.is_empty(), "warm: {warm}");
+            if warm {
+                let request: Value = serde_json::from_slice(&guest.received).unwrap();
+                assert_eq!(
+                    request["url"],
+                    "https://music.youtube.com/watch?v=abcdefghijk"
+                );
+            } else {
+                assert!(guest.received.is_empty());
+            }
             for handoff in [&guest, &account] {
                 assert!(!handoff.visible.contains("INVENTED_HANDOFF_SECRET"));
                 assert!(!handoff.visible.contains("brand||user"));
