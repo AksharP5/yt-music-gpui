@@ -123,7 +123,9 @@ impl Artwork {
                                     client,
                                     &request,
                                     disk.get_or_init(|| {
-                                        Mutex::new(DiskCache::new(cache_directory()))
+                                        Mutex::new(DiskCache::new(
+                                            crate::dirs::cache().map(|cache| cache.join("artwork")),
+                                        ))
                                     }),
                                 )
                                 .ok()
@@ -385,11 +387,6 @@ fn load_source(
     let image = decode(bytes.clone(), resolution, still)?;
     disk.lock().unwrap().write(&key, &bytes);
     Ok(image)
-}
-
-fn cache_directory() -> Option<PathBuf> {
-    crate::library::user_directory("XDG_CACHE_HOME", ".cache")
-        .map(|base| base.join("yt-music-gpui/artwork"))
 }
 
 struct DiskEntry {
