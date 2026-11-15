@@ -1,0 +1,53 @@
+# Temporary: launch the Windows build on the runner and capture what it draws.
+name: Windows screenshot
+on:
+  push:
+    branches: [windows-build]
+permissions:
+  contents: read
+jobs:
+  shot:
+    runs-on: windows-2025
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          cache: 'false'
+      - run: cargo build --release --locked
+        shell: bash
+      - name: Run the app, check its pipe, lock and cleanup, and capture the screen
+        shell: pwsh
+        run: |
+          $data = "$env:RUNNER_TEMP\appdata"
+          New-Item -ItemType Directory -Force "$data\yt-music-gpui", shots | Out-Null
+          '{"volume":0}' | Set-Content -Encoding ascii "$data\yt-music-gpui\library.json"
+          $env:LOCALAPPDATA = $data
+          $exe = (Resolve-Path target\release\yt-music-gpui.exe).Path
+          "exe size: $((Get-Item $exe).Length)"
+          $app = Start-Process -PassThru -FilePath $exe -RedirectStandardError "$env:RUNNER_TEMP\stderr.txt" -RedirectStandardOutput "$env:RUNNER_TEMP\stdout.txt"
+          Start-Sleep 20
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("shots\$name.png")
+          }
+          Shot home
+          "running: $(-not $app.HasExited)"
+          "pipes: $([System.IO.Directory]::GetFiles('\\.\pipe\') | Select-String yt-music-gpui)"
+          "runtime while running:"; Get-ChildItem -Recurse "$data\yt-music-gpui\runtime" | ForEach-Object FullName
+          $second = Start-Process -PassThru -Wait -FilePath $exe -RedirectStandardError "$env:RUNNER_TEMP\second.txt"
+          "second instance exit: $($second.ExitCode) $(Get-Content $env:RUNNER_TEMP\second.txt)"
+          "close: $($app.CloseMainWindow())"
+          if (-not $app.WaitForExit(15000)) { "did not exit on close"; Stop-Process -Id $app.Id }
+          "exit code: $($app.ExitCode)"
+          "runtime after close:"; Get-ChildItem -Recurse "$data\yt-music-gpui\runtime" | ForEach-Object FullName
+          "pipes after close: $([System.IO.Directory]::GetFiles('\\.\pipe\') | Select-String yt-music-gpui)"
+          "stderr:"; Get-Content "$env:RUNNER_TEMP\stderr.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-shots
+          path: shots

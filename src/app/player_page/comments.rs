@@ -1157,24 +1157,29 @@ impl Music {
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, Load, Pending, PlayerPage, PlayerTab, State};
-    use crate::app::native_tests::{
-        isolate,
-        render::{capture, wait_for_presented_frame},
-    };
-    use crate::{
-        app::{CatalogTarget, Music, Startup},
-        auth::Session,
-        song_text::{self, Content as SongText},
-    };
-    use anyhow::{Context as _, Result, ensure};
-    use gpui::{
-        AppContext, AsyncApp, Bounds, KeyUpEvent, Keystroke, PlatformInput, TitlebarOptions,
-        WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
-    };
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
+    use super::{Load, Pending, PlayerPage, State};
+    use crate::{auth::Session, song_text};
+    use std::sync::Arc;
+    // The native window check needs an isolated Linux desktop; see CONTRIBUTING.md.
+    #[cfg(unix)]
+    use {
+        super::{Control, PlayerTab},
+        crate::{
+            app::{
+                CatalogTarget, Music, Startup,
+                native_tests::{
+                    isolate,
+                    render::{capture, wait_for_presented_frame},
+                },
+            },
+            song_text::Content as SongText,
+        },
+        anyhow::{Context as _, Result, ensure},
+        gpui::{
+            AppContext, AsyncApp, Bounds, KeyUpEvent, Keystroke, PlatformInput, TitlebarOptions,
+            WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
+        },
+        std::time::{Duration, Instant},
     };
 
     fn session(identity: &str) -> Arc<Session> {
@@ -1269,6 +1274,7 @@ mod tests {
         assert!(state.continuation.is_none());
     }
 
+    #[cfg(unix)]
     async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
         cx.update_window(window.into(), |_, window, cx| {
             let keystroke = Keystroke::parse(key).unwrap();
@@ -1279,6 +1285,7 @@ mod tests {
         wait_for_presented_frame(window, cx).await;
     }
 
+    #[cfg(unix)]
     async fn settle_artwork(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1296,6 +1303,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn capture_panel(music: &Music, window: &gpui::Window, label: &str) {
         let width = f32::from(window.viewport_size().width);
         let image = capture(window, &format!("comments-{label}-{width:.0}"));
@@ -1318,6 +1326,7 @@ mod tests {
         println!("COMMENTS_PANEL label={label} width={width} x={x} y={y} panel={panel:.2}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires isolated X11 desktop/private D-Bus, yt-dlp and public playback; set YT_MUSIC_NATIVE_TESTS=1"]
     fn native_comments_read_controls_and_playback_cost() -> Result<()> {

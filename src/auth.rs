@@ -12,7 +12,7 @@ use sha1::{Digest, Sha1};
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, Write},
+    io::{Read, Seek},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
@@ -26,9 +26,12 @@ use std::{
 /// Sign-in copies a browser session into the Secret Service, which only Linux has.
 pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
 #[cfg(unix)]
-use std::os::{
-    fd::AsRawFd,
-    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+use std::{
+    io::Write,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
 };
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
