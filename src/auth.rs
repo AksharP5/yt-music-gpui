@@ -415,7 +415,7 @@ impl Session {
         let (first, second) = self
             .data_sync_id
             .split_once("||")
-            .expect("validated playback identity");
+            .context("The saved account has no playback identity. Connect your account again.")?;
         let user = if second.is_empty() { first } else { second };
         for (key, expected) in [
             ("USER_SESSION_ID", json!(user)),
@@ -837,7 +837,8 @@ fn page_config(page: impl Read) -> Result<Value> {
         let text = match std::str::from_utf8(&html) {
             Ok(text) => text,
             Err(error) if !complete && error.error_len().is_none() => {
-                std::str::from_utf8(&html[..error.valid_up_to()]).expect("valid prefix")
+                std::str::from_utf8(&html[..error.valid_up_to()])
+                    .context("YouTube Music returned an unreadable account page")?
             }
             Err(error) => {
                 return Err(error).context("YouTube Music returned an unreadable account page");
@@ -857,7 +858,10 @@ fn page_config(page: impl Read) -> Result<Value> {
             None if !complete => continue,
             None => bail!("YouTube Music returned no account configuration"),
         };
-        let rest = bootstrap[values.byte_offset()..].trim_start();
+        let rest = bootstrap
+            .get(values.byte_offset()..)
+            .context("YouTube Music returned an invalid account configuration")?
+            .trim_start();
         if rest.is_empty() && !complete {
             continue;
         }

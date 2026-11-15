@@ -46,6 +46,8 @@ bin/test
 bin/test-install
 ```
 
+Outside tests, Clippy rejects the calls that can crash the app: `unwrap`, `expect`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, byte-index string slicing and unchecked `Instant`/`SystemTime` subtraction (see `[lints.clippy]` in `Cargo.toml`). Handle the failure instead. For a true invariant, put `#[expect(clippy::..., reason = "...")]` on the narrowest item that needs it.
+
 CI runs the same checks on every pull request. `bin/build` and `bin/test` use two jobs unless `CARGO_BUILD_JOBS` is set.
 
 ## Integration tests

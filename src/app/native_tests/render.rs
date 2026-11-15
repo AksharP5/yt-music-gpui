@@ -669,7 +669,7 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                 music.page = crate::app::sync::tests::page(2, false);
                 music.page.header = crate::catalog::parse_page(&serde_json::json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Keyboard playlist"}}},"contents":[]}), "Keyboard playlist").unwrap().header;
                 for item in &mut music.page.shelves[0].items {
-                    let Item::Track(track) = item else { unreachable!() };
+                    let Item::Track(track) = item else { panic!() };
                     track.artist = "First artist & Second artist".into();
                     track.album = Some("Album".into());
                     track.details.links = links.to_vec();
@@ -1210,7 +1210,7 @@ async fn scrolled_artist_survives_tab(
             music.sidebar_collapsed = Some(false);
             for shelf in &mut music.page.shelves[1..] {
                 let Item::Collection(album) = &mut shelf.items[0] else {
-                    unreachable!()
+                    panic!()
                 };
                 album.title = "Random Access Memories (Drumless Edition)".into();
             }
@@ -1289,7 +1289,7 @@ async fn artist_revisit_shows_hero(window: WindowHandle<Music>, cx: &mut AsyncAp
             window.focus(&music.focus, cx);
             cx.notify();
             let Route::Browse(artist) = music.route.clone() else {
-                unreachable!()
+                panic!()
             };
             let page = music.page.clone();
             music.navigate(Route::Browse(artist.clone()), cx);

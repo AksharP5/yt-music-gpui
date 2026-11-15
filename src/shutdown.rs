@@ -12,9 +12,12 @@ extern "C" fn terminate(_: libc::c_int) {
     let errno = unsafe { libc::__errno_location() };
     #[cfg(target_os = "macos")]
     let errno = unsafe { libc::__error() };
+    // listen() sets WAKE before installing this handler.
+    let Some(wake) = WAKE.get() else {
+        return;
+    };
     let saved_errno = unsafe { *errno };
     let increment = 1_u64.to_ne_bytes();
-    let wake = WAKE.get().unwrap();
     loop {
         let result =
             unsafe { libc::write(wake.as_raw_fd(), increment.as_ptr().cast(), increment.len()) };
@@ -51,7 +54,7 @@ fn signal_channel() -> io::Result<(File, File)> {
 pub fn listen() -> io::Result<async_channel::Receiver<()>> {
     let (mut wakeups, wake) = signal_channel()?;
     WAKE.set(wake)
-        .expect("install shutdown signal handlers only once");
+        .map_err(|_| io::Error::other("Shutdown signal handlers are already installed"))?;
     let (sender, receiver) = async_channel::bounded(1);
     thread::Builder::new()
         .name("shutdown-signal".into())
@@ -93,13 +96,16 @@ pub fn listen() -> io::Result<async_channel::Receiver<()>> {
         if NOTIFIED.swap(true, Ordering::SeqCst) {
             return FALSE;
         }
-        let _ = SENDER.get().unwrap().try_send(());
+        // listen() sets SENDER before installing this handler.
+        if let Some(sender) = SENDER.get() {
+            let _ = sender.try_send(());
+        }
         TRUE
     }
     let (sender, receiver) = async_channel::bounded(1);
     SENDER
         .set(sender)
-        .expect("install shutdown handlers only once");
+        .map_err(|_| io::Error::other("Shutdown handlers are already installed"))?;
     if unsafe { SetConsoleCtrlHandler(Some(handle), TRUE) } == 0 {
         return Err(io::Error::last_os_error());
     }

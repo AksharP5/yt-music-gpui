@@ -319,10 +319,9 @@ impl Music {
             ListRow::Item(index) => self.row(index, inset, window, cx),
             ListRow::Shelf(index) => self.shelf(index, inset, window, cx),
             ListRow::More(index) => {
-                let link = self.page.shelves[index]
-                    .more
-                    .clone()
-                    .expect("shelf navigation row");
+                let Some(link) = self.page.shelves[index].more.clone() else {
+                    return div().into_any_element();
+                };
                 div()
                     .h(px(64.))
                     .px(px(inset))

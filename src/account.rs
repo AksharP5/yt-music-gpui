@@ -380,6 +380,10 @@ impl Worker {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+)]
 pub fn start(
     session: SharedSession,
 ) -> (

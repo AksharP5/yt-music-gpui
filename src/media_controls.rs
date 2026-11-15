@@ -7,7 +7,7 @@
 use crate::{catalog::Track, library::Repeat, player::PlaybackSpeed};
 use anyhow::{Context, Result};
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, PoisonError, mpsc},
     thread,
     time::Instant,
 };
@@ -207,7 +207,10 @@ impl MediaControls {
         if !seconds.is_finite() || seconds < 0. {
             return;
         }
-        let mut published = self.published.lock().unwrap();
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if published.state.track_id == Some(track_id) && published.state.position != seconds {
             published.state.position = seconds;
             published.sampled_at = Instant::now();
@@ -225,7 +228,10 @@ impl MediaControls {
         } else {
             0.
         };
-        let mut published = self.published.lock().unwrap();
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let old = &published.state;
         let properties_changed = !old.same_properties(&state);
         if old.position != state.position
@@ -248,7 +254,10 @@ impl MediaControls {
         if !seconds.is_finite() || seconds < 0. {
             return;
         }
-        let mut published = self.published.lock().unwrap();
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if published.state.track_id != Some(track_id) {
             return;
         }

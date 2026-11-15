@@ -853,22 +853,22 @@ fn link_spans<'a>(
     links: impl IntoIterator<Item = &'a BrowseLink>,
 ) -> Vec<(String, Option<BrowseLink>)> {
     let mut spans = Vec::new();
-    let mut rest = 0;
+    let mut rest = text;
     for link in links {
         if link.title.is_empty() {
             continue;
         }
-        let Some(start) = text[rest..].find(&link.title).map(|start| rest + start) else {
+        let Some((before, after)) = rest.split_once(link.title.as_str()) else {
             continue;
         };
-        if start > rest {
-            spans.push((text[rest..start].to_owned(), None));
+        if !before.is_empty() {
+            spans.push((before.to_owned(), None));
         }
-        rest = start + link.title.len();
+        rest = after;
         spans.push((link.title.clone(), Some(link.clone())));
     }
-    if rest < text.len() || spans.is_empty() {
-        spans.push((text[rest..].to_owned(), None));
+    if !rest.is_empty() || spans.is_empty() {
+        spans.push((rest.to_owned(), None));
     }
     spans
 }

@@ -170,6 +170,10 @@ impl Waker {
         event().map(Self)
     }
 
+    #[expect(
+        clippy::unreachable,
+        reason = "setting an owned event cannot fail, and silently losing a wakeup would hang the player"
+    )]
     pub fn wake(&self) {
         if unsafe { SetEvent(self.0.as_raw_handle()) } == 0 {
             unreachable!(

@@ -576,10 +576,9 @@ impl Music {
                 self.page.title = link.title.clone();
                 self.request(Query::Browse(link), cx);
             }
-            Route::Liked | Route::Saved | Route::Recent | Route::Library(_)
-                if self.account.is_some() =>
+            _ if self.account.is_some()
+                && let Some(section) = route.library_section() =>
             {
-                let section = route.library_section().expect("library route");
                 self.page.title = section.title().into();
                 self.request(Query::Library(section), cx);
             }
@@ -942,6 +941,10 @@ impl Music {
 }
 
 impl CatalogRequests {
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let catalog_requests = CatalogRequests::new();
         let (results, completed) = async_channel::unbounded::<CatalogResult>();
@@ -981,7 +984,7 @@ impl CatalogRequests {
                                         catalog.more(token)
                                     }
                                     Query::Revalidate(_) => {
-                                        unreachable!("revalidation unwrapped above")
+                                        Err(anyhow::anyhow!("Nested revalidation"))
                                     }
                                     Query::Search(search) => catalog.search_filtered(
                                         &search.query,

@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::{
     collections::HashMap,
     fmt::Write,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
     time::Instant,
 };
 use zbus::{
@@ -29,6 +29,10 @@ fn status_name(status: PlaybackStatus) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "writing to a String cannot fail, and hex digits are valid object path characters"
+)]
 fn track_path(id: &str) -> ObjectPath<'static> {
     let prefix = "/yt_music_gpui/track/v";
     let mut path = String::with_capacity(prefix.len() + id.len() * 2);
@@ -103,7 +107,7 @@ pub(super) fn serve(
     let mut previous = properties(&State::default());
     while updates.recv().is_ok() {
         let (state, seeked) = {
-            let mut published = published.lock().unwrap();
+            let mut published = published.lock().unwrap_or_else(PoisonError::into_inner);
             (published.state.clone(), published.seeked.take())
         };
         let properties = properties(&state);
@@ -135,6 +139,10 @@ fn emit_seeked(connection: &Connection, position: i64) -> zbus::Result<()> {
     connection.emit_signal(None::<&str>, PATH, PLAYER, "Seeked", &(position,))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "only file descriptors fail to convert, and MPRIS values never contain them"
+)]
 fn owned<'a>(value: impl Into<Value<'a>>) -> OwnedValue {
     value
         .into()
@@ -200,6 +208,13 @@ struct DesktopPlayer {
 }
 
 impl DesktopPlayer {
+    // A poisoned lock still holds the last published state, which is safe to read.
+    fn published(&self) -> MutexGuard<'_, Published> {
+        self.published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn send(&self, event: Event) -> fdo::Result<()> {
         self.events.try_send(event).map_err(|error| match error {
             async_channel::TrySendError::Full(_) => {
@@ -239,7 +254,7 @@ impl DesktopPlayer {
         self.send(Event::Pause)
     }
     fn play_pause(&self) -> fdo::Result<()> {
-        let state = &self.published.lock().unwrap().state;
+        let state = &self.published().state;
         let allowed = if state.playback == PlaybackStatus::Playing {
             state.can_pause
         } else {
@@ -254,7 +269,7 @@ impl DesktopPlayer {
         self.send(Event::Stop)
     }
     fn seek(&self, offset: i64) -> fdo::Result<()> {
-        let state = &self.published.lock().unwrap().state;
+        let state = &self.published().state;
         if !state.can_seek {
             return Ok(());
         }
@@ -267,7 +282,7 @@ impl DesktopPlayer {
         })
     }
     fn set_position(&self, track_id: ObjectPath<'_>, position: i64) -> fdo::Result<()> {
-        let state = &self.published.lock().unwrap().state;
+        let state = &self.published().state;
         if !state.can_seek || position < 0 {
             return Ok(());
         }
@@ -297,13 +312,11 @@ impl DesktopPlayer {
 
     #[zbus(property)]
     fn playback_status(&self) -> &'static str {
-        status_name(self.published.lock().unwrap().state.playback)
+        status_name(self.published().state.playback)
     }
     #[zbus(property)]
     fn metadata(&self) -> Properties {
-        self.published
-            .lock()
-            .unwrap()
+        self.published()
             .state
             .metadata
             .as_ref()
@@ -313,7 +326,7 @@ impl DesktopPlayer {
     // AppPlayer dispatches setters without zbus emitting the previous property value.
     #[zbus(property)]
     fn volume(&self) -> f64 {
-        self.published.lock().unwrap().state.volume / 100.
+        self.published().state.volume / 100.
     }
     #[zbus(property)]
     fn set_volume(&self, volume: f64) -> fdo::Result<()> {
@@ -324,7 +337,7 @@ impl DesktopPlayer {
     }
     #[zbus(property)]
     fn rate(&self) -> f64 {
-        f64::from(self.published.lock().unwrap().state.rate)
+        f64::from(self.published().state.rate)
     }
     #[zbus(property)]
     fn set_rate(&self, rate: f64) -> fdo::Result<()> {
@@ -337,7 +350,7 @@ impl DesktopPlayer {
     }
     #[zbus(property)]
     fn loop_status(&self) -> &'static str {
-        repeat_name(self.published.lock().unwrap().state.repeat)
+        repeat_name(self.published().state.repeat)
     }
     #[zbus(property)]
     fn set_loop_status(&self, status: &str) -> fdo::Result<()> {
@@ -366,7 +379,7 @@ impl DesktopPlayer {
     }
     #[zbus(property(emits_changed_signal = "false"))]
     fn position(&self) -> i64 {
-        self.published.lock().unwrap().position_at(Instant::now())
+        self.published().position_at(Instant::now())
     }
     #[zbus(property(emits_changed_signal = "const"))]
     fn minimum_rate(&self) -> f64 {
@@ -382,23 +395,23 @@ impl DesktopPlayer {
     }
     #[zbus(property)]
     fn can_play(&self) -> bool {
-        self.published.lock().unwrap().state.can_play
+        self.published().state.can_play
     }
     #[zbus(property)]
     fn can_pause(&self) -> bool {
-        self.published.lock().unwrap().state.can_pause
+        self.published().state.can_pause
     }
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        self.published.lock().unwrap().state.can_go_next
+        self.published().state.can_go_next
     }
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        self.published.lock().unwrap().state.can_go_previous
+        self.published().state.can_go_previous
     }
     #[zbus(property)]
     fn can_seek(&self) -> bool {
-        self.published.lock().unwrap().state.can_seek
+        self.published().state.can_seek
     }
 }
 
@@ -459,7 +472,7 @@ impl zbus::object_server::Interface for AppPlayer {
                     .0
                     .set_loop_status(<&str>::try_from(value).map_err(invalid)?),
                 "Shuffle" => self.0.set_shuffle(bool::try_from(value).map_err(invalid)?),
-                _ => unreachable!(),
+                _ => Err(fdo::Error::UnknownProperty(name.to_owned())),
             }
         }))
     }

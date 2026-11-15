@@ -338,12 +338,9 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) {
     }
     for track in sources {
         if !page.shelves.iter().flat_map(|shelf| &shelf.items).any(|item| matches!(item, Item::Track(current) if current.details.set_video_id == track.details.set_video_id))
+            && let Some(shelf) = page.shelves.last_mut()
         {
-            page.shelves
-                .last_mut()
-                .unwrap()
-                .items
-                .push(Item::Track(track.clone()));
+            shelf.items.push(Item::Track(track.clone()));
         }
     }
 }
@@ -599,6 +596,7 @@ impl Music {
         cx.notify();
     }
 
+    #[expect(clippy::expect_used, reason = "every library route has a section")]
     pub(super) fn page_query(&self) -> Query {
         match &self.route {
             Route::Home => Query::Home,
@@ -675,8 +673,14 @@ pub(super) mod tests {
     #[test]
     fn focus_refresh_waits_three_minutes() {
         let now = Instant::now();
-        assert!(!needs_refresh(Some(now - Duration::from_secs(179)), now));
-        assert!(needs_refresh(Some(now - Duration::from_secs(180)), now));
+        assert!(!needs_refresh(
+            Some(now.checked_sub(Duration::from_secs(179)).unwrap()),
+            now
+        ));
+        assert!(needs_refresh(
+            Some(now.checked_sub(Duration::from_secs(180)).unwrap()),
+            now
+        ));
         assert!(needs_refresh(None, now));
     }
 

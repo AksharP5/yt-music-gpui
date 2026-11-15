@@ -360,7 +360,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 assert!(view.error.is_some(), "The failed edit must remain visible for explicit retry");
                 assert!(!view.refresh_session(false, cx));
                 assert!(commands.is_empty());
-                view.next_session_refresh = Some(Instant::now() - Duration::from_secs(1));
+                view.next_session_refresh = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
                 let operation = refreshing(view, &commands, cx);
                 view.account_event(account::Event::Connected { operation, result: Ok(Some(connection(current.clone()))), save_session: false }, window, cx);
                 current
@@ -500,7 +500,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                             view.set_video_mode(true, cx);
                         }
                         "signout" => view.disconnect_account(cx),
-                        _ => unreachable!(),
+                        _ => panic!(),
                     }
                 }).unwrap();
                 if case == "signout" {

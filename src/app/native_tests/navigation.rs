@@ -157,7 +157,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                 );
                 let mut unsaved = page("Unsaved song", "search-tail");
                 let crate::catalog::Item::Track(track) = &mut unsaved.shelves[0].items[0] else {
-                    unreachable!()
+                    panic!()
                 };
                 track.details.in_library = Some(false);
                 let track = track.clone();
@@ -211,7 +211,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                 );
                 let mut fresh = page("Authoritative playlist", "fresh-tail");
                 let crate::catalog::Item::Track(saved) = &mut fresh.shelves[0].items[0] else {
-                    unreachable!()
+                    panic!()
                 };
                 saved.details.in_library = Some(true);
                 assert!(matches!(reply(view, fresh, cx), Query::Revalidate(_)));
@@ -325,8 +325,11 @@ fn stale_forward_revisit_replaces_loaded_tail_and_continuation() -> Result<()> {
             cx,
         );
         assert_eq!(view.rows.len(), 200);
-        view.forward_page.as_mut().unwrap().fetched_at =
-            Some(Instant::now() - Duration::from_secs(181));
+        view.forward_page.as_mut().unwrap().fetched_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(181))
+                .unwrap(),
+        );
         view.navigate(Route::Explore, cx);
         view.navigate(route, cx);
         assert_eq!(
@@ -842,7 +845,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 view.clear_account_state(cx);
                 view.navigate(playlist.clone(), cx);
                 reply(view, page("Cached playlist", "playlist-tail"), cx);
-                let fetched_at = Instant::now() - Duration::from_secs(181);
+                let fetched_at = Instant::now().checked_sub(Duration::from_secs(181)).unwrap();
                 view.forward_page.as_mut().unwrap().fetched_at = Some(fetched_at);
                 let token = view.page.continuation.clone().unwrap();
                 view.request(Query::More { token, search: None }, cx);
@@ -860,7 +863,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert!(view.rows.is_empty(), "The reply issued before the rating must not be cached");
                 reply(view, page("Fresh playlist", "fresh-tail"), cx);
                 assert_eq!(view.list_scroll.0.borrow().base_handle.offset().y, px(0.), "Forward navigation resets scroll");
-                view.forward_page.as_mut().unwrap().fetched_at = Some(Instant::now() - Duration::from_secs(181));
+                view.forward_page.as_mut().unwrap().fetched_at = Some(Instant::now().checked_sub(Duration::from_secs(181)).unwrap());
                 view.navigate(Route::Explore, cx);
                 view.navigate(playlist.clone(), cx);
                 assert_eq!(view.rows.len(), 100, "Stale forward navigation shows its page synchronously");
@@ -1145,7 +1148,9 @@ fn route_revalidation_forgets_the_previous_sort() -> Result<()> {
         reply(view, page("Default order", "default-tail"), cx);
         view.navigate(Route::Explore, cx);
         for entry in &mut view.page_cache {
-            entry.fetched_at = Instant::now() - Duration::from_secs(181);
+            entry.fetched_at = Instant::now()
+                .checked_sub(Duration::from_secs(181))
+                .unwrap();
         }
         view.navigate(Route::Library(Section::Songs), cx);
         let job = view.catalog_requests.pending.try_recv().unwrap();

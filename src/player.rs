@@ -15,13 +15,13 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File},
-    io::{ErrorKind, Read, Seek, Write},
+    io::{self, ErrorKind, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{ChildStdin, Command, Stdio},
     ptr::NonNull,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicI64, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -348,7 +348,8 @@ impl Player {
         Self::with_lookup(options, find_ytdlp()?, native::Lookup::new().ok())
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
+    #[cfg(unix)]
     fn with_extractor(options: PlayerOptions, ytdlp: PathBuf) -> Result<Self> {
         Self::with_lookup(options, ytdlp, None)
     }
@@ -405,7 +406,7 @@ impl Player {
                 "Invalid next YouTube video ID"
             );
         }
-        let mut next = self.next.lock().unwrap();
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
         let unchanged = match (next.as_ref(), video_id) {
             (None, None) => true,
             (Some(next), Some(id)) => {
@@ -434,7 +435,8 @@ impl Player {
         self.send(PlayerCommand::Prepare(next.clone()))
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn next_preparation(&self) -> Option<String> {
         self.next
             .lock()
@@ -448,7 +450,11 @@ impl Player {
             options.start.is_finite() && options.start >= 0.,
             "Invalid playback start position."
         );
-        let next = self.next.lock().unwrap().take();
+        let next = self
+            .next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         // A full lookup reload gets a fresh ID, so late events from a prepared
         // occurrence of the same song can never be mistaken for it.
         let track_id = next
@@ -480,7 +486,10 @@ impl Player {
         &self,
         credentials: PlaybackCredentials,
     ) -> Result<async_channel::Receiver<Result<(), String>>> {
-        self.next.lock().unwrap().take();
+        self.next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         let (reply, response) = async_channel::bounded(1);
         self.send(PlayerCommand::Credentials {
             next: Some(credentials),
@@ -491,7 +500,10 @@ impl Player {
     /// A successful response confirms extractor termination and credential revocation.
     /// A closed response channel means the player exited without confirming cleanup.
     pub fn clear_credentials(&self) -> Result<async_channel::Receiver<Result<(), String>>> {
-        self.next.lock().unwrap().take();
+        self.next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         let (reply, response) = async_channel::bounded(1);
         self.send(PlayerCommand::Credentials { next: None, reply })?;
         Ok(response)
@@ -500,7 +512,10 @@ impl Player {
         self.send(PlayerCommand::Pause(paused))
     }
     pub fn stop(&self) -> Result<()> {
-        self.next.lock().unwrap().take();
+        self.next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         self.send(PlayerCommand::Stop)
     }
     pub fn seek(&self, track_id: u64, seconds: f64) -> Result<u64> {
@@ -1161,21 +1176,20 @@ impl ResolvedStream {
 /// When a paused stream needs a fresh URL: five minutes before the earliest
 /// `expire` of its googlevideo URLs. Video plays an EDL of two URLs.
 fn stream_refresh_time(path: &str) -> Option<SystemTime> {
-    path.match_indices("expire=")
-        .filter(|(index, _)| {
-            index
-                .checked_sub(1)
-                .is_some_and(|before| matches!(path.as_bytes()[before], b'?' | b'&'))
-        })
-        .filter_map(|(index, name)| {
-            let value = &path[index + name.len()..];
-            let end = value
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(value.len());
-            value[..end].parse::<u64>().ok()
+    path.split(['?', '&'])
+        .skip(1)
+        .filter_map(|parameter| parameter.strip_prefix("expire="))
+        .filter_map(|value| {
+            value
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u64>()
+                .ok()
         })
         .min()
-        .map(|expiry| UNIX_EPOCH + Duration::from_secs(expiry.saturating_sub(5 * 60)))
+        .and_then(|expiry| {
+            UNIX_EPOCH.checked_add(Duration::from_secs(expiry.saturating_sub(5 * 60)))
+        })
 }
 
 impl StreamKey {
@@ -1245,7 +1259,10 @@ fn send_credentials(input: Arc<ChildStdin>, credentials: &ExtractorCredentials) 
 fn python_interpreter(ytdlp: &Path) -> Result<Command> {
     let mut header = [0; 1024];
     let count = File::open(ytdlp)?.read(&mut header)?;
-    let line = header[..count].split(|byte| *byte == b'\n').next().unwrap();
+    let line = header[..count]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
     let line = std::str::from_utf8(line)?
         .strip_prefix("#!")
         .context("Not a Python script")?;
@@ -1322,8 +1339,12 @@ impl WarmResolver {
         // An extractor holds account cookies in memory. Its own process group keeps
         // it out of terminal signals, so it must not outlive the player thread.
         let mut child = Group::spawn(&mut command)?;
-        let output = match child_output(child.stdout.take().unwrap()) {
-            Ok(output) => output,
+        let output = match (child.stdin.take(), child.stdout.take()) {
+            (Some(input), Some(output)) => child_output(output).map(|output| (input, output)),
+            _ => Err(io::Error::other("The resolver has no pipes")),
+        };
+        let (input, output) = match output {
+            Ok(pipes) => pipes,
             Err(error) => {
                 child.kill();
                 let _ = child.wait();
@@ -1331,7 +1352,7 @@ impl WarmResolver {
             }
         };
         let resolver = Self {
-            input: Arc::new(child.stdin.take().unwrap()),
+            input: Arc::new(input),
             output,
             child,
             bytes: Vec::new(),
@@ -1477,10 +1498,12 @@ impl NativeResolver {
                 return Some((target, result, self.started));
             }
         }
-        if self.target.is_some() && self.started.elapsed() >= native::BUDGET {
+        if self.started.elapsed() >= native::BUDGET
+            && let Some(target) = self.target.take()
+        {
             self.lookup.stalled();
             return Some((
-                self.target.take().unwrap(),
+                target,
                 Err(anyhow::anyhow!("Native lookup timed out")),
                 self.started,
             ));
@@ -1597,19 +1620,15 @@ impl StreamResolver {
             self.warm_enabled = self.warm.is_some();
         }
         self.started = Instant::now();
-        self.target = Some(target);
+        let target = self.target.insert(target);
         if let Some(warm) = &mut self.warm {
-            if warm.send(self.target.as_ref().unwrap()).is_ok() {
+            if warm.send(target).is_ok() {
                 return Ok(());
             }
             self.warm_enabled = warm.ready;
             self.warm.take();
         }
-        match StreamPreparation::start(
-            self.target.as_ref().unwrap().clone(),
-            &self.ytdlp,
-            credentials,
-        ) {
+        match StreamPreparation::start(target.clone(), &self.ytdlp, credentials) {
             Ok(job) => self.one_shot = Some(job),
             Err(error) => {
                 self.target = None;
@@ -1733,7 +1752,7 @@ impl StreamResolver {
         }
         let result = result?;
         self.one_shot.take();
-        Some((self.target.take().unwrap(), result))
+        Some((self.target.take()?, result))
     }
 }
 
@@ -2227,10 +2246,9 @@ fn run(
             pending_play.as_ref().map(|play| &play.target),
             credentials.as_ref(),
         ) {
-            if pending_play.as_ref().is_some_and(|play| {
+            if let Some(play) = pending_play.take_if(|play| {
                 play.target.track_id == target.track_id && play.target.key == target.key
             }) {
-                let play = pending_play.take().unwrap();
                 match result {
                     Ok(stream) => {
                         let options = PlayOptions {
@@ -2293,10 +2311,9 @@ fn run(
                 video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
             });
         }
-        if prepared.as_ref().is_some_and(|(target, stream)| {
+        if let Some((target, _)) = prepared.take_if(|(target, stream)| {
             state.current != Some(target.track_id) && SystemTime::now() >= stream.expires
         }) {
-            let (target, _) = prepared.take().unwrap();
             state.discard_upcoming();
             write_command(&mut socket, json!(["playlist-clear"]), None)?;
             let _ = resolver.start(target, credentials.as_ref());
@@ -2661,14 +2678,14 @@ impl PlaybackState {
             .and_then(|id| id.strip_prefix("seekable:"))
             .and_then(|revision| revision.parse::<u64>().ok())
         {
-            if self.seek.as_ref().is_some_and(|seek| {
+            if let Some(mut seek) = self.seek.take_if(|seek| {
                 seek.request.revision == revision && seek.phase == SeekPhase::Seekability
             }) {
                 if value["error"] == "success" && value["data"] == true {
-                    self.seek.as_mut().unwrap().phase = SeekPhase::Command;
+                    seek.phase = SeekPhase::Command;
+                    self.seek = Some(seek);
                 } else {
                     // mpv accepts a seek before demuxing it, and emits no completion if it cannot seek.
-                    let seek = self.seek.take().unwrap();
                     Self::seek_finished(
                         seek.request,
                         Err("This stream does not support seeking.".into()),
@@ -2683,11 +2700,11 @@ impl PlaybackState {
             .and_then(|id| id.strip_prefix("seek-position:"))
             .and_then(|revision| revision.parse::<u64>().ok())
         {
-            if self.seek.as_ref().is_some_and(|seek| {
-                seek.request.revision == revision && seek.phase == SeekPhase::Position
-            }) && value["error"] != "success"
+            if value["error"] != "success"
+                && let Some(seek) = self.seek.take_if(|seek| {
+                    seek.request.revision == revision && seek.phase == SeekPhase::Position
+                })
             {
-                let seek = self.seek.take().unwrap();
                 Self::seek_finished(
                     seek.request,
                     Err("mpv could not observe the seek position.".into()),
@@ -2717,13 +2734,14 @@ impl PlaybackState {
             return;
         }
         if let Some(id) = value["request_id"].as_u64().filter(|id| *id > 0) {
-            if self.seek.as_ref().is_some_and(|seek| {
-                seek.request.revision == id && seek.phase == SeekPhase::Acceptance
-            }) {
+            if let Some(mut seek) = self
+                .seek
+                .take_if(|seek| seek.request.revision == id && seek.phase == SeekPhase::Acceptance)
+            {
                 if value["error"] == "success" {
-                    self.seek.as_mut().unwrap().phase = SeekPhase::Start;
+                    seek.phase = SeekPhase::Start;
+                    self.seek = Some(seek);
                 } else {
-                    let seek = self.seek.take().unwrap();
                     Self::seek_finished(
                         seek.request,
                         Err("mpv could not seek in this track.".into()),
@@ -2778,15 +2796,17 @@ impl PlaybackState {
                     self.invalidate_seeks();
                 }
             }
-            Some("file-loaded") if self.current.is_some() && self.current == self.desired => {
+            Some("file-loaded")
+                if let Some(track_id) = self.current.filter(|id| Some(*id) == self.desired) =>
+            {
                 self.loaded = true;
                 let _ = events.send_blocking(PlayerEvent::Started {
-                    track_id: self.current.unwrap(),
+                    track_id,
                     paused: self.paused,
                 });
                 if self.seekable {
                     let _ = events.send_blocking(PlayerEvent::Seekable {
-                        track_id: self.current.unwrap(),
+                        track_id,
                         seekable: true,
                     });
                 }
@@ -2821,13 +2841,9 @@ impl PlaybackState {
             Some("property-change") => {
                 if value["name"] == "time-pos"
                     && value["id"].as_u64() == Some(self.position_observer.max(1))
-                    && self
-                        .seek
-                        .as_ref()
-                        .is_some_and(|seek| seek.phase == SeekPhase::Position)
+                    && let Some(seek) = self.seek.take_if(|seek| seek.phase == SeekPhase::Position)
                 {
                     // observe_property guarantees an initial notification, even for a no-op seek.
-                    let seek = self.seek.take().unwrap();
                     let result = value["data"]
                         .as_f64()
                         .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
@@ -3513,7 +3529,7 @@ YtMusicAccountIE._real_extract = extract
         for ready in [false, true] {
             let mut resolver = StreamResolver::new(&extractor, None);
             assert!(resolver.warm.is_some());
-            let started = Instant::now() - Duration::from_secs(30);
+            let started = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
             let warm = resolver.warm.as_mut().unwrap();
             warm.ready = ready;
             warm.started = started;
@@ -3718,7 +3734,7 @@ YtMusicAccountIE._real_extract = extract
                 Some(warm) => warm.child.id(),
                 None => resolver.one_shot.as_ref().unwrap().child.id(),
             };
-            let expired = Instant::now() - RESOLVER_TIMEOUT;
+            let expired = Instant::now().checked_sub(RESOLVER_TIMEOUT).unwrap();
             resolver.started = expired;
             if let Some(warm) = &mut resolver.warm {
                 warm.started = expired;
@@ -3949,6 +3965,8 @@ YtMusicAccountIE._real_extract = extract
         for path in [
             "/tmp/silence.wav",
             "https://rr1.googlevideo.com/videoplayback?sparams=expire%2Cei&noexpire=1",
+            // Past the end of SystemTime.
+            "https://rr1.googlevideo.com/videoplayback?expire=18446744073709551615",
         ] {
             assert_eq!(stream_refresh_time(path), None);
         }

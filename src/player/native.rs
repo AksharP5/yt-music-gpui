@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     cmp::Ordering,
     io::Read,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -57,7 +57,7 @@ impl Lookup {
     ) -> Result<Selection> {
         let deadline = Instant::now() + BUDGET;
         let epoch = {
-            let visitor = self.visitor.lock().unwrap();
+            let visitor = self.visitor.lock().unwrap_or_else(PoisonError::into_inner);
             ensure!(
                 !visitor
                     .paused_until
@@ -83,7 +83,7 @@ impl Lookup {
     }
 
     fn pause(&self, duration: Duration, epoch: u64) {
-        let mut visitor = self.visitor.lock().unwrap();
+        let mut visitor = self.visitor.lock().unwrap_or_else(PoisonError::into_inner);
         if visitor.epoch != epoch {
             return;
         }
@@ -96,14 +96,18 @@ impl Lookup {
     }
 
     pub(super) fn stalled(&self) {
-        let epoch = self.visitor.lock().unwrap().epoch;
+        let epoch = self
+            .visitor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .epoch;
         self.pause(STALL_COOLDOWN, epoch);
     }
 
     /// Forget the guest visitor ID and any pause, so a new account session
     /// cannot be linked to the previous one through cookie-free lookups.
     pub(super) fn reset(&self) {
-        let mut visitor = self.visitor.lock().unwrap();
+        let mut visitor = self.visitor.lock().unwrap_or_else(PoisonError::into_inner);
         *visitor = Visitor {
             epoch: visitor.epoch + 1,
             ..Visitor::default()
@@ -124,7 +128,14 @@ impl Lookup {
     }
 
     fn visitor_data(&self, refresh: bool, deadline: Instant, epoch: u64) -> Result<String> {
-        if !refresh && let Some(data) = self.visitor.lock().unwrap().data.clone() {
+        if !refresh
+            && let Some(data) = self
+                .visitor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .clone()
+        {
             return Ok(data);
         }
         // Do not hold the cache lock across IO: an obsolete preparation must
@@ -134,7 +145,7 @@ impl Lookup {
             .and_then(visitor_data);
         match result {
             Ok(data) => {
-                let mut visitor = self.visitor.lock().unwrap();
+                let mut visitor = self.visitor.lock().unwrap_or_else(PoisonError::into_inner);
                 if visitor.epoch == epoch {
                     visitor.data = Some(data.clone());
                 }
@@ -200,7 +211,7 @@ impl Lookup {
             );
             return Ok(player);
         }
-        unreachable!()
+        bail!("Native player requires a bot check")
     }
 }
 
@@ -216,14 +227,16 @@ fn visitor_data(mut page: impl Read) -> Result<String> {
         let text = String::from_utf8_lossy(&bytes);
         // yt-dlp's ytcfg pattern requires an object; `ytcfg.set("KEY", value)`
         // calls are skipped.
-        if let Some(start) = text.find("ytcfg.set({") {
-            let bootstrap = &text[start + "ytcfg.set(".len()..];
+        if let Some(bootstrap) = text
+            .find("ytcfg.set({")
+            .and_then(|start| text.get(start + "ytcfg.set(".len()..))
+        {
             let mut values = serde_json::Deserializer::from_str(bootstrap).into_iter::<Value>();
             match values.next() {
                 Some(Ok(config))
-                    if bootstrap[values.byte_offset()..]
-                        .trim_start()
-                        .starts_with(')') =>
+                    if bootstrap
+                        .get(values.byte_offset()..)
+                        .is_some_and(|rest| rest.trim_start().starts_with(')')) =>
                 {
                     return config["VISITOR_DATA"]
                         .as_str()

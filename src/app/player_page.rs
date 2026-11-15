@@ -61,7 +61,8 @@ pub(in crate::app) struct PlayerPage {
 }
 
 impl PlayerPage {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(in crate::app) fn selected_tab(&self) -> PlayerTab {
         self.tab
     }

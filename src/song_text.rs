@@ -82,6 +82,10 @@ impl Worker {
         })
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     fn spawn(
         mut load: impl FnMut(&Request) -> Result<Content> + Send + 'static,
     ) -> (Self, async_channel::Receiver<Event>) {
@@ -294,7 +298,7 @@ mod tests {
         let (release, resume) = mpsc::channel();
         let (worker, completed) = Worker::spawn(move |request| {
             let Query::Lyrics(id) = &request.query else {
-                unreachable!()
+                panic!()
             };
             started.send(id.clone()).unwrap();
             if id == "blocked" {

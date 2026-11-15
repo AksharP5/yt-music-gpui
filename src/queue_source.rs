@@ -250,6 +250,10 @@ impl Worker {
         })
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     fn spawn(
         mut load: impl FnMut(&Request) -> Result<QueuePage> + Send + 'static,
     ) -> (Self, async_channel::Receiver<Event>) {
@@ -1391,7 +1395,7 @@ mod tests {
                         .map(|i| format!("{:011}", if i == 7 || i == 80 { 0 } else { i % 173 }))
                         .collect();
                     let initial: Vec<&str> = original[..100].iter().map(String::as_str).collect();
-                    let (mut worker, _) = Worker::spawn(|_| unreachable!());
+                    let (mut worker, _) = Worker::spawn(|_| panic!());
                     let mut queue = Queue::default();
                     let old_session = signed_in.then(session);
                     if issued {
@@ -1514,7 +1518,7 @@ mod tests {
                         },
                         None,
                     ),
-                    |_| unreachable!(),
+                    |_| panic!(),
                 )
             });
             worker.restore(&mut queue, Some(&current));
@@ -1552,7 +1556,7 @@ mod tests {
                 watch.source_target = Some(WatchTarget::try_from(endpoint.clone()).unwrap());
                 let mut queue = Queue::default();
                 queue.replace(watch.queue.clone(), 0);
-                let (mut worker, _) = Worker::spawn(|_| unreachable!());
+                let (mut worker, _) = Worker::spawn(|_| panic!());
                 worker.attach_watch(&mut queue, &watch, Some(session()));
                 queue.remove(1);
                 queue.tracks.insert(1, track("manual-next"));

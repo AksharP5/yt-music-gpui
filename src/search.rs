@@ -625,7 +625,7 @@ mod tests {
             panic!("expected a history query first");
         };
         assert_eq!(query, "a previous search");
-        assert_eq!(&label[bold[0].clone()], "a ");
+        assert_eq!(label.get(bold[0].clone()), Some("a "));
         assert!(matches!(
             &suggestions[1],
             Suggestion::Query { query, label, history: false, .. }
