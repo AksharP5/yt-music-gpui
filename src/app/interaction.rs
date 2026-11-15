@@ -2,6 +2,33 @@
 
 use super::*;
 
+/// The `?` dialog and the README table both list these, in this order.
+pub(in crate::app) const SHORTCUTS: &[(&str, &str)] = &[
+    ("/ or Ctrl K", "Search"),
+    ("Space or ;", "Play or pause"),
+    ("J, Shift N or Ctrl →", "Next song"),
+    ("K, Shift P or Ctrl ←", "Previous song"),
+    ("→ / ←", "Seek 5 seconds"),
+    ("L / H or Shift → / Shift ←", "Seek 10 seconds"),
+    ("Shift L / Shift H or Ctrl Shift → / ←", "Seek 1 second"),
+    ("↑ / ↓ or = / -", "Volume up / down"),
+    ("M", "Mute"),
+    ("R", "Repeat: off, all, one"),
+    ("S", "Shuffle upcoming songs"),
+    ("+", "Like the current song"),
+    ("_", "Dislike the current song"),
+    ("Q", "Open or close the player page"),
+    ("F", "Video fullscreen"),
+    ("Ctrl R", "Reload the page"),
+    ("Alt ← or mouse Back", "Back"),
+    (
+        "Escape",
+        "Close a dialog, fullscreen, the player page or search",
+    ),
+    ("?", "Keyboard shortcuts"),
+    ("Ctrl Q", "Quit"),
+];
+
 #[derive(Clone, Copy, PartialEq)]
 pub(in crate::app) enum Drag {
     Seek,
@@ -45,6 +72,13 @@ impl Music {
             None => return,
         }
         cx.notify();
+    }
+
+    fn seek_by(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        let target = (self.playback_position() + seconds)
+            .min(self.duration)
+            .max(0.);
+        self.seek_current(target, cx);
     }
 
     pub(in crate::app) fn key_down(
@@ -132,42 +166,56 @@ impl Music {
             }
             return;
         }
-        if modifiers.control
-            || modifiers.alt
-            || modifiers.platform
-            || modifiers.function
-            || (modifiers.shift && !matches!(key, "?" | "/"))
-        {
+        let shift = modifiers.shift;
+        if modifiers.alt || modifiers.platform || modifiers.function {
             return;
         }
-        match key {
-            "space" => self.toggle_play(cx),
-            "f" => self.toggle_video_fullscreen(window, cx),
-            "right" => {
-                let seconds = (self.playback_position() + 5.).min(self.duration);
-                self.seek_current(seconds, cx);
+        if modifiers.control {
+            match (key, shift) {
+                ("right", true) => self.seek_by(1., cx),
+                ("left", true) => self.seek_by(-1., cx),
+                _ => {}
             }
-            "left" => {
-                let seconds = (self.playback_position() - 5.).max(0.);
-                self.seek_current(seconds, cx);
-            }
-            "up" => {
+            return;
+        }
+        // Linux reports Shift+= as "+" and Shift+/ as "?" without Shift; other
+        // platforms may keep the base key and the modifier.
+        match (key, shift) {
+            ("space" | ";", false) => self.toggle_play(cx),
+            ("j", false) | ("n", true) => self.next(false, cx),
+            ("k", false) | ("p", true) => self.previous(cx),
+            ("right", false) => self.seek_by(5., cx),
+            ("left", false) => self.seek_by(-5., cx),
+            ("right", true) | ("l", false) => self.seek_by(10., cx),
+            ("left", true) | ("h", false) => self.seek_by(-10., cx),
+            ("l", true) => self.seek_by(1., cx),
+            ("h", true) => self.seek_by(-1., cx),
+            ("up" | "=", false) => {
                 if self.set_volume(self.library.volume + 5., cx) {
                     self.save_preferences();
                 }
             }
-            "down" => {
+            ("down" | "-", false) => {
                 if self.set_volume(self.library.volume - 5., cx) {
                     self.save_preferences();
                 }
             }
-            "l" => {
+            ("m", false) => self.toggle_mute(cx),
+            ("r", false) => self.cycle_repeat(cx),
+            ("s", false) => self.shuffle_queue(cx),
+            ("+", _) | ("=", true) => {
                 if let Some(track) = self.library.queue.current().cloned() {
                     self.toggle_like(&track, cx);
                 }
             }
-            "q" => self.toggle_player_page(cx),
-            "escape" => {
+            ("_", _) | ("-", true) => {
+                if let Some(track) = self.library.queue.current().cloned() {
+                    self.toggle_dislike(&track, window, cx);
+                }
+            }
+            ("f", false) => self.toggle_video_fullscreen(window, cx),
+            ("q", false) => self.toggle_player_page(cx),
+            ("escape", false) => {
                 if self.sort_menu {
                     self.dismiss_sort_menu(window, cx);
                     return;
@@ -190,15 +238,27 @@ impl Music {
                     cx.notify();
                 }
             }
-            "?" => {
-                self.overlay = Some(Overlay::Help);
-                cx.notify();
-            }
-            "/" if event.keystroke.modifiers.shift => {
+            ("?", _) | ("/", true) => {
                 self.overlay = Some(Overlay::Help);
                 cx.notify();
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn readme_table_matches_the_help_dialog() {
+        let rows: String = super::SHORTCUTS
+            .iter()
+            .map(|(key, action)| format!("| {key} | {action} |\n"))
+            .collect();
+        let table = format!("| Key | Action |\n| --- | --- |\n{rows}\n");
+        assert!(
+            include_str!("../../README.md").contains(&table),
+            "Update the README shortcut table to:\n{table}"
+        );
     }
 }

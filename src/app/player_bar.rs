@@ -81,6 +81,18 @@ impl Music {
         self.notify_playback(cx);
     }
 
+    /// Off, all, one, as the repeat button cycles on the web.
+    pub(in crate::app) fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
+        self.library.repeat = self.library.repeat.next();
+        self.save_preferences();
+        self.notify_playback(cx);
+    }
+
+    pub(in crate::app) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.set_volume(if self.library.volume > 0. { 0. } else { 60. }, cx);
+        self.save_preferences();
+    }
+
     pub(in crate::app) fn player_bar(
         &mut self,
         width: f32,
@@ -199,22 +211,7 @@ impl Music {
                                 theme,
                                 cx,
                                 move |view, window, cx| {
-                                    // Guests are asked to sign in, as on the web.
-                                    if view.account.is_none() {
-                                        view.connect_account(window, cx);
-                                        return;
-                                    }
-                                    view.mutate(
-                                        Mutation::RateSong {
-                                            track: dislike_track.clone(),
-                                            rating: if disliked {
-                                                Rating::Indifferent
-                                            } else {
-                                                Rating::Dislike
-                                            },
-                                        },
-                                        cx,
-                                    );
+                                    view.toggle_dislike(&dislike_track, window, cx)
                                 },
                             ))
                         })
@@ -455,10 +452,7 @@ impl Music {
                         rgb(INACTIVE),
                         theme,
                         cx,
-                        |view, _, cx| {
-                            view.set_volume(if view.library.volume > 0. { 0. } else { 60. }, cx);
-                            view.save_preferences();
-                        },
+                        |view, _, cx| view.toggle_mute(cx),
                     )),
             )
             .child(
@@ -472,11 +466,7 @@ impl Music {
                     },
                     theme,
                     cx,
-                    |view, _, cx| {
-                        view.library.repeat = view.library.repeat.next();
-                        view.save_preferences();
-                        view.notify_playback(cx);
-                    },
+                    |view, _, cx| view.cycle_repeat(cx),
                 )
                 .when(repeat == Repeat::One, |d| {
                     d.child(
