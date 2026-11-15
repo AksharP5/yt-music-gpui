@@ -11,6 +11,7 @@ mod input;
 mod library;
 mod listening;
 mod mpris;
+mod os;
 mod player;
 mod playlist_form;
 mod queue_source;
@@ -37,12 +38,7 @@ fn shutdown_on_signal(cx: &mut App) {
 }
 
 fn main() {
-    // A crash dump must not persist reusable account credentials.
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+    if os::disable_core_dumps().is_err() {
         eprintln!("Could not disable credential-bearing crash dumps.");
         std::process::exit(1);
     }
