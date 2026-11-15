@@ -23,6 +23,12 @@ jobs:
           version=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
           python -m pip install --quiet "yt-dlp==$version"
           command -v yt-dlp
+      - name: Drive the player actor through mpv's pipe with local audio
+        shell: bash
+        run: >-
+          bin/test -- --ignored --nocapture
+          player::tests::local_seek_completion_handles_rapid_no_op_and_end_of_file
+          player::tests::headless_worker_shuts_down_after_ipc_controls
       - run: cargo build --release --locked
         shell: bash
       - name: Run the app, check its pipe, lock and cleanup, and capture the screen
