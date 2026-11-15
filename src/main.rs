@@ -22,6 +22,7 @@ mod shutdown;
 mod song_text;
 mod theme;
 mod track_state;
+#[cfg_attr(target_os = "macos", path = "video_macos.rs")]
 mod video;
 mod watch;
 
@@ -88,7 +89,7 @@ fn main() {
         }
     }
     if startup == app::Startup::Connect && !auth::ACCOUNT_LOGIN_ENABLED {
-        eprintln!("Account connection is disabled until the security review is complete.");
+        eprintln!("Sign-in on this system is coming soon.");
         std::process::exit(1);
     }
     if let Err(error) = video::initialize() {

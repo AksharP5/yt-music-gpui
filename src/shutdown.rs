@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{self, Read},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::AsRawFd,
     sync::OnceLock,
     thread,
 };
@@ -10,7 +10,10 @@ use std::{
 static WAKE: OnceLock<File> = OnceLock::new();
 
 extern "C" fn terminate(_: libc::c_int) {
+    #[cfg(target_os = "linux")]
     let errno = unsafe { libc::__errno_location() };
+    #[cfg(target_os = "macos")]
+    let errno = unsafe { libc::__error() };
     let saved_errno = unsafe { *errno };
     let increment = 1_u64.to_ne_bytes();
     let wake = WAKE.get().unwrap();
@@ -24,25 +27,40 @@ extern "C" fn terminate(_: libc::c_int) {
     unsafe { *errno = saved_errno };
 }
 
-pub fn listen() -> io::Result<async_channel::Receiver<()>> {
-    // Each handler runs once, so these writes cannot saturate a blocking eventfd.
+/// The ends the signal handler writes to and the shutdown thread reads from.
+/// Each handler runs once, so its write can never block.
+#[cfg(target_os = "linux")]
+fn signal_channel() -> io::Result<(File, File)> {
+    use std::os::fd::FromRawFd;
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    WAKE.set(unsafe { File::from_raw_fd(fd) })
+    let wake = unsafe { File::from_raw_fd(fd) };
+    Ok((wake.try_clone()?, wake))
+}
+
+#[cfg(target_os = "macos")]
+fn signal_channel() -> io::Result<(File, File)> {
+    let (read, write) = io::pipe()?;
+    Ok((
+        std::os::fd::OwnedFd::from(read).into(),
+        std::os::fd::OwnedFd::from(write).into(),
+    ))
+}
+
+pub fn listen() -> io::Result<async_channel::Receiver<()>> {
+    let (mut wakeups, wake) = signal_channel()?;
+    WAKE.set(wake)
         .expect("install shutdown signal handlers only once");
     let (sender, receiver) = async_channel::bounded(1);
     thread::Builder::new()
         .name("shutdown-signal".into())
-        .spawn(move || {
-            let mut wake = WAKE.get().unwrap();
-            match wake.read_exact(&mut [0; 8]) {
-                Ok(()) => {
-                    let _ = sender.send_blocking(());
-                }
-                Err(error) => eprintln!("Could not receive shutdown signal: {error}"),
+        .spawn(move || match wakeups.read_exact(&mut [0; 8]) {
+            Ok(()) => {
+                let _ = sender.send_blocking(());
             }
+            Err(error) => eprintln!("Could not receive shutdown signal: {error}"),
         })?;
     for signal in [libc::SIGTERM, libc::SIGINT] {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };

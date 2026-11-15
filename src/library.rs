@@ -283,6 +283,7 @@ impl Store {
             library.queue.index = None;
         }
         library.recent.truncate(100);
+        library.video &= crate::video::SUPPORTED;
         Ok((store, library))
     }
 

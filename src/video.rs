@@ -28,6 +28,8 @@ unsafe extern "C" {
     fn video_destroy(video: *mut c_void);
 }
 
+pub const SUPPORTED: bool = true;
+
 /// Call before GPUI or libmpv starts: hardware decoders can also use Xlib.
 pub fn initialize() -> Result<()> {
     ensure!(

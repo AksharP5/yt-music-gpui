@@ -1,4 +1,6 @@
-use crate::os::{exit_with_parent, private_file, sealed_file};
+#[cfg(target_os = "linux")]
+use crate::os::sealed_file;
+use crate::os::{exit_with_parent, private_file};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::header::HeaderValue;
@@ -23,7 +25,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const ACCOUNT_LOGIN_ENABLED: bool = true;
+/// Sign-in copies a browser session into the Secret Service, which only Linux has.
+pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
@@ -488,6 +491,7 @@ const MARKER: &str = "account-saved";
 /// The session, only when the user chose to save it without a keyring.
 const SESSION_FILE: &str = "account-session";
 
+#[cfg(target_os = "linux")]
 fn store_in_keyring(value: &[u8]) -> Result<()> {
     // A RAM stdin file cannot block on a full pipe while the keyring is locked.
     let mut input = sealed_file(value)?;
@@ -506,6 +510,11 @@ fn store_in_keyring(value: &[u8]) -> Result<()> {
         "The desktop keyring could not save the account"
     );
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn store_in_keyring(_: &[u8]) -> Result<()> {
+    bail!("Sign-in isn't available on this system yet")
 }
 
 /// Replaces the file atomically, so it is never readable by others or half written.
@@ -687,9 +696,13 @@ fn timestamp() -> u64 {
         .as_secs()
 }
 pub(crate) fn private_runtime() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("A private desktop runtime directory is required for account connection")?;
+    // macOS gives each user a private temporary directory in $TMPDIR.
+    #[cfg(target_os = "macos")]
+    let runtime = std::env::temp_dir();
     validate_private_runtime(&runtime)?;
     Ok(runtime)
 }
@@ -703,16 +716,21 @@ fn validate_private_runtime(runtime: &Path) -> Result<()> {
             && metadata.mode() & 0o077 == 0,
         "The desktop runtime directory must be private to your user"
     );
-    let runtime_name = std::ffi::CString::new(runtime.as_os_str().as_encoded_bytes())?;
-    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    ensure!(
-        unsafe { libc::statfs(runtime_name.as_ptr(), filesystem.as_mut_ptr()) } == 0,
-        "Could not inspect the private runtime directory"
-    );
-    ensure!(
-        unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC,
-        "Sign-in requires a RAM-backed private runtime directory"
-    );
+    // macOS has no tmpfs. Nothing secret is written there: credentials reach
+    // helpers over stdin, and browser sessions are read only on Linux.
+    #[cfg(target_os = "linux")]
+    {
+        let runtime_name = std::ffi::CString::new(runtime.as_os_str().as_encoded_bytes())?;
+        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        ensure!(
+            unsafe { libc::statfs(runtime_name.as_ptr(), filesystem.as_mut_ptr()) } == 0,
+            "Could not inspect the private runtime directory"
+        );
+        ensure!(
+            unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC,
+            "Sign-in requires a RAM-backed private runtime directory"
+        );
+    }
     Ok(())
 }
 
@@ -1081,6 +1099,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn browser_reader_uses_configured_profile_and_scoped_read_only_wal() {
         let mut source = sealed_file(include_bytes!("browser_session.py")).unwrap();
         source.rewind().unwrap();
@@ -1188,7 +1207,7 @@ mod tests {
     }
     #[test]
     fn a_timed_out_keyring_process_is_terminated_and_reaped() {
-        let mut command = Command::new("/usr/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("30");
         let mut process = AccountProcess::spawn(&mut command).unwrap();
         let pid = process.0.id() as libc::pid_t;
@@ -1233,7 +1252,7 @@ mod tests {
     #[test]
     fn keyring_cancellation_terminates_and_reaps_the_child() {
         let operation = Operation::default();
-        let mut command = Command::new("/usr/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("30");
         let mut process = AccountProcess::spawn(&mut command).unwrap();
         let pid = process.0.id() as libc::pid_t;
@@ -1261,6 +1280,7 @@ mod tests {
     }
     #[test]
     #[ignore = "requires the desktop Secret Service; uses only a unique synthetic test entry"]
+    #[cfg(target_os = "linux")]
     fn live_keyring_removal_is_idempotent() {
         let id = format!("synthetic-{}-{}", std::process::id(), timestamp());
         let attributes = ["application", "yt-music-gpui-tests", "credential", &id];
