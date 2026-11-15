@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use std::{
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
@@ -27,6 +27,7 @@ use std::{
 pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
 #[cfg(unix)]
 use std::{
+    fs::OpenOptions,
     io::Write,
     os::{
         fd::AsRawFd,

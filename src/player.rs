@@ -348,7 +348,7 @@ impl Player {
         Self::with_lookup(options, find_ytdlp()?, native::Lookup::new().ok())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_extractor(options: PlayerOptions, ytdlp: PathBuf) -> Result<Self> {
         Self::with_lookup(options, ytdlp, None)
     }
@@ -434,7 +434,7 @@ impl Player {
         self.send(PlayerCommand::Prepare(next.clone()))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn next_preparation(&self) -> Option<String> {
         self.next
             .lock()

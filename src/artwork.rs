@@ -93,7 +93,7 @@ enum CachedArtwork {
 }
 
 impl Artwork {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }

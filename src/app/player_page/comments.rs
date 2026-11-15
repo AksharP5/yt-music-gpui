@@ -367,7 +367,7 @@ impl State {
 }
 
 impl Music {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(in crate::app) fn seed_comments_for_render(&mut self) {
         let mut page = crate::comments::parse_page(
             &serde_json::from_str(include_str!("../../fixtures/comments/initial.json")).unwrap(),
