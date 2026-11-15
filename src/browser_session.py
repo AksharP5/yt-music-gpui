@@ -20,6 +20,8 @@ CHROMIUM = {
     "Chromium": (("chromium.desktop", "chromium-browser.desktop"), "chromium", "chromium"),
     "Google Chrome": (("google-chrome.desktop",), "google-chrome", "chrome"),
     "Brave": (("brave-browser.desktop",), "BraveSoftware/Brave-Browser", "brave"),
+    # Helium keeps Chromium's unbranded Safe Storage item, so its application is "chromium".
+    "Helium": (("helium.desktop", "net.imput.helium.desktop"), "net.imput.helium", "chromium"),
 }
 UNAMBIGUOUS = "The browser has no unambiguous default profile. Set its default profile and retry."
 UNDECRYPTABLE = "Could not decrypt the browser's YouTube session. Unlock your desktop keyring and retry."
@@ -33,7 +35,7 @@ def default_profile(desktop, home, config):
     for browser, (desktops, directory, _) in CHROMIUM.items():
         if desktop in desktops:
             return chromium_profile(browser, config / directory)
-    raise ValueError("Browser connection supports Zen, Firefox, Chromium, Google Chrome and Brave. "
+    raise ValueError("Browser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. "
                      "Your default browser is not supported.")
 
 

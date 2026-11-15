@@ -225,6 +225,23 @@ connection.close()
             self.assertEqual([(cookie["name"], cookie["value"]) for cookie in cookies], [("SAPISID", "legacy-sapisid")])
             self.assertEqual(lookups, ["brave"])
 
+    def test_helium_reads_its_profile_with_the_chromium_safe_storage_key(self):
+        keyring_value = b"v11" + bytes.fromhex(
+            "17f911b7385fa70e4798db5cb6372e68ddbc329eed3cb9bd5f65b6e36d08947f8a1b6ce029fd87b07591b838f9cafe67")
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            root = home / ".config/net.imput.helium"
+            (root / "Default").mkdir(parents=True)
+            (root / "Local State").write_text("{}")
+            for desktop in ("helium.desktop", "net.imput.helium.desktop"):
+                profile = helper["default_profile"](desktop, home, home / ".config")
+                self.assertEqual(profile, {"browser": "Helium", "name": "Default", "path": str(root / "Default")})
+            self.chromium_profile(profile["path"], 24, [(".youtube.com", "", "SAPISID", keyring_value, "/", 0)])
+            lookups = self.keyring(b"synthetic-safe-storage")
+            cookies = helper["youtube_cookies"]("Helium", profile["path"], Path(temporary) / "snapshot")
+            self.assertEqual([(cookie["name"], cookie["value"]) for cookie in cookies], [("SAPISID", "keyring-sapisid")])
+            self.assertEqual(lookups, ["chromium"])
+
     def test_snapshot_rejects_oversized_database(self):
         with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as snapshot:
             database = Path(profile) / "cookies.sqlite"
