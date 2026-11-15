@@ -1822,7 +1822,7 @@ impl Drop for StreamPreparation {
 fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("yt-music-gpui-");
-    // Windows folders inherit the private runtime's owner-only access instead.
+    // On Windows the folder inherits the private runtime's access instead.
     #[cfg(unix)]
     builder.permissions(fs::Permissions::from_mode(0o700));
     builder

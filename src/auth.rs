@@ -23,8 +23,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Sign-in copies a browser session into the Secret Service, which only Linux has.
-pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
 #[cfg(unix)]
 use std::{
     fs::OpenOptions,
@@ -34,6 +32,9 @@ use std::{
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
 };
+
+/// Sign-in copies a browser session into the Secret Service, which only Linux has.
+pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
