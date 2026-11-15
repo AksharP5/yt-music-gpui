@@ -187,8 +187,14 @@ impl Mutation {
 
 pub enum Effect {
     Changed,
-    CreatedPlaylist { id: String },
-    PlaylistAdded { additions: Vec<(String, String)> },
+    CreatedPlaylist {
+        id: String,
+    },
+    PlaylistAdded {
+        additions: Vec<(String, String)>,
+        /// The confirmation YouTube Music shows for this save, such as "Saved to Road trip".
+        toast: Option<String>,
+    },
     AlreadyAdded,
 }
 #[derive(Clone)]
@@ -857,7 +863,14 @@ fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
             remaining.is_empty() && !additions.is_empty(),
             "YouTube returned unexpected playlist additions. Refresh the playlist."
         );
-        return Ok(Effect::PlaylistAdded { additions });
+        let toast = find(response, "notificationActionRenderer")
+            .map(|renderer| crate::catalog::text(&renderer["responseText"]))
+            .or_else(|| {
+                find(response, "notificationTextRenderer")
+                    .map(|renderer| crate::catalog::text(&renderer["successResponseText"]))
+            })
+            .filter(|text| !text.is_empty());
+        return Ok(Effect::PlaylistAdded { additions, toast });
     }
     Ok(Effect::Changed)
 }
@@ -1089,7 +1102,21 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(effect, Effect::PlaylistAdded { additions } if additions.len() == 2 && additions[0].1 == "first" && additions[1].1 == "second")
+            matches!(effect, Effect::PlaylistAdded { additions, toast: None } if additions.len() == 2 && additions[0].1 == "first" && additions[1].1 == "second")
+        );
+        let effect = mutation_effect(
+            &mutation,
+            &json!({
+                "playlistEditResults":[
+                    {"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"first"}},
+                    {"playlistEditVideoAddedResultData":{"videoId":"abcdefghijk","setVideoId":"second"}}
+                ],
+                "actions":[{"addToToastAction":{"item":{"notificationActionRenderer":{"responseText":{"runs":[{"text":"Saved to "},{"text":"Road trip"}]}}}}}]
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(effect, Effect::PlaylistAdded { toast: Some(toast), .. } if toast == "Saved to Road trip")
         );
     }
 

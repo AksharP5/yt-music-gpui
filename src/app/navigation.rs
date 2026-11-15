@@ -78,9 +78,7 @@ pub(in crate::app) enum Query {
         search: Option<Search>,
     },
     Library(Section),
-    PlaylistChoices,
     SidebarPlaylists,
-    PlaylistChoicesMore(Continuation),
     SidebarMore(Continuation),
     /// The current page again in another order, replacing it.
     Reload(Continuation),
@@ -89,7 +87,6 @@ pub(in crate::app) enum Query {
 impl Query {
     pub(in crate::app) fn target(&self) -> CatalogTarget {
         match self {
-            Self::PlaylistChoices | Self::PlaylistChoicesMore(_) => CatalogTarget::PlaylistPicker,
             Self::SidebarPlaylists | Self::SidebarMore(_) => CatalogTarget::Sidebar,
             Self::Revalidate(query) => query.target(),
             _ => CatalogTarget::Page,
@@ -118,11 +115,10 @@ pub(in crate::app) struct CatalogResult {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum CatalogTarget {
     Page,
-    PlaylistPicker,
     Sidebar,
 }
 impl CatalogTarget {
-    pub(in crate::app) const ALL: [Self; 3] = [Self::Page, Self::PlaylistPicker, Self::Sidebar];
+    pub(in crate::app) const ALL: [Self; 2] = [Self::Page, Self::Sidebar];
 }
 struct RestoringRequest {
     id: u64,
@@ -412,11 +408,7 @@ impl Music {
             self.history_generation,
             session,
         );
-        if target == CatalogTarget::PlaylistPicker {
-            if let Some(Overlay::PlaylistPicker { error, .. }) = &mut self.overlay {
-                *error = result.err();
-            }
-        } else if target == CatalogTarget::Sidebar {
+        if target == CatalogTarget::Sidebar {
             self.sidebar_error = result.err();
         } else if target == CatalogTarget::Page {
             self.sync.page_error = result.err();
@@ -826,25 +818,6 @@ impl Music {
             cx.notify();
             return;
         }
-        if matches!(result.target, CatalogTarget::PlaylistPicker) {
-            if let Some(Overlay::PlaylistPicker { page, error, .. }) = &mut self.overlay {
-                match result.result {
-                    Ok(choices) => {
-                        if result.append
-                            && let Some(current) = page
-                        {
-                            current.continuation = choices.continuation;
-                            current.shelves.extend(choices.shelves);
-                        } else {
-                            *page = Some(Box::new(choices));
-                        }
-                    }
-                    Err(message) => *error = Some(message),
-                }
-                cx.notify();
-            }
-            return;
-        }
         match result.result {
             Ok(mut page) => {
                 // The view now has newer content for this route than any cached copy,
@@ -988,12 +961,8 @@ impl CatalogRequests {
                         if generations[target as usize].load(Ordering::Relaxed) != job.id {
                             continue;
                         }
-                        let append = matches!(
-                            job.query,
-                            Query::More { .. }
-                                | Query::PlaylistChoicesMore(_)
-                                | Query::SidebarMore(_)
-                        );
+                        let append =
+                            matches!(job.query, Query::More { .. } | Query::SidebarMore(_));
                         let revalidate = matches!(job.query, Query::Revalidate(_));
                         let query = match &job.query {
                             Query::Revalidate(query) => query.as_ref(),
@@ -1007,12 +976,10 @@ impl CatalogRequests {
                                     Query::Home => catalog.home(),
                                     Query::Explore => catalog.explore(),
                                     Query::Library(section) => catalog.library(*section),
-                                    Query::PlaylistChoices | Query::SidebarPlaylists => {
-                                        catalog.library(Section::Playlists)
+                                    Query::SidebarPlaylists => catalog.library(Section::Playlists),
+                                    Query::SidebarMore(token) | Query::Reload(token) => {
+                                        catalog.more(token)
                                     }
-                                    Query::PlaylistChoicesMore(token)
-                                    | Query::SidebarMore(token)
-                                    | Query::Reload(token) => catalog.more(token),
                                     Query::Revalidate(_) => {
                                         unreachable!("revalidation unwrapped above")
                                     }

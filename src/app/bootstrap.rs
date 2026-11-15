@@ -331,6 +331,7 @@ impl Music {
             list_id: 0,
             error,
             notice: None,
+            toast: None,
             catalog_requests,
             playback_jobs,
             pending_playback_jobs: playback_receiver,

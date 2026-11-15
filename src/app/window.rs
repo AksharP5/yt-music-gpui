@@ -185,6 +185,10 @@ impl Render for Music {
                 .inset_0()
                 .child(overlay)
         });
+        let toast = self
+            .toast
+            .as_ref()
+            .map(|toast| toast.render(player_height + 16., width));
         div()
             .size_full()
             .relative()
@@ -222,5 +226,6 @@ impl Render for Music {
             .child(content)
             .children(player)
             .children(overlay)
+            .children(toast)
     }
 }

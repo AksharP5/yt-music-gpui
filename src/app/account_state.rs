@@ -830,7 +830,6 @@ impl Music {
                                             // Rebind only this verified account's queue; discard other in-flight reads.
                                             view.catalog_requests.cancel(CatalogTarget::Page);
                                             view.catalog_requests.cancel(CatalogTarget::Sidebar);
-                                            view.catalog_requests.cancel(CatalogTarget::PlaylistPicker);
                                             if let Some(expected) = &previous_session
                                                 && let Err(error) = view.queue_source.renew_session(expected, session.clone())
                                             { view.queue_source.cancel(); view.error = Some(error); }
@@ -930,7 +929,9 @@ impl Music {
                             &mut self.ratings,
                             &mutation,
                         );
-                        self.notice = Some("Saved to YouTube Music".into());
+                        if !matches!(mutation, Mutation::AddToPlaylist { .. }) {
+                            self.notice = Some("Saved to YouTube Music".into());
+                        }
                         self.patch_confirmed(&mutation, cx);
                         match effect {
                             Effect::CreatedPlaylist { id } => {
@@ -950,13 +951,26 @@ impl Music {
                             }
                             Effect::AlreadyAdded => {
                                 if let Mutation::AddToPlaylist { id, video_ids, .. } = mutation {
-                                    self.notice = None;
                                     self.overlay = Some(Overlay::AlreadyAdded { id, video_ids });
                                 }
                             }
-                            Effect::PlaylistAdded { additions } => {
+                            Effect::PlaylistAdded { additions, toast } => {
                                 if let Mutation::AddToPlaylist { id, .. } = &mutation {
                                     self.patch_added(id, &additions, cx);
+                                    // YouTube's own confirmation, else the web's wording for it.
+                                    let toast = toast.or_else(|| {
+                                        self.sidebar_playlists
+                                            .iter()
+                                            .find(|playlist| {
+                                                playlist.id.trim_start_matches("VL")
+                                                    == id.trim_start_matches("VL")
+                                            })
+                                            .map(|playlist| format!("Saved to {}", playlist.title))
+                                    });
+                                    self.show_toast(
+                                        toast.unwrap_or_else(|| "Saved to playlist".into()),
+                                        cx,
+                                    );
                                 }
                             }
                             Effect::Changed => {
