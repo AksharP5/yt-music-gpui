@@ -32,3 +32,11 @@ debug = 0
 [profile.release]
 strip = true
 debug = 0
+
+# Same policy as ytsearch `check:precommit`:
+# `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

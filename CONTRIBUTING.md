@@ -35,7 +35,7 @@ Playback sockets and the account extractor live in a private directory under `$X
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bin/test
 bin/test-install
 ```
