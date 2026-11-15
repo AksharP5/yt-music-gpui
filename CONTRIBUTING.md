@@ -12,6 +12,8 @@ sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland lib
 
 On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the packages to install. Sign-in also needs Python 3, xdg-utils and libsecret's `secret-tool`, and saves accounts in a running Secret Service keyring.
 
+On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. The macOS build plays signed-out audio only for now: sign-in, video and media keys are Linux-only, and CI checks the build on Apple Silicon with macOS 15.
+
 ## Build and install from source
 
 ```sh
@@ -31,7 +33,7 @@ Account playback uses an extractor reviewed against one yt-dlp release, pinned i
 
 The app hands the account to yt-dlp over the extractor's stdin: one JSON line with the Netscape cookie jar and the account to play as. A short-lived thread writes it, because it can exceed the pipe buffer and the player thread must keep handling pause, seek and deadlines. Killing the extractor ends that write. The extractor reads the line before any request, loads the cookies into yt-dlp's in-memory jar and never gets a cookie file, so nothing is saved back. Credentials never appear in an argument, an environment variable or a file. The resident resolver reads the line before it reports ready, and the app holds a signed-in request until then, so the two never mix on the pipe. The one-shot fallback's stdin closes after the line. `credentials_reach_the_extractor_only_through_its_stdin` checks, for both, that the child receives exactly that line and that its arguments, environment and open descriptors carry nothing else. `an_unread_oversized_account_never_blocks_the_player_thread` gives a stalled or exited extractor a 1 MiB line and checks that the player thread returns at once, the deadline reaps the extractor, and the writer ends.
 
-Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR`, removed on normal shutdown, SIGTERM and SIGINT. The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json`. To sample CPU and memory of a running release build, use `bin/profile APP_PID 30`.
+Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR` (`$TMPDIR` on macOS), removed on normal shutdown, SIGTERM and SIGINT. The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json`. To sample CPU and memory of a running release build, use `bin/profile APP_PID 30`.
 
 ## Validate
 
