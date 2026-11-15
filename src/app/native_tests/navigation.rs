@@ -1220,7 +1220,8 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
             wait_for_presented_frame(window, cx).await;
             let loaded = window
                 .update(cx, |view, _, _| {
-                    urls.iter().all(|url| view.artwork.get(url).is_some())
+                    urls.iter()
+                        .all(|url| view.artwork.get(url, size(px(44.), px(44.))).is_some())
                 })
                 .unwrap();
             if loaded {

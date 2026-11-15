@@ -149,7 +149,8 @@ impl Music {
             .filter_map(|playlist| playlist.thumbnail.as_deref())
             .take(PICKER_PREFETCH)
         {
-            self.artwork.get(url);
+            self.artwork
+                .get(url, size(px(PICKER_COVER), px(PICKER_COVER)));
         }
     }
 
@@ -1232,10 +1233,10 @@ impl Music {
                                 })
                                 .map(|(index, choice)| {
                                     let playlist = &view.sidebar_playlists[choice];
-                                    let cover = playlist
-                                        .thumbnail
-                                        .as_deref()
-                                        .and_then(|url| view.artwork.get(url));
+                                    let cover = playlist.thumbnail.as_deref().and_then(|url| {
+                                        view.artwork
+                                            .get(url, size(px(PICKER_COVER), px(PICKER_COVER)))
+                                    });
                                     let id = playlist.id.clone();
                                     div()
                                         .id(("playlist-choice", index))
@@ -1248,7 +1249,7 @@ impl Music {
                                         .hover(|row| row.bg(gpui::white().opacity(0.05)))
                                         .child(
                                             div()
-                                                .size(px(44.))
+                                                .size(px(PICKER_COVER))
                                                 .mr(px(16.))
                                                 .flex_shrink_0()
                                                 .rounded(px(2.))
@@ -1410,6 +1411,7 @@ impl Toast {
 const TOAST_DURATION: Duration = Duration::from_secs(4);
 /// The web's `--ytmusic-playlist-item-height`.
 const PICKER_ROW: f32 = 64.;
+const PICKER_COVER: f32 = 44.;
 /// The gap above the first playlist.
 const PICKER_LIST_TOP: f32 = 7.;
 /// The "All playlists" heading with its top margin.
