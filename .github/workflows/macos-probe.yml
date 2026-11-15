@@ -5,12 +5,29 @@ on:
 permissions:
   contents: read
 jobs:
+  linux-live:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v7
+      - run: |
+          version=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          python -m pip install --quiet "yt-dlp==$version"
+      - name: Live guest playback on Linux, for comparison
+        run: bin/test -- --ignored --exact --nocapture player::tests::live_playback
   probe:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: brew install yt-dlp deno
+      - run: brew install deno
+      - name: Install the reviewed yt-dlp
+        run: |
+          version=$(sed -n 's/^REVIEWED_VERSION = "\(.*\)"/\1/p' src/ytdlp_account.py)
+          python3 -m venv "$RUNNER_TEMP/ytdlp"
+          "$RUNNER_TEMP/ytdlp/bin/pip" install --quiet "yt-dlp==$version"
+          echo "$RUNNER_TEMP/ytdlp/bin" >> "$GITHUB_PATH"
       - run: cargo build --locked
       - name: Player integration tests
         continue-on-error: true
@@ -53,9 +70,24 @@ jobs:
           screencapture -x shots/3-player.png || true
           kill -0 $pid && echo "app still running"
           lsof -p $pid | grep -iE "mpv|sock|coreaudio" | head -20 || true
+          ps -o pid,pgid,command -g $(ps -o pgid= -p $pid) || true
           kill -TERM $pid; sleep 3; kill -0 $pid 2>/dev/null && echo "app ignored SIGTERM" || echo "app exited on SIGTERM"
           ls -l "$TMPDIR" | grep yt-music || true
           cat shots/app.log
+      - name: Same run with the system font
+        continue-on-error: true
+        run: |
+          sed -i '' 's/"Roboto"/"Helvetica"/g' src/app/window.rs src/app/player_page.rs src/app/pages/shelves.rs
+          cargo build --locked
+          target/debug/yt-music-gpui --guest > shots/app-helvetica.log 2>&1 &
+          pid=$!
+          sleep 25
+          screencapture -x shots/4-helvetica-home.png || true
+          osascript -e 'tell application "System Events" to keystroke space' || true
+          sleep 20
+          screencapture -x shots/5-helvetica-after-space.png || true
+          kill -TERM $pid
+          git checkout src
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
