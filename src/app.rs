@@ -186,5 +186,6 @@ pub struct Music {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+// These need an isolated Linux desktop session; see CONTRIBUTING.md.
+#[cfg(all(test, unix))]
 mod native_tests;

@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use crate::os::exit_with_parent;
+use crate::os::private_file;
 #[cfg(target_os = "linux")]
 use crate::os::sealed_file;
-use crate::os::{exit_with_parent, private_file};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::header::HeaderValue;
@@ -11,10 +13,6 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    },
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
@@ -27,6 +25,11 @@ use std::{
 
 /// Sign-in copies a browser session into the Secret Service, which only Linux has.
 pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
+#[cfg(unix)]
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+};
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
@@ -518,6 +521,7 @@ fn store_in_keyring(_: &[u8]) -> Result<()> {
 }
 
 /// Replaces the file atomically, so it is never readable by others or half written.
+#[cfg(unix)]
 fn write_session_file(path: &Path, value: &[u8]) -> Result<()> {
     let directory = path.parent().context("Missing data directory")?;
     fs::create_dir_all(directory).context("Could not create the music data directory")?;
@@ -545,6 +549,7 @@ fn write_session_file(path: &Path, value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn read_session_file(path: &Path) -> Result<Option<Session>> {
     let file = match OpenOptions::new()
         .read(true)
@@ -565,6 +570,17 @@ fn read_session_file(path: &Path) -> Result<Option<Session>> {
     let mut value = Vec::new();
     file.take(64 * 1024).read_to_end(&mut value)?;
     Session::from_saved(&value).map(Some)
+}
+
+/// Sign-in is Linux-only so far, so nothing else has a session file to read or write.
+#[cfg(windows)]
+fn write_session_file(_: &Path, _: &[u8]) -> Result<()> {
+    bail!("Sign-in isn't available on this system yet")
+}
+
+#[cfg(windows)]
+fn read_session_file(_: &Path) -> Result<Option<Session>> {
+    Ok(None)
 }
 
 /// Removes everything the app saved about the account outside the keyring.
@@ -650,6 +666,8 @@ impl AccountProcess {
         })
     }
     fn spawn(command: &mut Command) -> Result<Self> {
+        // Account helpers run only where sign-in is available.
+        #[cfg(unix)]
         exit_with_parent(command, libc::SIGTERM);
         Ok(Self(
             command
@@ -703,6 +721,16 @@ pub(crate) fn private_runtime() -> Result<PathBuf> {
     // macOS gives each user a private temporary directory in $TMPDIR.
     #[cfg(target_os = "macos")]
     let runtime = std::env::temp_dir();
+    // Windows gives each user a %LOCALAPPDATA% that only they and
+    // administrators can open, and new folders inherit that.
+    #[cfg(windows)]
+    let runtime = {
+        let runtime = crate::dirs::data()
+            .context("A private local app data folder is required for playback")?
+            .join("runtime");
+        fs::create_dir_all(&runtime)?;
+        runtime
+    };
     validate_private_runtime(&runtime)?;
     Ok(runtime)
 }
@@ -710,10 +738,12 @@ pub(crate) fn private_runtime() -> Result<PathBuf> {
 fn validate_private_runtime(runtime: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(runtime)?;
     ensure!(
-        runtime.is_absolute()
-            && metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
+        runtime.is_absolute() && metadata.is_dir(),
+        "The desktop runtime directory must be private to your user"
+    );
+    #[cfg(unix)]
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
         "The desktop runtime directory must be private to your user"
     );
     // macOS has no tmpfs. Nothing secret is written there: credentials reach
@@ -734,10 +764,23 @@ fn validate_private_runtime(runtime: &Path) -> Result<()> {
     Ok(())
 }
 
+const ALREADY_RUNNING: &str =
+    "YouTube Music is already running. Close its window before opening another instance.";
+
+#[cfg(unix)]
 pub fn lock_instance() -> Result<File> {
     lock_file(&private_runtime()?.join("yt-music-gpui.lock"))
 }
 
+/// Windows has no flock; a named mutex in this login session does the same.
+#[cfg(windows)]
+pub fn lock_instance() -> Result<std::os::windows::io::OwnedHandle> {
+    crate::os::instance_mutex("yt-music-gpui")
+        .context("Could not lock the music application")?
+        .context(ALREADY_RUNNING)
+}
+
+#[cfg(unix)]
 fn lock_file(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -759,9 +802,7 @@ fn lock_file(path: &Path) -> Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Err(anyhow::anyhow!(
-                "YouTube Music is already running. Close its window before opening another instance."
-            ));
+            bail!(ALREADY_RUNNING);
         }
         return Err(error).context("Could not lock the music application");
     }
@@ -1066,6 +1107,7 @@ impl Session {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn private_runtime_rejects_shared_directories_and_symlinks() {
         let parent = tempfile::tempdir().unwrap();
@@ -1172,6 +1214,7 @@ mod tests {
             );
         }
     }
+    #[cfg(unix)]
     #[test]
     fn only_one_instance_can_own_account_state() {
         let directory = tempfile::tempdir().unwrap();
@@ -1205,6 +1248,7 @@ mod tests {
             source_profile: None,
         }
     }
+    #[cfg(unix)]
     #[test]
     fn a_timed_out_keyring_process_is_terminated_and_reaped() {
         let mut command = Command::new("sleep");
@@ -1222,6 +1266,7 @@ mod tests {
             Some(libc::ECHILD)
         );
     }
+    #[cfg(unix)]
     #[test]
     fn keyring_capture_handles_large_output_and_preserves_exit_status() {
         let mut command = Command::new("/bin/sh");
@@ -1249,6 +1294,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("oversized"));
     }
+    #[cfg(unix)]
     #[test]
     fn keyring_cancellation_terminates_and_reaps_the_child() {
         let operation = Operation::default();
@@ -1368,6 +1414,7 @@ mod tests {
         expected.playback_cookie = "x".repeat(8192);
         assert!(expected.saved_value().is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn keyring_failures_report_a_locked_account_only_after_one_was_saved() {
         use std::os::unix::process::ExitStatusExt;
@@ -1427,6 +1474,7 @@ mod tests {
         record_saved_account(Some(&marker));
         assert!(!target.exists(), "The marker never follows a symlink");
     }
+    #[cfg(unix)]
     #[test]
     fn session_file_is_owner_only_and_round_trips() {
         let directory = tempfile::tempdir().unwrap();
@@ -1448,6 +1496,7 @@ mod tests {
             "A readable file is refused"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn session_file_never_follows_a_symlink() {
         let directory = tempfile::tempdir().unwrap();
@@ -1463,6 +1512,7 @@ mod tests {
             "The link target is untouched"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn signing_out_removes_the_session_file_and_marker() {
         let directory = tempfile::tempdir().unwrap();
@@ -1476,6 +1526,7 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         forget_saved(directory.path()).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn a_keyring_account_wins_over_the_session_file() {
         use std::os::unix::process::ExitStatusExt;

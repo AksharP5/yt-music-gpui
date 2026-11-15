@@ -21,6 +21,20 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: brew install mpv
+    # mpv's own LGPL build, pinned by checksum. The app loads libmpv-2.dll at run time.
+    - name: Install libmpv
+      if: runner.os == 'Windows'
+      shell: bash
+      env:
+        VERSION: v0.42.0
+        SHA256: 8e5f77430efc53ef175804ba6618527e3af0448a0dcabf04d3cc72659d1a6fce
+      run: |
+        cd "$RUNNER_TEMP"
+        archive="libmpv-$VERSION-x86_64-w64-mingw32-lgpl.zip"
+        curl -fsSLO "https://github.com/mpv-player/mpv/releases/download/$VERSION/$archive"
+        echo "$SHA256  $archive" | sha256sum -c -
+        7z x -olibmpv "$archive" libmpv-2.dll
+        cygpath -w "$PWD/libmpv" >> "$GITHUB_PATH"
     - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       with:
         components: rustfmt, clippy
