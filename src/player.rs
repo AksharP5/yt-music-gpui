@@ -1,7 +1,6 @@
 use crate::auth::{PlaybackCredentials, private_runtime};
 use crate::os::{
-    Waker, exit_fd, exit_with_parent, kill_group, private_file, sealed_file, set_nonblocking,
-    wait_readable,
+    Waker, exit_fd, exit_with_parent, kill_group, private_file, set_nonblocking, wait_readable,
 };
 use crate::video::NativeVideo;
 use anyhow::{Context, Result, bail, ensure};
@@ -14,7 +13,7 @@ use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File},
     io::{ErrorKind, Read, Seek, Write},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     os::unix::process::CommandExt,
@@ -925,14 +924,6 @@ fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOptions) -> V
     }})
 }
 
-fn writable_playback_cookies(mut source: File) -> Result<File> {
-    // yt-dlp rewrites its cookie jar on exit, so give it a disposable RAM copy.
-    let mut file = private_file()?;
-    source.rewind()?;
-    std::io::copy(&mut source, &mut file)?;
-    Ok(file)
-}
-
 fn request(
     socket: &mut UnixStream,
     pending: &mut Vec<u8>,
@@ -991,10 +982,10 @@ fn read_message(
 
 const ACCOUNT_EXTRACTOR: &str = include_str!("ytdlp_account.py");
 
+/// The account extractor's directory and the credentials it reads from stdin.
 struct ExtractorCredentials {
-    cookies: File,
-    _identity: File,
-    config: File,
+    plugin_dir: PathBuf,
+    source: PlaybackCredentials,
 }
 
 fn write_account_extractor(runtime: &Path) -> Result<PathBuf> {
@@ -1003,29 +994,6 @@ fn write_account_extractor(runtime: &Path) -> Result<PathBuf> {
     fs::create_dir_all(&directory)?;
     fs::write(directory.join("account.py"), ACCOUNT_EXTRACTOR)?;
     Ok(root)
-}
-
-fn prepare_credentials(
-    source: PlaybackCredentials,
-    plugin_dir: &Path,
-) -> Result<ExtractorCredentials> {
-    let cookies = writable_playback_cookies(source.cookies)?;
-    let identity = source.identity;
-    let plugin_dir = plugin_dir
-        .to_str()
-        .context("Invalid private playback directory")?;
-    let quoted_directory = format!("'{}'", plugin_dir.replace('\'', "'\"'\"'"));
-    // Keep the account-only extractor and its sealed identity together in RAM.
-    let config = format!(
-        "--no-plugin-dirs\n--plugin-dirs {quoted_directory}\n--use-extractors '^ytmusicaccount$'\n--extractor-args ytmusicaccount:context=/proc/{}/fd/{}\n",
-        std::process::id(),
-        identity.as_raw_fd()
-    );
-    Ok(ExtractorCredentials {
-        cookies,
-        _identity: identity,
-        config: sealed_file(config.as_bytes())?,
-    })
 }
 
 fn replace_playback_credentials(
@@ -1037,9 +1005,10 @@ fn replace_playback_credentials(
     state: &mut PlaybackState,
     events: &async_channel::Sender<PlayerEvent>,
 ) -> Result<()> {
-    let next = source
-        .map(|source| prepare_credentials(source, plugin_dir))
-        .transpose()?;
+    let next = source.map(|source| ExtractorCredentials {
+        plugin_dir: plugin_dir.to_owned(),
+        source,
+    });
     request(socket, pending, json!(["stop"]), |value| {
         state.message(value, events)
     })?;
@@ -1226,10 +1195,7 @@ impl StreamKey {
     }
 }
 
-fn extractor_arguments(
-    command: &mut Command,
-    credentials: Option<&ExtractorCredentials>,
-) -> Result<Option<File>> {
+fn extractor_arguments(command: &mut Command, credentials: Option<&ExtractorCredentials>) {
     command.args([
         "--ignore-config",
         "--no-playlist",
@@ -1248,27 +1214,32 @@ fn extractor_arguments(
             .arg("--js-runtimes")
             .arg(format!("deno:{}", deno.display()));
     }
-    let cookies = credentials
-        .map(|credentials| writable_playback_cookies(credentials.cookies.try_clone()?))
-        .transpose()?;
+    command.arg("--no-plugin-dirs");
+    // The account extractor reads cookies and identity from stdin; see send_credentials.
     if let Some(credentials) = credentials {
         command
-            .arg("--cookies")
-            .arg(format!(
-                "/proc/{}/fd/{}",
-                std::process::id(),
-                cookies.as_ref().unwrap().as_raw_fd()
-            ))
-            .arg("--config-locations")
-            .arg(format!(
-                "/proc/{}/fd/{}",
-                std::process::id(),
-                credentials.config.as_raw_fd()
-            ));
-    } else {
-        command.arg("--no-plugin-dirs");
+            .arg("--plugin-dirs")
+            .arg(&credentials.plugin_dir)
+            .args(["--use-extractors", "^ytmusicaccount$"]);
     }
-    Ok(cookies)
+}
+
+/// The credentials never touch argv, the environment or a file: the extractor
+/// reads them from its own stdin pipe before its first request.
+///
+/// The line can exceed the pipe buffer, so a short-lived thread writes it and
+/// the player thread never waits on the extractor. Killing the extractor
+/// closes the pipe's read end, which ends the write with an error.
+fn send_credentials(input: impl Into<OwnedFd>, credentials: &ExtractorCredentials) -> Result<()> {
+    let mut input = File::from(input.into());
+    let message = credentials.source.message.clone();
+    thread::Builder::new()
+        .name("credentials".into())
+        .spawn(move || {
+            let _ = input.write_all(&message);
+        })
+        .context("Could not hand the account to the stream extractor")?;
+    Ok(())
 }
 
 fn python_interpreter(ytdlp: &Path) -> Result<Command> {
@@ -1330,8 +1301,11 @@ struct WarmResolver {
     output: ChildStdout,
     bytes: Vec<u8>,
     ready: bool,
+    /// A signed-in resolver's request waits for `ready`: until then the
+    /// account's credentials may still be on their way through stdin.
+    signed_in: bool,
+    request: Option<Vec<u8>>,
     started: Instant,
-    _cookies: Option<File>,
 }
 
 impl WarmResolver {
@@ -1340,7 +1314,7 @@ impl WarmResolver {
         command
             .args(["-I", "-B", "-u", "-c", include_str!("ytdlp_resolver.py")])
             .arg(ytdlp);
-        let cookies = extractor_arguments(&mut command, credentials)?;
+        extractor_arguments(&mut command, credentials);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1356,20 +1330,33 @@ impl WarmResolver {
             child,
             bytes: Vec::new(),
             ready: false,
+            signed_in: credentials.is_some(),
+            request: None,
             started: Instant::now(),
-            _cookies: cookies,
         };
         set_nonblocking(resolver.output.as_fd())
             .context("Could not read resolver output asynchronously")?;
+        if let Some(credentials) = credentials {
+            send_credentials(resolver.input.as_fd().try_clone_to_owned()?, credentials)?;
+        }
         Ok(resolver)
     }
 
     fn send(&mut self, target: &PreparedTarget) -> Result<()> {
-        serde_json::to_writer(
-            &mut self.input,
-            &json!({"url": target.key.url, "format": target.key.selector()}),
-        )?;
-        self.input.write_all(b"\n")?;
+        let mut request =
+            serde_json::to_vec(&json!({"url": target.key.url, "format": target.key.selector()}))?;
+        request.push(b'\n');
+        self.request = Some(request);
+        if self.ready || !self.signed_in {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if let Some(request) = self.request.take() {
+            self.input.write_all(&request)?;
+        }
         Ok(())
     }
 
@@ -1378,7 +1365,10 @@ impl WarmResolver {
             if let Some(end) = self.bytes.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.bytes.drain(..=end).collect();
                 match serde_json::from_slice(&line)? {
-                    ResolverResponse::Ready { ready: true } if !self.ready => self.ready = true,
+                    ResolverResponse::Ready { ready: true } if !self.ready => {
+                        self.ready = true;
+                        self.flush()?;
+                    }
                     ResolverResponse::Stream { urls, loudness } if self.ready => {
                         let gain_db =
                             normalization_gain(&loudness["audioConfig"], &loudness["format"]);
@@ -1754,7 +1744,6 @@ struct StreamPreparation {
     child: Child,
     output: File,
     exited: OwnedFd,
-    _cookies: Option<File>,
 }
 
 impl StreamPreparation {
@@ -1766,11 +1755,15 @@ impl StreamPreparation {
         // Keep signed URLs and any extractor output in anonymous RAM, never disk.
         let output = private_file()?;
         let mut command = Command::new(ytdlp);
-        let cookies = extractor_arguments(&mut command, credentials)?;
+        extractor_arguments(&mut command, credentials);
         command
             .arg("--format")
             .arg(target.key.selector())
-            .stdin(Stdio::null())
+            .stdin(if credentials.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(output.try_clone()?)
             .stderr(Stdio::null());
         command.process_group(0).arg(&target.key.url);
@@ -1785,13 +1778,18 @@ impl StreamPreparation {
                 return Err(error).context("Could not watch the stream extractor");
             }
         };
-        Ok(Self {
+        let input = child.stdin.take();
+        let job = Self {
             target,
             child,
             output,
             exited,
-            _cookies: cookies,
-        })
+        };
+        if let (Some(input), Some(credentials)) = (input, credentials) {
+            // The writer closes the pipe afterwards: the extractor gets nothing more.
+            send_credentials(input, credentials)?;
+        }
+        Ok(job)
     }
 
     fn finish(&mut self) -> Result<Option<ResolvedStream>> {
@@ -1929,9 +1927,11 @@ fn run(
         account_warned,
         &mut account_notice,
     )
-    .map(|source| prepare_credentials(source, &plugin_dir))
-    .transpose()?;
-    // Destroy the core before dropping the RAM credentials or private runtime.
+    .map(|source| ExtractorCredentials {
+        plugin_dir: plugin_dir.clone(),
+        source,
+    });
+    // Destroy the core before removing the private runtime.
     let core = MpvCore::new(&options, &socket_path)?;
     // Cancel/reap the resolver before credentials or the core can drop.
     let mut resolver = StreamResolver::new(ytdlp, credentials.as_ref());
@@ -2103,7 +2103,7 @@ fn run(
                 Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
                 Ok(PlayerCommand::Credentials { next, reply }) => {
-                    // Reap even an idle resolver before revoking its cookie copy.
+                    // Reap even an idle resolver: it holds the old account in memory.
                     resolver.stop();
                     pending_play = None;
                     next_target = None;
@@ -2899,6 +2899,7 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn private_tools_require_owned_non_writable_parents_and_regular_executables() {
@@ -2953,7 +2954,7 @@ mod tests {
     #[test]
     fn youtube_player_code_only_runs_in_sandboxed_deno() {
         let mut command = Command::new("yt-dlp");
-        extractor_arguments(&mut command, None).unwrap();
+        extractor_arguments(&mut command, None);
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -3094,7 +3095,7 @@ mod tests {
         // The actual account plugin is discovered normally. Replace only remote
         // extraction for these process-lifetime tests; Python tests cover identity checks.
         writeln!(file, r#"
-import signal, subprocess, sys
+import json, os, signal, subprocess, sys
 from pathlib import Path
 
 def initialize(self):
@@ -3135,17 +3136,10 @@ YtMusicAccountIE._real_extract = extract
     fn warm_resolver_reuses_requests_and_supersession_kills_the_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let plugin = synthetic_resolver_plugin(directory.path());
-        let credentials =
-            prepare_credentials(synthetic_credentials("INVENTED_FIRST"), &plugin).unwrap();
+        let credentials = signed_in(synthetic_credentials("INVENTED_FIRST"), &plugin);
         let ytdlp = find_ytdlp().unwrap();
         let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials));
-        let old = resolver.warm.as_ref().unwrap();
-        let pid = old.child.id();
-        let cookie = format!(
-            "/proc/self/fd/{}",
-            old._cookies.as_ref().unwrap().as_raw_fd()
-        );
-        let cookie_identity = file_identity(&cookie);
+        let pid = resolver.warm.as_ref().unwrap().child.id();
         let blocked = resolver_target("blocked0000", 1);
         resolver.start(blocked.clone(), Some(&credentials)).unwrap();
         let ready = directory.path().join("ready");
@@ -3155,6 +3149,8 @@ YtMusicAccountIE._real_extract = extract
                 Instant::now() < deadline,
                 "synthetic extractor did not start"
             );
+            // Like the actor: the signed-in request goes out once the resolver is ready.
+            assert!(resolver.finish(None, Some(&credentials)).is_none());
             thread::sleep(Duration::from_millis(5));
         }
         let child = serde_json::from_slice::<Value>(&fs::read(ready).unwrap()).unwrap()["child"]
@@ -3181,7 +3177,6 @@ YtMusicAccountIE._real_extract = extract
             !Path::new(&format!("/proc/{pid}")).exists(),
             "superseded resolver must be reaped synchronously"
         );
-        assert_ne!(file_identity(&cookie), cookie_identity);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let stat = fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
@@ -3237,11 +3232,10 @@ YtMusicAccountIE._real_extract = extract
 
     #[test]
     #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic accounts, no network"]
-    fn warm_credential_change_respawns_with_new_identity_and_revokes_old_files() {
+    fn warm_credential_change_respawns_with_the_new_account() {
         let directory = tempfile::tempdir().unwrap();
         let plugin = synthetic_resolver_plugin(directory.path());
-        let credentials =
-            prepare_credentials(synthetic_credentials("INVENTED_FIRST"), &plugin).unwrap();
+        let credentials = signed_in(synthetic_credentials("INVENTED_FIRST"), &plugin);
         let ytdlp = find_ytdlp().unwrap();
         let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials));
         resolver
@@ -3252,30 +3246,13 @@ YtMusicAccountIE._real_extract = extract
                 .url
                 .contains("identity=brand||user")
         );
-        let old = resolver.warm.as_ref().unwrap();
-        let pid = old.child.id();
-        let paths = [
-            old._cookies.as_ref().unwrap().as_raw_fd(),
-            credentials._identity.as_raw_fd(),
-            credentials.config.as_raw_fd(),
-        ]
-        .map(|fd| {
-            let path = format!("/proc/self/fd/{fd}");
-            let identity = file_identity(&path);
-            (path, identity)
-        });
+        let pid = resolver.warm.as_ref().unwrap().child.id();
         resolver.stop();
-        drop(credentials);
-        for (path, identity) in paths {
-            assert_ne!(file_identity(&path), identity);
-        }
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
-        let mut source = synthetic_credentials("INVENTED_SECOND");
-        source.identity = sealed_file(
-            br#"{"authuser":"3","delegated_session_id":"other","data_sync_id":"other||second"}"#,
-        )
-        .unwrap();
-        let credentials = prepare_credentials(source, &plugin).unwrap();
+        let credentials = signed_in(
+            synthetic_account("INVENTED_SECOND", "3", "other", "second"),
+            &plugin,
+        );
         resolver = StreamResolver::new(&ytdlp, Some(&credentials));
         resolver
             .start(resolver_target("abcdefghijk", 2), Some(&credentials))
@@ -3577,46 +3554,175 @@ YtMusicAccountIE._real_extract = extract
     }
 
     #[test]
-    fn cancelling_preparation_reaps_the_extractor_and_revokes_its_cookie_copy() {
+    fn cancelling_preparation_reaps_the_signed_in_extractor() {
         let directory = tempfile::tempdir().unwrap();
         let extractor = directory.path().join("extractor");
-        fs::write(
-            &extractor,
-            "#!/usr/bin/python3\nimport time\ntime.sleep(30)\n",
-        )
-        .unwrap();
+        fs::write(&extractor, "#!/bin/sh\nexec sleep 30\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
-        let credentials =
-            prepare_credentials(synthetic_credentials("INVENTED"), directory.path()).unwrap();
-        let target = PreparedTarget {
-            lane: ResolverLane::Full,
-            key: StreamKey {
-                url: "https://music.youtube.com/watch?v=abcdefghijk".into(),
-                quality: AudioQuality::Normal,
-                video: None,
-            },
-            track_id: 1,
-        };
+        let credentials = signed_in(synthetic_credentials("INVENTED"), directory.path());
+        let target = resolver_target("abcdefghijk", 1);
         let job = StreamPreparation::start(target, &extractor, Some(&credentials)).unwrap();
         let pid = job.child.id();
-        let copy = format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            job._cookies.as_ref().unwrap().as_raw_fd()
-        );
-        let original = format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            credentials.cookies.as_raw_fd()
-        );
-        let copied = file_identity(&copy);
-        assert_ne!(copied, file_identity(&original));
-        assert!(fs::read_to_string(&copy).unwrap().contains("INVENTED"));
         drop(job);
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
-        // Parallel tests can reuse the closed descriptor number for an unrelated file.
-        assert_ne!(file_identity(&copy), copied);
-        assert!(Path::new(&original).exists());
+    }
+
+    /// What a stub extractor saw of its own process: descriptors, argv,
+    /// environment and the credentials it read from stdin.
+    struct HandOff {
+        fds: Vec<String>,
+        visible: String,
+        received: Vec<u8>,
+    }
+
+    fn hand_off(warm: bool, credentials: Option<&ExtractorCredentials>) -> HandOff {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("report");
+        // The stub lists its descriptors and copies its argv and environment,
+        // then keeps the first line it reads: credentials, or a guest's request.
+        let record = format!(
+            "cd /proc/$$/fd && ls > {report}.fds\ncat /proc/$$/cmdline /proc/$$/environ > {report}.visible\n",
+            report = report.display()
+        );
+        let script = if warm {
+            let interpreter = directory.path().join("python3");
+            fs::write(
+                &interpreter,
+                format!(
+                    "#!/bin/sh\n{record}case \"$*\" in *--use-extractors*) IFS= read -r line; printf '%s\\n' \"$line\" > {report}.stdin;; esac\nprintf '%s\\n' '{{\"ready\":true}}'\nwhile IFS= read -r request; do [ -e {report}.stdin ] || printf '%s\\n' \"$request\" > {report}.stdin; printf '%s\\n' '{{\"urls\":[\"https://rr1.googlevideo.com/warm\"]}}'; done\n",
+                    report = report.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+            format!("#!{}\n", interpreter.display())
+        } else {
+            format!(
+                "#!/bin/sh\n{record}cat > {report}.stdin\nprintf '%s\\n' 'https://rr1.googlevideo.com/oneshot'\n",
+                report = report.display()
+            )
+        };
+        let extractor = directory.path().join("extractor");
+        fs::write(&extractor, script).unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut resolver = StreamResolver::new(&extractor, credentials);
+        assert_eq!(resolver.warm.is_some(), warm);
+        resolver
+            .start(resolver_target("abcdefghijk", 1), credentials)
+            .unwrap();
+        let url = resolved(&mut resolver, credentials).url;
+        assert!(url.ends_with(if warm { "warm" } else { "oneshot" }));
+        drop(resolver);
+        let read = |suffix: &str| fs::read(report.with_extension(suffix)).unwrap_or_default();
+        HandOff {
+            fds: String::from_utf8(read("fds"))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            visible: String::from_utf8_lossy(&read("visible")).into_owned(),
+            received: read("stdin"),
+        }
+    }
+
+    fn credential_writers() -> usize {
+        fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter(|task| {
+                fs::read_to_string(task.as_ref().unwrap().path().join("comm"))
+                    .is_ok_and(|name| name.trim() == "credentials")
+            })
+            .count()
+    }
+
+    #[test]
+    fn an_unread_oversized_account_never_blocks_the_player_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        // Far beyond any pipe buffer.
+        let credentials = ExtractorCredentials {
+            plugin_dir: directory.path().to_owned(),
+            source: PlaybackCredentials {
+                message: vec![b'x'; 1 << 20],
+            },
+        };
+        for (warm, behaviour) in [
+            (true, "exec sleep 60"),
+            (false, "exec sleep 60"),
+            (false, "exit 0"),
+        ] {
+            let extractor = directory.path().join("extractor");
+            if warm {
+                let interpreter = directory.path().join("python3");
+                fs::write(&interpreter, format!("#!/bin/sh\n{behaviour}\n")).unwrap();
+                fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
+            } else {
+                fs::write(&extractor, format!("#!/bin/sh\n{behaviour}\n")).unwrap();
+            }
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+            let start = Instant::now();
+            let mut resolver = StreamResolver::new(&extractor, Some(&credentials));
+            assert_eq!(resolver.warm.is_some(), warm);
+            resolver
+                .start(resolver_target("abcdefghijk", 1), Some(&credentials))
+                .unwrap();
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "the player thread waited for the extractor to read its account"
+            );
+            let pid = match &resolver.warm {
+                Some(warm) => warm.child.id(),
+                None => resolver.one_shot.as_ref().unwrap().child.id(),
+            };
+            let expired = Instant::now() - RESOLVER_TIMEOUT;
+            resolver.started = expired;
+            if let Some(warm) = &mut resolver.warm {
+                warm.started = expired;
+            }
+            // The deadline still runs on this thread and reaps the stalled extractor.
+            resolver.finish(None, Some(&credentials));
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "{behaviour}: extractor survived its deadline"
+            );
+            drop(resolver);
+        }
+        // Each writer ends once its extractor is gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while credential_writers() > 0 {
+            assert!(Instant::now() < deadline, "a credential writer is stuck");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn credentials_reach_the_extractor_only_through_its_stdin() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = signed_in(
+            synthetic_credentials("INVENTED_HANDOFF_SECRET"),
+            directory.path(),
+        );
+        for warm in [false, true] {
+            let guest = hand_off(warm, None);
+            let account = hand_off(warm, Some(&credentials));
+            assert_eq!(account.received, credentials.source.message, "warm: {warm}");
+            if warm {
+                let request: Value = serde_json::from_slice(&guest.received).unwrap();
+                assert_eq!(
+                    request["url"],
+                    "https://music.youtube.com/watch?v=abcdefghijk"
+                );
+            } else {
+                assert!(guest.received.is_empty());
+            }
+            for handoff in [&guest, &account] {
+                assert!(!handoff.visible.contains("INVENTED_HANDOFF_SECRET"));
+                assert!(!handoff.visible.contains("brand||user"));
+            }
+            assert!(account.visible.contains("--use-extractors"));
+            // stdin replaces /dev/null or carries requests; no other descriptor appears.
+            assert_eq!(account.fds, guest.fds, "warm: {warm}");
+        }
     }
 
     #[test]
@@ -4973,63 +5079,35 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         assert!(received.try_recv().is_err());
     }
 
-    fn file_identity(path: &str) -> Option<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        match fs::metadata(path) {
-            Ok(metadata) => Some((metadata.dev(), metadata.ino())),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => panic!("could not inspect synthetic playback file: {error}"),
-        }
-    }
-
-    fn sealed_cookies(value: &str) -> File {
-        sealed_file(
-            format!(
-                "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tYT_MUSIC_SYNTHETIC\t{value}\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap()
+    fn synthetic_account(
+        value: &str,
+        authuser: &str,
+        brand: &str,
+        user: &str,
+    ) -> PlaybackCredentials {
+        let session: crate::auth::Session = serde_json::from_value(json!({
+            "cookie": format!("SAPISID={value}"),
+            "playback_cookie": format!(
+                "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\t{value}\n"
+            ),
+            "authuser": authuser,
+            "delegated_session_id": brand,
+            "data_sync_id": format!("{brand}||{user}"),
+            "client_version": "synthetic",
+        }))
+        .unwrap();
+        session.playback_credentials().unwrap()
     }
 
     fn synthetic_credentials(value: &str) -> PlaybackCredentials {
-        PlaybackCredentials {
-            cookies: sealed_cookies(value),
-            identity: sealed_file(
-                br#"{"authuser":"2","delegated_session_id":"brand","data_sync_id":"brand||user"}"#,
-            )
-            .unwrap(),
-        }
+        synthetic_account(value, "2", "brand", "user")
     }
 
-    #[test]
-    fn extractor_cookie_copy_is_private_writable_ram() {
-        let mut source = sealed_cookies("INVENTED_FIRST");
-        let mut file = writable_playback_cookies(source.try_clone().unwrap()).unwrap();
-        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
-        let original = file_identity(&path);
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .contains("INVENTED_FIRST")
-        );
-        assert!(
-            fs::read_link(&path)
-                .unwrap()
-                .to_string_lossy()
-                .contains("memfd:")
-        );
-        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        assert_ne!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-            0
-        );
-        file.set_len(0).unwrap();
-        file.rewind().unwrap();
-        file.write_all(b"extractor rewrote its jar").unwrap();
-        assert!(source.write_all(b"source remains sealed").is_err());
-        drop(file);
-        assert_ne!(file_identity(&path), original);
+    fn signed_in(source: PlaybackCredentials, plugin_dir: &Path) -> ExtractorCredentials {
+        ExtractorCredentials {
+            plugin_dir: plugin_dir.to_owned(),
+            source,
+        }
     }
 
     fn credential_barrier_command(server: &mut UnixStream) -> Value {
@@ -5071,7 +5149,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
     }
 
     #[test]
-    fn credential_changes_wait_for_old_file_events_and_revoke_ram_files() {
+    fn credential_changes_wait_for_old_file_events() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_millis(80)))
@@ -5080,19 +5158,10 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let plugin_dir = Path::new("/private/synthetic-plugin-root");
-        let mut current =
-            Some(prepare_credentials(synthetic_credentials("INVENTED_FIRST"), plugin_dir).unwrap());
-        let files = [
-            current.as_ref().unwrap().cookies.as_raw_fd(),
-            current.as_ref().unwrap()._identity.as_raw_fd(),
-            current.as_ref().unwrap().config.as_raw_fd(),
-        ]
-        .map(|fd| {
-            let path = format!("/proc/self/fd/{fd}");
-            let identity = file_identity(&path);
-            (path, identity)
-        });
-        let old_files = files.clone();
+        let mut current = Some(signed_in(
+            synthetic_credentials("INVENTED_FIRST"),
+            plugin_dir,
+        ));
         let worker = thread::spawn(move || {
             for start_after_marker_reply in [true, false] {
                 let stop = socket_message(&mut server);
@@ -5126,11 +5195,6 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                     .set_read_timeout(Some(Duration::from_millis(25)))
                     .unwrap();
                 assert!(server.read(&mut [0]).is_err());
-                if start_after_marker_reply {
-                    for (path, identity) in &old_files {
-                        assert_eq!(file_identity(path), *identity);
-                    }
-                }
                 server
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
@@ -5150,17 +5214,8 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             &events,
         )
         .unwrap();
-        for (path, identity) in files {
-            assert_ne!(file_identity(&path), identity);
-        }
-        assert!(
-            fs::read_to_string(format!(
-                "/proc/self/fd/{}",
-                current.as_ref().unwrap().cookies.as_raw_fd()
-            ))
-            .unwrap()
-            .contains("INVENTED_SECOND")
-        );
+        let installed = &current.as_ref().unwrap().source.message;
+        assert!(String::from_utf8_lossy(installed).contains("INVENTED_SECOND"));
         replace_playback_credentials(
             &mut client,
             &mut pending,
@@ -5251,14 +5306,10 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
             let plugin_dir = Path::new("/private/synthetic-plugin-root");
-            let mut current = Some(
-                prepare_credentials(synthetic_credentials("INVENTED_FIRST"), plugin_dir).unwrap(),
-            );
-            let path = format!(
-                "/proc/self/fd/{}",
-                current.as_ref().unwrap().cookies.as_raw_fd()
-            );
-            let original = file_identity(&path);
+            let mut current = Some(signed_in(
+                synthetic_credentials("INVENTED_FIRST"),
+                plugin_dir,
+            ));
             let worker = thread::spawn(move || {
                 let stop = socket_message(&mut server);
                 assert_eq!(stop["command"], json!(["stop"]));
@@ -5300,10 +5351,8 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
                     .to_string()
                     .contains("INVENTED_PRIVATE_DIAGNOSTIC")
             );
-            // The actor keeps the old files until core teardown on this fatal error.
-            assert_eq!(file_identity(&path), original);
-            drop(current);
-            assert_ne!(file_identity(&path), original);
+            // The actor keeps the old account until core teardown on this fatal error.
+            assert!(current.is_some());
             worker.join().unwrap();
         }
     }
@@ -5314,22 +5363,17 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             &extractor,
             r#"#!/bin/sh
 if [ "$3" = --version ]; then echo 2026.08.19; exit; fi
-exec python3 - "$@" <<'PYTHON'
-import json, os, re, signal, sys
+exec python3 -c '
+import json, os, signal, sys
 from pathlib import Path
 
-args = sys.argv[1:]
-cookies = args[args.index('--cookies') + 1]
-config = args[args.index('--config-locations') + 1]
-identity = re.search(r'context=(/proc/\d+/fd/\d+)', Path(config).read_text())[1]
-paths = [cookies, config, identity]
-files = [open(path, 'rb') for path in paths]
-assert b'INVENTED_' in files[0].read()
-ready = Path('READY_PATH')
-ready.with_suffix('.tmp').write_text(json.dumps({'pid': os.getpid(), 'paths': paths}))
-ready.with_suffix('.tmp').replace(ready)
+assert "^ytmusicaccount$" in sys.argv
+assert b"INVENTED_" in sys.stdin.buffer.read()
+ready = Path("READY_PATH")
+ready.with_suffix(".tmp").write_text(json.dumps({"pid": os.getpid()}))
+ready.with_suffix(".tmp").replace(ready)
 os.kill(os.getpid(), signal.SIGSTOP)
-PYTHON
+' "$@"
 "#
             .replace("READY_PATH", directory.join("ready").to_str().unwrap()),
         )
@@ -5348,7 +5392,6 @@ PYTHON
 
     struct ExtractorProcess {
         pid: u64,
-        files: Vec<(String, Option<(u64, u64)>)>,
     }
 
     impl ExtractorProcess {
@@ -5375,18 +5418,7 @@ PYTHON
             let data: Value = serde_json::from_slice(&fs::read(ready).unwrap()).unwrap();
             let pid = data["pid"].as_u64().unwrap();
             assert!(Path::new(&format!("/proc/{pid}")).exists());
-            let files = data["paths"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|path| {
-                    let path = path.as_str().unwrap().to_owned();
-                    let original = file_identity(&path);
-                    assert!(original.is_some());
-                    (path, original)
-                })
-                .collect();
-            Self { pid, files }
+            Self { pid }
         }
 
         fn assert_revoked(&self) {
@@ -5394,13 +5426,6 @@ PYTHON
                 !Path::new(&format!("/proc/{}", self.pid)).exists(),
                 "extractor must be reaped before cleanup completes"
             );
-            for (path, original) in &self.files {
-                assert_ne!(
-                    &file_identity(path),
-                    original,
-                    "credential descriptor still open"
-                );
-            }
         }
     }
 
@@ -5427,36 +5452,6 @@ PYTHON
             .recv_blocking()
             .unwrap()
             .unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires libmpv and yt-dlp; no network, display, or audio"]
-    fn credential_installation_reports_preparation_failure() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut player = Player::new(PlayerOptions {
-            audio_output: Some("null".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        player
-            .clear_credentials()
-            .unwrap()
-            .recv_blocking()
-            .unwrap()
-            .unwrap();
-        let mut credentials = synthetic_credentials("INVENTED_INVALID_SOURCE");
-        credentials.cookies = File::open(directory.path()).unwrap();
-        let result = player
-            .set_credentials(credentials)
-            .unwrap()
-            .recv_blocking()
-            .unwrap();
-        assert!(
-            result.is_err(),
-            "failed installation must not acknowledge success"
-        );
-        player.shutdown().unwrap();
-        assert!(player.clear_credentials().is_err());
     }
 
     #[test]
@@ -5554,15 +5549,12 @@ PYTHON
         let runtime = tempfile::tempdir().unwrap();
         let plugin_dir = write_account_extractor(runtime.path()).unwrap();
         let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
-        let server_script = sealed_file(include_bytes!("ytdlp_resolver.py")).unwrap();
+        let server_script = runtime.path().join("ytdlp_resolver.py");
+        fs::write(&server_script, include_str!("ytdlp_resolver.py")).unwrap();
         let mut child = Command::new(python)
             .args(["-B", "-"])
             .arg(plugin_dir)
-            .arg(format!(
-                "/proc/{}/fd/{}",
-                std::process::id(),
-                server_script.as_raw_fd()
-            ))
+            .arg(server_script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

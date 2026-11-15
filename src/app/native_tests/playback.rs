@@ -2,7 +2,6 @@ use crate::{
     app::{CatalogTarget, Music, Playback, Route, Startup},
     auth,
     catalog::{BrowseLink, Catalog, Track},
-    os,
     queue_source::PageRequest,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -52,8 +51,7 @@ fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> R
             let outcome: Result<()> = async {
                 let response = window.update(cx, |music, _, _| {
                     music.player.as_ref().unwrap().set_credentials(auth::PlaybackCredentials {
-                        cookies: os::sealed_file(b"# Netscape HTTP Cookie File\n")?,
-                        identity: os::sealed_file(br#"{"authuser":"0","delegated_session_id":null,"data_sync_id":"synthetic||"}"#)?,
+                        message: [br##"{"cookies":"# Netscape HTTP Cookie File\n","account":{"authuser":"0","delegated_session_id":null,"data_sync_id":"synthetic||"}}"##.as_slice(), b"\n"].concat(),
                     })
                 })??;
                 response.recv().await.context("Player closed credential response")?.map_err(anyhow::Error::msg)?;

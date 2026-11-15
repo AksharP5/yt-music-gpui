@@ -154,6 +154,8 @@ with contextlib.redirect_stdout(output):
             if (set(ydl._ies) != {'YtMusicAccount'}
                     or ydl.get_info_extractor('YtMusicAccount').IE_NAME != 'ytmusicaccount'):
                 raise RuntimeError('Account extractor is unavailable')
+            # Its credentials arrive on stdin ahead of every request.
+            ydl.get_info_extractor('YtMusicAccount')._account
         protocol.write('{"ready":true}\n')
         protocol.flush()
         for line in sys.stdin:
