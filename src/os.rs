@@ -1,4 +1,5 @@
 //! Process and descriptor primitives the rest of the app builds on.
+//! os_windows.rs has the same interface for Windows.
 
 use anyhow::Result;
 #[cfg(target_os = "linux")]
@@ -7,16 +8,36 @@ use std::{
     ffi::c_int,
     fs::File,
     io::{self, ErrorKind},
+    ops::{Deref, DerefMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-    process::{Child, Command},
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Child, ChildStdout, Command},
     time::Instant,
 };
 #[cfg(target_os = "linux")]
-use std::{
-    fs,
-    io::Write,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
-};
+use std::{fs, io::Write, os::unix::fs::PermissionsExt};
+
+/// mpv's IPC connection.
+pub use std::os::unix::net::UnixStream as IpcStream;
+
+/// What `wait_readable` waits on.
+pub type Waitable<'a> = BorrowedFd<'a>;
+
+pub trait AsWaitable {
+    fn as_waitable(&self) -> Waitable<'_>;
+}
+
+impl<T: AsFd> AsWaitable for T {
+    fn as_waitable(&self) -> Waitable<'_> {
+        self.as_fd()
+    }
+}
+
+/// Where mpv listens for the player: a socket in the private runtime directory.
+pub fn ipc_path(runtime: &Path) -> Result<PathBuf> {
+    Ok(runtime.join("mpv.sock"))
+}
 
 /// A crash dump must not persist reusable account credentials.
 pub fn disable_core_dumps() -> io::Result<()> {
@@ -90,14 +111,52 @@ pub fn exit_with_parent(command: &mut Command, signal: c_int) {
 #[cfg(target_os = "macos")]
 pub fn exit_with_parent(_: &mut Command, _: c_int) {}
 
-/// SIGKILL a child started with `process_group(0)` and everything it spawned.
-pub fn kill_group(child: &Child) {
-    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+/// A helper in a process group of its own, so it can be killed together
+/// with everything it started. It also dies with the spawning thread where
+/// `exit_with_parent` can arrange that.
+pub struct Group(Child);
+
+impl Group {
+    pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        command.process_group(0);
+        exit_with_parent(command, libc::SIGKILL);
+        command.spawn().map(Self)
+    }
+
+    /// SIGKILL the helper and everything it started.
+    pub fn kill(&self) {
+        unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
+    }
 }
+
+impl Deref for Group {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for Group {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+/// A child's stdout, which `read` returns `WouldBlock` from instead of waiting.
+pub type ChildOutput = ChildStdout;
+
+pub fn child_output(stdout: ChildStdout) -> io::Result<ChildOutput> {
+    set_nonblocking(stdout.as_fd())?;
+    Ok(stdout)
+}
+
+/// What `exit_notice` returns.
+pub type ExitNotice = OwnedFd;
 
 /// A descriptor that becomes readable once `child` exits.
 #[cfg(target_os = "linux")]
-pub fn exit_fd(child: &Child) -> io::Result<OwnedFd> {
+pub fn exit_notice(child: &Child) -> io::Result<ExitNotice> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -107,7 +166,7 @@ pub fn exit_fd(child: &Child) -> io::Result<OwnedFd> {
 
 /// A descriptor that becomes readable once `child` exits: a kqueue watching it.
 #[cfg(target_os = "macos")]
-pub fn exit_fd(child: &Child) -> io::Result<OwnedFd> {
+pub fn exit_notice(child: &Child) -> io::Result<ExitNotice> {
     let queue = unsafe { libc::kqueue() };
     if queue < 0 {
         return Err(io::Error::last_os_error());
@@ -150,7 +209,7 @@ pub fn exit_fd(child: &Child) -> io::Result<OwnedFd> {
     Ok(queue)
 }
 
-pub fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
+fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
         || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
@@ -294,7 +353,7 @@ impl AsFd for Waker {
 /// Block until one of `fds` is readable or hung up, or until `deadline`.
 /// Each result is true when that descriptor has something to report.
 pub fn wait_readable<const N: usize>(
-    fds: [Option<BorrowedFd>; N],
+    fds: [Option<Waitable>; N],
     deadline: Option<Instant>,
 ) -> io::Result<[bool; N]> {
     let mut descriptors = fds.map(|fd| libc::pollfd {

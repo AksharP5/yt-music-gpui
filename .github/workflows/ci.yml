@@ -57,6 +57,22 @@ jobs:
       - name: Play through Homebrew's libmpv
         run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
 
+  # Builds and plays audio on Windows. Sign-in and video are Linux-only so far.
+  windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Git for Windows checks out CRLF by default, which breaks bin/test.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: bin/test
+      - name: Play through mpv's libmpv
+        run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
+
   release-test:
     if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/release-build.yml

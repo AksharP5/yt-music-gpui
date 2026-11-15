@@ -1,4 +1,4 @@
-//! macOS has no native video renderer yet, so the app plays audio only.
+//! Only Linux has a native video renderer so far, so elsewhere the app plays audio only.
 //! A `NativeVideo` cannot exist, which leaves every video path unreachable.
 
 use crate::os::Waker;
@@ -16,7 +16,7 @@ pub(crate) enum NativeVideo {}
 
 impl NativeVideo {
     pub(crate) fn new(_: Bounds<Pixels>, _: &Window) -> Result<Self> {
-        bail!("Video on macOS is coming soon")
+        bail!("Video on this system is coming soon")
     }
 
     pub(crate) fn start(&self, _: *mut c_void, _: &Waker) -> Result<()> {

@@ -32,7 +32,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn idle() -> Self {
         let (requests, pending) = async_channel::bounded(1);
         Self {

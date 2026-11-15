@@ -9,7 +9,13 @@ fn main() {
         .expect("reviewed yt-dlp version");
     println!("cargo:rustc-env=REVIEWED_YTDLP={version}");
     println!("cargo:rerun-if-changed=src/ytdlp_account.py");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+    let target = std::env::var("CARGO_CFG_TARGET_OS");
+    // Video is Linux-only so far. player.rs binds to libmpv-2.dll at run time
+    // on Windows, so it needs no import library.
+    if target.as_deref() == Ok("windows") {
+        return;
+    }
+    if target.as_deref() == Ok("macos") {
         // Video is Linux-only so far. Apple Silicon Homebrew keeps libmpv outside
         // the linker's default search path.
         let homebrew = std::env::var("HOMEBREW_PREFIX").unwrap_or("/opt/homebrew".into());

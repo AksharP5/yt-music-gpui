@@ -1,14 +1,12 @@
-use std::{
-    fs::File,
-    io::{self, Read},
-    os::fd::AsRawFd,
-    sync::OnceLock,
-    thread,
-};
+#[cfg(unix)]
+use std::{fs::File, io::Read, os::fd::AsRawFd, thread};
+use std::{io, sync::OnceLock};
 
 // Keep the descriptor alive until process exit, including during stalled cleanup.
+#[cfg(unix)]
 static WAKE: OnceLock<File> = OnceLock::new();
 
+#[cfg(unix)]
 extern "C" fn terminate(_: libc::c_int) {
     #[cfg(target_os = "linux")]
     let errno = unsafe { libc::__errno_location() };
@@ -49,6 +47,7 @@ fn signal_channel() -> io::Result<(File, File)> {
     ))
 }
 
+#[cfg(unix)]
 pub fn listen() -> io::Result<async_channel::Receiver<()>> {
     let (mut wakeups, wake) = signal_channel()?;
     WAKE.set(wake)
@@ -75,14 +74,51 @@ pub fn listen() -> io::Result<async_channel::Receiver<()>> {
     Ok(receiver)
 }
 
+/// Windows sends Ctrl+C, Ctrl+Break and closing the console to this
+/// handler, on a thread of its own.
+#[cfg(windows)]
+pub fn listen() -> io::Result<async_channel::Receiver<()>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::{
+        Win32::{
+            Foundation::{FALSE, TRUE},
+            System::Console::SetConsoleCtrlHandler,
+        },
+        core::BOOL,
+    };
+    static SENDER: OnceLock<async_channel::Sender<()>> = OnceLock::new();
+    static NOTIFIED: AtomicBool = AtomicBool::new(false);
+    unsafe extern "system" fn handle(_: u32) -> BOOL {
+        // A repeated event must still terminate if GPUI or a destructor hangs.
+        if NOTIFIED.swap(true, Ordering::SeqCst) {
+            return FALSE;
+        }
+        let _ = SENDER.get().unwrap().try_send(());
+        TRUE
+    }
+    let (sender, receiver) = async_channel::bounded(1);
+    SENDER
+        .set(sender)
+        .expect("install shutdown handlers only once");
+    if unsafe { SetConsoleCtrlHandler(Some(handle), TRUE) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(receiver)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
         io::{BufRead, BufReader},
-        os::unix::process::ExitStatusExt,
         process::{Child, Command, Stdio},
+        thread,
         time::Duration,
+    };
+    #[cfg(windows)]
+    use windows_sys::Win32::{
+        Foundation::STATUS_CONTROL_C_EXIT,
+        System::{Console::CTRL_BREAK_EVENT, Threading::CREATE_NEW_PROCESS_GROUP},
     };
 
     struct SignalProcess(Child);
@@ -92,6 +128,23 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[cfg(unix)]
+    const EVENTS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
+    // Ctrl+C cannot target one process; Ctrl+Break reaches its process group.
+    #[cfg(windows)]
+    const EVENTS: [u32; 1] = [CTRL_BREAK_EVENT];
+
+    #[cfg(unix)]
+    fn send(child: &Child, signal: libc::c_int) {
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    }
+
+    #[cfg(windows)]
+    fn send(child: &Child, event: u32) {
+        use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
+        assert_ne!(unsafe { GenerateConsoleCtrlEvent(event, child.id()) }, 0);
     }
 
     #[test]
@@ -112,25 +165,35 @@ mod tests {
             }
         }
 
-        for signal in [libc::SIGTERM, libc::SIGINT] {
-            let mut child = SignalProcess(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "shutdown::tests::signals_notify_then_terminate_stalled_shutdown",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, "1")
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
+        for event in EVENTS {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "shutdown::tests::signals_notify_then_terminate_stalled_shutdown",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(Stdio::piped());
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::creation_flags(
+                &mut command,
+                CREATE_NEW_PROCESS_GROUP,
             );
+            let mut child = SignalProcess(command.spawn().unwrap());
             let mut output = BufReader::new(child.0.stdout.take().unwrap()).lines();
             assert!(output.by_ref().any(|line| line.unwrap() == "READY"));
-            assert_eq!(unsafe { libc::kill(child.0.id() as i32, signal) }, 0);
+            send(&child.0, event);
             assert!(output.by_ref().any(|line| line.unwrap() == "QUITTING"));
-            assert_eq!(unsafe { libc::kill(child.0.id() as i32, signal) }, 0);
-            assert_eq!(child.0.wait().unwrap().signal(), Some(signal));
+            send(&child.0, event);
+            let status = child.0.wait().unwrap();
+            #[cfg(unix)]
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(event)
+            );
+            #[cfg(windows)]
+            assert_eq!(status.code(), Some(STATUS_CONTROL_C_EXIT));
         }
     }
 }

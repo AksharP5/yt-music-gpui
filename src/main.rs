@@ -12,6 +12,7 @@ mod input;
 mod library;
 mod listening;
 mod media_controls;
+#[cfg_attr(windows, path = "os_windows.rs")]
 mod os;
 mod player;
 mod playlist_form;
@@ -22,7 +23,7 @@ mod shutdown;
 mod song_text;
 mod theme;
 mod track_state;
-#[cfg_attr(target_os = "macos", path = "video_macos.rs")]
+#[cfg_attr(not(target_os = "linux"), path = "video_unsupported.rs")]
 mod video;
 mod watch;
 
@@ -72,7 +73,9 @@ fn main() {
                 // yt-dlp looks for Deno on PATH unless the app passes a trusted copy.
                 let deno = player::private_tool("deno").or_else(|| {
                     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                        .map(|directory| directory.join("deno"))
+                        .map(|directory| {
+                            directory.join(format!("deno{}", std::env::consts::EXE_SUFFIX))
+                        })
                         .find(|path| path.is_file())
                 });
                 println!("yt-dlp: {}", ytdlp.as_deref().unwrap_or("not found"));

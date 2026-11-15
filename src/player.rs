@@ -1,24 +1,23 @@
 use crate::auth::{PlaybackCredentials, private_runtime};
 use crate::os::{
-    Waker, exit_fd, exit_with_parent, kill_group, private_file, set_nonblocking, wait_readable,
+    AsWaitable, ChildOutput, ExitNotice, Group, IpcStream, Waitable, Waker, child_output,
+    exit_notice, ipc_path, private_file, wait_readable,
 };
 use crate::video::NativeVideo;
 use anyhow::{Context, Result, bail, ensure};
 use gpui::{AnyWindowHandle, App, BackgroundExecutor, Bounds, Pixels, Subscription, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File},
     io::{ErrorKind, Read, Seek, Write},
-    os::fd::{AsFd, BorrowedFd, OwnedFd},
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    os::unix::net::UnixStream,
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     ptr::NonNull,
     rc::Rc,
     sync::{
@@ -315,13 +314,17 @@ impl CommandSender {
 }
 
 fn wait_for_player_input(
-    socket: &UnixStream,
+    socket: &IpcStream,
     wake: &Waker,
-    resolver: Option<BorrowedFd>,
+    resolver: Option<Waitable>,
     deadline: Option<Instant>,
 ) -> Result<bool> {
     let [socket_ready, woken, _] = wait_readable(
-        [Some(socket.as_fd()), Some(wake.as_fd()), resolver],
+        [
+            Some(socket.as_waitable()),
+            Some(wake.as_waitable()),
+            resolver,
+        ],
         deadline,
     )
     .context("Could not wait for the player")?;
@@ -345,7 +348,7 @@ impl Player {
         Self::with_lookup(options, find_ytdlp()?, native::Lookup::new().ok())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_extractor(options: PlayerOptions, ytdlp: PathBuf) -> Result<Self> {
         Self::with_lookup(options, ytdlp, None)
     }
@@ -431,7 +434,7 @@ impl Player {
         self.send(PlayerCommand::Prepare(next.clone()))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn next_preparation(&self) -> Option<String> {
         self.next
             .lock()
@@ -756,7 +759,9 @@ struct MpvEvent {
     data: *mut c_void,
 }
 
-#[link(name = "mpv")]
+// Windows binds to the DLL at run time, so no import library is needed.
+#[cfg_attr(not(windows), link(name = "mpv"))]
+#[cfg_attr(windows, link(name = "libmpv-2", kind = "raw-dylib"))]
 unsafe extern "C" {
     fn mpv_create() -> *mut c_void;
     fn mpv_set_option_string(
@@ -867,7 +872,7 @@ impl Drop for MpvCore {
     }
 }
 
-fn write_command(socket: &mut UnixStream, command: Value, request_id: Option<Value>) -> Result<()> {
+fn write_command(socket: &mut IpcStream, command: Value, request_id: Option<Value>) -> Result<()> {
     let mut message = json!({ "command": command });
     if let Some(id) = request_id {
         message["request_id"] = id;
@@ -879,7 +884,7 @@ fn write_command(socket: &mut UnixStream, command: Value, request_id: Option<Val
         .context("Could not send the command to mpv")
 }
 
-fn write_pause(socket: &mut UnixStream, paused: bool, revision: u64) -> Result<()> {
+fn write_pause(socket: &mut IpcStream, paused: bool, revision: u64) -> Result<()> {
     write_command(socket, json!(["set_property", "pause", paused]), None)?;
     // A no-op set produces no property-change; always acknowledge the latest intent.
     write_command(
@@ -925,7 +930,7 @@ fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOptions) -> V
 }
 
 fn request(
-    socket: &mut UnixStream,
+    socket: &mut IpcStream,
     pending: &mut Vec<u8>,
     command: Value,
     mut on_event: impl FnMut(Value),
@@ -948,11 +953,7 @@ fn request(
     }
 }
 
-fn read_message(
-    socket: &mut UnixStream,
-    pending: &mut Vec<u8>,
-    deadline: Instant,
-) -> Result<Value> {
+fn read_message(socket: &mut IpcStream, pending: &mut Vec<u8>, deadline: Instant) -> Result<Value> {
     loop {
         let timeout = deadline
             .checked_duration_since(Instant::now())
@@ -997,7 +998,7 @@ fn write_account_extractor(runtime: &Path) -> Result<PathBuf> {
 }
 
 fn replace_playback_credentials(
-    socket: &mut UnixStream,
+    socket: &mut IpcStream,
     pending: &mut Vec<u8>,
     current: &mut Option<ExtractorCredentials>,
     source: Option<PlaybackCredentials>,
@@ -1230,13 +1231,12 @@ fn extractor_arguments(command: &mut Command, credentials: Option<&ExtractorCred
 /// The line can exceed the pipe buffer, so a short-lived thread writes it and
 /// the player thread never waits on the extractor. Killing the extractor
 /// closes the pipe's read end, which ends the write with an error.
-fn send_credentials(input: impl Into<OwnedFd>, credentials: &ExtractorCredentials) -> Result<()> {
-    let mut input = File::from(input.into());
+fn send_credentials(input: Arc<ChildStdin>, credentials: &ExtractorCredentials) -> Result<()> {
     let message = credentials.source.message.clone();
     thread::Builder::new()
         .name("credentials".into())
         .spawn(move || {
-            let _ = input.write_all(&message);
+            let _ = (&*input).write_all(&message);
         })
         .context("Could not hand the account to the stream extractor")?;
     Ok(())
@@ -1296,9 +1296,9 @@ enum ResolverResponse {
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct WarmResolver {
-    child: Child,
-    input: ChildStdin,
-    output: ChildStdout,
+    child: Group,
+    input: Arc<ChildStdin>,
+    output: ChildOutput,
     bytes: Vec<u8>,
     ready: bool,
     /// A signed-in resolver's request waits for `ready`: until then the
@@ -1318,15 +1318,21 @@ impl WarmResolver {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
+            .stderr(Stdio::null());
         // An extractor holds account cookies in memory. Its own process group keeps
         // it out of terminal signals, so it must not outlive the player thread.
-        exit_with_parent(&mut command, libc::SIGKILL);
-        let mut child = command.spawn()?;
+        let mut child = Group::spawn(&mut command)?;
+        let output = match child_output(child.stdout.take().unwrap()) {
+            Ok(output) => output,
+            Err(error) => {
+                child.kill();
+                let _ = child.wait();
+                return Err(error).context("Could not read resolver output asynchronously");
+            }
+        };
         let resolver = Self {
-            input: child.stdin.take().unwrap(),
-            output: child.stdout.take().unwrap(),
+            input: Arc::new(child.stdin.take().unwrap()),
+            output,
             child,
             bytes: Vec::new(),
             ready: false,
@@ -1334,10 +1340,8 @@ impl WarmResolver {
             request: None,
             started: Instant::now(),
         };
-        set_nonblocking(resolver.output.as_fd())
-            .context("Could not read resolver output asynchronously")?;
         if let Some(credentials) = credentials {
-            send_credentials(resolver.input.as_fd().try_clone_to_owned()?, credentials)?;
+            send_credentials(resolver.input.clone(), credentials)?;
         }
         Ok(resolver)
     }
@@ -1355,7 +1359,7 @@ impl WarmResolver {
 
     fn flush(&mut self) -> Result<()> {
         if let Some(request) = self.request.take() {
-            self.input.write_all(&request)?;
+            (&*self.input).write_all(&request)?;
         }
         Ok(())
     }
@@ -1394,7 +1398,7 @@ impl WarmResolver {
 impl Drop for WarmResolver {
     fn drop(&mut self) {
         // The group can still contain a JS runtime after Python has exited.
-        kill_group(&self.child);
+        self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -1509,11 +1513,11 @@ impl StreamResolver {
         }
     }
 
-    fn fd(&self) -> Option<BorrowedFd<'_>> {
+    fn fd(&self) -> Option<Waitable<'_>> {
         self.warm
             .as_ref()
-            .map(|warm| warm.output.as_fd())
-            .or_else(|| self.one_shot.as_ref().map(|job| job.exited.as_fd()))
+            .map(|warm| warm.output.as_waitable())
+            .or_else(|| self.one_shot.as_ref().map(|job| job.exited.as_waitable()))
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -1741,9 +1745,9 @@ struct PendingPlay {
 
 struct StreamPreparation {
     target: PreparedTarget,
-    child: Child,
+    child: Group,
     output: File,
-    exited: OwnedFd,
+    exited: ExitNotice,
 }
 
 impl StreamPreparation {
@@ -1766,14 +1770,13 @@ impl StreamPreparation {
             })
             .stdout(output.try_clone()?)
             .stderr(Stdio::null());
-        command.process_group(0).arg(&target.key.url);
-        exit_with_parent(&mut command, libc::SIGKILL);
-        let mut child = command.spawn()?;
+        command.arg(&target.key.url);
+        let mut child = Group::spawn(&mut command)?;
         // stdout is a memfd, so watch process exit instead of polling try_wait.
-        let exited = match exit_fd(&child) {
+        let exited = match exit_notice(&child) {
             Ok(exited) => exited,
             Err(error) => {
-                kill_group(&child);
+                child.kill();
                 let _ = child.wait();
                 return Err(error).context("Could not watch the stream extractor");
             }
@@ -1787,7 +1790,7 @@ impl StreamPreparation {
         };
         if let (Some(input), Some(credentials)) = (input, credentials) {
             // The writer closes the pipe afterwards: the extractor gets nothing more.
-            send_credentials(input, credentials)?;
+            send_credentials(Arc::new(input), credentials)?;
         }
         Ok(job)
     }
@@ -1811,21 +1814,25 @@ impl StreamPreparation {
 impl Drop for StreamPreparation {
     fn drop(&mut self) {
         // yt-dlp can start a JS runtime. Cancel its process group as well.
-        kill_group(&self.child);
+        self.child.kill();
         let _ = self.child.wait();
     }
 }
 
 fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
-    tempfile::Builder::new()
-        .prefix("yt-music-gpui-")
-        .permissions(fs::Permissions::from_mode(0o700))
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("yt-music-gpui-");
+    // On Windows the folder inherits the private runtime's access instead.
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    builder
         .tempdir_in(parent)
         .context("Could not create the private playback directory")
 }
 
 // Account cookies may reach these tools. Refuse a redirected or writable path,
 // including every directory through `top`, before preferring a private copy.
+#[cfg(unix)]
 fn trusted_tool(path: &Path, top: &Path, owner: u32) -> bool {
     if !top.is_absolute() || !path.starts_with(top) {
         return false;
@@ -1852,11 +1859,13 @@ fn trusted_tool(path: &Path, top: &Path, owner: u32) -> bool {
 }
 
 // .deb and .rpm packages ship their root-owned helpers here.
+#[cfg(unix)]
 const PACKAGE_HELPERS: &str = "/usr/lib/yt-music-gpui";
 
 // Each install prefers the helpers it shipped, whose versions it pins: the
 // release installer's copies in HOME, or the copies bundled with the running
 // executable. Builds without bundled helpers fall back to the package's.
+#[cfg(unix)]
 pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
     let installer = std::env::var_os("HOME").map(|home| {
         let home = PathBuf::from(home);
@@ -1884,10 +1893,17 @@ pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
 // Linux only the package binary has bundled helpers: /usr/bin/yt-music-gpui
 // uses /usr/lib/yt-music-gpui. After a package upgrade replaces the running
 // binary, Linux reports its old path with a " (deleted)" suffix.
+#[cfg(unix)]
 fn bundled_helpers(exe: &Path) -> Option<PathBuf> {
     let exe = exe.as_os_str().as_encoded_bytes();
     let exe = exe.strip_suffix(b" (deleted)").unwrap_or(exe);
     (exe == b"/usr/bin/yt-music-gpui").then(|| PathBuf::from(PACKAGE_HELPERS))
+}
+
+/// Windows builds bundle no helpers yet, so yt-dlp and Deno come from PATH.
+#[cfg(windows)]
+pub(crate) fn private_tool(_: &str) -> Option<PathBuf> {
+    None
 }
 
 pub(crate) fn find_ytdlp() -> Result<PathBuf> {
@@ -1897,7 +1913,7 @@ pub(crate) fn find_ytdlp() -> Result<PathBuf> {
             std::env::var_os("PATH")
                 .into_iter()
                 .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-                .map(|path| path.join("yt-dlp"))
+                .map(|path| path.join(format!("yt-dlp{}", std::env::consts::EXE_SUFFIX)))
                 .chain(
                     std::env::var_os("HOME")
                         .map(|home| PathBuf::from(home).join(".local/bin/yt-dlp")),
@@ -1916,7 +1932,7 @@ fn run(
     lookup: Option<native::Lookup>,
 ) -> Result<()> {
     let runtime = playback_runtime(&private_runtime()?)?;
-    let socket_path = runtime.path().join("mpv.sock");
+    let socket_path = ipc_path(runtime.path())?;
     let plugin_dir = write_account_extractor(runtime.path())?;
     let account_supported = account_playback_supported(ytdlp);
     let mut account_warned = false;
@@ -1945,7 +1961,7 @@ fn run(
     let mut video: Option<AttachedVideo> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket = loop {
-        match UnixStream::connect(&socket_path) {
+        match IpcStream::connect(&socket_path) {
             Ok(socket) => break socket,
             Err(_) if Instant::now() < deadline => {
                 ensure!(!core.is_shutdown(), "mpv exited during startup");
@@ -2444,7 +2460,7 @@ struct PlaybackState {
 impl PlaybackState {
     fn read_messages(
         &mut self,
-        socket: &mut UnixStream,
+        socket: &mut IpcStream,
         pending: &mut Vec<u8>,
         buffer: &mut [u8],
         events: &async_channel::Sender<PlayerEvent>,
@@ -2553,7 +2569,7 @@ impl PlaybackState {
         self.restarted = false;
     }
 
-    fn write_seek(&mut self, socket: &mut UnixStream) -> Result<()> {
+    fn write_seek(&mut self, socket: &mut IpcStream) -> Result<()> {
         if self.seek.is_none()
             && self.restarted
             && let Some(request) = self.next_seek.take()
@@ -2899,8 +2915,10 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+    #[cfg(unix)]
+    use std::os::fd::{AsFd, AsRawFd};
 
+    #[cfg(unix)]
     #[test]
     fn private_tools_require_owned_non_writable_parents_and_regular_executables() {
         let home = tempfile::tempdir().unwrap();
@@ -2930,6 +2948,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_the_package_binary_uses_bundled_helpers_even_after_an_upgrade_replaces_it() {
         let package = Some(PathBuf::from("/usr/lib/yt-music-gpui"));
@@ -2973,6 +2992,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn playback_runtime_stays_private_under_the_desktop_runtime_and_cleans_up() {
         use std::os::unix::fs::MetadataExt;
@@ -3088,6 +3108,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn synthetic_resolver_plugin(directory: &Path) -> PathBuf {
         let plugin = write_account_extractor(directory).unwrap();
         let path = plugin.join("account/yt_dlp_plugins/extractor/account.py");
@@ -3117,6 +3138,7 @@ YtMusicAccountIE._real_extract = extract
         plugin
     }
 
+    #[cfg(unix)]
     fn resolved(
         resolver: &mut StreamResolver,
         credentials: Option<&ExtractorCredentials>,
@@ -3131,6 +3153,7 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic account and process group, no network"]
     fn warm_resolver_reuses_requests_and_supersession_kills_the_process_group() {
@@ -3230,6 +3253,7 @@ YtMusicAccountIE._real_extract = extract
         assert!(!alive(respawned));
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic accounts, no network"]
     fn warm_credential_change_respawns_with_the_new_account() {
@@ -3266,13 +3290,14 @@ YtMusicAccountIE._real_extract = extract
 
     #[test]
     fn resolver_output_wakes_the_actor_without_mpv_or_commands() {
-        let (socket, _mpv) = UnixStream::pair().unwrap();
-        let (resolver, mut output) = UnixStream::pair().unwrap();
+        let (socket, _mpv) = IpcStream::pair().unwrap();
+        let (resolver, mut output) = IpcStream::pair().unwrap();
         let (commands, _received) = command_channel().unwrap();
         output.write_all(b"{\"ready\":true}\n").unwrap();
         let start = Instant::now();
         assert!(
-            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_fd()), None).unwrap()
+            !wait_for_player_input(&socket, &commands.wake, Some(resolver.as_waitable()), None)
+                .unwrap()
         );
         assert!(
             start.elapsed() < Duration::from_millis(60),
@@ -3280,6 +3305,7 @@ YtMusicAccountIE._real_extract = extract
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn one_shot_exit_wakes_the_actor_without_mpv_or_commands() {
         let directory = tempfile::tempdir().unwrap();
@@ -3294,7 +3320,7 @@ YtMusicAccountIE._real_extract = extract
         resolver
             .start(resolver_target("abcdefghijk", 1), None)
             .unwrap();
-        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (socket, _mpv) = IpcStream::pair().unwrap();
         let (commands, _received) = command_channel().unwrap();
         let start = Instant::now();
         assert!(
@@ -3314,6 +3340,7 @@ YtMusicAccountIE._real_extract = extract
         assert!(resolver.fd().is_none() && resolver.deadline().is_none());
     }
 
+    #[cfg(unix)]
     fn synthetic_full_resolver(directory: &Path, blocked: bool) -> StreamResolver {
         let interpreter = directory.join("python3");
         let response = if blocked {
@@ -3332,6 +3359,7 @@ YtMusicAccountIE._real_extract = extract
         StreamResolver::new(&extractor, None)
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_click_during_full_preparation_does_not_wait_or_restart_python() {
         let directory = tempfile::tempdir().unwrap();
@@ -3355,7 +3383,7 @@ YtMusicAccountIE._real_extract = extract
         let start = Instant::now();
         resolver.start(click.clone(), None).unwrap();
         resolver.retain(Some(&click), Some(&preparation));
-        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (socket, _mpv) = IpcStream::pair().unwrap();
         let (target, stream) = loop {
             if let Some(result) = resolver.finish(None, None) {
                 break result;
@@ -3377,6 +3405,7 @@ YtMusicAccountIE._real_extract = extract
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_native_preparation_leaves_the_full_reload_running() {
         let directory = tempfile::tempdir().unwrap();
@@ -3394,7 +3423,7 @@ YtMusicAccountIE._real_extract = extract
         resolver.start(reload.clone(), None).unwrap();
         let pid = resolver.warm.as_ref().unwrap().child.id();
         resolver.retain(Some(&reload), Some(&preparation));
-        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (socket, _mpv) = IpcStream::pair().unwrap();
         let start = Instant::now();
         loop {
             assert!(resolver.finish(Some(&reload), None).is_none());
@@ -3416,6 +3445,7 @@ YtMusicAccountIE._real_extract = extract
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_failures_fall_back_to_the_same_full_resolver() {
         let mut cipher = native::tests::fixture();
@@ -3443,6 +3473,7 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_fast_lookup_in_flight_never_answers_a_full_request() {
         let directory = tempfile::tempdir().unwrap();
@@ -3468,6 +3499,7 @@ YtMusicAccountIE._real_extract = extract
         assert_eq!(resolver.target.as_ref().unwrap().lane, ResolverLane::Full);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolver_startup_and_request_deadlines_wake_without_output() {
         let directory = tempfile::tempdir().unwrap();
@@ -3476,7 +3508,7 @@ YtMusicAccountIE._real_extract = extract
         fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
         let extractor = directory.path().join("extractor");
         fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
-        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (socket, _mpv) = IpcStream::pair().unwrap();
         let (commands, _received) = command_channel().unwrap();
         for ready in [false, true] {
             let mut resolver = StreamResolver::new(&extractor, None);
@@ -3514,6 +3546,7 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsupported_interpreters_and_failed_warm_start_use_one_shot_resolution() {
         for fails_start in [false, true] {
@@ -3553,6 +3586,7 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancelling_preparation_reaps_the_signed_in_extractor() {
         let directory = tempfile::tempdir().unwrap();
@@ -3567,11 +3601,13 @@ YtMusicAccountIE._real_extract = extract
         assert!(!alive(pid));
     }
 
+    #[cfg(unix)]
     /// Whether `pid` exists, including as an unreaped zombie.
     fn alive(pid: impl Into<u64>) -> bool {
         unsafe { libc::kill(pid.into() as libc::pid_t, 0) == 0 }
     }
 
+    #[cfg(unix)]
     /// What a stub extractor saw of its own process: descriptors, argv,
     /// environment and the credentials it read from stdin.
     struct HandOff {
@@ -3580,6 +3616,7 @@ YtMusicAccountIE._real_extract = extract
         received: Vec<u8>,
     }
 
+    #[cfg(unix)]
     fn hand_off(warm: bool, credentials: Option<&ExtractorCredentials>) -> HandOff {
         let directory = tempfile::tempdir().unwrap();
         let report = directory.path().join("report");
@@ -3641,6 +3678,7 @@ YtMusicAccountIE._real_extract = extract
             .count()
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unread_oversized_account_never_blocks_the_player_thread() {
         let directory = tempfile::tempdir().unwrap();
@@ -3701,6 +3739,7 @@ YtMusicAccountIE._real_extract = extract
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn credentials_reach_the_extractor_only_through_its_stdin() {
         let directory = tempfile::tempdir().unwrap();
@@ -4115,7 +4154,7 @@ YtMusicAccountIE._real_extract = extract
 
     #[test]
     fn idle_wait_blocks_until_a_command_and_deadline_wait_expires() {
-        let (socket, _mpv) = UnixStream::pair().unwrap();
+        let (socket, _mpv) = IpcStream::pair().unwrap();
         let (commands, _received) = command_channel().unwrap();
         thread::scope(|scope| {
             let (completed, result) = mpsc::channel();
@@ -4152,7 +4191,7 @@ YtMusicAccountIE._real_extract = extract
 
     #[test]
     fn synchronous_reads_use_the_remaining_deadline() {
-        let (mut socket, _mpv) = UnixStream::pair().unwrap();
+        let (mut socket, _mpv) = IpcStream::pair().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
@@ -4171,10 +4210,11 @@ YtMusicAccountIE._real_extract = extract
         assert!(start.elapsed() < Duration::from_millis(250));
     }
 
+    #[cfg(unix)]
     #[test]
     fn command_wakeups_coalesce_without_losing_commands_or_socket_readiness() {
         let (commands, received) = command_channel().unwrap();
-        let (mut mpv, socket) = UnixStream::pair().unwrap();
+        let (mut mpv, socket) = IpcStream::pair().unwrap();
         commands.send(PlayerCommand::Stop).unwrap();
         commands.clone().send(PlayerCommand::Pause(true)).unwrap();
         assert!(!wait_for_player_input(&socket, &commands.wake, None, None).unwrap());
@@ -4218,7 +4258,7 @@ YtMusicAccountIE._real_extract = extract
     /// the socket instead of dropping it, so it hangs up only after the test
     /// joins it: macOS refuses to set a read timeout once the peer has hung
     /// up, even with replies still unread, while mpv itself never does.
-    fn socket_message(socket: &mut UnixStream) -> Value {
+    fn socket_message(socket: &mut IpcStream) -> Value {
         let mut line = Vec::new();
         loop {
             let mut byte = [0];
@@ -4233,7 +4273,7 @@ YtMusicAccountIE._real_extract = extract
 
     #[test]
     fn synchronous_requests_ignore_zero_and_previous_request_replies() {
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(80)))
             .unwrap();
@@ -4284,7 +4324,7 @@ YtMusicAccountIE._real_extract = extract
     #[test]
     fn buffered_seek_completion_is_delivered_while_mpv_is_silent() {
         let (events, received) = async_channel::unbounded();
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(80)))
             .unwrap();
@@ -4337,8 +4377,8 @@ YtMusicAccountIE._real_extract = extract
 
     fn accepted_seek_command(
         state: &mut PlaybackState,
-        socket: &mut UnixStream,
-        mpv: &mut UnixStream,
+        socket: &mut IpcStream,
+        mpv: &mut IpcStream,
         events: &async_channel::Sender<PlayerEvent>,
     ) -> Value {
         state.write_seek(socket).unwrap();
@@ -4382,7 +4422,7 @@ YtMusicAccountIE._real_extract = extract
     #[test]
     fn seek_waits_for_restart_then_confirms_position_with_a_fresh_observer() {
         let (events, received) = async_channel::unbounded();
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         mpv.set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
         let mut state = PlaybackState {
@@ -4466,7 +4506,7 @@ YtMusicAccountIE._real_extract = extract
     #[test]
     fn rapid_seeks_coalesce_behind_one_in_flight_seek_and_no_op_is_acknowledged() {
         let (events, received) = async_channel::unbounded();
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         let mut state = PlaybackState {
             desired: Some(1),
             current: Some(1),
@@ -4548,7 +4588,7 @@ YtMusicAccountIE._real_extract = extract
     #[test]
     fn seek_errors_end_of_file_and_invalidation_do_not_leave_pending_work() {
         let (events, received) = async_channel::unbounded();
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         let mut state = PlaybackState {
             desired: Some(1),
             current: Some(1),
@@ -4651,7 +4691,7 @@ YtMusicAccountIE._real_extract = extract
             json!({"error":"property unavailable"}),
         ] {
             let (events, received) = async_channel::unbounded();
-            let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+            let (mut socket, mut mpv) = IpcStream::pair().unwrap();
             let mut state = PlaybackState {
                 desired: Some(1),
                 current: Some(1),
@@ -4679,7 +4719,7 @@ YtMusicAccountIE._real_extract = extract
             assert!(state.seek.is_none());
         }
         let (events, received) = async_channel::unbounded();
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         let mut state = PlaybackState {
             desired: Some(1),
             current: Some(1),
@@ -5120,7 +5160,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         }
     }
 
-    fn credential_barrier_command(server: &mut UnixStream) -> Value {
+    fn credential_barrier_command(server: &mut IpcStream) -> Value {
         let name = socket_message(server);
         assert_eq!(name["command"], json!(["client_name"]));
         writeln!(
@@ -5137,7 +5177,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         marker
     }
 
-    fn reply_to_credential_barrier(server: &mut UnixStream) {
+    fn reply_to_credential_barrier(server: &mut IpcStream) {
         let marker = credential_barrier_command(server);
         // Also cover the event arriving before its command reply.
         writeln!(
@@ -5160,7 +5200,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
 
     #[test]
     fn credential_changes_wait_for_old_file_events() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = IpcStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_millis(80)))
             .unwrap();
@@ -5247,7 +5287,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             vec![],
             vec![json!({"event":"start-file"}), json!({"event":"end-file"})],
         ] {
-            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let (mut client, mut server) = IpcStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_millis(80)))
                 .unwrap();
@@ -5310,7 +5350,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
     #[test]
     fn failed_credential_cleanup_does_not_report_success() {
         for failure in ["stop", "marker", "end-file"] {
-            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let (mut client, mut server) = IpcStream::pair().unwrap();
             client
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -5369,6 +5409,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         }
     }
 
+    #[cfg(unix)]
     fn local_extractor_player(directory: &Path) -> Player {
         let extractor = directory.join("extractor");
         fs::write(
@@ -5402,10 +5443,12 @@ os.kill(os.getpid(), signal.SIGSTOP)
         .unwrap()
     }
 
+    #[cfg(unix)]
     struct ExtractorProcess {
         pid: u64,
     }
 
+    #[cfg(unix)]
     impl ExtractorProcess {
         fn start(player: &Player, directory: &Path) -> Self {
             let ready = directory.join("ready");
@@ -5441,6 +5484,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires libmpv, yt-dlp and python3; synthetic local extractor, no network or audio"]
     fn live_credential_replacement_and_clear_reap_extractors_before_completion() {
@@ -5466,6 +5510,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires libmpv, yt-dlp and python3; synthetic local extractor, no network or audio"]
     fn live_immediate_play_then_clear_credentials_does_not_leave_an_extractor() {
@@ -5524,6 +5569,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires libmpv, yt-dlp and python3; synthetic local extractor, no network or audio"]
     fn live_player_drop_and_fatal_exit_revoke_extractor_credentials() {
@@ -5720,7 +5766,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
     #[test]
     fn adopting_a_loaded_stream_refreshes_duration_and_seekability() {
         let (events, received) = async_channel::unbounded();
-        let (mut socket, mut mpv) = UnixStream::pair().unwrap();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
         mpv.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         // mpv finished loading before the UI adopted this occurrence. Its first
@@ -5812,6 +5858,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "measures /proc actor wakeups and latency with libmpv, null audio and synthetic silence"]
     fn local_actor_wakeups_and_latency() {
@@ -5948,7 +5995,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let path = silent_audio(directory.path(), 5)
             .to_string_lossy()
             .into_owned();
-        let socket_path = directory.path().join("mpv.sock");
+        let socket_path = ipc_path(directory.path()).unwrap();
         let _core = MpvCore::new(
             &PlayerOptions {
                 volume: 0.,
@@ -5961,7 +6008,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         // mpv creates its IPC socket on a thread of its own.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut socket = loop {
-            match UnixStream::connect(&socket_path) {
+            match IpcStream::connect(&socket_path) {
                 Ok(socket) => break socket,
                 Err(error) if Instant::now() < deadline => {
                     use std::io::ErrorKind::{ConnectionRefused, NotFound};
@@ -5974,18 +6021,14 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 Err(error) => panic!("{error}"),
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut pending = Vec::new();
         let mut next_id = 0;
         let mut request = |command: Value| {
             next_id += 1;
             write_command(&mut socket, command, Some(json!(next_id))).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                let mut line = String::new();
-                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
-                let reply: Value = serde_json::from_str(&line).unwrap();
+                let reply = read_message(&mut socket, &mut pending, deadline).unwrap();
                 if reply["request_id"] == next_id {
                     break reply;
                 }
@@ -6047,6 +6090,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         eprintln!("{version}: start, pause, title and append applied; loudness {loudness}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires libmpv; uses local silent audio, null audio and no network"]
     fn pausing_an_expired_stream_asks_for_a_reload_unless_mpv_buffered_it_to_the_end() {
@@ -6103,6 +6147,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires libmpv; uses a synthetic extractor, null audio and no network"]
     fn paused_actor_refreshes_expired_preparation_and_writes_pending_seek() {

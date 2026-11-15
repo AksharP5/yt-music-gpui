@@ -153,7 +153,7 @@ impl SearchBox {
             .update(cx, |input, cx| input.set_value(query, cx));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn show_suggestions(&mut self, queries: &[&str], cx: &mut Context<Self>) {
         self.suggestions = queries
             .iter()
