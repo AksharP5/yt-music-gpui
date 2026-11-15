@@ -1216,7 +1216,7 @@ impl ResolvedStream {
             !urls.is_empty() && urls.len() <= 2,
             "Invalid prepared stream"
         );
-        let mut expires = now + Duration::from_secs(5 * 60);
+        let mut expires: Option<SystemTime> = None;
         for url in &urls {
             let parsed = reqwest::Url::parse(url)?;
             ensure!(
@@ -1231,9 +1231,12 @@ impl ResolvedStream {
                     .then(|| value.parse::<u64>().ok())
                     .flatten()
             }) {
-                expires = expires.min(UNIX_EPOCH + Duration::from_secs(expiry.saturating_sub(60)));
+                let expiry = UNIX_EPOCH + Duration::from_secs(expiry.saturating_sub(60));
+                expires = Some(expires.map_or(expiry, |earlier| earlier.min(expiry)));
             }
         }
+        // A link without an expiry is only trusted briefly.
+        let expires = expires.unwrap_or(now + Duration::from_secs(5 * 60));
         ensure!(expires > now, "Prepared stream expired");
         let url = if urls.len() == 1 {
             urls[0].to_owned()
@@ -3898,6 +3901,20 @@ YtMusicAccountIE._real_extract = extract
         )
         .unwrap();
         assert!(stream.matches(&key));
+        // A queued song keeps its link for as long as YouTube says it lasts, so a paused app
+        // does not look the next song up again every few minutes.
+        let hours = now.duration_since(UNIX_EPOCH).unwrap().as_secs() + 6 * 60 * 60;
+        let lasting = ResolvedStream::parse(
+            key.clone(),
+            format!("https://rr1.googlevideo.com/videoplayback?expire={hours}&id=x\n").as_bytes(),
+            0.,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            lasting.expires,
+            UNIX_EPOCH + Duration::from_secs(hours - 60)
+        );
         assert!(!stream.matches(&StreamKey {
             quality: AudioQuality::High,
             ..key.clone()
