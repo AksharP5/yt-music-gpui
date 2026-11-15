@@ -5,17 +5,6 @@ on:
 permissions:
   contents: read
 jobs:
-  linux-live:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
-      - uses: actions/setup-python@v7
-      - run: |
-          version=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
-          python -m pip install --quiet "yt-dlp==$version"
-      - name: Live guest playback on Linux, for comparison
-        run: bin/test -- --ignored --exact --nocapture player::tests::live_playback
   probe:
     runs-on: macos-15
     steps:
@@ -29,65 +18,48 @@ jobs:
           "$RUNNER_TEMP/ytdlp/bin/pip" install --quiet "yt-dlp==$version"
           echo "$RUNNER_TEMP/ytdlp/bin" >> "$GITHUB_PATH"
       - run: cargo build --locked
-      - name: Player integration tests
-        continue-on-error: true
-        run: >-
-          bin/test -- --ignored --exact --test-threads=1
-          player::tests::plays_with_the_installed_libmpv
-          player::tests::headless_worker_shuts_down_after_ipc_controls
-          player::tests::paused_actor_refreshes_expired_preparation_and_writes_pending_seek
-          player::tests::pausing_an_expired_stream_asks_for_a_reload_unless_mpv_buffered_it_to_the_end
-          player::tests::local_seek_completion_handles_rapid_no_op_and_end_of_file
-          player::tests::live_credential_replacement_and_clear_reap_extractors_before_completion
-          player::tests::live_immediate_play_then_clear_credentials_does_not_leave_an_extractor
-          player::tests::live_player_drop_and_fatal_exit_revoke_extractor_credentials
-          player::tests::warm_resolver_reuses_requests_and_supersession_kills_the_process_group
-          player::tests::warm_credential_change_respawns_with_the_new_account
-      - name: Live guest playback
-        continue-on-error: true
-        run: bin/test -- --ignored --exact --nocapture player::tests::live_playback player::tests::live_prepared_next_latency
-      - name: Run the app and play a restored song
+      - name: GPUI text without the app
         continue-on-error: true
         run: |
-          set -x
-          echo "TMPDIR=$TMPDIR"; ls -ld "$TMPDIR"
-          data="$HOME/Library/Application Support/yt-music-gpui"
-          mkdir -p "$data" shots
-          cat > "$data/library.json" <<'JSON'
-          {"volume":0,"queue":{"tracks":[{"id":"csILUDfmtqM","title":"Hold Me Up (Thank You)","artist":"Khruangbin","album":null,"duration":226,"thumbnail":null}],"index":0}}
-          JSON
-          target/debug/yt-music-gpui --version
-          target/debug/yt-music-gpui --guest > shots/app.log 2>&1 &
-          pid=$!
-          sleep 25
-          screencapture -x shots/1-home.png || true
-          ls -l "$TMPDIR" | grep yt-music || true
-          osascript -e 'tell application "System Events" to keystroke space' || true
-          sleep 20
-          screencapture -x shots/2-after-space.png || true
-          osascript -e 'tell application "System Events" to keystroke "p"' || true
-          sleep 3
-          screencapture -x shots/3-player.png || true
-          kill -0 $pid && echo "app still running"
-          lsof -p $pid | grep -iE "mpv|sock|coreaudio" | head -20 || true
-          ps -o pid,pgid,command -g $(ps -o pgid= -p $pid) || true
-          kill -TERM $pid; sleep 3; kill -0 $pid 2>/dev/null && echo "app ignored SIGTERM" || echo "app exited on SIGTERM"
-          ls -l "$TMPDIR" | grep yt-music || true
-          cat shots/app.log
-      - name: Same run with the system font
+          mkdir -p examples shots
+          cat > examples/hello.rs <<'RS'
+          use gpui::{App, AppContext, Bounds, Context, IntoElement, ParentElement, Render, Styled, Window, WindowBounds, WindowOptions, div, px, rgb, size};
+          struct Hello;
+          impl Render for Hello {
+              fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                  div().size_full().bg(rgb(0x505050)).text_color(rgb(0xffffff)).text_size(px(32.))
+                      .flex().flex_col().gap_4().p_8()
+                      .child("Default font: Hello macOS")
+                      .child(div().font_family("Helvetica").child("Helvetica: Hello macOS"))
+                      .child(div().font_family("Roboto").child("Roboto: Hello macOS"))
+              }
+          }
+          fn main() {
+              gpui_platform::application().run(|cx: &mut App| {
+                  cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Roboto.ttf").as_slice())]).unwrap();
+                  let bounds = Bounds::centered(None, size(px(700.), px(400.)), cx);
+                  cx.open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, |_, cx| cx.new(|_| Hello)).unwrap();
+                  cx.activate(true);
+              });
+          }
+          RS
+          cargo build --locked --example hello
+          target/debug/examples/hello & pid=$!
+          sleep 10
+          screencapture -x shots/6-gpui-hello.png || true
+          kill $pid
+          defaults read -g AppleFontSmoothing || echo "AppleFontSmoothing unset"
+          defaults -currentHost read -g AppleFontSmoothing || echo "currentHost AppleFontSmoothing unset"
+          system_profiler SPDisplaysDataType || true
+      - name: The app with font smoothing off
         continue-on-error: true
         run: |
-          sed -i '' 's/"Roboto"/"Helvetica"/g' src/app/window.rs src/app/player_page.rs src/app/pages/shelves.rs
-          cargo build --locked
-          target/debug/yt-music-gpui --guest > shots/app-helvetica.log 2>&1 &
-          pid=$!
-          sleep 25
-          screencapture -x shots/4-helvetica-home.png || true
-          osascript -e 'tell application "System Events" to keystroke space' || true
+          defaults -currentHost write -g AppleFontSmoothing -int 0
+          defaults write -g AppleFontSmoothing -int 0
+          target/debug/yt-music-gpui --guest & pid=$!
           sleep 20
-          screencapture -x shots/5-helvetica-after-space.png || true
+          screencapture -x shots/7-smoothing-off.png || true
           kill -TERM $pid
-          git checkout src
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
