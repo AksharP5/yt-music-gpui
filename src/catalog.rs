@@ -1198,7 +1198,13 @@ fn apply_episode_page(page: &mut Page, data: &Value, browse_id: &str) -> Result<
     if let Some(video_id) = browse_id.strip_prefix("MPED") {
         let track = episode_header(data, video_id)?;
         page.title = track.title.clone();
-        page.description = track.details.episode.as_ref().unwrap().description.clone();
+        page.description = track
+            .details
+            .episode
+            .as_ref()
+            .context("YouTube Music returned no podcast episode details")?
+            .description
+            .clone();
         page.shelves = vec![Shelf {
             title: String::new(),
             items: vec![Item::Track(track)],

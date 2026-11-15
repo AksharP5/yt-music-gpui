@@ -6,7 +6,7 @@ use std::{
     ffi::{c_ulong, c_void},
     os::fd::{AsFd, AsRawFd},
     ptr::NonNull,
-    sync::{Mutex, TryLockError},
+    sync::{Mutex, PoisonError, TryLockError},
 };
 
 unsafe extern "C" {
@@ -135,7 +135,7 @@ impl NativeVideo {
     }
 
     pub(crate) fn start(&self, core: *mut c_void, wake: &Waker) -> Result<()> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
         let handle = handle.context("The video surface was detached")?;
         ensure!(
             unsafe { video_start(handle.as_ptr(), core, wake.as_fd().as_raw_fd()) } != 0,
@@ -201,13 +201,18 @@ impl NativeVideo {
     }
 
     pub(crate) fn stop(&self) {
-        if let Some(handle) = *self.handle.lock().unwrap() {
+        if let Some(handle) = *self.handle.lock().unwrap_or_else(PoisonError::into_inner) {
             unsafe { video_stop(handle.as_ptr()) };
         }
     }
 
     pub(crate) fn destroy(&self) {
-        if let Some(handle) = self.handle.lock().unwrap().take() {
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             unsafe { video_destroy(handle.as_ptr()) };
         }
     }

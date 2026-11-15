@@ -309,7 +309,7 @@ mod tests {
             "replies" => include_str!("fixtures/comments/replies.json"),
             "continuation" => include_str!("fixtures/comments/continuation.json"),
             "disabled" => include_str!("fixtures/comments/disabled.json"),
-            _ => unreachable!(),
+            _ => panic!(),
         })
         .unwrap()
     }

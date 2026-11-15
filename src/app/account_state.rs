@@ -811,10 +811,7 @@ impl Music {
                             let result = response.recv().await.unwrap_or_else(|_| Err("The player stopped before confirming the account. Restart the app.".into()));
                             let _ = view.update_in(cx, |view, window, cx| {
                                 if !matches!(&view.account_operation, Some(AccountOperation::Activating { operation: active, .. }) if active.matches(&operation)) { return; }
-                                let resume = match view.account_operation.take() {
-                                    Some(AccountOperation::Activating { resume, .. }) => resume,
-                                    _ => unreachable!("activation checked above"),
-                                };
+                                let Some(AccountOperation::Activating { resume, .. }) = view.account_operation.take() else { return; };
                                 view.notice = None;
                                 let previous_session = view.account.as_ref().map(|account| account.session.clone());
                                 match connection.activate(&view.session, &operation, result) {

@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -387,6 +387,10 @@ impl LibraryWriter {
         Self::with_save(store, Store::save)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     fn with_save(
         store: Store,
         mut save: impl FnMut(&Store, &Library) -> Result<()> + Send + 'static,
@@ -400,9 +404,15 @@ impl LibraryWriter {
                 let mut current = None;
                 loop {
                     let request = {
-                        let mut pending = worker_queue.pending.lock().unwrap();
+                        let mut pending = worker_queue
+                            .pending
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
                         while pending.request.is_none() && !pending.closed {
-                            pending = worker_queue.ready.wait(pending).unwrap();
+                            pending = worker_queue
+                                .ready
+                                .wait(pending)
+                                .unwrap_or_else(PoisonError::into_inner);
                         }
                         let Some(request) = pending.request.take() else {
                             break;
@@ -431,11 +441,14 @@ impl LibraryWriter {
                                     }
                                 }
                             }
-                            let library = current.as_mut().unwrap();
-                            update.apply(library);
+                            if let Some(library) = current.as_mut() {
+                                update.apply(library);
+                            }
                         }
                     }
-                    if let Err(error) = save(&store, current.as_ref().unwrap()) {
+                    if let Some(library) = &current
+                        && let Err(error) = save(&store, library)
+                    {
                         let _ = errors.send_blocking(format!("{error:#}"));
                     }
                 }
@@ -452,7 +465,11 @@ impl LibraryWriter {
 
     pub fn save(&self, library: &Library) {
         let snapshot = Box::new(library.clone());
-        let mut pending = self.queue.pending.lock().unwrap();
+        let mut pending = self
+            .queue
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         pending.request = Some(SaveRequest::Snapshot(snapshot));
         self.queue.ready.notify_one();
     }
@@ -474,7 +491,11 @@ impl LibraryWriter {
 
     fn update(&self, update: LibraryUpdate) {
         // Merge and dequeue use the same lock; the worker never holds it during I/O.
-        let mut pending = self.queue.pending.lock().unwrap();
+        let mut pending = self
+            .queue
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         pending.request = Some(match pending.request.take() {
             Some(SaveRequest::Snapshot(mut snapshot)) => {
                 update.apply(&mut snapshot);
@@ -492,7 +513,11 @@ impl LibraryWriter {
 
 impl Drop for LibraryWriter {
     fn drop(&mut self) {
-        self.queue.pending.lock().unwrap().closed = true;
+        self.queue
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
         self.queue.ready.notify_one();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

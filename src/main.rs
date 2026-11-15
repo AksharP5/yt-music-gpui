@@ -29,8 +29,8 @@ mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
-fn shutdown_on_signal(cx: &mut App) {
-    let signal = shutdown::listen().expect("install shutdown signal handlers");
+fn shutdown_on_signal(cx: &mut App) -> std::io::Result<()> {
+    let signal = shutdown::listen()?;
     cx.spawn(async move |cx| {
         if signal.recv().await.is_ok() {
             // Quit on GPUI's thread so player and video destructors can clean up.
@@ -38,6 +38,7 @@ fn shutdown_on_signal(cx: &mut App) {
         }
     })
     .detach();
+    Ok(())
 }
 
 fn main() {
@@ -115,7 +116,10 @@ fn main() {
                 eprintln!("Could not load the interface font: {error:#}");
             }
             input::init(cx);
-            shutdown_on_signal(cx);
+            if let Err(error) = shutdown_on_signal(cx) {
+                eprintln!("Could not install shutdown signal handlers: {error}");
+                std::process::exit(1);
+            }
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -123,7 +127,7 @@ fn main() {
             })
             .detach();
             let bounds = Bounds::centered(None, size(px(1320.), px(860.)), cx);
-            cx.open_window(
+            let window = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(850.), px(560.))),
@@ -135,8 +139,12 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| cx.new(|cx| app::Music::new(startup, window, cx)),
-            )
-            .expect("open YouTube Music window");
+            );
+            if let Err(error) = window {
+                eprintln!("Could not open the window: {error:#}");
+                cx.quit();
+                return;
+            }
             cx.activate(true);
         });
 }

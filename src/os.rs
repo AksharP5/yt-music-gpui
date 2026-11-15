@@ -234,6 +234,10 @@ impl Waker {
         Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
+    #[expect(
+        clippy::unreachable,
+        reason = "an owned eventfd write fails only with EINTR or EAGAIN, and silently losing a wakeup would hang the player"
+    )]
     pub fn wake(&self) {
         let increment = 1_u64.to_ne_bytes();
         loop {
@@ -300,6 +304,10 @@ impl Waker {
         Ok(Self { read, write })
     }
 
+    #[expect(
+        clippy::unreachable,
+        reason = "an owned pipe write fails only with EINTR or EAGAIN, and silently losing a wakeup would hang the player"
+    )]
     pub fn wake(&self) {
         loop {
             let result = unsafe { libc::write(self.write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };

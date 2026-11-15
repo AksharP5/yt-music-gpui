@@ -36,7 +36,7 @@ impl Render for PlayerBar {
         let focus = self.controls_focus.clone();
         self.music
             .update(cx, |music, cx| music.player_bar(width, expanded, focus, cx))
-            .expect("Music owns its player bar")
+            .unwrap_or_else(|_| div().into_any_element())
     }
 }
 

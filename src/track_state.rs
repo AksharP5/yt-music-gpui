@@ -32,7 +32,8 @@ pub struct Worker {
 }
 
 impl Worker {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn idle() -> Self {
         let (requests, pending) = async_channel::bounded(1);
         Self {
@@ -42,6 +43,10 @@ impl Worker {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     pub fn start() -> (Self, async_channel::Receiver<Event>) {
         let (requests, pending) = async_channel::bounded::<Request>(1);
         let (events, completed) = async_channel::unbounded();

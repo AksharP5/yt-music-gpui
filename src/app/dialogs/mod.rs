@@ -457,7 +457,8 @@ impl Music {
         cx: &Context<Self>,
     ) -> AnyElement {
         match kind {
-            Overlay::Account => unreachable!("Account artwork is prepared by the renderer"),
+            // The window renders the account popup itself, with its artwork.
+            Overlay::Account => return div().into_any_element(),
             Overlay::SignIn => return self.sign_in_dialog(cx),
             Overlay::Settings => return self.settings_dialog(window, cx),
             Overlay::PlaylistPicker { tracks } => {
@@ -517,7 +518,8 @@ impl Music {
                                 | Overlay::Account
                                 | Overlay::SignIn
                                 | Overlay::PlaylistPicker { .. } => {
-                                    unreachable!()
+                                    // Rendered by their own dialogs above.
+                                    String::new()
                                 }
                                 Overlay::Description { .. } => "Description".into(),
                                 Overlay::Chapters(_) => "Chapters".into(),
@@ -528,7 +530,7 @@ impl Music {
                                 Overlay::NoKeyring(_) => "No keyring found".into(),
                                 Overlay::SongText { title, .. } => title.clone(),
                                 Overlay::PlaylistForm { .. } | Overlay::CountryPicker(_) => {
-                                    unreachable!()
+                                    String::new()
                                 }
                             }),
                     )

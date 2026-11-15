@@ -1,3 +1,8 @@
+#![expect(
+    clippy::expect_used,
+    reason = "a build script reports failure by panicking"
+)]
+
 fn main() {
     let source = std::fs::read_to_string("src/ytdlp_account.py").expect("read yt-dlp pin");
     let version = source

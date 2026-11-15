@@ -31,7 +31,7 @@ impl Render for MusicContent {
         }
         self.music
             .update(cx, |music, cx| music.render_content(window, cx))
-            .expect("Music owns its content view")
+            .unwrap_or_else(|_| div().into_any_element())
     }
 }
 

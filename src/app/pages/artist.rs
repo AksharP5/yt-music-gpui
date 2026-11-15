@@ -11,11 +11,10 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let header = self.page.header.clone().expect("artist page header");
-        let (_, top) = hero_lines(self.page_layout(window).tier);
-        let Route::Browse(link) = &self.route else {
-            unreachable!("artist pages are browse routes");
+        let (Some(header), Route::Browse(link)) = (self.page.header.clone(), &self.route) else {
+            return div().into_any_element();
         };
+        let (_, top) = hero_lines(self.page_layout(window).tier);
         let artist = Collection {
             id: link.id.clone(),
             title: self.page.title.clone(),

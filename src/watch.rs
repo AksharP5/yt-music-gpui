@@ -47,9 +47,7 @@ pub struct WatchContinuation {
 
 impl WatchContinuation {
     pub(crate) fn token(&self) -> &str {
-        self.request["continuation"]
-            .as_str()
-            .expect("validated watch continuation token")
+        self.request["continuation"].as_str().unwrap_or_default()
     }
 
     pub(crate) fn renew_session(

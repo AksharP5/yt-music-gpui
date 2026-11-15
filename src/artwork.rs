@@ -1,3 +1,4 @@
+use anyhow::Context;
 use gpui::{Pixels, RenderImage, Size};
 use sha1::{Digest, Sha1};
 use std::{
@@ -5,7 +6,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -93,11 +94,16 @@ enum CachedArtwork {
 }
 
 impl Artwork {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     pub fn new() -> (Self, async_channel::Receiver<LoadedArtwork>) {
         let (requests, receiver) = async_channel::bounded::<ArtworkRequest>(64);
         let (results, loaded) = async_channel::bounded(WORKERS);
@@ -238,10 +244,9 @@ impl Artwork {
             },
         );
         while self.cache.len() > CACHE_ENTRIES || self.cache_bytes > CACHE_BYTES {
-            let oldest = self
-                .recent
-                .pop_front()
-                .expect("Cached artwork has an eviction entry");
+            let Some(oldest) = self.recent.pop_front() else {
+                break;
+            };
             if let Some(CachedArtwork::Loaded { image, bytes }) = self.cache.remove(&oldest) {
                 self.cache_bytes -= bytes;
                 evicted.push(image);
@@ -260,7 +265,7 @@ fn load(
     disk: &Mutex<DiskCache>,
 ) -> anyhow::Result<RenderImage> {
     let sources = sources(&request.url, request.resolution);
-    let (listed, better) = sources.split_last().expect("Artwork has a source");
+    let (listed, better) = sources.split_last().context("Artwork has no source")?;
     better
         .iter()
         .find_map(|source| load_source(client, source, request.resolution, disk).ok())
@@ -314,11 +319,11 @@ fn google_sized(url: &str, width: u32, height: u32) -> Option<String> {
     }
     let (base, options) = url.rsplit_once('=')?;
     fn size(option: &str) -> Option<(char, u32)> {
-        let kind = option
-            .chars()
+        let mut chars = option.chars();
+        let kind = chars
             .next()
             .filter(|kind| matches!(kind, 'w' | 'h' | 's'))?;
-        let size = option[1..].parse().ok().filter(|size| *size > 0)?;
+        let size = chars.as_str().parse().ok().filter(|size| *size > 0)?;
         Some((kind, size))
     }
     let (mut source_width, mut source_height) = (None, None);
@@ -366,12 +371,17 @@ fn load_source(
     );
     let still = parsed.host_str() == Some("i.ytimg.com");
     let key = format!("{:x}", Sha1::digest(url.as_bytes()));
-    let cached = disk.lock().unwrap().read(&key);
+    let cached = disk
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .read(&key);
     if let Some(bytes) = cached {
         if let Ok(image) = decode(bytes, resolution, still) {
             return Ok(image);
         }
-        disk.lock().unwrap().remove(&key);
+        disk.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
     }
     let mut bytes = Vec::new();
     client
@@ -385,7 +395,9 @@ fn load_source(
         "Artwork response is too large"
     );
     let image = decode(bytes.clone(), resolution, still)?;
-    disk.lock().unwrap().write(&key, &bytes);
+    disk.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .write(&key, &bytes);
     Ok(image)
 }
 
@@ -704,7 +716,7 @@ mod tests {
         let CachedArtwork::Failed(retry_at) = artwork.cache.get_mut(&request).unwrap() else {
             panic!("failed downloads must have a retry deadline");
         };
-        *retry_at = Instant::now() - Duration::from_secs(1);
+        *retry_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         artwork.get("artwork", edge(48.));
         artwork.get("artwork", edge(48.));
         assert_eq!(queued.try_recv().unwrap(), request);

@@ -867,6 +867,10 @@ pub(in crate::app) struct PlaybackChannels {
 }
 
 impl PlaybackChannels {
+    #[expect(
+        clippy::expect_used,
+        reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
+    )]
     pub(in crate::app) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let (playback_jobs, playback_receiver) = async_channel::bounded::<PlaybackJob>(1);
         let (playback_results, playback_completed) = async_channel::unbounded();

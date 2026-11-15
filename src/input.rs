@@ -291,19 +291,21 @@ impl SearchInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
             self.replace_text_in_range(None, "", window, cx)
         }
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.content
+            .get(self.selected_range.clone())
+            .filter(|text| !text.is_empty())
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -414,7 +416,7 @@ impl EntityInputHandler for SearchInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        self.content.get(range).map(str::to_owned)
     }
 
     fn selected_text_range(
@@ -456,9 +458,13 @@ impl EntityInputHandler for SearchInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        let (Some(before), Some(after)) = (
+            self.content.get(..range.start),
+            self.content.get(range.end..),
+        ) else {
+            return;
+        };
+        self.content = format!("{before}{new_text}{after}").into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
         self.selection_reversed = false;
@@ -480,9 +486,13 @@ impl EntityInputHandler for SearchInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        let (Some(before), Some(after)) = (
+            self.content.get(..range.start),
+            self.content.get(range.end..),
+        ) else {
+            return;
+        };
+        self.content = format!("{before}{new_text}{after}").into();
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
@@ -711,16 +721,19 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection)
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(
+        let Some(line) = prepaint.line.take() else {
+            return;
+        };
+        if let Err(error) = line.paint(
             point(bounds.left() - prepaint.scroll_x, bounds.top()),
             window.line_height(),
             gpui::TextAlign::Left,
             None,
             window,
             cx,
-        )
-        .unwrap();
+        ) {
+            eprintln!("Could not draw the search text: {error:#}");
+        }
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
