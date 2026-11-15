@@ -49,7 +49,7 @@ Use either a package or the script, not both. Uninstalling keeps your library, s
 
 ## Sign in
 
-Sign-in needs a supported default browser: Zen, Firefox, Chromium, Google Chrome or Brave. The app saves your session in a Secret Service keyring such as GNOME Keyring or KWallet. Without one, it asks whether to save the session unencrypted in a file only your user can read, or keep you signed in until you quit.
+Sign-in needs a supported default browser: Zen, Firefox, Chromium, Google Chrome, Brave or Helium. The app saves your session in a Secret Service keyring such as GNOME Keyring or KWallet. Without one, it asks whether to save the session unencrypted in a file only your user can read, or keep you signed in until you quit.
 
 1. Choose **Sign in**.
 2. Sign in to YouTube Music in your browser.

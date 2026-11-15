@@ -54,6 +54,8 @@ pub(in crate::app) struct PlayerPage {
     pub(in crate::app) hovered_row: Option<usize>,
     /// The pointer while reordering Up next, kept for edge auto-scroll between moves.
     pub(in crate::app) drag_pointer: Point<Pixels>,
+    /// Where a queue row was pressed, until the pointer moves far enough to drag it.
+    pub(in crate::app) press: Option<Point<Pixels>>,
     pub(in crate::app) autoscrolling: bool,
     pub(in crate::app) video_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
@@ -97,6 +99,7 @@ impl PlayerPage {
             reorder: None,
             hovered_row: None,
             drag_pointer: Point::default(),
+            press: None,
             autoscrolling: false,
             video_bounds: Rc::new(Cell::new(None)),
         }
@@ -481,7 +484,8 @@ impl Music {
             .is_some_and(|track| track.details.episode.is_some());
         let video = self.library.video;
         let theme = self.theme;
-        let option = move |id: &'static str, label: &'static str, selected: bool| {
+        let option = move |id: &'static str, label: &'static str, mode: bool| {
+            let selected = video == mode;
             div()
                 .id(id)
                 .keyboard_control(theme)
@@ -494,15 +498,19 @@ impl Music {
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
                 .when(selected, |option| option.bg(gpui::white().opacity(0.2)))
-                .when(!selected, |option| option.text_color(theme.muted))
+                .when(!selected, |option| {
+                    option
+                        .text_color(theme.muted)
+                        .hover(|option| option.text_color(theme.text))
+                })
                 .child(label)
                 .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                     // Keep keyboard focus on the choice; a click hands it back to the app.
                     if !matches!(event, ClickEvent::Keyboard(_)) {
                         window.focus(&view.focus, cx);
                     }
-                    if view.library.video == selected {
-                        view.set_video_mode(!selected, cx);
+                    if view.library.video != mode {
+                        view.set_video_mode(mode, cx);
                     }
                 }))
         };
@@ -519,9 +527,9 @@ impl Music {
                     .child(option(
                         "song-mode",
                         if episode { "Audio" } else { "Song" },
-                        !video,
+                        false,
                     ))
-                    .child(option("video-mode", "Video", video)),
+                    .child(option("video-mode", "Video", true)),
             )
             .into_any_element()
     }
