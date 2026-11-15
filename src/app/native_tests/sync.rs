@@ -52,7 +52,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             view.pending_playback_jobs = pending;
             view.track_state = track_state::Worker::idle();
             view.player = None;
-            view.mpris = None;
+            view.media_controls = None;
             view.video = None;
             view.store = None;
             view.library.volume = 0.;

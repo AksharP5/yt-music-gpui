@@ -9,7 +9,7 @@ use crate::{
     catalog::{Account, BrowseLink, Item, Rating, Track},
     input,
     library::{LibraryWriter, Repeat, Store},
-    mpris,
+    media_controls,
     player::{Player, PlayerOptions},
     track_state,
     watch::{MediaPair, Watch, WatchMode},
@@ -244,7 +244,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
             view.pending_playback_jobs = pending;
             view.track_state = track_state::Worker::idle();
             view.store = None;
-            view.mpris = None;
+            view.media_controls = None;
             view.video = None;
             view.player = Some(Player::new(PlayerOptions { audio_output: Some("null".into()), volume: 0., ..Default::default() }).unwrap());
             view.library.volume = 0.;
@@ -258,7 +258,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 let (store, _) = Store::load().unwrap();
                 let (writer, errors) = LibraryWriter::new(store);
                 view.store = Some(writer);
-                view.desktop_event(mpris::Event::Volume(view.library.volume), cx);
+                view.desktop_event(media_controls::Event::Volume(view.library.volume), cx);
                 view.drag = Some(Drag::Seek);
                 view.drag_position = Some(42.);
                 view.end_drag(cx);
@@ -623,7 +623,7 @@ fn startup_window(
                             view.pending_playback_jobs = pending;
                             view.track_state = track_state::Worker::idle();
                             view.store = None;
-                            view.mpris = None;
+                            view.media_controls = None;
                             view.video = None;
                             view.player = Some(
                                 Player::new(PlayerOptions {

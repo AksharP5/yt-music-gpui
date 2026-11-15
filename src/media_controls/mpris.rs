@@ -1,10 +1,12 @@
-use crate::{catalog::Track, library::Repeat, player::PlaybackSpeed};
-use anyhow::{Context, Result};
+//! MPRIS over the D-Bus session bus.
+
+use super::{Event, Metadata, PlaybackStatus, Published, State};
+use crate::{library::Repeat, player::PlaybackSpeed};
+use anyhow::Result;
 use std::{
     collections::HashMap,
     fmt::Write,
     sync::{Arc, Mutex, mpsc},
-    thread,
     time::Instant,
 };
 use zbus::{
@@ -19,307 +21,92 @@ const NAME: &str = "org.mpris.MediaPlayer2.yt_music_gpui";
 
 type Properties = HashMap<&'static str, OwnedValue>;
 
-#[derive(Debug, PartialEq)]
-pub enum Event {
-    Next,
-    Previous,
-    Play,
-    Pause,
-    PlayPause,
-    Stop,
-    Seek { track_id: u64, offset: f64 },
-    SetPosition { track_id: u64, seconds: f64 },
-    Volume(f64),
-    Rate(PlaybackSpeed),
-    LoopStatus(Repeat),
-    Error(String),
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PlaybackStatus {
-    #[default]
-    Stopped,
-    Playing,
-    Paused,
-}
-
-impl PlaybackStatus {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Stopped => "Stopped",
-            Self::Playing => "Playing",
-            Self::Paused => "Paused",
-        }
+fn status_name(status: PlaybackStatus) -> &'static str {
+    match status {
+        PlaybackStatus::Stopped => "Stopped",
+        PlaybackStatus::Playing => "Playing",
+        PlaybackStatus::Paused => "Paused",
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Metadata {
-    path: ObjectPath<'static>,
-    title: String,
-    artist: String,
-    album: Option<String>,
-    url: String,
-    art_url: Option<String>,
-    length: Option<i64>,
-}
-
-impl Metadata {
-    pub fn new(track: &Track, duration: f64) -> Self {
-        let duration = if duration.is_finite() && duration > 0. {
-            Some(duration)
-        } else {
-            track.duration.map(|seconds| seconds as f64)
-        };
-        let prefix = "/yt_music_gpui/track/v";
-        let mut path = String::with_capacity(prefix.len() + track.id.len() * 2);
-        path.push_str(prefix);
-        for byte in track.id.bytes() {
-            write!(path, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        Self {
-            path: ObjectPath::try_from(path).expect("hex-encoded track IDs are valid object paths"),
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            url: format!("https://music.youtube.com/watch?v={}", track.id),
-            art_url: track.thumbnail.clone(),
-            length: duration.map(microseconds),
-        }
+fn track_path(id: &str) -> ObjectPath<'static> {
+    let prefix = "/yt_music_gpui/track/v";
+    let mut path = String::with_capacity(prefix.len() + id.len() * 2);
+    path.push_str(prefix);
+    for byte in id.bytes() {
+        write!(path, "{byte:02x}").expect("writing to a String cannot fail");
     }
+    ObjectPath::try_from(path).expect("hex-encoded track IDs are valid object paths")
+}
 
-    fn values(&self) -> Properties {
-        let mut values = HashMap::from([
-            ("mpris:trackid", self.path.clone().into()),
-            ("xesam:title", owned(self.title.as_str())),
-            ("xesam:artist", owned(vec![self.artist.as_str()])),
-            ("xesam:url", owned(self.url.as_str())),
-        ]);
-        if let Some(length) = self.length {
-            values.insert("mpris:length", length.into());
-        }
-        if let Some(album) = &self.album {
-            values.insert("xesam:album", owned(album.as_str()));
-        }
-        if let Some(url) = &self.art_url {
-            values.insert("mpris:artUrl", owned(url.as_str()));
-        }
-        values
+fn metadata_values(track: &Metadata) -> Properties {
+    let mut values = HashMap::from([
+        ("mpris:trackid", track_path(&track.id).into()),
+        ("xesam:title", owned(track.title.as_str())),
+        ("xesam:artist", owned(vec![track.artist.as_str()])),
+        (
+            "xesam:url",
+            owned(format!("https://music.youtube.com/watch?v={}", track.id)),
+        ),
+    ]);
+    if let Some(length) = track.length {
+        values.insert("mpris:length", length.into());
     }
-}
-
-/// Confirmed app state. Position is seconds, volume is 0..=100.
-/// `advancing` is false during loading, buffering, pause, and stop.
-#[derive(Clone, Debug, PartialEq)]
-pub struct State {
-    pub playback: PlaybackStatus,
-    pub metadata: Option<Metadata>,
-    pub track_id: Option<u64>,
-    pub position: f64,
-    pub advancing: bool,
-    pub volume: f64,
-    pub rate: PlaybackSpeed,
-    pub repeat: Repeat,
-    pub can_play: bool,
-    pub can_pause: bool,
-    pub can_go_next: bool,
-    pub can_go_previous: bool,
-    pub can_seek: bool,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            playback: PlaybackStatus::Stopped,
-            metadata: None,
-            track_id: None,
-            position: 0.,
-            advancing: false,
-            volume: 60.,
-            rate: PlaybackSpeed::default(),
-            repeat: Repeat::Off,
-            can_play: false,
-            can_pause: false,
-            can_go_next: false,
-            can_go_previous: false,
-            can_seek: false,
-        }
+    if let Some(album) = &track.album {
+        values.insert("xesam:album", owned(album.as_str()));
     }
+    if let Some(url) = &track.art_url {
+        values.insert("mpris:artUrl", owned(url.as_str()));
+    }
+    values
 }
 
-impl State {
-    fn properties(&self) -> Properties {
-        HashMap::from([
-            ("PlaybackStatus", owned(self.playback.name())),
-            (
-                "Metadata",
-                owned(
-                    self.metadata
-                        .as_ref()
-                        .map(Metadata::values)
-                        .unwrap_or_default(),
-                ),
+fn properties(state: &State) -> Properties {
+    HashMap::from([
+        ("PlaybackStatus", owned(status_name(state.playback))),
+        (
+            "Metadata",
+            owned(
+                state
+                    .metadata
+                    .as_ref()
+                    .map(metadata_values)
+                    .unwrap_or_default(),
             ),
-            ("Volume", (self.volume / 100.).into()),
-            ("Rate", f64::from(self.rate).into()),
-            ("LoopStatus", owned(repeat_name(self.repeat))),
-            ("CanPlay", self.can_play.into()),
-            ("CanPause", self.can_pause.into()),
-            ("CanGoNext", self.can_go_next.into()),
-            ("CanGoPrevious", self.can_go_previous.into()),
-            ("CanSeek", self.can_seek.into()),
-        ])
-    }
-
-    fn same_properties(&self, other: &Self) -> bool {
-        self.playback == other.playback
-            && self.metadata == other.metadata
-            && self.volume == other.volume
-            && self.rate == other.rate
-            && self.repeat == other.repeat
-            && self.can_play == other.can_play
-            && self.can_pause == other.can_pause
-            && self.can_go_next == other.can_go_next
-            && self.can_go_previous == other.can_go_previous
-            && self.can_seek == other.can_seek
-    }
+        ),
+        ("Volume", (state.volume / 100.).into()),
+        ("Rate", f64::from(state.rate).into()),
+        ("LoopStatus", owned(repeat_name(state.repeat))),
+        ("CanPlay", state.can_play.into()),
+        ("CanPause", state.can_pause.into()),
+        ("CanGoNext", state.can_go_next.into()),
+        ("CanGoPrevious", state.can_go_previous.into()),
+        ("CanSeek", state.can_seek.into()),
+    ])
 }
 
-struct Published {
-    state: State,
-    sampled_at: Instant,
-    seeked: Option<(u64, i64)>,
-}
-
-impl Published {
-    fn position_at(&self, now: Instant) -> i64 {
-        let elapsed = if self.state.advancing && self.state.playback == PlaybackStatus::Playing {
-            now.saturating_duration_since(self.sampled_at).as_secs_f64()
-                * f64::from(self.state.rate)
-        } else {
-            0.
-        };
-        let position = microseconds(self.state.position + elapsed);
-        self.state
-            .metadata
-            .as_ref()
-            .and_then(|track| track.length)
-            .map_or(position, |length| position.min(length))
-    }
-}
-
-/// Owns the desktop service, not playback. Keep it on the app and consume events
-/// on the app thread. Dropping it closes the service without blocking the UI.
-pub struct Mpris {
+/// Serves MPRIS until the app drops its `MediaControls`.
+pub(super) fn serve(
     published: Arc<Mutex<Published>>,
-    wake: mpsc::SyncSender<()>,
-    events: async_channel::Receiver<Event>,
-}
-
-impl Mpris {
-    pub fn new() -> Result<Self> {
-        let published = Arc::new(Mutex::new(Published {
-            state: State::default(),
-            sampled_at: Instant::now(),
-            seeked: None,
-        }));
-        let (wake, updates) = mpsc::sync_channel(1);
-        let (events, receiver) = async_channel::bounded(64);
-        let player = DesktopPlayer {
-            published: published.clone(),
-            events: events.clone(),
-        };
-        thread::Builder::new()
-            .name("music-mpris".into())
-            .spawn(move || {
-                if let Err(error) = serve(player, updates) {
-                    let _ = events.try_send(Event::Error(format!(
-                        "Desktop media controls unavailable: {error:#}"
-                    )));
-                }
-            })
-            .context("Could not start desktop media controls")?;
-        Ok(Self {
-            published,
-            wake,
-            events: receiver,
-        })
-    }
-
-    pub fn events(&self) -> async_channel::Receiver<Event> {
-        self.events.clone()
-    }
-
-    /// Frequent clock samples do not allocate metadata or wake the D-Bus worker.
-    pub fn position_sample(&self, track_id: u64, seconds: f64) {
-        if !seconds.is_finite() || seconds < 0. {
-            return;
-        }
-        let mut published = self.published.lock().unwrap();
-        if published.state.track_id == Some(track_id) && published.state.position != seconds {
-            published.state.position = seconds;
-            published.sampled_at = Instant::now();
-        }
-    }
-
-    pub fn publish(&self, mut state: State) {
-        state.position = if state.position.is_finite() {
-            state.position.max(0.)
-        } else {
-            0.
-        };
-        state.volume = if state.volume.is_finite() {
-            state.volume.clamp(0., 100.)
-        } else {
-            0.
-        };
-        let mut published = self.published.lock().unwrap();
-        let old = &published.state;
-        let properties_changed = !old.same_properties(&state);
-        if old.position != state.position
-            || old.advancing != state.advancing
-            || old.playback != state.playback
-            || old.rate != state.rate
-            || old.track_id != state.track_id
-        {
-            published.sampled_at = Instant::now();
-        }
-        published.state = state;
-        drop(published);
-        if properties_changed {
-            let _ = self.wake.try_send(());
-        }
-    }
-
-    /// Call after a confirmed seek, after publishing its resulting state.
-    pub fn seeked(&self, track_id: u64, seconds: f64) {
-        if !seconds.is_finite() || seconds < 0. {
-            return;
-        }
-        let mut published = self.published.lock().unwrap();
-        if published.state.track_id != Some(track_id) {
-            return;
-        }
-        published.seeked = Some((track_id, microseconds(seconds)));
-        drop(published);
-        let _ = self.wake.try_send(());
-    }
-}
-
-fn serve(player: DesktopPlayer, updates: mpsc::Receiver<()>) -> Result<()> {
-    let published = player.published.clone();
+    events: async_channel::Sender<Event>,
+    updates: mpsc::Receiver<()>,
+) -> Result<()> {
+    let player = DesktopPlayer {
+        published: published.clone(),
+        events,
+    };
     let connection = Builder::session()?
         .serve_at(PATH, DesktopRoot)?
         .serve_at(PATH, AppPlayer(player))?
         .name(NAME)?
         .build()?;
-    let mut previous = State::default().properties();
+    let mut previous = properties(&State::default());
     while updates.recv().is_ok() {
         let (state, seeked) = {
             let mut published = published.lock().unwrap();
             (published.state.clone(), published.seeked.take())
         };
-        let properties = state.properties();
+        let properties = properties(&state);
         let changed: HashMap<_, _> = properties
             .iter()
             .filter(|(key, value)| previous.get(*key) != Some(*value))
@@ -353,10 +140,6 @@ fn owned<'a>(value: impl Into<Value<'a>>) -> OwnedValue {
         .into()
         .try_into()
         .expect("MPRIS values contain no file descriptors")
-}
-
-fn microseconds(seconds: f64) -> i64 {
-    (seconds.max(0.) * 1_000_000.) as i64
 }
 
 fn repeat_name(repeat: Repeat) -> &'static str {
@@ -491,7 +274,8 @@ impl DesktopPlayer {
         let Some(track) = &state.metadata else {
             return Ok(());
         };
-        if track.path != track_id || track.length.is_some_and(|length| position > length) {
+        if track_path(&track.id) != track_id || track.length.is_some_and(|length| position > length)
+        {
             return Ok(());
         }
         let Some(track_id) = state.track_id else {
@@ -513,7 +297,7 @@ impl DesktopPlayer {
 
     #[zbus(property)]
     fn playback_status(&self) -> &'static str {
-        self.published.lock().unwrap().state.playback.name()
+        status_name(self.published.lock().unwrap().state.playback)
     }
     #[zbus(property)]
     fn metadata(&self) -> Properties {
@@ -523,7 +307,7 @@ impl DesktopPlayer {
             .state
             .metadata
             .as_ref()
-            .map(Metadata::values)
+            .map(metadata_values)
             .unwrap_or_default()
     }
     // AppPlayer dispatches setters without zbus emitting the previous property value.
@@ -720,48 +504,15 @@ impl zbus::object_server::Interface for AppPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::media_controls::{MediaControls, tests::playing};
 
-    fn fixture() -> (Mpris, DesktopPlayer, mpsc::Receiver<()>) {
-        let published = Arc::new(Mutex::new(Published {
-            state: State::default(),
-            sampled_at: Instant::now(),
-            seeked: None,
-        }));
-        let (wake, updates) = mpsc::sync_channel(1);
-        let (events, receiver) = async_channel::bounded(64);
-        let mpris = Mpris {
-            published: published.clone(),
-            wake,
-            events: receiver,
+    fn fixture() -> (MediaControls, DesktopPlayer, mpsc::Receiver<()>) {
+        let (mpris, events, updates) = MediaControls::unserved();
+        let player = DesktopPlayer {
+            published: mpris.published.clone(),
+            events,
         };
-        let player = DesktopPlayer { published, events };
         (mpris, player, updates)
-    }
-
-    fn playing() -> State {
-        let track = Track {
-            id: "abcdefghijk".into(),
-            title: "Song".into(),
-            artist: "Artist".into(),
-            album: Some("Album".into()),
-            duration: Some(60),
-            thumbnail: None,
-            details: Default::default(),
-        };
-        State {
-            playback: PlaybackStatus::Playing,
-            metadata: Some(Metadata::new(&track, 60.)),
-            track_id: Some(7),
-            position: 10.,
-            advancing: true,
-            can_play: true,
-            can_pause: true,
-            can_go_next: true,
-            can_go_previous: true,
-            can_seek: true,
-            ..Default::default()
-        }
     }
 
     #[test]
@@ -794,7 +545,7 @@ mod tests {
     fn seek_requests_are_track_bound_and_stale_or_out_of_range_positions_are_ignored() {
         let (mpris, player, _) = fixture();
         let state = playing();
-        let path = state.metadata.as_ref().unwrap().path.clone();
+        let path = track_path(&state.metadata.as_ref().unwrap().id);
         mpris.publish(state.clone());
         player.seek(-3_500_000).unwrap();
         assert_eq!(
@@ -868,62 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn position_projects_at_rate_and_freezes_during_pause_buffering_and_stop() {
-        let (mpris, _, updates) = fixture();
-        let mut state = playing();
-        state.rate = PlaybackSpeed::try_from(1.5).unwrap();
-        mpris.publish(state.clone());
-        updates.try_recv().unwrap();
-        let sampled_at = mpris.published.lock().unwrap().sampled_at;
-        assert_eq!(
-            mpris
-                .published
-                .lock()
-                .unwrap()
-                .position_at(sampled_at + Duration::from_secs(2)),
-            13_000_000
-        );
-        mpris.publish(state.clone());
-        assert_eq!(mpris.published.lock().unwrap().sampled_at, sampled_at);
-        assert!(updates.try_recv().is_err());
-        state.position = 11.;
-        mpris.publish(state.clone());
-        assert!(
-            updates.try_recv().is_err(),
-            "position samples must not emit PropertiesChanged"
-        );
-        assert!(!state.properties().contains_key("Position"));
-        for playback in [
-            PlaybackStatus::Playing,
-            PlaybackStatus::Paused,
-            PlaybackStatus::Stopped,
-        ] {
-            state.playback = playback;
-            state.advancing = false;
-            mpris.publish(state.clone());
-            let published = mpris.published.lock().unwrap();
-            assert_eq!(
-                published.position_at(published.sampled_at + Duration::from_secs(20)),
-                11_000_000
-            );
-        }
-        state.playback = PlaybackStatus::Playing;
-        state.advancing = true;
-        mpris.publish(state);
-        let published = mpris.published.lock().unwrap();
-        assert_eq!(
-            published.position_at(published.sampled_at + Duration::from_secs(60)),
-            60_000_000
-        );
-    }
-
-    #[test]
     fn metadata_survives_backend_reload_and_stop_and_seeked_requires_current_load() {
         let (mpris, player, updates) = fixture();
         let mut state = playing();
         mpris.publish(state.clone());
         updates.try_recv().unwrap();
         let metadata = player.metadata();
+        assert!(
+            !properties(&state).contains_key("Position"),
+            "position samples must not emit PropertiesChanged"
+        );
         assert!(<&ObjectPath<'_>>::try_from(metadata.get("mpris:trackid").unwrap()).is_ok());
         assert_eq!(
             i64::try_from(metadata.get("mpris:length").unwrap()).unwrap(),

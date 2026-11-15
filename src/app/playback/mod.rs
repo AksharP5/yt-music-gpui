@@ -814,7 +814,7 @@ impl Music {
                 changed = self.position.floor() != seconds.floor();
                 self.position = seconds;
                 self.sample_listening();
-                if let Some(service) = &self.mpris {
+                if let Some(service) = &self.media_controls {
                     service.position_sample(track_id, seconds);
                 }
                 if changed {
@@ -881,7 +881,7 @@ impl Music {
             self.notify_playback(cx);
         }
         if let Some((track_id, seconds)) = seeked
-            && let Some(service) = &self.mpris
+            && let Some(service) = &self.media_controls
         {
             service.seeked(track_id, seconds);
         }
