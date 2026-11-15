@@ -124,9 +124,10 @@ pub struct Session {
     pub(crate) source_profile: Option<BrowserProfile>,
 }
 
+/// What the account extractor reads from its stdin: one JSON line with the
+/// Netscape cookie jar and the account to play as.
 pub struct PlaybackCredentials {
-    pub(crate) cookies: File,
-    pub(crate) identity: File,
+    pub(crate) message: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -467,19 +468,16 @@ impl Session {
     }
     pub fn playback_credentials(&self) -> Result<PlaybackCredentials> {
         self.validate()?;
-        let identity = serde_json::to_vec(&json!({
-            "authuser": self.authuser,
-            "delegated_session_id": self.delegated_session_id,
-            "data_sync_id": self.data_sync_id,
+        let mut message = serde_json::to_vec(&json!({
+            "cookies": self.playback_cookie,
+            "account": {
+                "authuser": self.authuser,
+                "delegated_session_id": self.delegated_session_id,
+                "data_sync_id": self.data_sync_id,
+            },
         }))?;
-        Ok(PlaybackCredentials {
-            cookies: self.playback_file()?,
-            identity: sealed_file(&identity)?,
-        })
-    }
-    /// Closing the last descriptor destroys the anonymous sealed RAM file.
-    pub fn playback_file(&self) -> Result<File> {
-        sealed_file(self.playback_cookie.as_bytes())
+        message.push(b'\n');
+        Ok(PlaybackCredentials { message })
     }
 }
 
@@ -1797,23 +1795,5 @@ mod tests {
         assert!(!debug.contains("sensitive-cookie"));
         assert!(request.headers()["cookie"].is_sensitive());
         assert!(request.headers()["authorization"].is_sensitive());
-    }
-    #[test]
-    fn playback_credentials_are_anonymous_and_read_only() {
-        let credentials = session("SAPISID=value").playback_credentials().unwrap();
-        for mut file in [credentials.cookies, credentials.identity] {
-            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-            assert!(
-                fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains("memfd:")
-            );
-            assert_ne!(
-                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-                0
-            );
-            assert!(file.write_all(b"changed").is_err());
-        }
     }
 }

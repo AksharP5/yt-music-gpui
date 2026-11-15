@@ -1,12 +1,11 @@
 """Account-bound playback for the yt-dlp version exercised by this application."""
 
 import copy
-import fcntl
 import functools
+import io
 import json
-import os
 import re
-import stat
+import sys
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -25,9 +24,8 @@ DENO_VERSION = "2.9.8"
 DENO_SHA256 = "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609"
 DENO_SIZE = 41963064
 
-# Some portable CPython builds omit these stable Linux fcntl ABI constants.
-_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
-_REQUIRED_SEALS = 0x0f
+# The cookie jar is capped at 128 KiB when the app reads it from the browser.
+_MAX_CREDENTIALS = 256 * 1024
 
 
 class _NoAccountRedirect(urllib.request.HTTPRedirectHandler):
@@ -51,19 +49,22 @@ class YtMusicAccountIE(YoutubeIE):
 
     @functools.cached_property
     def _account(self):
+        """Take the account from stdin, once, before any request.
+
+        The app writes one JSON line there: the Netscape cookie jar and the
+        account to play as. Both stay in this process's memory, and with no
+        cookie file yt-dlp has nowhere to save the jar back to.
+        """
         if __version__ != REVIEWED_VERSION:
             raise DownloadError(f"Account playback requires yt-dlp {REVIEWED_VERSION}; the installed version has not been reviewed")
-        paths = self._configuration_arg("context", ie_key="ytmusicaccount", casesense=True)
         try:
-            if len(paths) != 1 or not re.fullmatch(r"/proc/[0-9]+/fd/[0-9]+", paths[0]):
+            line = sys.stdin.readline(_MAX_CREDENTIALS + 1)
+            if not line.endswith("\n"):
                 raise ValueError
-            with open(paths[0], "rb") as file:
-                metadata = os.fstat(file.fileno())
-                if (stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid()
-                        or metadata.st_size > 4096 or metadata.st_nlink != 0
-                        or fcntl.fcntl(file, _F_GET_SEALS) & _REQUIRED_SEALS != _REQUIRED_SEALS):
-                    raise ValueError
-                account = json.load(file)
+            credentials = json.loads(line)
+            if set(credentials) != {"cookies", "account"} or not isinstance(credentials["cookies"], str):
+                raise ValueError
+            account = credentials["account"]
             if set(account) != {"authuser", "delegated_session_id", "data_sync_id"}:
                 raise ValueError
             index = account["authuser"]
@@ -76,9 +77,10 @@ class YtMusicAccountIE(YoutubeIE):
             delegated = first if second else None
             if account["delegated_session_id"] != delegated:
                 raise ValueError
+            self._downloader.cookiejar.load(io.StringIO(credentials["cookies"]))
             return {**account, "authuser": int(index), "user_session_id": second or first}
         except (OSError, ValueError, TypeError, KeyError):
-            raise DownloadError("Playback account identity is unavailable or invalid") from None
+            raise DownloadError("Playback account credentials are unavailable or invalid") from None
 
     def _real_initialize(self):
         self._account
@@ -160,7 +162,7 @@ class YtMusicAccountIE(YoutubeIE):
 
     def _generate_cookie_auth_headers(self, *, ytcfg=None, **kwargs):
         self._check_identity(ytcfg)
-        # Discard request-local identity hints. Only the sealed context selects authority.
+        # Discard request-local identity hints. Only the app's credentials select authority.
         kwargs.update(
             session_index=self._account["authuser"],
             delegated_session_id=self._account["delegated_session_id"],

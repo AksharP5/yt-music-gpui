@@ -1,7 +1,5 @@
 """Offline contract tests for the embedded extractor and installed yt-dlp."""
 
-import fcntl
-import ctypes
 import importlib.util
 import io
 import json
@@ -36,15 +34,12 @@ plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
 
 
-def ram_file(data, *, sealed=True):
-    fd = ctypes.CDLL(None).memfd_create(b"yt-music-synthetic", 3)
-    if fd < 0:
-        raise OSError("Could not create synthetic RAM input")
-    os.fchmod(fd, 0o600)
-    os.write(fd, data)
-    if sealed:
-        fcntl.fcntl(fd, getattr(fcntl, "F_ADD_SEALS", 1033), 0x0f)
-    return fd
+COOKIES = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tINVENTED_COOKIE\n"
+
+
+def credentials(account):
+    """The line the app writes to the extractor's stdin."""
+    return json.dumps({"cookies": COOKIES, "account": account}) + "\n"
 
 
 class Probe(plugin.YtMusicAccountIE):
@@ -57,15 +52,18 @@ class Probe(plugin.YtMusicAccountIE):
 
 
 class AccountContract(unittest.TestCase):
-    def extractor(self, delegated=None, *, sealed=True):
-        identity = {"authuser": "2", "delegated_session_id": delegated,
-                    "data_sync_id": f"{delegated}||user" if delegated else "user||"}
-        fd = ram_file(json.dumps(identity).encode(), sealed=sealed)
-        self.addCleanup(os.close, fd)
-        ydl = yt_dlp.YoutubeDL({"quiet": True, "extractor_args": {
-            "ytmusicaccount": {"context": [f"/proc/{os.getpid()}/fd/{fd}"]}}}, auto_init=False)
+    def extractor(self, delegated=None, *, stdin=None):
+        account = {"authuser": "2", "delegated_session_id": delegated,
+                   "data_sync_id": f"{delegated}||user" if delegated else "user||"}
+        ydl = yt_dlp.YoutubeDL({"quiet": True}, auto_init=False)
         ydl.urlopen = lambda *_: self.fail("an offline test attempted a network request")
-        return Probe(ydl)
+        ie = Probe(ydl)
+        with patch.object(sys, "stdin", io.StringIO(credentials(account) if stdin is None else stdin)):
+            try:
+                ie._account
+            except DownloadError:
+                pass
+        return ie
 
     def test_nonzero_account_and_brand_reach_headers_and_context(self):
         for brand in [None, "brand"]:
@@ -176,12 +174,28 @@ class AccountContract(unittest.TestCase):
             director.close()
         self.assertEqual(requests, ["https://www.youtube.com/youtubei/v1/player"])
 
-    def test_missing_or_unsealed_context_fails_before_network(self):
-        with self.assertRaises(DownloadError):
-            self.extractor(sealed=False)._extract_session_index({})
-        ie = self.extractor()
-        with self.assertRaises(DownloadError):
-            ie._request_webpage("https://www.youtube.com", "abcdefghijk")
+    def test_credentials_load_into_memory_only(self):
+        ie = self.extractor("brand")
+        self.assertEqual(ie._account["data_sync_id"], "brand||user")
+        self.assertEqual([cookie.value for cookie in ie.cookiejar], ["INVENTED_COOKIE"])
+        self.assertIsNone(ie._downloader.params.get("cookiefile"))
+
+    def test_missing_or_malformed_credentials_fail_before_network(self):
+        account = {"authuser": "2", "delegated_session_id": None, "data_sync_id": "user||"}
+        for stdin in ["", credentials(account)[:-1], "{}\n", "[]\n", "not json\n",
+                      json.dumps({"cookies": COOKIES, "account": account, "extra": 1}) + "\n",
+                      json.dumps({"cookies": None, "account": account}) + "\n",
+                      credentials({**account, "authuser": "02x"}),
+                      credentials({**account, "delegated_session_id": "other"}),
+                      json.dumps({"cookies": "x" * (300 * 1024), "account": account}) + "\n"]:
+            # A failed read is not cached; later calls must find nothing either.
+            with self.subTest(stdin=stdin[:40]), patch.object(sys, "stdin", io.StringIO()):
+                ie = self.extractor(stdin=stdin)
+                with self.assertRaises(DownloadError):
+                    ie._extract_session_index({})
+                with self.assertRaises(DownloadError):
+                    ie._request_webpage("https://www.youtube.com", "abcdefghijk")
+                self.assertEqual(list(ie.cookiejar), [])
         with patch.object(plugin, "__version__", "unreviewed"):
             with self.assertRaises(DownloadError):
                 self.extractor()._extract_session_index({})
@@ -211,12 +225,10 @@ with YoutubeDL({'quiet': True, 'allowed_extractors': ['^ytmusicaccount$']}) as y
                                 env={**os.environ, "YTDLP_NO_PLUGINS": "1"}, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
 
-    def test_ordered_ram_config_loads_only_the_account_extractor(self):
-        config = ram_file((f"--no-plugin-dirs\n--plugin-dirs '{plugin_root}'\n"
-                           "--use-extractors '^ytmusicaccount$'\n").encode())
-        self.addCleanup(os.close, config)
+    def test_account_arguments_load_only_the_account_extractor(self):
         _, opts, _, params = yt_dlp.parse_options([
-            "--ignore-config", "--config-locations", f"/proc/{os.getpid()}/fd/{config}"])
+            "--ignore-config", "--no-plugin-dirs", "--plugin-dirs", str(plugin_root),
+            "--use-extractors", "^ytmusicaccount$"])
         self.assertEqual(opts.plugin_dirs, [str(plugin_root)])
         plugin_dirs.value = opts.plugin_dirs
         load_all_plugins()
@@ -225,14 +237,9 @@ with YoutubeDL({'quiet': True, 'allowed_extractors': ['^ytmusicaccount$']}) as y
 
 
 class WarmServerContract(unittest.TestCase):
-    def server(self, *, disabled=False):
-        identity = ram_file(b'{"authuser":"2","delegated_session_id":"brand","data_sync_id":"brand||user"}')
-        cookies = ram_file(b'# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tINVENTED_COOKIE\n', sealed=False)
-        config = ram_file((f"--no-plugin-dirs\n--plugin-dirs '{plugin_root}'\n"
-                           "--use-extractors '^ytmusicaccount$'\n"
-                           f"--extractor-args ytmusicaccount:context=/proc/{os.getpid()}/fd/{identity}\n").encode())
-        for fd in [identity, cookies, config]:
-            self.addCleanup(os.close, fd)
+    ACCOUNT = credentials({"authuser": "2", "delegated_session_id": "brand", "data_sync_id": "brand||user"})
+
+    def server(self, *, disabled=False, one_shot=False):
         # Patch the remote boundary only. The real plugin still selects authority,
         # verifies each response, and must be discovered by the server's CLI setup.
         code = r"""
@@ -275,13 +282,17 @@ def extract(self, url):
          'ext':'webm', 'vcodec':'vp9', 'acodec':'none', 'height':720}]}
 
 YoutubeIE._real_extract = extract
+if sys.argv[1] == 'one-shot':
+    del sys.argv[1:3]
+    sys.exit(yt_dlp.main(sys.argv[1:]))
 exec(sys.argv.pop(1))
 """
         server = subprocess.Popen([sys.executable, '-I', '-B', '-u', '-c', code,
-                                   zipapp or '', server_script, zipapp or 'unused-script', '--ignore-config', '--get-url',
-                                   '--no-cache-dir', '--quiet', '--no-warnings', '--no-playlist',
-                                   '--cookies', f'/proc/{os.getpid()}/fd/{cookies}',
-                                   '--config-locations', f'/proc/{os.getpid()}/fd/{config}'],
+                                   zipapp or '', 'one-shot' if one_shot else server_script, zipapp or 'unused-script',
+                                   '--ignore-config', '--get-url', '--no-cache-dir', '--quiet', '--no-warnings',
+                                   '--no-playlist', '--no-plugin-dirs', '--plugin-dirs', str(plugin_root),
+                                   '--use-extractors', '^ytmusicaccount$',
+                                   *(['--format', 'bestaudio', 'https://music.youtube.com/watch?v=abcdefghijk'] if one_shot else [])],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   text=True, env={**os.environ, **({'YTDLP_NO_PLUGINS': '1'} if disabled else {})})
         def cleanup():
@@ -301,7 +312,7 @@ exec(sys.argv.pop(1))
             {'url': 'https://music.youtube.com/watch?v=unconfirmed', 'format': 'bestaudio'},
             {'url': 'https://music.youtube.com/watch?v=abcdefghijk', 'format': 'bestvideo+bestaudio'},
         ]
-        stdout, stderr = server.communicate(''.join(json.dumps(request) + '\n' for request in requests), timeout=15)
+        stdout, stderr = server.communicate(self.ACCOUNT + ''.join(json.dumps(request) + '\n' for request in requests), timeout=15)
         self.assertEqual(server.returncode, 0, stderr)
         self.assertEqual([json.loads(line) for line in stdout.splitlines()], [
             {'ready': True},
@@ -316,9 +327,22 @@ exec(sys.argv.pop(1))
 
     def test_warm_server_refuses_startup_without_the_account_plugin(self):
         server = self.server(disabled=True)
-        stdout, _ = server.communicate('', timeout=15)
+        stdout, _ = server.communicate(self.ACCOUNT, timeout=15)
         self.assertNotEqual(server.returncode, 0)
         self.assertEqual(stdout, '')
+
+    def test_warm_server_refuses_startup_without_credentials(self):
+        server = self.server()
+        request = json.dumps({'url': 'https://music.youtube.com/watch?v=abcdefghijk', 'format': 'bestaudio'})
+        stdout, _ = server.communicate(request + '\n', timeout=15)
+        self.assertNotEqual(server.returncode, 0)
+        self.assertEqual(stdout, '')
+
+    def test_one_shot_cli_reads_the_same_credentials(self):
+        server = self.server(one_shot=True)
+        stdout, stderr = server.communicate(self.ACCOUNT, timeout=15)
+        self.assertEqual(server.returncode, 0, stderr)
+        self.assertEqual(stdout, 'https://rr1.googlevideo.com/audio?itag=251&call=1\n')
 
 
 unittest.main()
