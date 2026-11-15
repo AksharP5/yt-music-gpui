@@ -10,7 +10,7 @@ use crate::{
     },
     country_picker::{CountryPicker, CountryPickerEvent},
     library::{LastPosition, Library, LibraryWriter, Queue, Repeat, Store},
-    mpris,
+    media_controls,
     player::{
         AudioQuality, PlayOptions, PlaybackSpeed, Player, PlayerEvent, PlayerOptions,
         VideoAttachment, VideoQuality, VideoStatus,
@@ -146,7 +146,7 @@ pub struct Music {
     library: Library,
     store: Option<LibraryWriter>,
     player: Option<Player>,
-    mpris: Option<mpris::Mpris>,
+    media_controls: Option<media_controls::MediaControls>,
     seekable: bool,
     video: Option<VideoAttachment>,
     /// The full-window player page, showing artwork or video beside its tabs.

@@ -206,14 +206,14 @@ impl Music {
             })
             .detach();
         }
-        let mpris = match mpris::Mpris::new() {
+        let media_controls = match media_controls::MediaControls::new() {
             Ok(service) => Some(service),
             Err(failure) => {
                 error.get_or_insert_with(|| failure.to_string());
                 None
             }
         };
-        if let Some(service) = &mpris {
+        if let Some(service) = &media_controls {
             let events = service.events();
             cx.spawn_in(window, async move |view, cx| {
                 while let Ok(event) = events.recv().await {
@@ -352,7 +352,7 @@ impl Music {
             library,
             store,
             player,
-            mpris,
+            media_controls,
             seekable: false,
             video,
             player_open: false,

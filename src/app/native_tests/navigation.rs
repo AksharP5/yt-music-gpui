@@ -112,7 +112,7 @@ pub(super) fn check_cache_window(
                             view.track_state = track_state::Worker::idle();
                             view.player = None;
                             view.video = None;
-                            view.mpris = None;
+                            view.media_controls = None;
                             view.store = None;
                             view.library.volume = 0.;
                             view.account = Some(connection(session("cache-regression")));
@@ -803,7 +803,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
             view.track_state = track_state::Worker::idle();
             view.player = None;
             view.video = None;
-            view.mpris = None;
+            view.media_controls = None;
             view.store = None;
             view.library.volume = 0.;
             view.navigate(Route::Home, cx);

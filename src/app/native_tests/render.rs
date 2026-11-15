@@ -2107,11 +2107,11 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                             // Close their subscriptions so late startup events cannot redraw
                             // the body during the position-only measurement.
                             music.player.as_ref().unwrap().events().close();
-                            if let Some(service) = &music.mpris {
+                            if let Some(service) = &music.media_controls {
                                 service.events().close();
                             }
                             music.player = None;
-                            music.mpris = None;
+                            music.media_controls = None;
                             music.video = None;
                             music.store = None;
                             music.library.volume = 0.;

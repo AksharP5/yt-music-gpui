@@ -1,10 +1,12 @@
-//! MPRIS state publication and desktop playback commands.
+//! Desktop media control publication and commands.
 
 use super::super::*;
 
 impl Music {
     pub(in crate::app) fn publish_desktop(&self) {
-        let Some(service) = &self.mpris else { return };
+        let Some(service) = &self.media_controls else {
+            return;
+        };
         let queue = &self.library.queue;
         let skip = |track: &Track| is_disliked(&self.ratings, track);
         let seed_available = !self.autoplay_seeded
@@ -39,17 +41,17 @@ impl Music {
         let waiting = self.queue_waiting.is_some()
             || self.autoplay_waiting.is_some()
             || self.waiting_for_watch();
-        service.publish(mpris::State {
+        service.publish(media_controls::State {
             playback: if self.playback == Playback::Stopped {
-                mpris::PlaybackStatus::Stopped
+                media_controls::PlaybackStatus::Stopped
             } else if self.playback.is_paused() {
-                mpris::PlaybackStatus::Paused
+                media_controls::PlaybackStatus::Paused
             } else {
-                mpris::PlaybackStatus::Playing
+                media_controls::PlaybackStatus::Playing
             },
             metadata: queue
                 .current()
-                .map(|track| mpris::Metadata::new(track, self.duration)),
+                .map(|track| media_controls::Metadata::new(track, self.duration)),
             track_id: self.active_id,
             position: self.position,
             advancing: self.playback.is_advancing(),
@@ -67,24 +69,28 @@ impl Music {
         });
     }
 
-    pub(in crate::app) fn desktop_event(&mut self, event: mpris::Event, cx: &mut Context<Self>) {
+    pub(in crate::app) fn desktop_event(
+        &mut self,
+        event: media_controls::Event,
+        cx: &mut Context<Self>,
+    ) {
         match event {
-            mpris::Event::Next => self.next(false, cx),
-            mpris::Event::Previous => self.previous(cx),
-            mpris::Event::Play
+            media_controls::Event::Next => self.next(false, cx),
+            media_controls::Event::Previous => self.previous(cx),
+            media_controls::Event::Play
                 if self.playback == Playback::Stopped || self.playback.is_paused() =>
             {
                 self.toggle_play(cx)
             }
-            mpris::Event::Pause
+            media_controls::Event::Pause
                 if self.playback != Playback::Stopped && !self.playback.is_paused() =>
             {
                 self.toggle_play(cx)
             }
-            mpris::Event::Play | mpris::Event::Pause => {}
-            mpris::Event::PlayPause => self.toggle_play(cx),
-            mpris::Event::Stop => self.stop_playback(cx),
-            mpris::Event::Seek { track_id, offset }
+            media_controls::Event::Play | media_controls::Event::Pause => {}
+            media_controls::Event::PlayPause => self.toggle_play(cx),
+            media_controls::Event::Stop => self.stop_playback(cx),
+            media_controls::Event::Seek { track_id, offset }
                 if Some(track_id) == self.active_id && self.seekable =>
             {
                 let seconds = (self.playback_position() + offset).max(0.);
@@ -94,26 +100,28 @@ impl Music {
                     self.seek_current(seconds, cx);
                 }
             }
-            mpris::Event::SetPosition { track_id, seconds }
+            media_controls::Event::SetPosition { track_id, seconds }
                 if Some(track_id) == self.active_id
                     && self.seekable
                     && (self.duration <= 0. || seconds <= self.duration) =>
             {
                 self.seek_current(seconds, cx)
             }
-            mpris::Event::Seek { .. } | mpris::Event::SetPosition { .. } => {}
-            mpris::Event::Volume(volume) => {
+            media_controls::Event::Seek { .. } | media_controls::Event::SetPosition { .. } => {}
+            media_controls::Event::Volume(volume) => {
                 if !self.set_volume(volume, cx) {
                     return;
                 }
                 self.save_preferences();
             }
-            mpris::Event::Rate(speed) => self.player_command(|player| player.set_speed(speed)),
-            mpris::Event::LoopStatus(repeat) => {
+            media_controls::Event::Rate(speed) => {
+                self.player_command(|player| player.set_speed(speed))
+            }
+            media_controls::Event::LoopStatus(repeat) => {
                 self.library.repeat = repeat;
                 self.save_preferences();
             }
-            mpris::Event::Error(error) => self.error = Some(error),
+            media_controls::Event::Error(error) => self.error = Some(error),
         }
         self.notify_playback(cx);
     }

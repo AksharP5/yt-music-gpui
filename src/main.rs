@@ -11,7 +11,7 @@ mod history;
 mod input;
 mod library;
 mod listening;
-mod mpris;
+mod media_controls;
 mod os;
 mod player;
 mod playlist_form;
