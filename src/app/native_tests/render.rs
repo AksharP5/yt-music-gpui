@@ -71,7 +71,7 @@ async fn wait_for_quiescence(
     }
 }
 
-async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
+pub(super) async fn key(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
     cx.update_window(window.into(), |_, window, cx| {
         let keystroke = gpui::Keystroke::parse(key).unwrap();
         window.dispatch_keystroke(keystroke.clone(), cx);

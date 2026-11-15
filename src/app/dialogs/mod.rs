@@ -44,6 +44,8 @@ pub(in crate::app) enum Overlay {
         id: String,
         title: String,
     },
+    /// Sign-in worked, but no keyring can save it.
+    NoKeyring(Arc<Session>),
     SongText {
         id: u64,
         title: String,
@@ -478,6 +480,7 @@ impl Music {
                                 Overlay::PlaylistPicker { .. } => "Add to playlist".into(),
                                 Overlay::AlreadyAdded { .. } => "Already added".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
+                                Overlay::NoKeyring(_) => "No keyring found".into(),
                                 Overlay::SongText { title, .. } => title.clone(),
                                 Overlay::PlaylistForm { .. } | Overlay::CountryPicker(_) => {
                                     unreachable!()
@@ -1124,6 +1127,36 @@ impl Music {
             body = body.child(self.menu_action(
                 "cancel-duplicate",
                 "Cancel",
+                cx,
+                |view, window, cx| view.close_overlay(window, cx),
+            ));
+        } else if let Overlay::NoKeyring(session) = kind {
+            body = body
+                .child(div().mb(px(12.)).child(
+                    "You're signed in until you quit. To stay signed in, install and start a keyring such as GNOME Keyring, then sign in again.",
+                ))
+                .child(div().mb(px(18.)).text_color(self.theme.muted).child(
+                    "Or save your session unencrypted in a file only your user can read.",
+                ));
+            let session = session.clone();
+            body = body.child(self.menu_action(
+                "save-without-keyring",
+                "Save without a keyring",
+                cx,
+                move |view, window, cx| {
+                    if view
+                        .account_commands
+                        .try_send(crate::account::Command::SaveWithoutKeyring(session.clone()))
+                        .is_err()
+                    {
+                        view.error = Some("Could not save the account. Try again.".into());
+                    }
+                    view.close_overlay(window, cx);
+                },
+            ));
+            body = body.child(self.menu_action(
+                "not-now-keyring",
+                "Not now",
                 cx,
                 |view, window, cx| view.close_overlay(window, cx),
             ));
