@@ -353,7 +353,7 @@ pub(in crate::app) fn tinted_button(
         "pause" => "Pause",
         "previous" => "Previous song",
         "next" => "Next song",
-        "shuffle" => "Shuffle upcoming songs",
+        "shuffle" => "Shuffle",
         "repeat" => "Cycle repeat: off, all, one",
         "heart" => "Like song",
         "heart-filled" => "Remove from liked music",

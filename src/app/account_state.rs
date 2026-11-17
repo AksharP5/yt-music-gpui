@@ -154,10 +154,13 @@ impl Music {
                 }
             }
             Some(PlaybackIntent::Queue {
-                query,
+                mut query,
                 paused,
                 advance,
             }) => {
+                if !same_account && let PlaybackQuery::Collection(collection) = &mut query {
+                    collection.clear_actions();
+                }
                 self.start_queue(query, cx);
                 self.playback = self.playback.with_pause(paused);
                 if let Some(mut intent) = advance {

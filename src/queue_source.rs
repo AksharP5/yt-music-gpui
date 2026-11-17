@@ -38,7 +38,7 @@ pub(crate) enum PlaybackOrder {
 
 /// A collection's issued Play and Shuffle actions. Saved queues keep only its
 /// public browse ID and order; actions are refreshed under the current account.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CollectionPlayback {
     id: String,
     pub order: PlaybackOrder,
@@ -46,7 +46,7 @@ pub(crate) struct CollectionPlayback {
     actions: Option<Arc<CollectionActions>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct CollectionActions {
     play: Arc<PlaylistTarget>,
     shuffle: Arc<PlaylistTarget>,

@@ -2,7 +2,7 @@ use crate::{
     app::{CatalogTarget, Music, Playback, Route, Startup},
     auth,
     catalog::{BrowseLink, Catalog, Track},
-    queue_source::PageRequest,
+    queue_source::{CollectionPlayback, PageRequest, PlaybackOrder},
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
@@ -13,24 +13,104 @@ fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> cr
     crate::app::sync::tests::response(&[("Songs", indices.collect())], token, true)
 }
 
+fn collection_source() -> CollectionPlayback {
+    let details = crate::catalog::parse_page(&serde_json::json!({
+        "header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Synthetic playlist"},"buttons":[
+            {"musicPlayButtonRenderer":{"playNavigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"PLsynthetic","params":"original%3D"}}}},
+            {"menuRenderer":{"items":[{"menuNavigationItemRenderer":{"icon":{"iconType":"MUSIC_SHUFFLE"},"navigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"PLsynthetic","params":"shuffle%3D"}}}}]}}
+        ]}},"contents":[]
+    }), "Synthetic playlist").unwrap().header.unwrap().collection;
+    CollectionPlayback::new("VLPLsynthetic", &details, PlaybackOrder::Original).unwrap()
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account activation only"]
+fn collection_shuffle_refreshes_actions_only_when_the_account_changes() -> Result<()> {
+    use crate::app::{AccountOperation, BrowserConnection, PlaybackQuery};
+    use crate::player::{Player, PlayerOptions};
+    use std::sync::Arc;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        for (guest, same_account) in [(false, false), (true, false), (false, true)] {
+            let source = collection_source();
+            let old = super::account::session("old-actions");
+            let mut fields = serde_json::to_value(&*old).unwrap();
+            fields["client_version"] = serde_json::json!("new-session");
+            if !same_account {
+                fields["data_sync_id"] = serde_json::json!("different-user||");
+            }
+            let next = Arc::new(serde_json::from_value::<auth::Session>(fields).unwrap());
+            window.update(cx, |view, window, cx| {
+                if view.player.is_none() {
+                    view.player = Some(Player::new(PlayerOptions { audio_output:Some("null".into()), volume:0., ..Default::default() }).unwrap());
+                }
+                let (jobs, pending) = async_channel::bounded(1);
+                view.playback_jobs = jobs;
+                view.pending_playback_jobs = pending;
+                view.watch_pending = None;
+                view.account = (!guest).then(|| super::account::connection(old.clone()));
+                *view.session.write().unwrap() = (!guest).then(|| old.clone());
+                view.library.queue.replace(continuation_page(0..3,None).tracks(), 1);
+                view.library.queue.collection = Some(source.clone());
+                let operation = auth::Operation::default();
+                view.account_operation = Some(if same_account {
+                    AccountOperation::Refreshing { operation:operation.clone(), retry_change:false, resume:None }
+                } else {
+                    AccountOperation::Connecting(operation.clone(), BrowserConnection::Reading(serde_json::from_value(serde_json::json!({
+                        "browser":"Synthetic browser","name":"Synthetic profile","path":"/synthetic/profile"
+                    })).unwrap()))
+                });
+                view.account_event(crate::account::Event::Connected {
+                    operation, result:Ok(Some(super::account::connection(next.clone()))), save_session:false,
+                },window,cx);
+                assert!(matches!(view.account_operation, Some(AccountOperation::Activating { .. })));
+                view.shuffle_queue(cx);
+                assert!(view.pending_playback_jobs.is_empty());
+            }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while window
+                .update(cx, |view, _, _| {
+                    matches!(
+                        view.account_operation,
+                        Some(AccountOperation::Activating { .. })
+                    )
+                })
+                .unwrap()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "Synthetic player must acknowledge account activation"
+                );
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+            }
+            window.update(cx, |view,_,_| {
+                let job = view.pending_playback_jobs.try_recv().unwrap();
+                assert!(job.session.is_some_and(|session| Arc::ptr_eq(&session,&next)));
+                let PlaybackQuery::Collection(collection) = job.query else { panic!("Activation must replay the requested collection order") };
+                let expected = if same_account {
+                    source.toggled()
+                } else {
+                    serde_json::from_value(serde_json::json!({"id":"VLPLsynthetic","order":"Shuffled"})).unwrap()
+                };
+                assert_eq!(collection,expected,"A new account must refresh actions; the same account can retain its issued pair");
+                assert!(view.pending_playback_jobs.is_empty());
+            }).unwrap();
+        }
+    })
+}
+
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playlist responses only"]
 fn collection_shuffle_toggles_pending_requests_and_ignores_stale_results() -> Result<()> {
     use crate::app::{
         AccountOperation, PlaybackIntent, PlaybackQuery, PlaybackResult, QueueUpdate,
     };
-    use crate::queue_source::{CollectionPlayback, PlaybackOrder};
     use std::sync::atomic::Ordering;
 
     super::navigation::check_cache_window(async |window, cx| {
-        let details = crate::catalog::parse_page(&serde_json::json!({
-            "header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Synthetic playlist"},"buttons":[
-                {"musicPlayButtonRenderer":{"playNavigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"PLsynthetic","params":"original%3D"}}}},
-                {"menuRenderer":{"items":[{"menuNavigationItemRenderer":{"icon":{"iconType":"MUSIC_SHUFFLE"},"navigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"PLsynthetic","params":"shuffle%3D"}}}}]}}
-            ]}},"contents":[]
-        }), "Synthetic playlist").unwrap().header.unwrap().collection;
-        let source =
-            CollectionPlayback::new("VLPLsynthetic", &details, PlaybackOrder::Original).unwrap();
+        let source = collection_source();
         let tracks = continuation_page(0..3, None).tracks();
         let watch = |shuffled| {
             let queue = if shuffled {
