@@ -61,6 +61,8 @@ fn deliver(view: &mut Music, job: Job, result: Result<Page, String>, cx: &mut Co
 fn playlist_refreshes_expire_cached_pages_and_cancel_deleted_playlists() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window.update(cx, |view, window, cx| {
+            view.navigate(Route::Explore, cx);
+            super::navigation::reply(view, page(1, false), cx);
             let track = view.page.tracks()[0].clone();
             view.account_event(account::Event::Applied {
                 session:view.account.as_ref().unwrap().session.clone(),
@@ -68,10 +70,14 @@ fn playlist_refreshes_expire_cached_pages_and_cancel_deleted_playlists() -> Resu
                 result:Ok(Effect::PlaylistAdded { additions:vec![(track.id,"added-occurrence".into())], toast:None }), session_rejected:false,
             }, window, cx);
             let metadata = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(&metadata.query, Query::PlaylistMetadata(refresh) if refresh.id=="alpha"), "The held response must belong to Alpha's metadata read");
             view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "Opening the destination requests its first page");
             super::navigation::reply(view, playlist(0, false, "0 tracks"), cx);
             view.navigate(Route::Explore, cx);
-            super::navigation::reply(view, page(1, false), cx);
+            if view.catalog_requests.is_loading(CatalogTarget::Page) {
+                super::navigation::reply(view, page(1, false), cx);
+            }
             assert!(view.page_cache.iter().any(|entry| matches!(&entry.route, Route::Browse(link) if link.id=="VLalpha")), "The lagging destination must have entered the forward cache");
             let mut fresh = playlist(1, false, "1 track");
             let crate::catalog::Item::Track(added) = &mut fresh.shelves[0].items[0] else { panic!() };
@@ -79,6 +85,7 @@ fn playlist_refreshes_expire_cached_pages_and_cancel_deleted_playlists() -> Resu
             deliver(view, metadata, Ok(fresh.clone()), cx);
             view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
             assert!(view.rows.is_empty(), "Forward must not reuse the stale empty playlist");
+            assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "Verified metadata expires the stale forward visit");
             assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), Query::Browse(_)));
             assert_eq!(view.rows.len(), 1);
             assert_eq!(view.page.header.as_ref().unwrap().stats, "1 track");
