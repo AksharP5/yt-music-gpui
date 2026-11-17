@@ -979,9 +979,7 @@ impl PlaybackChannels {
                         }
                         PlaybackQuery::Collection(mut collection) => {
                             let result = catalog
-                                .and_then(|catalog| {
-                                    catalog.watch_playlist(collection.target(&catalog)?)
-                                })
+                                .and_then(|catalog| collection.watch(&catalog))
                                 .map(Box::new);
                             let session_rejected =
                                 result.as_ref().is_err_and(auth::session_was_rejected);

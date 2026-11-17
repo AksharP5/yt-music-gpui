@@ -128,7 +128,7 @@ impl CollectionPlayback {
         self.actions = None;
     }
 
-    pub fn target(&mut self, catalog: &Catalog) -> Result<&PlaylistTarget> {
+    pub fn watch(&mut self, catalog: &Catalog) -> Result<Watch> {
         if self.actions.is_none() {
             let page = catalog.browse(&BrowseLink::new(&self.id, "Queued collection"))?;
             if let Some(header) = page.header {
@@ -144,18 +144,27 @@ impl CollectionPlayback {
                 };
             }
         }
+        self.watch_with(|target| catalog.watch_playlist(target))
+    }
+
+    fn watch_with(
+        &mut self,
+        mut watch: impl FnMut(&PlaylistTarget) -> Result<Watch>,
+    ) -> Result<Watch> {
         if let (Some(action), Some(CollectionActions::Initial(target))) =
             (self.artist_action, &self.actions)
             && action.order() != self.order
         {
-            let watch = catalog.watch_playlist(target)?;
-            let shuffle = watch.shuffle.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "YouTube Music did not provide Shuffle controls for this artist queue"
-                )
-            })?;
-            self.actions = Some(CollectionActions::Pair(shuffle.actions));
+            let bootstrap = watch(target)?;
+            let Some(shuffle) = &bootstrap.shuffle else {
+                return Ok(bootstrap);
+            };
+            self.actions = Some(CollectionActions::Pair(shuffle.actions.clone()));
         }
+        watch(self.target()?)
+    }
+
+    fn target(&self) -> Result<&PlaylistTarget> {
         let actions = self.actions.as_ref().ok_or_else(|| {
             anyhow::anyhow!("YouTube Music did not provide playback actions for this collection")
         })?;
@@ -822,18 +831,17 @@ mod tests {
             }},"contents":[]
         }), "Playlist").unwrap();
         let details = page.header.unwrap().collection;
-        let catalog = Catalog::new().unwrap();
-        let mut original =
+        let original =
             CollectionPlayback::new("VLPLsource", &details, PlaybackOrder::Original).unwrap();
         assert_eq!(
-            original.target(&catalog).unwrap().request(),
+            original.target().unwrap().request(),
             json!({
                 "playlistId":"PLsource","params":"original%3D","index":0
             })
         );
-        let mut shuffled = original.toggled();
+        let shuffled = original.toggled();
         assert_eq!(
-            shuffled.target(&catalog).unwrap().request(),
+            shuffled.target().unwrap().request(),
             json!({
                 "playlistId":"PLsource","params":"shuffle%3D","index":7
             })
@@ -865,14 +873,14 @@ mod tests {
             "id":id,"order":"Shuffled"
         }))?;
         assert!(restored.actions.is_none());
-        let shuffled_request = restored.target(&catalog)?.request();
-        let shuffled = catalog.watch_playlist(restored.target(&catalog)?)?;
+        let shuffled = restored.watch(&catalog)?;
+        let shuffled_request = restored.target()?.request();
         assert!(!shuffled.queue.is_empty());
         assert!(shuffled.current.is_some());
         let mut original = restored.toggled();
-        let original_request = original.target(&catalog)?.request();
+        let original_request = original.target()?.request();
         assert_ne!(original_request, shuffled_request);
-        let watch = catalog.watch_playlist(original.target(&catalog)?)?;
+        let watch = original.watch(&catalog)?;
         assert_eq!(watch.current.as_ref().map(|track| &track.id), Some(&first));
         println!(
             "COLLECTION_RESTART guest=true actions_refreshed=true shuffled_rows={} original_rows={} original_first_matches=true",
@@ -897,7 +905,6 @@ mod tests {
             mix: Some(target("RDEMartist", "header-mix%3D")),
             ..Default::default()
         };
-        let catalog = Catalog::new().unwrap();
         for (mut source, origin, playlist, initial_order) in [
             (
                 CollectionPlayback::new("UCartist", &details, PlaybackOrder::Shuffled).unwrap(),
@@ -912,10 +919,7 @@ mod tests {
                 PlaybackOrder::Original,
             ),
         ] {
-            assert_eq!(
-                source.target(&catalog).unwrap().request()["playlistId"],
-                playlist
-            );
+            assert_eq!(source.target().unwrap().request()["playlistId"], playlist);
             assert!(
                 !source.apply_watch(&watch(&["abcdefghijk"], None, None)),
                 "Missing toggle controls must fall back to ordinary playback"
@@ -929,14 +933,14 @@ mod tests {
                 }),
             });
             assert!(source.apply_watch(&response));
-            let mut toggled = source.toggled();
+            let toggled = source.toggled();
             let expected = if initial_order == PlaybackOrder::Shuffled {
                 "queue-original%3D"
             } else {
                 "queue-shuffle%3D"
             };
             assert_eq!(
-                toggled.target(&catalog).unwrap().request(),
+                toggled.target().unwrap().request(),
                 json!({"playlistId":playlist,"params":expected})
             );
             let saved = serde_json::to_value(&source).unwrap();
@@ -958,6 +962,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_artist_bootstrap_controls_keep_the_playable_queue() {
+        let target = Arc::new(
+            PlaylistTarget::from_navigation(&json!({
+                "watchPlaylistEndpoint":{"playlistId":"RDartist","params":"header%3D"}
+            }))
+            .unwrap(),
+        );
+        let details = CollectionDetails {
+            shuffle: Some(target.clone()),
+            mix: Some(target),
+            ..Default::default()
+        };
+        for mut source in [
+            CollectionPlayback::new("UCartist", &details, PlaybackOrder::Shuffled)
+                .unwrap()
+                .toggled(),
+            CollectionPlayback::mix("UCartist", &details)
+                .unwrap()
+                .toggled(),
+        ] {
+            let mut requests = Vec::new();
+            let loaded = source
+                .watch_with(|target| {
+                    requests.push(target.request());
+                    Ok(watch(&["abcdefghijk", "lmnopqrstuv"], None, None))
+                })
+                .unwrap();
+            assert_eq!(
+                requests,
+                vec![json!({"playlistId":"RDartist","params":"header%3D"})]
+            );
+            assert_eq!(
+                loaded
+                    .queue
+                    .iter()
+                    .map(|track| track.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["abcdefghijk", "lmnopqrstuv"]
+            );
+            assert_eq!(loaded.current.as_ref().unwrap().id, "abcdefghijk");
+            assert!(
+                !source.apply_watch(&loaded),
+                "The worker must discard unsupported collection controls while retaining playback"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires network; public guest artist only, no account or playback"]
     fn artist_queues_refresh_both_orders_for_shuffle_and_mix() -> Result<()> {
         let id = "UCLEcrRNFiDrhwENdwVI-ZPQ";
@@ -975,7 +1027,7 @@ mod tests {
             CollectionPlayback::new(id, &details, PlaybackOrder::Shuffled).unwrap(),
             CollectionPlayback::mix(id, &details).unwrap(),
         ] {
-            let watch = catalog.watch_playlist(source.target(&catalog)?)?;
+            let watch = source.watch(&catalog)?;
             ensure!(
                 source.apply_watch(&watch),
                 "Artist queue must supply toggle actions"
@@ -987,14 +1039,14 @@ mod tests {
             let initial = source.order;
             let mut toggled = source.toggled();
             let requested = toggled.order;
-            let watch = catalog.watch_playlist(toggled.target(&catalog)?)?;
+            let watch = toggled.watch(&catalog)?;
             ensure!(
                 toggled.apply_watch(&watch) && toggled.order == requested,
                 "Toggle must return the requested order"
             );
             let saved = serde_json::to_value(&toggled)?;
             let mut restored: CollectionPlayback = serde_json::from_value(saved)?;
-            let watch = catalog.watch_playlist(restored.target(&catalog)?)?;
+            let watch = restored.watch(&catalog)?;
             ensure!(
                 restored.apply_watch(&watch) && restored.order == requested,
                 "Restart must refresh the same artist action and order"
