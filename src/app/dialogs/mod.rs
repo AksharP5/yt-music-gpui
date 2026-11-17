@@ -31,6 +31,7 @@ pub(in crate::app) enum Overlay {
     PlaylistPicker {
         /// One song from its menu, or the whole queue from Up next's Save.
         tracks: Vec<Track>,
+        error: Option<String>,
     },
     AlreadyAdded {
         id: String,
@@ -132,12 +133,15 @@ impl Music {
     /// Show loaded destinations at once while YouTube Music returns this selection's choices.
     pub(in crate::app) fn playlist_picker(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
         self.error = None;
-        self.overlay = Some(Overlay::PlaylistPicker { tracks });
+        self.overlay = Some(Overlay::PlaylistPicker {
+            tracks,
+            error: None,
+        });
         self.refresh_playlist_choices(cx);
     }
 
     pub(in crate::app) fn refresh_playlist_choices(&mut self, cx: &mut Context<Self>) {
-        let Some(Overlay::PlaylistPicker { tracks }) = &self.overlay else {
+        let Some(Overlay::PlaylistPicker { tracks, .. }) = &self.overlay else {
             return;
         };
         let video_ids = tracks.iter().map(|track| track.id.clone()).collect();
@@ -149,7 +153,7 @@ impl Music {
             return Cow::Borrowed(choices);
         }
         let tracks = match &self.overlay {
-            Some(Overlay::PlaylistPicker { tracks }) => tracks.as_slice(),
+            Some(Overlay::PlaylistPicker { tracks, .. }) => tracks.as_slice(),
             _ => &[],
         };
         Cow::Owned(playlist_choices::provisional(
@@ -1167,6 +1171,10 @@ impl Music {
     fn playlist_picker_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let theme = self.theme;
         let divider = gpui::white().opacity(0.1);
+        let submission_error = match &self.overlay {
+            Some(Overlay::PlaylistPicker { error, .. }) => error.as_ref(),
+            _ => None,
+        };
         let choices = self.playlist_picker_choices();
         let count = choices.destinations.len();
         let viewport: f32 = window.viewport_size().height.into();
@@ -1314,7 +1322,7 @@ impl Music {
                                             ))
                                         })
                                         .on_click(cx.listener(move |view, _, window, cx| {
-                                            let Some(Overlay::PlaylistPicker { tracks }) =
+                                            let Some(Overlay::PlaylistPicker { tracks, .. }) =
                                                 &view.overlay
                                             else {
                                                 return;
@@ -1340,8 +1348,20 @@ impl Music {
                                                     }
                                                 }
                                             };
+                                            if let Some(Overlay::PlaylistPicker { error, .. }) =
+                                                &mut view.overlay
+                                            {
+                                                *error = None;
+                                            }
+                                            view.error = None;
                                             if view.mutate(mutation, cx) {
                                                 view.close_overlay(window, cx);
+                                            } else if let Some(Overlay::PlaylistPicker {
+                                                error,
+                                                ..
+                                            }) = &mut view.overlay
+                                            {
+                                                *error = view.error.take();
                                             }
                                         }))
                                         .into_any_element()
@@ -1376,7 +1396,9 @@ impl Music {
         } else {
             body = body.child(div().h(px(PICKER_ROW)));
         }
-        if let Some(error) = &self.catalog_requests.playlist_choices_error {
+        if let Some(error) =
+            submission_error.or(self.catalog_requests.playlist_choices_error.as_ref())
+        {
             body = body.child(
                 div()
                     .px(px(24.))
@@ -1385,12 +1407,14 @@ impl Music {
                     .text_size(px(14.))
                     .text_color(theme.muted)
                     .child(pages::error_summary(error))
-                    .child(self.menu_action(
-                        "retry-playlist-choices",
-                        "Retry",
-                        cx,
-                        |view, _, cx| view.refresh_playlist_choices(cx),
-                    )),
+                    .when(submission_error.is_none(), |footer| {
+                        footer.child(self.menu_action(
+                            "retry-playlist-choices",
+                            "Retry",
+                            cx,
+                            |view, _, cx| view.refresh_playlist_choices(cx),
+                        ))
+                    }),
             );
         }
         body = body.child(
@@ -1416,7 +1440,7 @@ impl Music {
                 .child(icon("plus", 24., rgb(0x0f0f0f).into()))
                 .child("New playlist")
                 .on_click(cx.listener(|view, _, window, cx| {
-                    let Some(Overlay::PlaylistPicker { tracks }) = &view.overlay else {
+                    let Some(Overlay::PlaylistPicker { tracks, .. }) = &view.overlay else {
                         return;
                     };
                     let video_ids = tracks.iter().map(|track| track.id.clone()).collect();

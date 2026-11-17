@@ -811,7 +811,7 @@ impl Music {
         let Query::PlaylistChoices(video_ids) = &response.job.query else {
             return;
         };
-        let Some(Overlay::PlaylistPicker { tracks }) = &self.overlay else {
+        let Some(Overlay::PlaylistPicker { tracks, .. }) = &self.overlay else {
             return;
         };
         if response.job.account_revision != self.account_revision

@@ -465,8 +465,13 @@ impl Music {
                 self.notice = Some("Saving to YouTube Music…".into());
                 true
             }
-            Err(_) => {
+            Err(async_channel::TrySendError::Full(_)) => {
                 self.error = Some("Too many pending changes. Wait for them to finish.".into());
+                false
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                self.error =
+                    Some("The account connection stopped. Restart the app to reconnect.".into());
                 false
             }
         };
