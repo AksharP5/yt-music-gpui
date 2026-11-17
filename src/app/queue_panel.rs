@@ -155,6 +155,39 @@ impl Music {
                         .size_full(),
                     ),
             )
+            .when_some(
+                self.queue_source
+                    .error()
+                    .filter(|_| self.account_operation.is_none())
+                    .map(str::to_owned),
+                |panel, error| {
+                    panel.child(
+                        div()
+                            .px(px(8.))
+                            .py(px(12.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .text_size(px(12.))
+                            .text_color(theme.muted)
+                            .child(div().flex_1().min_w_0().child(error))
+                            .child(
+                                div()
+                                    .id("retry-queue")
+                                    .keyboard_control(theme)
+                                    .flex_shrink_0()
+                                    .px(px(12.))
+                                    .py(px(8.))
+                                    .text_size(px(14.))
+                                    .text_color(theme.text)
+                                    .cursor_pointer()
+                                    .child("Retry")
+                                    .on_click(cx.listener(|view, _, _, cx| view.retry_queue(cx))),
+                            ),
+                    )
+                },
+            )
             .into_any_element()
     }
 

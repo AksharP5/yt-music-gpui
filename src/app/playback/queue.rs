@@ -496,12 +496,42 @@ impl Music {
                         return;
                     }
                 }
-                if self.queue_waiting.take().is_some() {
+                if self.queue_waiting.is_some() {
                     self.playback = Playback::Stopped;
                     self.notice = None;
                 }
                 self.error = Some(error);
             }
+        }
+        self.notify_playback(cx);
+    }
+
+    pub(in crate::app) fn retry_queue(&mut self, cx: &mut Context<Self>) {
+        if self.account_operation.is_some() {
+            return;
+        }
+        let Some(error) = self.queue_source.error().map(str::to_owned) else {
+            return;
+        };
+        let session = self.account.as_ref().map(|account| &account.session);
+        match self.queue_source.load(session, true) {
+            Ok(true) => {
+                if self.error.as_ref() == Some(&error) {
+                    self.error = None;
+                }
+                if let Some(intent) = self.queue_waiting {
+                    if intent.playback != Playback::Stopped {
+                        self.playback = Playback::Loading {
+                            paused: intent.playback.is_paused(),
+                            retried: false,
+                            full_lookup: false,
+                        };
+                    }
+                    self.notice = Some("Loading more queued songs".into());
+                }
+            }
+            Ok(false) => {}
+            Err(error) => self.error = Some(error),
         }
         self.notify_playback(cx);
     }
@@ -700,8 +730,13 @@ impl Music {
                 self.autoplay_waiting = None;
                 let session = self.account.as_ref().map(|account| &account.session);
                 self.queue_source.restore(&mut self.library.queue, session);
-                match self.queue_source.load(session, !intent.natural) {
+                let error = self.queue_source.error().map(str::to_owned);
+                let retry = !intent.natural || self.queue_source.retryable_failure();
+                match self.queue_source.load(session, retry) {
                     Ok(true) => {
+                        if self.error == error {
+                            self.error = None;
+                        }
                         self.queue_waiting = Some(intent);
                         if intent.playback != Playback::Stopped {
                             self.playback = Playback::Loading {

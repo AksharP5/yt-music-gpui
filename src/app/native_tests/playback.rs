@@ -9,6 +9,210 @@ use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, poi
 use std::time::{Duration, Instant};
 use std::{collections::HashSet, process::Command};
 
+fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> crate::catalog::Page {
+    crate::app::sync::tests::response(&[("Songs", indices.collect())], token, true)
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic queue and local connection failures only"]
+fn natural_advancement_retries_a_failed_prefetch_and_continues_the_queue() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut calls = 0;
+        let (source, events) = crate::queue_source::Worker::with_page_loader(move || {
+            calls += 1;
+            if calls <= 2 {
+                return Err(client
+                    .get("http://127.0.0.1:0")
+                    .send()
+                    .unwrap_err()
+                    .without_url()
+                    .into());
+            }
+            Ok(continuation_page(100..102, None))
+        });
+        window
+            .update(cx, move |view, _, cx| {
+                view.account = None;
+                view.library.autoplay = false;
+                view.queue_source = source;
+                view.queue_source.replace_queue(
+                    &mut view.library.queue,
+                    &continuation_page(0..100, Some("tail")),
+                    99,
+                    PageRequest::Browse,
+                    None,
+                );
+                view.playback = Playback::Stopped;
+                view.error = None;
+                view.prefetch_queue(cx);
+            })
+            .unwrap();
+        for _ in 0..2 {
+            let event = events.recv().await.unwrap();
+            window
+                .update(cx, move |view, _, cx| view.queue_source_result(event, cx))
+                .unwrap();
+        }
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.queue_source.error().is_some());
+                assert_eq!(view.library.queue.tracks.len(), 100);
+                assert_eq!(view.library.queue.index, Some(99));
+                view.next(true, cx);
+                assert!(
+                    view.queue_waiting.is_some(),
+                    "A natural end must retry the failed prefetch"
+                );
+                assert!(view.queue_source.error().is_none());
+            })
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        window
+            .update(cx, move |view, _, cx| {
+                view.queue_source_result(event, cx);
+                assert_eq!(view.library.queue.index, Some(100));
+                assert_eq!(view.library.queue.current().unwrap().id, "00000000100");
+                assert_eq!(view.library.queue.tracks.len(), 102);
+                assert!(!view.library.queue.incomplete);
+                assert!(view.queue_waiting.is_none());
+                assert!(view.error.is_none());
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic queue and local connection failures only"]
+fn queue_retry_button_preserves_pause_and_a_stopped_retry_cannot_start_playback() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+    super::navigation::check_cache_window(async |window, cx| {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut calls = 0;
+        let (source, events) = crate::queue_source::Worker::with_page_loader(move || {
+            calls += 1;
+            if calls <= 3 {
+                return Err(client
+                    .get("http://127.0.0.1:0")
+                    .send()
+                    .unwrap_err()
+                    .without_url()
+                    .into());
+            }
+            Ok(continuation_page(1..2, None))
+        });
+        window
+            .update(cx, move |view, _, cx| {
+                view.account = None;
+                view.library.autoplay = false;
+                view.queue_source = source;
+                view.queue_source.replace_queue(
+                    &mut view.library.queue,
+                    &continuation_page(0..1, Some("tail")),
+                    0,
+                    PageRequest::Browse,
+                    None,
+                );
+                view.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                view.player_open = true;
+                view.error = None;
+                view.prefetch_queue(cx);
+            })
+            .unwrap();
+        for _ in 0..2 {
+            let event = events.recv().await.unwrap();
+            window
+                .update(cx, move |view, _, cx| view.queue_source_result(event, cx))
+                .unwrap();
+        }
+        window
+            .update(cx, |view, _, cx| {
+                assert!(
+                    view.playback.is_paused(),
+                    "Failed prefetch must not change the current song's pause state"
+                );
+                view.next(false, cx);
+                assert!(view.queue_waiting.unwrap().playback.is_paused());
+            })
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        window
+            .update(cx, move |view, _, cx| {
+                view.queue_source_result(event, cx);
+                assert_eq!(view.playback, Playback::Stopped);
+                assert!(view.queue_waiting.unwrap().playback.is_paused());
+                assert!(view.queue_source.error().is_some());
+                assert!(view.library.queue.incomplete);
+                assert_eq!(view.library.queue.index, Some(0));
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        let position = window
+            .update(cx, |view, window, _| {
+                super::render::capture(window, "queue-continuation-retry");
+                let bounds = view.player_page.queue_bounds.get();
+                point(bounds.right() - px(36.), bounds.bottom() + px(28.))
+            })
+            .unwrap();
+        for event in [
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+        }
+        window
+            .update(cx, |view, _, cx| {
+                assert!(
+                    view.queue_source.error().is_none(),
+                    "Clicking Retry must dispatch a new continuation request"
+                );
+                assert!(view.queue_waiting.unwrap().playback.is_paused());
+                assert!(
+                    view.playback.is_paused(),
+                    "Retry must preserve the paused queue's intent"
+                );
+                view.stop_playback(cx);
+            })
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        window
+            .update(cx, move |view, _, cx| {
+                view.queue_source_result(event, cx);
+                assert_eq!(view.library.queue.tracks.len(), 2);
+                assert_eq!(view.library.queue.index, Some(0));
+                assert_eq!(view.playback, Playback::Stopped);
+                assert!(view.active_id.is_none());
+                assert!(view.queue_waiting.is_none());
+                assert!(view.error.is_none());
+            })
+            .unwrap();
+    })
+}
+
 #[test]
 #[ignore = "requires isolated desktop/D-Bus, network and a yt-dlp version-mismatch wrapper; set YT_MUSIC_NATIVE_TESTS=1"]
 fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> Result<()> {
