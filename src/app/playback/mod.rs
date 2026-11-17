@@ -11,7 +11,25 @@ pub(in crate::app) use queue::PlaybackChannels;
 pub(in crate::app) enum PlaybackQuery {
     Watch { track: Box<Track>, mode: WatchMode },
     Playlist(Arc<PlaylistTarget>),
+    Collection(queue_source::CollectionPlayback),
     More(WatchContinuation),
+}
+
+impl PlaybackQuery {
+    pub(in crate::app) fn collection(
+        collection: &Collection,
+        order: queue_source::PlaybackOrder,
+    ) -> Option<Self> {
+        let target = match order {
+            queue_source::PlaybackOrder::Original => &collection.details.play,
+            queue_source::PlaybackOrder::Shuffled => &collection.details.shuffle,
+        }
+        .clone()?;
+        Some(
+            queue_source::CollectionPlayback::new(&collection.id, &collection.details, order)
+                .map_or(Self::Playlist(target), Self::Collection),
+        )
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum QueueUpdate {
@@ -39,6 +57,7 @@ pub(in crate::app) enum PlaybackResult {
         id: u64,
         account_revision: u64,
         update: QueueUpdate,
+        collection: Option<queue_source::CollectionPlayback>,
         result: Result<Box<Watch>, String>,
         session_rejected: bool,
     },

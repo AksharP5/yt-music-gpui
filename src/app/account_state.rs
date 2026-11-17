@@ -73,6 +73,9 @@ impl Music {
         self.pending_mutations.clear();
         self.playback_generation.fetch_add(1, Ordering::Relaxed);
         self.watch_pending = None;
+        if let Some(collection) = &mut self.library.queue.collection {
+            collection.clear_actions();
+        }
         self.reset_radio();
         let _ = self.pending_playback_jobs.try_recv();
         self.now_playing = None;
@@ -151,10 +154,13 @@ impl Music {
                 }
             }
             Some(PlaybackIntent::Queue {
-                query,
+                mut query,
                 paused,
                 advance,
             }) => {
+                if !same_account && let PlaybackQuery::Collection(collection) = &mut query {
+                    collection.clear_actions();
+                }
                 self.start_queue(query, cx);
                 self.playback = self.playback.with_pause(paused);
                 if let Some(mut intent) = advance {
@@ -267,7 +273,8 @@ impl Music {
                     mode: WatchMode::Radio,
                     ..
                 }
-                | PlaybackQuery::Playlist(_)),
+                | PlaybackQuery::Playlist(_)
+                | PlaybackQuery::Collection(_)),
             ) => Some(PlaybackIntent::Queue {
                 query,
                 paused: self.playback.is_paused(),

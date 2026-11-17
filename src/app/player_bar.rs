@@ -71,7 +71,37 @@ fn tinted_control(
 }
 
 impl Music {
+    fn collection_playback(&self) -> Option<&queue_source::CollectionPlayback> {
+        let pending = self
+            .watch_pending
+            .as_ref()
+            .or(match self.account_operation.as_ref() {
+                Some(
+                    AccountOperation::Refreshing { resume, .. }
+                    | AccountOperation::Activating { resume, .. }
+                    | AccountOperation::RefreshFailed { resume },
+                ) => match resume {
+                    Some(PlaybackIntent::Queue { query, .. }) => Some(query),
+                    _ => None,
+                },
+                _ => None,
+            });
+        match pending {
+            Some(PlaybackQuery::Collection(collection)) => Some(collection),
+            None
+            | Some(PlaybackQuery::Watch {
+                mode: WatchMode::Details,
+                ..
+            }) => self.library.queue.collection.as_ref(),
+            Some(_) => None,
+        }
+    }
+
     pub(in crate::app) fn shuffle_queue(&mut self, cx: &mut Context<Self>) {
+        if let Some(collection) = self.collection_playback() {
+            self.start_queue(PlaybackQuery::Collection(collection.toggled()), cx);
+            return;
+        }
         let session = self.account.as_ref().map(|account| &account.session);
         match self.queue_source.shuffle(&mut self.library.queue, session) {
             Ok(()) => self.notice = Some("Upcoming songs shuffled".into()),
@@ -492,7 +522,14 @@ impl Music {
             .child(tinted_control(
                 "shuffle",
                 "shuffle",
-                rgb(INACTIVE),
+                if self
+                    .collection_playback()
+                    .is_some_and(|collection| collection.order == PlaybackOrder::Shuffled)
+                {
+                    theme.text
+                } else {
+                    rgb(INACTIVE).into()
+                },
                 theme,
                 cx,
                 |view, _, cx| view.shuffle_queue(cx),

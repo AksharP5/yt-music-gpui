@@ -71,7 +71,7 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | ↑ / ↓ or = / - | Volume up / down |
 | M | Mute |
 | R | Repeat: off, all, one |
-| S | Shuffle upcoming songs |
+| S | Shuffle |
 | + | Like the current song |
 | _ | Dislike the current song |
 | Q | Open or close the player page |

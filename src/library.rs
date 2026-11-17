@@ -119,8 +119,10 @@ pub struct Queue {
     /// The album, playlist or mix this queue came from, shown as "Playing from".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playing_from: Option<String>,
-    /// Keep continuation pages mixed into the remaining queue after Shuffle.
+    /// Local shuffle mixes continuation pages. Service ordering lives in `collection`.
     pub(crate) shuffled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) collection: Option<crate::queue_source::CollectionPlayback>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<crate::queue_source::SavedSource>,
     #[serde(skip)]
@@ -137,6 +139,7 @@ impl Queue {
         self.incomplete = false;
         self.playing_from = None;
         self.shuffled = false;
+        self.collection = None;
         self.source_id = None;
         self.source = None;
     }

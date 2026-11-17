@@ -1,6 +1,9 @@
 use crate::{
     auth::{self, Session},
-    catalog::{BrowseLink, Catalog, Continuation, Item, Page, Track, WatchTarget},
+    catalog::{
+        BrowseLink, Catalog, CollectionDetails, Continuation, Item, Page, PlaylistTarget, Track,
+        WatchTarget,
+    },
     library::Queue,
     search::{SearchFilter, SearchScope},
     watch::{Watch, WatchContinuation},
@@ -25,6 +28,84 @@ pub enum PageRequest {
         filter: SearchFilter,
         scope: SearchScope,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PlaybackOrder {
+    Original,
+    Shuffled,
+}
+
+/// A collection's issued Play and Shuffle actions. Saved queues keep only its
+/// public browse ID and order; actions are refreshed under the current account.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CollectionPlayback {
+    id: String,
+    pub order: PlaybackOrder,
+    #[serde(skip)]
+    actions: Option<Arc<CollectionActions>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct CollectionActions {
+    play: Arc<PlaylistTarget>,
+    shuffle: Arc<PlaylistTarget>,
+}
+
+impl CollectionActions {
+    fn new(details: &CollectionDetails) -> Option<Self> {
+        Some(Self {
+            play: details.play.clone()?,
+            shuffle: details.shuffle.clone()?,
+        })
+    }
+}
+
+impl CollectionPlayback {
+    pub fn new(id: &str, details: &CollectionDetails, order: PlaybackOrder) -> Option<Self> {
+        if !id.starts_with("VL") && !id.starts_with("MPREb") {
+            return None;
+        }
+        Some(Self {
+            id: id.to_owned(),
+            order,
+            actions: Some(Arc::new(CollectionActions::new(details)?)),
+        })
+    }
+
+    pub fn toggled(&self) -> Self {
+        Self {
+            order: match self.order {
+                PlaybackOrder::Original => PlaybackOrder::Shuffled,
+                PlaybackOrder::Shuffled => PlaybackOrder::Original,
+            },
+            ..self.clone()
+        }
+    }
+
+    pub fn clear_actions(&mut self) {
+        self.actions = None;
+    }
+
+    pub fn target(&mut self, catalog: &Catalog) -> Result<&PlaylistTarget> {
+        if self.actions.is_none() {
+            let page = catalog.browse(&BrowseLink::new(&self.id, "Queued collection"))?;
+            self.actions = page
+                .header
+                .as_ref()
+                .and_then(|header| CollectionActions::new(&header.collection))
+                .map(Arc::new);
+        }
+        let actions = self.actions.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "YouTube Music did not provide Play and Shuffle actions for this collection"
+            )
+        })?;
+        Ok(match self.order {
+            PlaybackOrder::Original => &actions.play,
+            PlaybackOrder::Shuffled => &actions.shuffle,
+        })
+    }
 }
 
 /// Only public request fields and consumed track IDs, never continuation tokens,
@@ -646,6 +727,81 @@ mod tests {
     };
     use serde_json::json;
     use std::{collections::VecDeque, sync::mpsc, time::Duration};
+
+    #[test]
+    fn collection_shuffle_keeps_issued_actions_out_of_saved_queues() {
+        let page = crate::catalog::parse_page(&json!({
+            "header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"Playlist"},"buttons":[
+                    {"musicPlayButtonRenderer":{"playNavigationEndpoint":{"watchPlaylistEndpoint":{
+                        "playlistId":"PLsource","params":"original%3D","index":0
+                    }}}},
+                    {"menuRenderer":{"items":[{"menuNavigationItemRenderer":{
+                        "icon":{"iconType":"MUSIC_SHUFFLE"},"navigationEndpoint":{"watchPlaylistEndpoint":{
+                            "playlistId":"PLsource","params":"shuffle%3D","index":7
+                        }}
+                    }}]}}
+                ]
+            }},"contents":[]
+        }), "Playlist").unwrap();
+        let details = page.header.unwrap().collection;
+        let catalog = Catalog::new().unwrap();
+        let mut original =
+            CollectionPlayback::new("VLPLsource", &details, PlaybackOrder::Original).unwrap();
+        assert_eq!(
+            original.target(&catalog).unwrap().request(),
+            json!({
+                "playlistId":"PLsource","params":"original%3D","index":0
+            })
+        );
+        let mut shuffled = original.toggled();
+        assert_eq!(
+            shuffled.target(&catalog).unwrap().request(),
+            json!({
+                "playlistId":"PLsource","params":"shuffle%3D","index":7
+            })
+        );
+        let saved = serde_json::to_value(&shuffled).unwrap();
+        assert_eq!(saved, json!({"id":"VLPLsource","order":"Shuffled"}));
+        let restored: CollectionPlayback = serde_json::from_value(saved).unwrap();
+        assert!(restored.actions.is_none());
+        assert_eq!(restored.order, PlaybackOrder::Shuffled);
+        assert!(CollectionPlayback::new("UCartist", &details, PlaybackOrder::Original).is_none());
+        let mut queue = Queue {
+            collection: Some(shuffled),
+            ..Default::default()
+        };
+        queue.replace(vec![track("new-selection")], 0);
+        assert!(queue.collection.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires network; public guest collection only, no account or playback"]
+    fn restored_collection_refreshes_its_actions_and_loads_both_playback_orders() -> Result<()> {
+        let id = "VLRDCLAK5uy_k0UsUzNCizrQpUspNsoj2iO-EsevEywLY";
+        let catalog = Catalog::new()?;
+        let page = catalog.browse(&BrowseLink::new(id, "Instrumental Pop Covers"))?;
+        let first = page.tracks().first().map(|track| track.id.clone()).unwrap();
+        let mut restored: CollectionPlayback = serde_json::from_value(json!({
+            "id":id,"order":"Shuffled"
+        }))?;
+        assert!(restored.actions.is_none());
+        let shuffled_request = restored.target(&catalog)?.request();
+        let shuffled = catalog.watch_playlist(restored.target(&catalog)?)?;
+        assert!(!shuffled.queue.is_empty());
+        assert!(shuffled.current.is_some());
+        let mut original = restored.toggled();
+        let original_request = original.target(&catalog)?.request();
+        assert_ne!(original_request, shuffled_request);
+        let watch = catalog.watch_playlist(original.target(&catalog)?)?;
+        assert_eq!(watch.current.as_ref().map(|track| &track.id), Some(&first));
+        println!(
+            "COLLECTION_RESTART guest=true actions_refreshed=true shuffled_rows={} original_rows={} original_first_matches=true",
+            shuffled.queue.len(),
+            watch.queue.len()
+        );
+        Ok(())
+    }
 
     fn track(id: &str) -> crate::catalog::Track {
         crate::catalog::Track {

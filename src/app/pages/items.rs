@@ -289,7 +289,9 @@ impl Music {
         let artist =
             matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
         let play = match &item {
-            Item::Collection(collection) => collection.details.play.clone(),
+            Item::Collection(collection) => {
+                PlaybackQuery::collection(collection, PlaybackOrder::Original)
+            }
             _ => None,
         };
         let playable = play.is_some() || matches!(&item, Item::Track(_));
@@ -346,10 +348,10 @@ impl Music {
                 .cursor_pointer()
                 .child(icon("play", 24., self.theme.text));
             hover = hover.child(match play {
-                Some(target) => play_button.on_click(cx.listener(move |view, _, window, cx| {
+                Some(query) => play_button.on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
                     window.focus(&view.focus, cx);
-                    view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                    view.start_queue(query.clone(), cx);
                 })),
                 None => play_button.on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
