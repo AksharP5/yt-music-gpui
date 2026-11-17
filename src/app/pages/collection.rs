@@ -262,7 +262,7 @@ impl Music {
                 .child(
                     filter_chip("edit-playlist", "Edit playlist", false, self.theme).on_click(
                         cx.listener(|view, _, window, cx| {
-                            view.playlist_form(true, None, window, cx)
+                            view.playlist_form(true, Vec::new(), window, cx)
                         }),
                     ),
                 )
@@ -289,7 +289,9 @@ impl Music {
         {
             actions = actions.child(
                 filter_chip("new-playlist", "New playlist", false, self.theme).on_click(
-                    cx.listener(|view, _, window, cx| view.playlist_form(false, None, window, cx)),
+                    cx.listener(|view, _, window, cx| {
+                        view.playlist_form(false, Vec::new(), window, cx)
+                    }),
                 ),
             );
         }

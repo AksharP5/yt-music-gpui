@@ -1,12 +1,13 @@
 use crate::{
     auth::{self, Operation, Session, SharedSession},
     catalog::{
-        Account, ArtistSubscription, Catalog, Collection, Page, Rating, Track, find, parse_page,
+        Account, ArtistSubscription, Catalog, Collection, Continuation, Page, Rating, Track, find,
+        parse_page, valid_video_id,
     },
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{sync::Arc, thread};
+use std::{collections::HashSet, sync::Arc, thread};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -139,7 +140,7 @@ pub enum Mutation {
         title: String,
         description: String,
         privacy: Privacy,
-        initial_video_id: Option<String>,
+        initial_video_ids: Vec<String>,
     },
     EditPlaylist {
         id: String,
@@ -615,9 +616,7 @@ impl Catalog {
             _ => None,
         };
         if let Some(id) = playlist {
-            self.wait_for_playlist(id, current, expected, |page| {
-                playlist_metadata_visible(mutation, page)
-            })?;
+            self.wait_for_playlist(id, current, expected, mutation)?;
         }
         Ok(effect)
     }
@@ -627,7 +626,7 @@ impl Catalog {
         id: &str,
         current: &SharedSession,
         expected: &Arc<Session>,
-        visible: impl Fn(&Page) -> bool,
+        mutation: &Mutation,
     ) -> Result<()> {
         // Playlist reads can lag an acknowledged write. Retry reads, never the write.
         for attempt in 0..5 {
@@ -635,8 +634,26 @@ impl Catalog {
             let response = self.request("browse", json!({"browseId":format!("VL{}",playlist_id(id))}))
                 .context("YouTube accepted the change, but refreshing the playlist failed. Refresh the playlist.")?;
             require_current_session(current, expected)?;
-            if response.get("contents").is_some() && visible(&parse_page(&response, "Playlist")?) {
-                return Ok(());
+            if response.get("contents").is_some() {
+                let page = self.bind_page(parse_page(&response, "Playlist")?, &response, None)?;
+                if playlist_metadata_visible(mutation, &page) {
+                    let tracks_visible = match mutation {
+                        Mutation::CreatePlaylist {
+                            initial_video_ids, ..
+                        } => playlist_tracks_visible(initial_video_ids, page, |continuation| {
+                            require_current_session(current, expected)?;
+                            let page = self.more(continuation).context(
+                                    "YouTube accepted the change, but refreshing the rest of the playlist failed. Refresh the playlist.",
+                                )?;
+                            require_current_session(current, expected)?;
+                            Ok(page)
+                        })?,
+                        _ => true,
+                    };
+                    if tracks_visible {
+                        return Ok(());
+                    }
+                }
             }
             if attempt < 4 {
                 thread::sleep(std::time::Duration::from_millis(500));
@@ -716,12 +733,16 @@ impl Catalog {
                 title,
                 description,
                 privacy,
-                initial_video_id,
+                initial_video_ids,
             } => {
                 ensure!(!title.trim().is_empty(), "Enter a playlist name");
+                ensure!(
+                    initial_video_ids.iter().all(|id| valid_video_id(id)),
+                    "A song has an invalid YouTube ID. Refresh and try again."
+                );
                 let mut body = json!({"title":title.trim(),"description":description,"privacyStatus":privacy.value()});
-                if let Some(video_id) = initial_video_id {
-                    body["videoIds"] = json!([video_id]);
+                if !initial_video_ids.is_empty() {
+                    body["videoIds"] = json!(initial_video_ids);
                 }
                 ("playlist/create", body)
             }
@@ -789,20 +810,16 @@ impl Catalog {
 }
 
 fn playlist_metadata_visible(mutation: &Mutation, page: &Page) -> bool {
-    let tracks = page.tracks();
     match mutation {
         Mutation::CreatePlaylist {
             title,
             description,
             privacy,
-            initial_video_id,
+            ..
         } => {
             page.title == title.trim()
                 && page.description == *description
                 && page.privacy.as_deref() == Some(privacy.value())
-                && initial_video_id
-                    .as_ref()
-                    .is_none_or(|id| tracks.iter().any(|track| track.id == *id))
         }
         Mutation::EditPlaylist {
             title,
@@ -816,6 +833,35 @@ fn playlist_metadata_visible(mutation: &Mutation, page: &Page) -> bool {
         }
         _ => false,
     }
+}
+
+fn playlist_tracks_visible(
+    video_ids: &[String],
+    mut page: Page,
+    mut more: impl FnMut(&Continuation) -> Result<Page>,
+) -> Result<bool> {
+    let mut confirmed = 0;
+    let mut continuations = HashSet::new();
+    while confirmed < video_ids.len() {
+        let before = confirmed;
+        for track in page.tracks() {
+            if track.id != video_ids[confirmed] {
+                return Ok(false);
+            }
+            confirmed += 1;
+            if confirmed == video_ids.len() {
+                return Ok(true);
+            }
+        }
+        let Some(continuation) = page.continuation else {
+            return Ok(false);
+        };
+        if confirmed == before || !continuations.insert(continuation.token().to_owned()) {
+            return Ok(false);
+        }
+        page = more(&continuation)?;
+    }
+    Ok(true)
 }
 
 fn mutation_effect(mutation: &Mutation, response: &Value) -> Result<Effect> {
@@ -1009,7 +1055,7 @@ mod tests {
                 title: " Renamed ".into(),
                 description: "Updated description".into(),
                 privacy: Privacy::Private,
-                initial_video_id: Some("abcdefghijk".into()),
+                initial_video_ids: vec!["abcdefghijk".into()],
             },
             Mutation::EditPlaylist {
                 id: "PLedited".into(),
@@ -1217,22 +1263,29 @@ mod tests {
     }
 
     #[test]
-    fn playlist_creation_includes_the_submitted_song_in_its_request() {
+    fn playlist_creation_preserves_submitted_songs_in_order_with_duplicates() {
         let catalog = Catalog::new().unwrap();
-        for initial_video_id in [None, Some("abcdefghijk".to_owned())] {
+        for (ids, expected) in [
+            (vec![], None),
+            (vec!["abcdefghijk"], Some(json!(["abcdefghijk"]))),
+            (
+                vec!["abcdefghijk", "lmnopqrstuv", "abcdefghijk"],
+                Some(json!(["abcdefghijk", "lmnopqrstuv", "abcdefghijk"])),
+            ),
+        ] {
             let submitted = Mutation::CreatePlaylist {
                 title: " First playlist ".into(),
                 description: "Description".into(),
                 privacy: Privacy::Unlisted,
-                initial_video_id: initial_video_id.clone(),
+                initial_video_ids: ids.into_iter().map(str::to_owned).collect(),
             };
             let (endpoint, body) = catalog.mutation_request(&submitted).unwrap();
             assert_eq!(endpoint, "playlist/create");
             assert_eq!(body["title"], "First playlist");
             assert_eq!(body["description"], "Description");
             assert_eq!(body["privacyStatus"], "UNLISTED");
-            match initial_video_id {
-                Some(_) => assert_eq!(body["videoIds"], json!(["abcdefghijk"])),
+            match expected {
+                Some(expected) => assert_eq!(body["videoIds"], expected),
                 None => assert!(body.get("videoIds").is_none()),
             }
             let Effect::CreatedPlaylist { id } =
@@ -1243,6 +1296,80 @@ mod tests {
             assert_eq!(id, "PLcreated");
             assert!(mutation_effect(&submitted, &json!({})).is_err());
         }
+        for invalid in 0..3 {
+            let mut initial_video_ids = vec!["abcdefghijk".into(); 3];
+            initial_video_ids[invalid] = "invalid".into();
+            assert!(
+                catalog
+                    .mutation_request(&Mutation::CreatePlaylist {
+                        title: "First playlist".into(),
+                        description: String::new(),
+                        privacy: Privacy::Private,
+                        initial_video_ids,
+                    })
+                    .is_err(),
+                "Every submitted song ID must be validated"
+            );
+        }
+    }
+
+    #[test]
+    fn playlist_creation_readback_checks_the_complete_ordered_queue() {
+        let page = |ids: &[&str], continuation: Option<&str>| {
+            let mut page = playlist_page(&[]);
+            page.shelves[0].items = ids
+                .iter()
+                .map(|id| {
+                    crate::catalog::Item::Track(
+                        serde_json::from_value(json!({
+                            "id":id, "title":"Song", "artist":"Artist"
+                        }))
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            page.continuation = continuation
+                .map(|token| Continuation::from_response(token, &json!({}), None).unwrap());
+            page
+        };
+        let ids = ["abcdefghijk", "lmnopqrstuv", "abcdefghijk"].map(str::to_owned);
+        let mut reads = 0;
+        assert!(
+            playlist_tracks_visible(&ids, page(&["abcdefghijk"], Some("tail")), |token| {
+                reads += 1;
+                assert_eq!(token.token(), "tail");
+                Ok(page(&["lmnopqrstuv", "abcdefghijk"], Some("unused")))
+            })
+            .unwrap()
+        );
+        assert_eq!(reads, 1, "Read only until every submitted song is verified");
+
+        for tail in [
+            page(&["lmnopqrstuv"], None),
+            page(&["lmnopqrstuv", "lmnopqrstuv"], None),
+            page(&["lmnopqrstuv"], Some("tail")),
+            page(&[], Some("another-tail")),
+        ] {
+            let mut reads = 0;
+            assert!(
+                !playlist_tracks_visible(&ids, page(&["abcdefghijk"], Some("tail")), |_| {
+                    reads += 1;
+                    assert_eq!(reads, 1, "Repeated or empty pages must not keep loading");
+                    Ok(tail.clone())
+                })
+                .unwrap(),
+                "A prefix, missing duplicate, wrong order or looping continuation is not confirmation"
+            );
+        }
+        let failed = playlist_tracks_visible(&ids, page(&["abcdefghijk"], Some("tail")), |_| {
+            anyhow::bail!("Synthetic continuation failure")
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .contains("Synthetic continuation failure")
+        );
     }
     fn synthetic_session() -> Session {
         serde_json::from_value(json!({

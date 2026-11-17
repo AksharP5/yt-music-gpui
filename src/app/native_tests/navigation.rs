@@ -1424,6 +1424,98 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn a_queue_can_create_its_first_playlist_without_losing_songs() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+
+    check_cache_window(async |window, cx| {
+        let (commands, submitted) = async_channel::bounded(1);
+        window
+            .update(cx, |view, _, cx| {
+                view.account_commands = commands;
+                view.sidebar_playlists.clear();
+                let tracks = view.page.tracks();
+                view.library.queue.replace(
+                    vec![tracks[0].clone(), tracks[1].clone(), tracks[0].clone()],
+                    0,
+                );
+                view.player_open = true;
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let save = window
+            .update(cx, |view, _, _| {
+                let queue = view.player_page.queue_bounds.get();
+                // Save is above the 62px autoplay section, centered in its 64px header.
+                point(queue.right() - px(45.), queue.top() - px(94.))
+            })
+            .unwrap();
+        for event in [
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: save,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: save,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        }
+        window
+            .update(cx, |view, _, _| {
+                assert!(matches!(
+                    &view.overlay,
+                    Some(crate::app::Overlay::PlaylistPicker { tracks }) if tracks.len() == 3
+                ));
+            })
+            .unwrap();
+        // With no saved playlists, the dialog has Close and New playlist as its tab stops.
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    matches!(view.overlay, Some(crate::app::Overlay::PlaylistForm { .. })),
+                    "New playlist must be available when saving a queue with no editable playlists"
+                );
+            })
+            .unwrap();
+        for key in ["q", "u", "e", "u", "e", "d", "enter"] {
+            super::render::key(window, cx, key).await;
+        }
+        let account::Command::Apply { mutation, .. } = submitted.try_recv().unwrap() else {
+            panic!("Expected a playlist creation request")
+        };
+        let Mutation::CreatePlaylist {
+            title,
+            initial_video_ids,
+            ..
+        } = *mutation
+        else {
+            panic!("Expected New playlist to create the selected queue")
+        };
+        assert_eq!(title, "queued");
+        assert_eq!(
+            initial_video_ids,
+            ["00000000000", "00000000001", "00000000000"],
+            "Saving a queue must preserve every song in order, including repeats"
+        );
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn clicking_a_queued_row_plays_it_and_dragging_reorders() -> Result<()> {
     use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
     check_cache_window(async |window, cx| {
