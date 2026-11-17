@@ -1637,6 +1637,72 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_picker_shows_a_rejected_save_inside_the_dialog() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let (commands, submitted) = async_channel::bounded(1);
+                drop(submitted);
+                view.account_commands = commands;
+                view.sidebar_playlists.clear();
+                let track = view.page.tracks()[0].clone();
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(vec![track], cx);
+            })
+            .unwrap();
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        wait_for_presented_frame(window, cx).await;
+        let before = window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-save-before-rejection")
+            })
+            .unwrap();
+        super::render::key(window, cx, "enter").await;
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                let Some(crate::app::Overlay::PlaylistPicker { error, .. }) = &view.overlay else {
+                    panic!("A rejected save must keep the picker open")
+                };
+                assert_eq!(
+                    error.as_deref(),
+                    Some("The account connection stopped. Restart the app to reconnect.")
+                );
+                assert!(
+                    view.error.is_none(),
+                    "A picker submission error must not move the background page"
+                );
+                assert!(view.pending_mutations.is_empty());
+            })
+            .unwrap();
+        let after = window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-save-rejected")
+            })
+            .unwrap();
+        let x = after.width() / 2 - 190;
+        let y = after.height() / 2 + 150;
+        assert_ne!(
+            before.get_pixel(x, y),
+            after.get_pixel(x, y),
+            "A rejected save must visibly expand the picker with its error"
+        );
+        assert_eq!(
+            after.get_pixel(x, y),
+            after.get_pixel(x, y - 50),
+            "The submission error must be inside the visible dialog"
+        );
+        assert!(
+            (0..after.height())
+                .all(|y| (0..440).all(|x| before.get_pixel(x, y) == after.get_pixel(x, y))),
+            "Submission feedback must leave the page behind the picker unchanged"
+        );
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn a_queue_can_create_its_first_playlist_without_losing_songs() -> Result<()> {
     use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
 
@@ -1688,7 +1754,7 @@ fn a_queue_can_create_its_first_playlist_without_losing_songs() -> Result<()> {
             .update(cx, |view, _, _| {
                 assert!(matches!(
                     &view.overlay,
-                    Some(crate::app::Overlay::PlaylistPicker { tracks }) if tracks.len() == 3
+                    Some(crate::app::Overlay::PlaylistPicker { tracks, .. }) if tracks.len() == 3
                 ));
             })
             .unwrap();
