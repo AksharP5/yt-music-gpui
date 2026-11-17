@@ -67,6 +67,8 @@ The native window tests live in `src/app/native_tests/` and `src/app/player_page
 
 The Comments check reads public guest comments during muted playback, exercises sorting and keyboard controls, and verifies that a 500-comment list renders only the visible rows. Set `YT_MUSIC_COMMENTS_PROFILE=1` to run `bin/profile PID 30` for two paired Up next/Comments samples. Panel crops are captured at 1280×800 and 1920×1080. Deterministic comments also check that Read more follows four rendered lines after wrapping and resizing.
 
+Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
+
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
 At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline. Search top-result captures check stacked cards at column widths of 592 and 720 pixels and two-column cards at 860 pixels. At 956, 1280 and 1920 pixels, it captures search and player chrome, including the Autoplay header and hover handles. It opens the compact player controls with a pointer and dismisses them with Escape.

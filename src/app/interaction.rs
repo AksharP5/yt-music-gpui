@@ -239,6 +239,8 @@ impl Music {
                 }
             }
             ("?", _) | ("/", true) => {
+                self.overlay_return_focus = window.focused(cx);
+                window.focus(&self.overlay_focus, cx);
                 self.overlay = Some(Overlay::Help);
                 cx.notify();
             }

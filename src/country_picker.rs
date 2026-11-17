@@ -75,7 +75,7 @@ impl CountryPicker {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.modifiers.modified() {
             return;
         }
@@ -91,6 +91,7 @@ impl CountryPicker {
             if let Some(index) = next {
                 self.highlighted = Some(index);
                 self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+                window.focus(&self.input.focus_handle(cx), cx);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -207,6 +208,20 @@ impl Render for CountryPicker {
                                                     .child("Current"),
                                             )
                                         })
+                                        .on_key_down(cx.listener(
+                                            move |picker, event: &KeyDownEvent, window, cx| {
+                                                if event.keystroke.modifiers.modified()
+                                                    || !matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "up" | "down"
+                                                    )
+                                                {
+                                                    return;
+                                                }
+                                                picker.highlighted = Some(index);
+                                                picker.key_down(event, window, cx);
+                                            },
+                                        ))
                                         .on_click(cx.listener(move |picker, _, _, cx| {
                                             picker.choose(index, cx)
                                         }))

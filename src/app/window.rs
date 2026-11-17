@@ -183,6 +183,7 @@ impl Render for Music {
                 .tab_stop(false)
                 .absolute()
                 .inset_0()
+                .occlude()
                 .child(overlay)
         });
         let toast = self

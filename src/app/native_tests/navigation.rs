@@ -1190,6 +1190,121 @@ const COVERS: [(&str, &str, &str); 5] = [
 ];
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Result<()> {
+    use gpui::{
+        MouseButton, MouseDownEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
+    };
+
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, _, cx| {
+                view.navigate(Route::Library(Section::Songs), cx);
+                reply(view, page("Songs", "songs-tail"), cx);
+                view.sidebar_playlists = (0..40)
+                    .map(|index| crate::catalog::Collection {
+                        id: format!("VLscroll{index}"),
+                        title: format!("Playlist {index:02}"),
+                        subtitle: "Synthetic account • 30 songs".into(),
+                        thumbnail: None,
+                        details: crate::catalog::CollectionDetails {
+                            editable: true,
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let track = view.page.tracks()[0].clone();
+                view.playlist_picker(vec![track], cx);
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let background = window
+            .update(cx, |view, _, _| {
+                assert!(view.list_scroll.0.borrow().base_handle.max_offset().y > px(0.));
+                view.list_scroll.0.borrow().base_handle.offset()
+            })
+            .unwrap();
+        let before = window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-scroll-before")
+            })
+            .unwrap();
+        for (name, position) in [
+            ("list-right", point(px(800.), px(400.))),
+            ("list-left", point(px(490.), px(400.))),
+            ("backdrop", point(px(1000.), px(400.))),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-300.))),
+                        modifiers: Default::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            let image = window
+                .update(cx, |_, window, _| {
+                    super::render::capture(window, &format!("playlist-scroll-{name}"))
+                })
+                .unwrap();
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(
+                        view.list_scroll.0.borrow().base_handle.offset(),
+                        background,
+                        "Scrolling {name} must not move the page behind Save to playlist"
+                    );
+                })
+                .unwrap();
+            if name == "list-right" {
+                let changed = before
+                    .enumerate_pixels()
+                    .filter(|(x, y, pixel)| {
+                        (470..780).contains(x)
+                            && (250..550).contains(y)
+                            && image.get_pixel(*x, *y) != *pixel
+                    })
+                    .count();
+                assert!(
+                    changed > 100,
+                    "The right side must scroll the playlist rows"
+                );
+            }
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: point(px(380.), px(400.)),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    matches!(
+                        view.overlay,
+                        Some(crate::app::Overlay::PlaylistPicker { .. })
+                    ),
+                    "Right-clicking the dimmed page must not replace the dialog with a song menu"
+                );
+            })
+            .unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; public artwork; synthetic accounts only"]
 fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> Result<()> {
     check_cache_window(async |window, cx| {

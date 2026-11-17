@@ -1160,7 +1160,7 @@ impl Music {
         let mut body = div()
             .id("overlay-body")
             .relative()
-            .w(px(384.))
+            .w(px(386.))
             .flex()
             .flex_col()
             .bg(theme.panel)
@@ -1231,6 +1231,7 @@ impl Music {
                                     div()
                                         .id(("playlist-choice", index))
                                         .keyboard_control(view.theme)
+                                        .w_full()
                                         .h(px(PICKER_ROW))
                                         .px(px(24.))
                                         .flex()
@@ -1298,6 +1299,7 @@ impl Music {
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .w_full()
                     .h(px(list_height))
                     .pt(px(PICKER_LIST_TOP))
                     .pb(px(PICKER_ROW)),
