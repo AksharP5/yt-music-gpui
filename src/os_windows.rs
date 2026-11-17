@@ -279,7 +279,7 @@ fn wide(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain([0]).collect()
 }
 
-/// Round up, so a wait never ends just before its deadline.
+/// Round up fractional milliseconds before passing a timeout to Win32.
 fn milliseconds(timeout: Option<Duration>) -> u32 {
     timeout.map_or(INFINITE, |timeout| {
         timeout
@@ -302,16 +302,26 @@ pub fn wait_readable<const N: usize>(
         .flatten()
         .map(|handle| handle.as_raw_handle())
         .collect();
-    let timeout =
-        milliseconds(deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())));
     if raw.is_empty() {
+        let timeout = milliseconds(
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())),
+        );
         thread::sleep(Duration::from_millis(timeout.into()));
         return Ok([false; N]);
     }
-    if unsafe { WaitForMultipleObjects(raw.len() as u32, raw.as_ptr(), FALSE, timeout) }
-        == WAIT_FAILED
-    {
-        return Err(io::Error::last_os_error());
+    loop {
+        let timeout = milliseconds(
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())),
+        );
+        let result =
+            unsafe { WaitForMultipleObjects(raw.len() as u32, raw.as_ptr(), FALSE, timeout) };
+        if result == WAIT_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // Win32 timeout accuracy follows clock ticks and can expire early.
+        if result != WAIT_TIMEOUT || !deadline.is_some_and(|deadline| Instant::now() < deadline) {
+            break;
+        }
     }
     // The wait names only the first signalled handle, so check each one.
     Ok(handles.map(|handle| {
@@ -616,6 +626,22 @@ mod tests {
     use super::*;
     use std::{io::BufRead, process::Stdio};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    #[test]
+    fn readable_wait_timeouts_reach_the_absolute_deadline() {
+        let wake = Waker::new().unwrap();
+        for milliseconds in [1, 2, 7, 25, 31] {
+            let deadline = Instant::now() + Duration::from_millis(milliseconds);
+            assert_eq!(
+                wait_readable([Some(wake.as_waitable())], Some(deadline)).unwrap(),
+                [false]
+            );
+            assert!(
+                Instant::now() >= deadline,
+                "The {milliseconds} ms wait ended early"
+            );
+        }
+    }
 
     /// A helper that starts a grandchild, prints its process ID and waits.
     fn helper_with_grandchild() -> (Group, u32) {
