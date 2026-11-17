@@ -401,7 +401,7 @@ fn playlist_revalidation_keeps_pages_loaded_after_an_edit() -> Result<()> {
                     before
                 })
                 .unwrap();
-            super::render::wait_for_presented_frame(window, cx).await;
+            super::render::wait_for_quiescence(window, cx).await;
             window
                 .update(cx, |view, window, _| {
                     let after = view.detail_list.state.logical_scroll_top();
