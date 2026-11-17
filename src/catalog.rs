@@ -809,6 +809,29 @@ impl Catalog {
         self.bind_page(page, &data, None)
     }
 
+    pub(crate) fn playlist_metadata(
+        &self,
+        id: &str,
+        additions: &[String],
+        removal: Option<&str>,
+        current: impl Fn() -> bool,
+    ) -> Result<Page> {
+        let link = BrowseLink::new(format!("VL{}", id.trim_start_matches("VL")), "Playlist");
+        // YouTube can acknowledge an edit before browse reflects it. Only retry
+        // these reads, and never walk a long playlist to verify its totals.
+        for attempt in 0..5 {
+            ensure!(current(), "Playlist refresh was superseded");
+            let page = self.browse(&link)?;
+            if page.header.is_some() && playlist_metadata_visible(&page, additions, removal) {
+                return Ok(page);
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        anyhow::bail!("Playlist saved, but its details have not updated yet. Refresh the playlist.")
+    }
+
     pub fn more(&self, continuation: &Continuation) -> Result<Page> {
         let data = self.request_with_continuation(
             "browse",
@@ -2347,9 +2370,68 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
     Ok(choices)
 }
 
+fn playlist_metadata_visible(page: &Page, additions: &[String], removal: Option<&str>) -> bool {
+    let occurrences: HashSet<_> = page
+        .shelves
+        .iter()
+        .flat_map(|shelf| &shelf.items)
+        .filter_map(|item| match item {
+            Item::Track(track) => track.details.set_video_id.as_deref(),
+            _ => None,
+        })
+        .collect();
+    !removal.is_some_and(|removed| occurrences.contains(removed))
+        && (page.continuation.is_some()
+            || additions
+                .iter()
+                .all(|added| occurrences.contains(added.as_str())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_metadata_waits_for_the_edited_occurrences_without_scanning_the_tail() {
+        let mut page = parse_page(&json!({"contents":[]}), "Playlist").unwrap();
+        let mut track: Track = serde_json::from_value(
+            json!({"id":"00000000000", "title":"Song", "artist":"Synthetic artist"}),
+        )
+        .unwrap();
+        track.details.set_video_id = Some("occurrence-0".into());
+        page.shelves.push(Shelf {
+            title: String::new(),
+            layout: ShelfLayout::Songs,
+            more: None,
+            items: vec![Item::Track(track.clone())],
+        });
+        assert!(!playlist_metadata_visible(&page, &[], Some("occurrence-0")));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &["new-occurrence".into()],
+            None
+        ));
+        page.shelves[0].items.clear();
+        assert!(playlist_metadata_visible(&page, &[], Some("occurrence-0")));
+        page.shelves[0].items.push(Item::Track(track));
+        page.continuation = Some(Continuation::new("tail"));
+        assert!(playlist_metadata_visible(
+            &page,
+            &["tail-occurrence".into()],
+            None
+        ));
+        assert!(!playlist_metadata_visible(&page, &[], Some("occurrence-0")));
+        page.shelves[0].items[0] = Item::Track({
+            let mut track = page.tracks()[0].clone();
+            track.details.set_video_id = Some("new-occurrence".into());
+            track
+        });
+        assert!(playlist_metadata_visible(
+            &page,
+            &["new-occurrence".into()],
+            None
+        ));
+    }
 
     #[test]
     fn page_heroes_use_the_page_header_and_never_a_song_cover() {

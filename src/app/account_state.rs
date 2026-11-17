@@ -472,6 +472,7 @@ impl Music {
         }) {
             Ok(()) => {
                 self.pending_mutations.insert(key);
+                self.error = None;
                 self.notice = Some("Saving to YouTube Music…".into());
                 true
             }
@@ -978,6 +979,15 @@ impl Music {
                             Effect::PlaylistAdded { additions, toast } => {
                                 if let Mutation::AddToPlaylist { id, .. } = &mutation {
                                     self.patch_added(id, &additions, cx);
+                                    self.refresh_playlist_metadata(
+                                        id,
+                                        additions
+                                            .iter()
+                                            .map(|(_, occurrence)| occurrence.clone())
+                                            .collect(),
+                                        None,
+                                        cx,
+                                    );
                                     // YouTube's own confirmation, else the web's wording for it.
                                     let toast = toast.or_else(|| {
                                         self.sidebar_playlists
@@ -995,6 +1005,22 @@ impl Music {
                                 }
                             }
                             Effect::Changed => {
+                                match &mutation {
+                                    Mutation::RemoveFromPlaylist {
+                                        id, set_video_id, ..
+                                    } => {
+                                        self.refresh_playlist_metadata(
+                                            id,
+                                            Vec::new(),
+                                            Some(set_video_id.clone()),
+                                            cx,
+                                        );
+                                    }
+                                    Mutation::MoveInPlaylist { id, .. } => {
+                                        self.refresh_playlist_metadata(id, Vec::new(), None, cx);
+                                    }
+                                    _ => {}
+                                }
                                 if deleting {
                                     self.request(
                                         Query::Revalidate(Box::new(Query::SidebarPlaylists)),

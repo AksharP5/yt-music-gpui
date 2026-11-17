@@ -82,6 +82,11 @@ pub(in crate::app) enum Query {
     SidebarPlaylists,
     SidebarMore(Continuation),
     PlaylistChoices(Vec<String>),
+    PlaylistMetadata {
+        id: String,
+        additions: Vec<String>,
+        removal: Option<String>,
+    },
     /// The current page again in another order, replacing it.
     Reload(Continuation),
     Revalidate(Box<Query>),
@@ -91,6 +96,7 @@ impl Query {
         match self {
             Self::SidebarPlaylists | Self::SidebarMore(_) => CatalogTarget::Sidebar,
             Self::PlaylistChoices(_) => CatalogTarget::PlaylistChoices,
+            Self::PlaylistMetadata { .. } => CatalogTarget::PlaylistMetadata,
             Self::Revalidate(query) => query.target(),
             _ => CatalogTarget::Page,
         }
@@ -131,9 +137,15 @@ pub(in crate::app) enum CatalogTarget {
     Page,
     Sidebar,
     PlaylistChoices,
+    PlaylistMetadata,
 }
 impl CatalogTarget {
-    pub(in crate::app) const ALL: [Self; 3] = [Self::Page, Self::Sidebar, Self::PlaylistChoices];
+    pub(in crate::app) const ALL: [Self; 4] = [
+        Self::Page,
+        Self::Sidebar,
+        Self::PlaylistChoices,
+        Self::PlaylistMetadata,
+    ];
 }
 struct RestoringRequest {
     id: u64,
@@ -440,6 +452,11 @@ impl Music {
             if let Some(error) = &self.sync.page_error {
                 self.error = Some(error.clone());
             }
+        } else if target == CatalogTarget::PlaylistMetadata
+            && let Err(error) = result
+        {
+            self.sync.metadata_playlist = None;
+            self.error = Some(error);
         }
         cx.notify();
     }
@@ -872,6 +889,10 @@ impl Music {
         if result.session_rejected {
             self.refresh_session(false, cx);
         }
+        if result.target == CatalogTarget::PlaylistMetadata {
+            self.playlist_metadata_result(result.result, cx);
+            return;
+        }
         if result.target == CatalogTarget::Sidebar {
             match result.result {
                 Ok(page) => {
@@ -1088,6 +1109,19 @@ impl CatalogRequests {
                                     Query::PlaylistChoices(_) => {
                                         Err(anyhow::anyhow!("Invalid playlist destination request"))
                                     }
+                                    Query::PlaylistMetadata {
+                                        id,
+                                        additions,
+                                        removal,
+                                    } => catalog.playlist_metadata(
+                                        id,
+                                        additions,
+                                        removal.as_deref(),
+                                        || {
+                                            generations[target as usize].load(Ordering::Relaxed)
+                                                == job.id
+                                        },
+                                    ),
                                     Query::Search(search) => catalog.search_filtered(
                                         &search.query,
                                         search.filter,

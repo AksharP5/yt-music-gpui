@@ -13,6 +13,7 @@ pub(in crate::app) struct SyncState {
     pub page_coverage: PageCoverage,
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
+    pub metadata_playlist: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -596,6 +597,54 @@ impl Music {
         cx.notify();
     }
 
+    pub(super) fn refresh_playlist_metadata(
+        &mut self,
+        id: &str,
+        additions: Vec<String>,
+        removal: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync.metadata_playlist = Some(id.to_owned());
+        self.request(
+            Query::PlaylistMetadata {
+                id: id.to_owned(),
+                additions,
+                removal,
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn playlist_metadata_result(
+        &mut self,
+        result: Result<Page, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.sync.metadata_playlist.take() else {
+            return;
+        };
+        match result {
+            Ok(fresh) => {
+                // The confirmed occurrence patch owns the rows. A metadata read
+                // must not replace loaded continuations or undo a newer edit.
+                for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
+                    self.back
+                        .iter_mut()
+                        .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
+                ) {
+                    if matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
+                    {
+                        page.header = fresh.header.clone();
+                        page.background = fresh.background.clone();
+                    }
+                }
+            }
+            Err(error) => self.error = Some(error),
+        }
+        self.request(Query::Revalidate(Box::new(Query::SidebarPlaylists)), cx);
+        cx.notify();
+    }
+
     #[expect(clippy::expect_used, reason = "every library route has a section")]
     pub(super) fn page_query(&self) -> Query {
         match &self.route {
@@ -614,6 +663,7 @@ impl Music {
     }
 
     pub(super) fn patch_confirmed(&mut self, mutation: &Mutation, cx: &mut Context<Self>) {
+        let anchor = self.page_anchor();
         if self.catalog_requests.is_loading(CatalogTarget::Page) {
             self.sync
                 .page_changes
@@ -646,6 +696,7 @@ impl Music {
             }
         }
         self.rebuild_rows();
+        self.restore_page_anchor(&anchor);
         cx.notify();
     }
 }

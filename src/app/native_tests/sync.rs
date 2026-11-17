@@ -24,6 +24,111 @@ use std::{
 };
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            let (sender, commands) = async_channel::bounded(4);
+            view.account_commands = sender;
+            view.navigate(Route::Browse(BrowseLink::new("VLsynthetic", "Sync validation playlist")), cx);
+            let mut initial = page(1, false);
+            initial.header = crate::catalog::parse_page(&json!({"header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"Sync validation playlist"},
+                "secondSubtitle":{"simpleText":"1 track • 2 minutes, 17 seconds"}
+            }},"contents":[]}), "Playlist").unwrap().header;
+            super::navigation::reply(view, initial.clone(), cx);
+            view.sidebar_playlists = vec![serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"1 track"})).unwrap()];
+            let track = view.page.tracks()[0].clone();
+            let removal = Mutation::RemoveFromPlaylist { id:"synthetic".into(), video_id:track.id, set_video_id:"occurrence-0".into() };
+            assert!(view.mutate(removal.clone(), cx));
+            assert!(matches!(commands.try_recv().unwrap(), account::Command::Apply { .. }));
+            view.account_event(account::Event::Applied {
+                session:view.account.as_ref().unwrap().session.clone(), mutation:Box::new(removal),
+                result:Ok(Effect::Changed), session_rejected:false,
+            }, window, cx);
+            assert!(view.rows.is_empty(), "Confirmed removal immediately removes the row");
+            let job = view.catalog_requests.pending.try_recv().expect("Confirmed removal refreshes the playlist details");
+            assert!(matches!(&job.query, Query::PlaylistMetadata { id, removal:Some(occurrence), .. } if id=="synthetic" && occurrence=="occurrence-0"));
+            let mut fresh = initial;
+            // Keep an old row in this response to prove that metadata publication
+            // cannot undo the confirmed edit, even if service reads disagree.
+            fresh.header.as_mut().unwrap().stats = "0 tracks".into();
+            view.catalog_result(CatalogResult {
+                id:job.id, account_revision:job.account_revision, account_generation:job.account_generation,
+                history_generation:job.history_generation, append:false, revalidate:false,
+                result:Ok(fresh), session_rejected:false, target:job.query.target(),
+            }, cx);
+            assert!(view.rows.is_empty());
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks");
+            let job = view.catalog_requests.pending.try_recv().expect("The settled playlist refreshes the guide");
+            assert!(job.query.target() == CatalogTarget::Sidebar);
+            let mut guide = page(0, false);
+            guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"0 tracks"})).unwrap()));
+            view.catalog_result(CatalogResult {
+                id:job.id, account_revision:job.account_revision, account_generation:job.account_generation,
+                history_generation:job.history_generation, append:false, revalidate:true,
+                result:Ok(guide), session_rejected:false, target:CatalogTarget::Sidebar,
+            }, cx);
+            assert_eq!(view.sidebar_playlists[0].subtitle, "0 tracks");
+            assert!(view.error.is_none());
+            assert!(view.catalog_requests.pending.is_empty());
+
+            view.page = page(500, true);
+            view.page.header = crate::catalog::parse_page(&json!({"header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"Sync validation playlist"}, "secondSubtitle":{"simpleText":"500 tracks"}
+            }},"contents":[]}), "Playlist").unwrap().header;
+            view.rebuild_rows();
+            view.detail_list.state.scroll_to(ListOffset { item_ix:451, offset_in_item:px(8.) });
+            cx.notify();
+        }).unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window.update(cx, |view, window, cx| {
+            let before = view.detail_list.state.logical_scroll_top();
+            assert_eq!(before.item_ix, 451);
+            let anchor = view.rows[450].id().to_owned();
+            let track = view.page.tracks()[0].clone();
+            view.account_event(account::Event::Applied {
+                session:view.account.as_ref().unwrap().session.clone(),
+                mutation:Box::new(Mutation::RemoveFromPlaylist { id:"synthetic".into(), video_id:track.id, set_video_id:"occurrence-0".into() }),
+                result:Ok(Effect::Changed), session_rejected:false,
+            }, window, cx);
+            let job = view.catalog_requests.pending.try_recv().unwrap();
+            let mut fresh = page(50, true);
+            fresh.header = crate::catalog::parse_page(&json!({"header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"Sync validation playlist"}, "secondSubtitle":{"simpleText":"499 tracks"}
+            }},"contents":[]}), "Playlist").unwrap().header;
+            view.catalog_result(CatalogResult {
+                id:job.id, account_revision:job.account_revision, account_generation:job.account_generation,
+                history_generation:job.history_generation, append:false, revalidate:false,
+                result:Ok(fresh), session_rejected:false, target:job.query.target(),
+            }, cx);
+            assert_eq!(view.rows.len(), 499, "Refreshing details must retain all loaded songs");
+            assert_eq!(view.rows[449].id(), anchor);
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "499 tracks");
+            assert!(view.page.continuation.is_some());
+            let after = view.detail_list.state.logical_scroll_top();
+            assert_eq!(after.item_ix, 450, "The visible occurrence stays in place after removing an earlier row");
+            assert_eq!(after.offset_in_item, before.offset_in_item);
+            let job = view.catalog_requests.pending.try_recv().unwrap();
+            let mut guide = page(0, false);
+            guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"499 tracks"})).unwrap()));
+            view.catalog_result(CatalogResult {
+                id:job.id, account_revision:job.account_revision, account_generation:job.account_generation,
+                history_generation:job.history_generation, append:false, revalidate:true,
+                result:Ok(guide), session_rejected:false, target:job.query.target(),
+            }, cx);
+            cx.notify();
+        }).unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-details-after-removal");
+            })
+            .unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; set YT_MUSIC_NATIVE_TESTS=1; synthetic account only"]
 fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
     super::isolate()?;

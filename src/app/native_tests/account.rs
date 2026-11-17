@@ -360,6 +360,12 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 assert!(view.error.is_some(), "The failed edit must remain visible for explicit retry");
                 assert!(!view.refresh_session(false, cx));
                 assert!(commands.is_empty());
+                let retry = Mutation::RateSong { track: track("invalid-first"), rating: Rating::Like };
+                assert!(view.mutate(retry, cx));
+                assert!(view.error.is_none(), "An accepted explicit retry clears the reconnect message");
+                let account::Command::Apply { session, .. } = commands.try_recv().unwrap() else { panic!("Retry must submit one edit"); };
+                assert!(Arc::ptr_eq(&session, &current));
+                assert!(commands.is_empty(), "Recovery never replays an edit automatically");
                 view.next_session_refresh = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
                 let operation = refreshing(view, &commands, cx);
                 view.account_event(account::Event::Connected { operation, result: Ok(Some(connection(current.clone()))), save_session: false }, window, cx);
