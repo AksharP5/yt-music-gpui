@@ -14,7 +14,8 @@ pub(in crate::app) struct SyncState {
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
     pub playlist_refreshes: VecDeque<PlaylistRefresh>,
-    pub playlist_metadata_error: Option<(PlaylistRefresh, String)>,
+    pub playlist_failures: HashMap<String, PlaylistRefresh>,
+    pub playlist_metadata_error: Option<(String, String)>,
     pub sidebar_changes: Vec<PlaylistMetadata>,
 }
 
@@ -28,14 +29,16 @@ pub(super) enum PageChange {
     Confirmed(Box<Mutation>),
     PlaylistAdded { id: String, tracks: Vec<Track> },
     PlaylistMetadata(PlaylistMetadata),
+    PlaylistEdits(PlaylistRefresh),
 }
 
 impl PageChange {
-    pub(super) fn apply(self, page: &mut Page, route: &Route) -> bool {
+    pub(super) fn apply(self, page: &mut Page, route: &Route, first_page: bool) -> bool {
         match self {
             Self::Confirmed(mutation) => patch_page(page, route, &mutation),
-            Self::PlaylistAdded { id, tracks } => append_added(page, route, &id, &tracks),
+            Self::PlaylistAdded { id, tracks } => return append_added(page, route, &id, &tracks),
             Self::PlaylistMetadata(metadata) => return metadata.apply(page, route),
+            Self::PlaylistEdits(refresh) => return refresh.apply(page, route, first_page),
         }
         false
     }
@@ -46,21 +49,52 @@ pub(in crate::app) struct PlaylistRefresh {
     pub id: String,
     pub additions: Vec<String>,
     pub removals: Vec<String>,
+    // Retain final rows: replaying a sequence of moves can change its result.
+    pub order: Option<Arc<Page>>,
     pub account_generation: u64,
 }
 
 impl PlaylistRefresh {
-    fn merge(&mut self, additions: Vec<String>, removal: Option<String>) {
+    fn merge(&mut self, additions: Vec<String>, removal: Option<String>, order: Option<Page>) {
+        if let Some(order) = order {
+            self.order = Some(Arc::new(order));
+        }
         self.removals.retain(|id| !additions.contains(id));
         self.additions.extend(additions);
         self.additions.sort_unstable();
         self.additions.dedup();
         if let Some(removal) = removal {
+            if let Some(order) = &mut self.order {
+                for shelf in &mut Arc::make_mut(order).shelves {
+                    shelf.items.retain(|item| !matches!(item, Item::Track(track) if track.details.set_video_id.as_ref() == Some(&removal)));
+                }
+            }
             self.additions.retain(|id| id != &removal);
             if !self.removals.contains(&removal) {
                 self.removals.push(removal);
             }
         }
+    }
+
+    fn apply(&self, page: &mut Page, route: &Route, first_page: bool) -> bool {
+        if !matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == self.id) {
+            return false;
+        }
+        let mut patched = false;
+        if first_page
+            && let Some(order) = &self.order
+            && crate::catalog::playlist_order_visible(page, order) == Some(false)
+        {
+            page.shelves = order.shelves.clone();
+            page.continuation = order.continuation.clone();
+            patched = true;
+        }
+        for shelf in &mut page.shelves {
+            let count = shelf.items.len();
+            shelf.items.retain(|item| !matches!(item, Item::Track(track) if track.details.set_video_id.as_ref().is_some_and(|id| self.removals.contains(id))));
+            patched |= count != shelf.items.len();
+        }
+        patched
     }
 }
 
@@ -204,8 +238,26 @@ pub(super) fn merge_page(loaded: &mut Page, mut fresh: Page, coverage: &mut Page
 impl SyncState {
     pub(super) fn cancel_playlist_refreshes(&mut self) {
         self.playlist_refreshes.clear();
+        self.playlist_failures.clear();
         self.playlist_metadata_error = None;
         self.sidebar_changes.clear();
+    }
+
+    pub(super) fn replay_playlist_edits(
+        &self,
+        page: &mut Page,
+        route: &Route,
+        first_page: bool,
+    ) -> bool {
+        let mut patched = false;
+        for refresh in self
+            .playlist_refreshes
+            .iter()
+            .chain(self.playlist_failures.values())
+        {
+            patched |= refresh.apply(page, route, first_page);
+        }
+        patched
     }
 
     pub(super) fn update_sidebar(
@@ -415,11 +467,12 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     }
 }
 
-fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) {
+fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) -> bool {
     if !matches!(route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
         || page.continuation.is_some()
+        || sources.is_empty()
     {
-        return;
+        return false;
     }
     if page.shelves.is_empty() {
         page.shelves.push(Shelf {
@@ -429,13 +482,16 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) {
             items: Vec::new(),
         });
     }
+    let mut added = false;
     for track in sources {
         if !page.shelves.iter().flat_map(|shelf| &shelf.items).any(|item| matches!(item, Item::Track(current) if current.details.set_video_id == track.details.set_video_id))
             && let Some(shelf) = page.shelves.last_mut()
         {
             shelf.items.push(Item::Track(track.clone()));
+            added = true;
         }
     }
+    added
 }
 
 impl Music {
@@ -638,7 +694,18 @@ impl Music {
         additions: &[(String, String)],
         cx: &mut Context<Self>,
     ) {
-        let sources: Vec<_> = additions
+        let sources = self.playlist_added_sources(additions);
+        self.append_playlist_tracks(id, &sources);
+        if sources.len() < additions.len()
+            && matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
+        {
+            self.revalidate_page(cx);
+        }
+        cx.notify();
+    }
+
+    fn playlist_added_sources(&self, additions: &[(String, String)]) -> Vec<Track> {
+        additions
             .iter()
             .filter_map(|(video, occurrence)| {
                 let source = self
@@ -666,27 +733,40 @@ impl Music {
                 track.details.set_video_id = Some(occurrence.clone());
                 Some(track)
             })
-            .collect();
+            .collect()
+    }
+
+    fn append_playlist_tracks(&mut self, id: &str, sources: &[Track]) {
+        if sources.is_empty() {
+            return;
+        }
         if self.catalog_requests.is_loading(CatalogTarget::Page) {
             self.sync.page_changes.push(PageChange::PlaylistAdded {
                 id: id.into(),
-                tracks: sources.clone(),
+                tracks: sources.to_vec(),
             });
         }
-        for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
-            self.back
-                .iter_mut()
-                .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
-        ) {
-            append_added(page, route, id, &sources);
+        let anchor = self.page_anchor();
+        let changed = append_added(&mut self.page, &self.route, id, sources);
+        for state in &mut self.back {
+            if let Some(page) = &mut state.page {
+                append_added(page, &state.route, id, sources);
+            }
         }
-        self.rebuild_rows();
-        if sources.len() < additions.len()
-            && matches!(&self.route, Route::Browse(link) if link.id.strip_prefix("VL").unwrap_or(&link.id) == id.strip_prefix("VL").unwrap_or(id))
-        {
-            self.revalidate_page(cx);
+        if changed {
+            self.rebuild_rows();
+            self.restore_page_anchor(&anchor);
+            self.overlay_ratings();
         }
-        cx.notify();
+    }
+
+    pub(super) fn playlist_order_snapshot(&self, id: &str) -> Option<Page> {
+        std::iter::once((&self.page, &self.route)).chain(
+            self.back.iter().rev().filter_map(|state| Some((state.page.as_ref()?, &state.route)))
+        ).find_map(|(page, route)| {
+            matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
+                .then(|| page.clone())
+        })
     }
 
     pub(super) fn refresh_playlist_metadata(
@@ -694,9 +774,21 @@ impl Music {
         id: &str,
         additions: Vec<String>,
         removal: Option<String>,
+        order: Option<Page>,
         cx: &mut Context<Self>,
     ) {
         let id = id.trim_start_matches("VL");
+        let order = order.or_else(|| {
+            let retaining_order = self
+                .sync
+                .playlist_refreshes
+                .iter()
+                .chain(self.sync.playlist_failures.values())
+                .any(|refresh| refresh.id == id && refresh.order.is_some());
+            retaining_order
+                .then(|| self.playlist_order_snapshot(id))
+                .flatten()
+        });
         if let Some((index, refresh)) = self
             .sync
             .playlist_refreshes
@@ -705,24 +797,35 @@ impl Music {
             .find(|(_, refresh)| refresh.id == id)
         {
             refresh.account_generation = self.account_generation;
-            refresh.merge(additions, removal);
+            refresh.merge(additions, removal, order);
             if index > 0 {
                 return;
             }
         } else {
-            let mut refresh = PlaylistRefresh {
-                id: id.to_owned(),
-                additions: Vec::new(),
-                removals: Vec::new(),
-                account_generation: self.account_generation,
-            };
-            refresh.merge(additions, removal);
+            let mut refresh =
+                self.sync
+                    .playlist_failures
+                    .remove(id)
+                    .unwrap_or_else(|| PlaylistRefresh {
+                        id: id.to_owned(),
+                        additions: Vec::new(),
+                        removals: Vec::new(),
+                        order: None,
+                        account_generation: self.account_generation,
+                    });
+            refresh.account_generation = self.account_generation;
+            refresh.merge(additions, removal, order);
             self.sync.playlist_refreshes.push_back(refresh);
             if self.sync.playlist_refreshes.len() > 1 {
                 return;
             }
         }
-        self.request_playlist_metadata(cx);
+        if !self
+            .catalog_requests
+            .is_loading(CatalogTarget::PlaylistMetadata)
+        {
+            self.request_playlist_metadata(cx);
+        }
     }
 
     fn request_playlist_metadata(&mut self, cx: &mut Context<Self>) {
@@ -734,25 +837,86 @@ impl Music {
     pub(super) fn playlist_metadata_result(
         &mut self,
         result: Result<Page, String>,
+        account_generation: u64,
         cx: &mut Context<Self>,
     ) {
-        let Some(refresh) = self.sync.playlist_refreshes.pop_front() else {
+        if self
+            .sync
+            .playlist_refreshes
+            .front()
+            .is_some_and(|refresh| refresh.account_generation > account_generation)
+        {
+            self.request_playlist_metadata(cx);
+            return;
+        }
+        let Some(mut refresh) = self.sync.playlist_refreshes.pop_front() else {
             return;
         };
-        match result.and_then(|page| PlaylistMetadata::from_page(refresh.id.clone(), &page)) {
-            Ok(metadata) => self.publish_playlist_metadata(metadata),
-            Err(error) if self.error.is_none() => {
-                self.sync.playlist_metadata_error = Some((refresh, error.clone()));
-                self.error = Some(error);
+        match result.and_then(|page| {
+            let metadata = PlaylistMetadata::from_page(refresh.id.clone(), &page)?;
+            let additions: Vec<_> = page
+                .shelves
+                .iter()
+                .flat_map(|shelf| &shelf.items)
+                .filter_map(|item| match item {
+                    Item::Track(track)
+                        if track
+                            .details
+                            .set_video_id
+                            .as_ref()
+                            .is_some_and(|id| refresh.additions.contains(id)) =>
+                    {
+                        Some(track.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok((metadata, additions))
+        }) {
+            Ok((metadata, returned)) => {
+                let additions: Vec<_> = returned
+                    .iter()
+                    .filter_map(|track| {
+                        Some((track.id.clone(), track.details.set_video_id.clone()?))
+                    })
+                    .collect();
+                let mut sources = self.playlist_added_sources(&additions);
+                for track in returned {
+                    if !sources
+                        .iter()
+                        .any(|source| source.details.set_video_id == track.details.set_video_id)
+                    {
+                        sources.push(track);
+                    }
+                }
+                self.append_playlist_tracks(&refresh.id, &sources);
+                if let Some(order) = &mut refresh.order {
+                    let route =
+                        Route::Browse(BrowseLink::new(format!("VL{}", refresh.id), "Playlist"));
+                    append_added(Arc::make_mut(order), &route, &refresh.id, &sources);
+                }
+                self.clear_playlist_failure(&refresh.id);
+                self.publish_playlist_metadata(metadata, &refresh);
             }
-            Err(_) => {}
+            Err(error) => {
+                if self.error.is_none() {
+                    self.sync.playlist_metadata_error = Some((refresh.id.clone(), error.clone()));
+                    self.error = Some(error);
+                }
+                self.sync
+                    .playlist_failures
+                    .insert(refresh.id.clone(), refresh);
+            }
         }
         self.request_playlist_metadata(cx);
         cx.notify();
     }
 
-    fn publish_playlist_metadata(&mut self, metadata: PlaylistMetadata) {
+    fn publish_playlist_metadata(&mut self, metadata: PlaylistMetadata, refresh: &PlaylistRefresh) {
         if self.catalog_requests.is_loading(CatalogTarget::Page) {
+            self.sync
+                .page_changes
+                .push(PageChange::PlaylistEdits(refresh.clone()));
             self.sync
                 .page_changes
                 .push(PageChange::PlaylistMetadata(metadata.clone()));
@@ -789,37 +953,51 @@ impl Music {
             return true;
         };
         let id = link.id.trim_start_matches("VL");
-        let Some(refresh) = self
+        let Some((refresh, pending)) = self
             .sync
             .playlist_refreshes
             .iter()
             .find(|refresh| refresh.id == id)
+            .map(|refresh| (refresh, true))
             .or_else(|| {
                 self.sync
-                    .playlist_metadata_error
-                    .as_ref()
-                    .map(|(refresh, _)| refresh)
-                    .filter(|refresh| refresh.id == id)
+                    .playlist_failures
+                    .get(id)
+                    .map(|refresh| (refresh, false))
             })
         else {
             return true;
         };
         // Check the unpatched response. Replayed local removals cannot prove
         // that the service has caught up with the acknowledged edit.
-        if account_generation < refresh.account_generation
-            || (page.continuation.is_some() && !refresh.removals.is_empty())
-            || !crate::catalog::playlist_occurrences_visible(
+        let order = refresh.order.as_ref().map_or(Some(true), |order| {
+            crate::catalog::playlist_order_visible(page, order)
+        });
+        let strict = !(page.continuation.is_some() && !refresh.removals.is_empty())
+            && order == Some(true)
+            && crate::catalog::playlist_occurrences_visible(
                 page,
                 &refresh.additions,
                 &refresh.removals,
-            )
-        {
+            );
+        let reflected = if pending {
+            strict
+        } else {
+            order != Some(false)
+                && crate::catalog::playlist_metadata_visible(
+                    page,
+                    &refresh.additions,
+                    &refresh.removals,
+                )
+        };
+        if account_generation < refresh.account_generation || !reflected {
             return false;
         }
+        let refresh = refresh.clone();
         if let Ok(metadata) = PlaylistMetadata::from_page(refresh.id.clone(), page) {
             self.cancel_playlist_refresh(&metadata.id, cx);
-            self.publish_playlist_metadata(metadata);
-            return true;
+            self.publish_playlist_metadata(metadata, &refresh);
+            return strict;
         }
         false
     }
@@ -835,23 +1013,30 @@ impl Music {
             .playlist_refreshes
             .retain(|refresh| refresh.id != id);
         self.sync.sidebar_changes.retain(|change| change.id != id);
-        self.sync.page_changes.retain(
-            |change| !matches!(change, PageChange::PlaylistMetadata(metadata) if metadata.id == id),
-        );
-        if self
-            .sync
-            .playlist_metadata_error
-            .as_ref()
-            .is_some_and(|(refresh, _)| refresh.id == id)
-            && let Some((_, error)) = self.sync.playlist_metadata_error.take()
-            && self.error.as_ref() == Some(&error)
-        {
-            self.error = None;
-        }
+        self.sync.page_changes.retain(|change| {
+            !matches!(change, PageChange::PlaylistMetadata(metadata) if metadata.id == id)
+                && !matches!(change, PageChange::PlaylistEdits(refresh) if refresh.id == id)
+        });
+        self.clear_playlist_failure(id);
         if active {
             self.catalog_requests
                 .cancel(CatalogTarget::PlaylistMetadata);
             self.request_playlist_metadata(cx);
+        }
+    }
+
+    fn clear_playlist_failure(&mut self, id: &str) {
+        self.sync.playlist_failures.remove(id);
+        if self
+            .sync
+            .playlist_metadata_error
+            .as_ref()
+            .is_some_and(|(playlist, _)| playlist == id)
+            && let Some((_, error)) = self.sync.playlist_metadata_error.take()
+            && self.error.as_ref() == Some(&error)
+            && self.sync.page_error.as_ref() != Some(&error)
+        {
+            self.error = None;
         }
     }
 
@@ -883,6 +1068,17 @@ impl Music {
         for state in &mut self.back {
             if let Some(page) = &mut state.page {
                 patch_page(page, &state.route, mutation);
+            }
+        }
+        for refresh in self
+            .sync
+            .playlist_refreshes
+            .iter_mut()
+            .chain(self.sync.playlist_failures.values_mut())
+        {
+            if let Some(order) = &mut refresh.order {
+                let route = Route::Browse(BrowseLink::new(format!("VL{}", refresh.id), "Playlist"));
+                patch_page(Arc::make_mut(order), &route, mutation);
             }
         }
         if let Mutation::DeletePlaylist { id } = mutation {

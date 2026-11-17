@@ -175,8 +175,26 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                     "renewed",
                     Vec::new(),
                     Some("old-occurrence".into()),
+                    Some(view.page.clone()),
                     cx,
                 );
+                let failed = view.catalog_requests.pending.try_recv().unwrap();
+                view.catalog_result(
+                    CatalogResult {
+                        id: failed.id,
+                        account_revision: failed.account_revision,
+                        account_generation: failed.account_generation,
+                        history_generation: failed.history_generation,
+                        append: false,
+                        revalidate: false,
+                        result: Err("Old-session readback failed".into()),
+                        session_rejected: false,
+                        target: CatalogTarget::PlaylistMetadata,
+                    },
+                    cx,
+                );
+                assert!(view.sync.playlist_failures.contains_key("renewed"));
+                view.refresh_playlist_metadata("old-other", Vec::new(), None, None, cx);
                 let metadata = view.catalog_requests.pending.try_recv().unwrap();
                 assert!(matches!(metadata.query, Query::PlaylistMetadata(_)));
                 renew(view, next.clone(), &commands, window, cx);
@@ -200,6 +218,7 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
         window.update(cx, |view, _, cx| {
             assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &next));
             assert!(view.sync.playlist_refreshes.is_empty());
+            assert!(view.sync.playlist_failures.is_empty(), "Renewal releases failed readback facts and old-session row snapshots");
             assert!(!view.catalog_requests.is_loading(CatalogTarget::PlaylistMetadata));
             assert_ne!(stale_metadata.id,view.catalog_requests.generations[CatalogTarget::PlaylistMetadata as usize].load(Ordering::Relaxed),"Cookie renewal cancels further reads with the old session");
             view.catalog_result(CatalogResult {

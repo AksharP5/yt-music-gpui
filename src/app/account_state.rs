@@ -986,6 +986,7 @@ impl Music {
                                             .map(|(_, occurrence)| occurrence.clone())
                                             .collect(),
                                         None,
+                                        None,
                                         cx,
                                     );
                                     // YouTube's own confirmation, else the web's wording for it.
@@ -1013,11 +1014,19 @@ impl Music {
                                             id,
                                             Vec::new(),
                                             Some(set_video_id.clone()),
+                                            None,
                                             cx,
                                         );
                                     }
                                     Mutation::MoveInPlaylist { id, .. } => {
-                                        self.refresh_playlist_metadata(id, Vec::new(), None, cx);
+                                        let order = self.playlist_order_snapshot(id);
+                                        self.refresh_playlist_metadata(
+                                            id,
+                                            Vec::new(),
+                                            None,
+                                            order,
+                                            cx,
+                                        );
                                     }
                                     _ => {}
                                 }

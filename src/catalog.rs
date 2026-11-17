@@ -825,6 +825,7 @@ impl Catalog {
         id: &str,
         additions: &[String],
         removals: &[String],
+        order: Option<&Page>,
         current: impl Fn() -> bool,
     ) -> Result<Page> {
         let link = BrowseLink::new(format!("VL{}", id.trim_start_matches("VL")), "Playlist");
@@ -833,7 +834,10 @@ impl Catalog {
         for attempt in 0..5 {
             ensure!(current(), "Playlist refresh was superseded");
             let page = self.browse(&link)?;
-            if page.header.is_some() && playlist_metadata_visible(&page, additions, removals) {
+            if page.header.is_some()
+                && playlist_metadata_visible(&page, additions, removals)
+                && order.is_none_or(|order| playlist_order_visible(&page, order) != Some(false))
+            {
                 return Ok(page);
             }
             if attempt < 4 {
@@ -2381,7 +2385,11 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
     Ok(choices)
 }
 
-fn playlist_metadata_visible(page: &Page, additions: &[String], removals: &[String]) -> bool {
+pub(crate) fn playlist_metadata_visible(
+    page: &Page,
+    additions: &[String],
+    removals: &[String],
+) -> bool {
     playlist_occurrences_visible(
         page,
         if page.continuation.is_some() {
@@ -2415,9 +2423,88 @@ pub(crate) fn playlist_occurrences_visible(
             .all(|added| occurrences.contains(added.as_str()))
 }
 
+/// Compare the known prefix after all acknowledged moves, allowing unrelated new rows.
+pub(crate) fn playlist_order_visible(page: &Page, order: &Page) -> Option<bool> {
+    fn occurrences(page: &Page) -> Vec<&str> {
+        page.shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .filter_map(|item| match item {
+                Item::Track(track) => track.details.set_video_id.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }
+    let expected = occurrences(order);
+    let known: HashSet<_> = expected.iter().copied().collect();
+    let visible: Vec<_> = occurrences(page)
+        .into_iter()
+        .filter(|id| known.contains(id))
+        .collect();
+    if visible.is_empty() {
+        return None;
+    }
+    Some(expected.into_iter().take(visible.len()).eq(visible))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_order_evidence_uses_the_final_acknowledged_prefix() {
+        let page = |ids: &[usize], partial: bool| {
+            let mut page = parse_page(&json!({"contents":[]}), "Playlist").unwrap();
+            page.shelves.push(Shelf {
+                title: String::new(),
+                layout: ShelfLayout::Songs,
+                more: None,
+                items: ids
+                    .iter()
+                    .map(|id| {
+                        let mut track: Track = serde_json::from_value(
+                            json!({"id":format!("{id:011}"),"title":"Song","artist":"Artist"}),
+                        )
+                        .unwrap();
+                        track.details.set_video_id = Some(format!("occurrence-{id}"));
+                        Item::Track(track)
+                    })
+                    .collect(),
+            });
+            page.continuation = partial.then(|| Continuation::new("tail"));
+            page
+        };
+        // From 2,0,1: moving 0 before 1, then 1 before 2, ends at 1,2,0.
+        // Replaying both commands on that final order would incorrectly produce 0,1,2.
+        let order = page(&[1, 2, 0], false);
+        assert_eq!(
+            playlist_order_visible(&page(&[1, 2, 0], false), &order),
+            Some(true)
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[2, 0, 1], false), &order),
+            Some(false)
+        );
+        let order = page(&[450, 0, 1, 2], false);
+        assert_eq!(
+            playlist_order_visible(&page(&[0, 1], true), &order),
+            Some(false),
+            "A moved item must appear at the beginning of the known prefix"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[450, 0], true), &order),
+            Some(true)
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[999, 450, 0], true), &order),
+            Some(true),
+            "An unrelated new row may precede the acknowledged order"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[998, 999], true), &order),
+            None
+        );
+    }
 
     #[test]
     fn playlist_metadata_waits_for_the_edited_occurrences_without_scanning_the_tail() {

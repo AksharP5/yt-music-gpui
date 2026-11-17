@@ -889,7 +889,7 @@ impl Music {
             self.refresh_session(false, cx);
         }
         if result.target == CatalogTarget::PlaylistMetadata {
-            self.playlist_metadata_result(result.result, cx);
+            self.playlist_metadata_result(result.result, result.account_generation, cx);
             return;
         }
         if result.target == CatalogTarget::Sidebar {
@@ -922,10 +922,13 @@ impl Music {
                     entry.account_revision != self.account_revision
                         || !entry.route.same_page(&self.route)
                 });
-                let mut metadata_replayed = false;
+                let mut replayed_changes = false;
                 for change in self.sync.page_changes.drain(..) {
-                    metadata_replayed |= change.apply(&mut page, &self.route);
+                    replayed_changes |= change.apply(&mut page, &self.route, !result.append);
                 }
+                replayed_changes |=
+                    self.sync
+                        .replay_playlist_edits(&mut page, &self.route, !result.append);
                 for track in page
                     .shelves
                     .iter()
@@ -952,7 +955,7 @@ impl Music {
                     }
                 }
                 self.sync.page_fetched_at =
-                    (!metadata_replayed && reload_verified).then(Instant::now);
+                    (!replayed_changes && reload_verified).then(Instant::now);
                 if let Some(active) = &mut self.forward_page
                     && active.list_id == self.list_id
                     && !result.append
@@ -1120,6 +1123,7 @@ impl CatalogRequests {
                                         &refresh.id,
                                         &refresh.additions,
                                         &refresh.removals,
+                                        refresh.order.as_deref(),
                                         || {
                                             generations[target as usize].load(Ordering::Relaxed)
                                                 == job.id
