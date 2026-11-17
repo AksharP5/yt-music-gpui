@@ -1703,6 +1703,128 @@ fn playlist_picker_shows_a_rejected_save_inside_the_dialog() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn already_added_shows_a_rejected_retry_inside_the_dialog() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                let (commands, submitted) = async_channel::bounded(1);
+                drop(submitted);
+                view.account_commands = commands;
+                view.error = None;
+                view.notice = None;
+                view.account_event(
+                    account::Event::Applied {
+                        session: view.account.as_ref().unwrap().session.clone(),
+                        mutation: Box::new(Mutation::AddToPlaylist {
+                            id: "PLduplicate".into(),
+                            video_ids: vec!["00000000000".into()],
+                            duplicates: false,
+                        }),
+                        result: Ok(Effect::AlreadyAdded),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+                window.focus(&view.overlay_focus, cx);
+            })
+            .unwrap();
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        let before = window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "duplicate-save-before-rejection")
+            })
+            .unwrap();
+        super::render::key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                let Some(crate::app::Overlay::AlreadyAdded { error, .. }) = &view.overlay else {
+                    panic!("A rejected duplicate save must keep the dialog open")
+                };
+                assert_eq!(
+                    error.as_deref(),
+                    Some("The account connection stopped. Restart the app to reconnect.")
+                );
+                assert!(view.error.is_none());
+                assert!(view.pending_mutations.is_empty());
+            })
+            .unwrap();
+        let after = window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "duplicate-save-rejected")
+            })
+            .unwrap();
+        let left = after.width() / 2 - 240;
+        let error_pixels = (0..after.height())
+            .flat_map(|y| (left..left + 480).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let [r, g, b, _] = after.get_pixel(x, y).0;
+                r > 100 && r.saturating_sub(g) > 20 && r.saturating_sub(b) > 20
+            })
+            .count();
+        assert!(
+            error_pixels > 100,
+            "The duplicate save error must be visible"
+        );
+        assert!(
+            (0..after.height())
+                .all(|y| (0..left).all(|x| before.get_pixel(x, y) == after.get_pixel(x, y))),
+            "Duplicate save feedback must leave the surrounding page unchanged"
+        );
+        let (commands, submitted) = async_channel::bounded(1);
+        window
+            .update(cx, |view, _, _| {
+                view.account_commands = commands;
+                view.account_operation = Some(crate::app::AccountOperation::RestoreFailed);
+            })
+            .unwrap();
+        super::render::key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                let Some(crate::app::Overlay::AlreadyAdded { error, .. }) = &view.overlay else {
+                    panic!("An account change must keep the duplicate dialog open")
+                };
+                assert_eq!(
+                    error.as_deref(),
+                    Some("Finish the account change before saving edits.")
+                );
+                assert!(view.error.is_none());
+                assert!(submitted.is_empty());
+                view.account_operation = None;
+            })
+            .unwrap();
+        super::render::key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    view.overlay.is_none(),
+                    "An accepted retry closes the dialog"
+                );
+                assert!(
+                    view.error.is_none(),
+                    "An accepted retry clears the prior error"
+                );
+                let account::Command::Apply { session, mutation } = submitted.try_recv().unwrap()
+                else {
+                    panic!("Add anyway must submit the duplicate save")
+                };
+                assert!(Arc::ptr_eq(
+                    &session,
+                    &view.account.as_ref().unwrap().session
+                ));
+                assert!(
+                    matches!(*mutation, Mutation::AddToPlaylist { id, video_ids, duplicates: true }
+                    if id == "PLduplicate" && video_ids == ["00000000000"])
+                );
+                assert!(view.pending_mutations.contains("PLduplicate"));
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn a_queue_can_create_its_first_playlist_without_losing_songs() -> Result<()> {
     use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
 

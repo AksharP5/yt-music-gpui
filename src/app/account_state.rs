@@ -954,7 +954,11 @@ impl Music {
                             }
                             Effect::AlreadyAdded => {
                                 if let Mutation::AddToPlaylist { id, video_ids, .. } = mutation {
-                                    self.overlay = Some(Overlay::AlreadyAdded { id, video_ids });
+                                    self.overlay = Some(Overlay::AlreadyAdded {
+                                        id,
+                                        video_ids,
+                                        error: None,
+                                    });
                                 }
                             }
                             Effect::PlaylistAdded { additions, toast } => {

@@ -36,6 +36,7 @@ pub(in crate::app) enum Overlay {
     AlreadyAdded {
         id: String,
         video_ids: Vec<String>,
+        error: Option<String>,
     },
     PlaylistForm {
         form: Entity<PlaylistForm>,
@@ -1032,7 +1033,12 @@ impl Music {
                     }
                 }
             }
-        } else if let Overlay::AlreadyAdded { id, video_ids } = kind {
+        } else if let Overlay::AlreadyAdded {
+            id,
+            video_ids,
+            error,
+        } = kind
+        {
             body = body.child(
                 div()
                     .p(px(12.))
@@ -1045,6 +1051,10 @@ impl Music {
                 "Add anyway",
                 cx,
                 move |view, window, cx| {
+                    if let Some(Overlay::AlreadyAdded { error, .. }) = &mut view.overlay {
+                        *error = None;
+                    }
+                    view.error = None;
                     if view.mutate(
                         Mutation::AddToPlaylist {
                             id: id.clone(),
@@ -1054,6 +1064,8 @@ impl Music {
                         cx,
                     ) {
                         view.close_overlay(window, cx);
+                    } else if let Some(Overlay::AlreadyAdded { error, .. }) = &mut view.overlay {
+                        *error = view.error.take();
                     }
                 },
             ));
@@ -1063,6 +1075,14 @@ impl Music {
                 cx,
                 |view, window, cx| view.close_overlay(window, cx),
             ));
+            if let Some(error) = error {
+                body = body.child(
+                    div()
+                        .mt(px(12.))
+                        .text_color(rgb(0xf1a6ae))
+                        .child(error.clone()),
+                );
+            }
         } else if let Overlay::NoKeyring(session) = kind {
             body = body
                 .child(div().mb(px(12.)).child(
