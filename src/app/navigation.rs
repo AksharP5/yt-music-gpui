@@ -396,6 +396,9 @@ impl Music {
 
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
+        if target == CatalogTarget::Sidebar {
+            self.sync.sidebar_changes.clear();
+        }
         if target == CatalogTarget::Page {
             self.clear_playlist_metadata_error();
             if let Some(page) = &mut self.forward_page
@@ -901,21 +904,28 @@ impl Music {
                     );
                     self.sidebar_error = None;
                 }
-                Err(error) => self.sidebar_error = Some(error),
+                Err(error) => {
+                    self.sync.sidebar_changes.clear();
+                    self.sidebar_error = Some(error);
+                }
             }
             cx.notify();
             return;
         }
         match result.result {
             Ok(mut page) => {
+                if !result.append && self.sync.page_reload.is_some() {
+                    self.playlist_reloaded(&page, cx);
+                }
                 // The view now has newer content for this route than any cached copy,
                 // however the user leaves it (link, Back, or another Back).
                 self.page_cache.retain(|entry| {
                     entry.account_revision != self.account_revision
                         || !entry.route.same_page(&self.route)
                 });
+                let mut metadata_replayed = false;
                 for change in self.sync.page_changes.drain(..) {
-                    change.apply(&mut page, &self.route);
+                    metadata_replayed |= change.apply(&mut page, &self.route);
                 }
                 for track in page
                     .shelves
@@ -942,7 +952,7 @@ impl Music {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                self.sync.page_fetched_at = Some(Instant::now());
+                self.sync.page_fetched_at = (!metadata_replayed).then(Instant::now);
                 if let Some(active) = &mut self.forward_page
                     && active.list_id == self.list_id
                     && !result.append

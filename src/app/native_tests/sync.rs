@@ -58,6 +58,129 @@ fn deliver(view: &mut Music, job: Job, result: Result<Page, String>, cx: &mut Co
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_metadata_cannot_make_an_older_page_cacheable() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            view.navigate(Route::Explore, cx);
+            super::navigation::reply(view, page(1, false), cx);
+            let track = view.page.tracks()[0].clone();
+            view.account_event(account::Event::Applied {
+                session:view.account.as_ref().unwrap().session.clone(),
+                mutation:Box::new(Mutation::AddToPlaylist { id:"alpha".into(), video_ids:vec![track.id.clone()], duplicates:false }),
+                result:Ok(Effect::PlaylistAdded { additions:vec![(track.id,"added-occurrence".into())], toast:None }), session_rejected:false,
+            }, window, cx);
+            let metadata = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(metadata.query.target() == CatalogTarget::PlaylistMetadata);
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            let mut fresh = playlist(1, false, "1 track");
+            let crate::catalog::Item::Track(added) = &mut fresh.shelves[0].items[0] else { panic!() };
+            added.details.set_video_id = Some("added-occurrence".into());
+            deliver(view, metadata, Ok(fresh), cx);
+            super::navigation::reply(view, playlist(0, false, "0 tracks"), cx);
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "1 track");
+            assert!(view.rows.is_empty());
+            view.navigate(Route::Explore, cx);
+            if view.catalog_requests.is_loading(CatalogTarget::Page) {
+                super::navigation::reply(view, page(1, false), cx);
+            }
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "Replaying fresh totals cannot certify an older response's empty rows for forward reuse");
+            super::navigation::reply(view, playlist(1, false, "1 track"), cx);
+            assert_eq!(view.rows.len(), 1);
+        }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_reload_supersedes_older_readback_failures() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            for (id, failure_first, fresh) in [("before",true,true),("after",false,true),("stale",false,false),("stale-before",true,false)] {
+                view.error = None;
+                view.navigate(Route::Browse(BrowseLink::new(format!("VL{id}"), id)), cx);
+                super::navigation::reply(view, playlist(1, false, "1 track"), cx);
+                super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
+                    id:id.into(), video_id:"00000000000".into(), set_video_id:"occurrence-0".into(),
+                }, cx);
+                let mut metadata = Some(view.catalog_requests.pending.try_recv().unwrap());
+                view.reload_current_page(cx);
+                let jobs:Vec<_> = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
+                let mut page_read = None;
+                for job in jobs {
+                    match job.query.target() {
+                        CatalogTarget::Page => page_read = Some(job),
+                        CatalogTarget::Sidebar => deliver(view, job, Ok(page(0, false)), cx),
+                        _ => panic!("Unexpected reload job"),
+                    }
+                }
+                if failure_first {
+                    deliver(view, metadata.take().unwrap(), Err("Older playlist details failed".into()), cx);
+                }
+                let response = if fresh { playlist(0, false, "0 tracks") } else { playlist(1, false, "1 track") };
+                deliver(view, page_read.unwrap(), Ok(response), cx);
+                if let Some(metadata) = metadata {
+                    deliver(view, metadata, Err("Older playlist details failed".into()), cx);
+                }
+                if fresh {
+                    assert!(view.error.is_none(), "A successful Reload must supersede older readback feedback: {id}: {:?}", view.error);
+                    assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks");
+                } else {
+                    assert_eq!(view.error.as_deref(), Some("Older playlist details failed"), "A lagging Reload must not hide an unresolved readback failure");
+                }
+            }
+        }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_guide_replay_ends_with_its_read() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, _, cx| {
+            view.navigate(Route::Explore, cx);
+            super::navigation::reply(view, page(1, false), cx);
+            for terminal in ["continuation", "failure", "superseded"] {
+                view.request(Query::SidebarPlaylists, cx);
+                let initial = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(initial.query.target() == CatalogTarget::Sidebar);
+                let mut guide = page(0, true);
+                guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLalpha", "title":"Alpha", "subtitle":"3 tracks"})).unwrap()));
+                deliver(view, initial, Ok(guide.clone()), cx);
+                view.request(Query::SidebarMore(view.sync.sidebar_continuation.clone().unwrap()), cx);
+                let older_guide = view.catalog_requests.pending.try_recv().unwrap();
+                view.refresh_playlist_metadata("alpha", Vec::new(), None, cx);
+                let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                deliver(view, metadata, Ok(playlist(2, false, "2 tracks")), cx);
+                assert_eq!(view.sidebar_playlists[0].subtitle, "2 tracks");
+                match terminal {
+                    "continuation" => deliver(view, older_guide, Ok(page(0, false)), cx),
+                    "failure" => deliver(view, older_guide, Err("Guide read failed".into()), cx),
+                    _ => {
+                        view.request(Query::SidebarPlaylists, cx);
+                        let newer_guide = view.catalog_requests.pending.try_recv().unwrap();
+                        deliver(view, older_guide, Err("Superseded guide failure".into()), cx);
+                        deliver(view, newer_guide, Ok(guide), cx);
+                        assert_eq!(view.sidebar_playlists[0].subtitle, "3 tracks", "A new guide read must not inherit the previous read's replay");
+                        continue;
+                    }
+                }
+                view.refresh_playlist_metadata("alpha", Vec::new(), None, cx);
+                let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                deliver(view, metadata, Ok(playlist(1, false, "1 track")), cx);
+                view.request(Query::SidebarPlaylists, cx);
+                let newer_guide = view.catalog_requests.pending.try_recv().unwrap();
+                let crate::catalog::Item::Collection(alpha) = &mut guide.shelves[0].items[0] else { panic!() };
+                alpha.subtitle = "1 track".into();
+                deliver(view, newer_guide, Ok(guide), cx);
+                assert_eq!(view.sidebar_playlists[0].subtitle, "1 track", "A completed {terminal} must not leave an older replay for the next guide read");
+            }
+        }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playlist_refreshes_expire_cached_pages_and_cancel_deleted_playlists() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window.update(cx, |view, window, cx| {

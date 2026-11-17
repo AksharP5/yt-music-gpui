@@ -2381,7 +2381,11 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
     Ok(choices)
 }
 
-fn playlist_metadata_visible(page: &Page, additions: &[String], removals: &[String]) -> bool {
+pub(crate) fn playlist_metadata_visible(
+    page: &Page,
+    additions: &[String],
+    removals: &[String],
+) -> bool {
     let occurrences: HashSet<_> = page
         .shelves
         .iter()

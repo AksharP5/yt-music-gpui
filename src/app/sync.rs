@@ -14,8 +14,8 @@ pub(in crate::app) struct SyncState {
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
     pub playlist_refreshes: VecDeque<PlaylistRefresh>,
-    pub playlist_metadata_error: Option<(String, String)>,
-    sidebar_changes: Vec<PlaylistMetadata>,
+    pub playlist_metadata_error: Option<(PlaylistRefresh, String)>,
+    pub sidebar_changes: Vec<PlaylistMetadata>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -31,12 +31,13 @@ pub(super) enum PageChange {
 }
 
 impl PageChange {
-    pub(super) fn apply(self, page: &mut Page, route: &Route) {
+    pub(super) fn apply(self, page: &mut Page, route: &Route) -> bool {
         match self {
             Self::Confirmed(mutation) => patch_page(page, route, &mutation),
             Self::PlaylistAdded { id, tracks } => append_added(page, route, &id, &tracks),
-            Self::PlaylistMetadata(metadata) => metadata.apply(page, route),
+            Self::PlaylistMetadata(metadata) => return metadata.apply(page, route),
         }
+        false
     }
 }
 
@@ -72,28 +73,30 @@ pub(super) struct PlaylistMetadata {
 }
 
 impl PlaylistMetadata {
-    fn from_page(id: String, page: Page) -> Result<Self, String> {
-        let header = page.header.ok_or_else(|| {
+    fn from_page(id: String, page: &Page) -> Result<Self, String> {
+        let header = page.header.as_ref().ok_or_else(|| {
             "Playlist saved, but its details are unavailable. Refresh the playlist.".to_owned()
         })?;
         let count = header.track_count().map(str::to_owned);
         Ok(Self {
             id,
-            stats: header.stats,
+            stats: header.stats.clone(),
             count,
-            thumbnail: header.thumbnail,
-            background: page.background,
+            thumbnail: header.thumbnail.clone(),
+            background: page.background.clone(),
         })
     }
 
-    fn apply(&self, page: &mut Page, route: &Route) {
+    fn apply(&self, page: &mut Page, route: &Route) -> bool {
         if matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == self.id) {
             if let Some(header) = &mut page.header {
                 header.stats = self.stats.clone();
                 header.thumbnail = self.thumbnail.clone();
             }
             page.background = self.background.clone();
+            return true;
         }
+        false
     }
 
     fn apply_sidebar(&self, playlists: &mut [Collection]) {
@@ -235,7 +238,7 @@ impl SyncState {
             );
             self.sidebar_coverage.continued = true;
             self.sidebar_continuation = page.continuation;
-            for change in &self.sidebar_changes {
+            for change in self.sidebar_changes.drain(..) {
                 change.apply_sidebar(playlists);
             }
             return;
@@ -733,42 +736,75 @@ impl Music {
         let Some(refresh) = self.sync.playlist_refreshes.pop_front() else {
             return;
         };
-        match result.and_then(|page| PlaylistMetadata::from_page(refresh.id.clone(), page)) {
-            Ok(metadata) => {
-                if self.catalog_requests.is_loading(CatalogTarget::Page) {
-                    self.sync
-                        .page_changes
-                        .push(PageChange::PlaylistMetadata(metadata.clone()));
-                }
-                for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
-                    self.back
-                        .iter_mut()
-                        .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
-                ) {
-                    metadata.apply(page, route);
-                }
-                self.page_cache.retain(|entry| !matches!(&entry.route, Route::Browse(link) if link.id.trim_start_matches("VL") == metadata.id));
-                if matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == metadata.id)
-                    && let Some(active) = &mut self.forward_page
-                {
-                    active.fetched_at = None;
-                }
-                metadata.apply_sidebar(&mut self.sidebar_playlists);
-                if self.catalog_requests.is_loading(CatalogTarget::Sidebar) {
-                    self.sync
-                        .sidebar_changes
-                        .retain(|change| change.id != metadata.id);
-                    self.sync.sidebar_changes.push(metadata);
-                }
-            }
+        match result.and_then(|page| PlaylistMetadata::from_page(refresh.id.clone(), &page)) {
+            Ok(metadata) => self.publish_playlist_metadata(metadata),
             Err(error) if self.error.is_none() => {
-                self.sync.playlist_metadata_error = Some((refresh.id, error.clone()));
+                self.sync.playlist_metadata_error = Some((refresh, error.clone()));
                 self.error = Some(error);
             }
             Err(_) => {}
         }
         self.request_playlist_metadata(cx);
         cx.notify();
+    }
+
+    fn publish_playlist_metadata(&mut self, metadata: PlaylistMetadata) {
+        if self.catalog_requests.is_loading(CatalogTarget::Page) {
+            self.sync
+                .page_changes
+                .push(PageChange::PlaylistMetadata(metadata.clone()));
+        }
+        for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
+            self.back
+                .iter_mut()
+                .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
+        ) {
+            metadata.apply(page, route);
+        }
+        self.page_cache.retain(|entry| !matches!(&entry.route, Route::Browse(link) if link.id.trim_start_matches("VL") == metadata.id));
+        if matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == metadata.id)
+            && let Some(active) = &mut self.forward_page
+        {
+            active.fetched_at = None;
+        }
+        metadata.apply_sidebar(&mut self.sidebar_playlists);
+        if self.catalog_requests.is_loading(CatalogTarget::Sidebar) {
+            self.sync
+                .sidebar_changes
+                .retain(|change| change.id != metadata.id);
+            self.sync.sidebar_changes.push(metadata);
+        }
+    }
+
+    pub(super) fn playlist_reloaded(&mut self, page: &Page, cx: &mut Context<Self>) {
+        let Route::Browse(link) = &self.route else {
+            return;
+        };
+        let id = link.id.trim_start_matches("VL");
+        let Some(refresh) = self
+            .sync
+            .playlist_refreshes
+            .iter()
+            .find(|refresh| refresh.id == id)
+            .or_else(|| {
+                self.sync
+                    .playlist_metadata_error
+                    .as_ref()
+                    .map(|(refresh, _)| refresh)
+                    .filter(|refresh| refresh.id == id)
+            })
+        else {
+            return;
+        };
+        // Check the unpatched response. Replayed local removals cannot prove
+        // that the service has caught up with the acknowledged edit.
+        if !crate::catalog::playlist_metadata_visible(page, &refresh.additions, &refresh.removals) {
+            return;
+        }
+        if let Ok(metadata) = PlaylistMetadata::from_page(refresh.id.clone(), page) {
+            self.cancel_playlist_refresh(&metadata.id, cx);
+            self.publish_playlist_metadata(metadata);
+        }
     }
 
     fn cancel_playlist_refresh(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -789,7 +825,7 @@ impl Music {
             .sync
             .playlist_metadata_error
             .as_ref()
-            .is_some_and(|(playlist, _)| playlist == id)
+            .is_some_and(|(refresh, _)| refresh.id == id)
             && let Some((_, error)) = self.sync.playlist_metadata_error.take()
             && self.error.as_ref() == Some(&error)
         {
@@ -803,8 +839,8 @@ impl Music {
     }
 
     pub(super) fn clear_playlist_metadata_error(&mut self) {
-        if self.sync.playlist_metadata_error.as_ref().is_some_and(|(id, _)| {
-            matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id)
+        if self.sync.playlist_metadata_error.as_ref().is_some_and(|(refresh, _)| {
+            matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == refresh.id)
         }) && let Some((_, error)) = self.sync.playlist_metadata_error.take()
             && self.error.as_ref() == Some(&error)
         {
@@ -895,7 +931,7 @@ pub(super) mod tests {
                 "Playlist",
             )
             .unwrap();
-            let metadata = PlaylistMetadata::from_page("playlist".into(), page).unwrap();
+            let metadata = PlaylistMetadata::from_page("playlist".into(), &page).unwrap();
             let mut playlists = vec![Collection {
                 id: "VLplaylist".into(),
                 title: "Playlist".into(),
