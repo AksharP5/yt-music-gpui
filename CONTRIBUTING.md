@@ -79,6 +79,8 @@ Album and playlist queues retain their independently issued Play and Shuffle act
 bin/test -- --ignored --exact queue_source::tests::restored_collection_refreshes_its_actions_and_loads_both_playback_orders
 ```
 
+MPRIS Shuffle uses the same album or playlist source as the player bar. Repeated requests for the same pending order do not reload it, and a rapid on/off pair keeps the last request. `desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests` checks these commands in a native window. Queues without a reversible collection source still reject enabling persistent shuffle through MPRIS.
+
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
 At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline. Search top-result captures check stacked cards at column widths of 592 and 720 pixels and two-column cards at 860 pixels. At 956, 1280 and 1920 pixels, it captures search and player chrome, including the Autoplay header and hover handles. It opens the compact player controls with a pointer and dismisses them with Escape.

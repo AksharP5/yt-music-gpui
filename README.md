@@ -11,7 +11,7 @@ A fast, native YouTube Music client for Linux, built with Rust and GPUI. Audio a
 - Volume levelled between songs like the YouTube Music website (needs mpv 0.38 or newer).
 - Autoplay and Next skip songs the app knows you disliked.
 - Picks up the last song where you left off after a restart.
-- Keyboard shortcuts, media keys and MPRIS desktop controls.
+- Keyboard shortcuts, media keys and MPRIS desktop controls, including reversible album and playlist shuffle.
 
 Songs start about 0.2 s after a click, and playback uses around 1% CPU (measured on Arch).
 

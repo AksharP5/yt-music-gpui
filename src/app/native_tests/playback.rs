@@ -24,6 +24,46 @@ fn collection_source() -> CollectionPlayback {
 }
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playlist commands only"]
+fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests() -> Result<()> {
+    use crate::{app::PlaybackQuery, media_controls::Event};
+
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, _, cx| {
+            let (jobs, pending) = async_channel::bounded(4);
+            view.playback_jobs = jobs;
+            view.pending_playback_jobs = pending;
+            view.account = None;
+            view.account_operation = None;
+            view.watch_pending = None;
+            view.library.autoplay = false;
+            view.library.queue.replace(continuation_page(0..3, None).tracks(), 1);
+            view.library.queue.collection = Some(collection_source());
+            view.desktop_event(Event::Shuffle(false), cx);
+            assert!(view.pending_playback_jobs.is_empty());
+            view.desktop_event(Event::Shuffle(true), cx);
+            view.desktop_event(Event::Shuffle(true), cx);
+            let shuffled = view.pending_playback_jobs.try_recv().unwrap();
+            assert!(matches!(shuffled.query, PlaybackQuery::Collection(source) if source.order == PlaybackOrder::Shuffled));
+            assert!(view.pending_playback_jobs.is_empty());
+            view.desktop_event(Event::Shuffle(false), cx);
+            view.desktop_event(Event::Shuffle(false), cx);
+            let original = view.pending_playback_jobs.try_recv().unwrap();
+            assert!(matches!(original.query, PlaybackQuery::Collection(source) if source.order == PlaybackOrder::Original));
+            assert!(original.id > shuffled.id);
+            assert!(view.pending_playback_jobs.is_empty());
+            view.watch_pending = None;
+            view.library.queue.collection = None;
+            let tracks = view.library.queue.tracks.clone();
+            view.desktop_event(Event::Shuffle(true), cx);
+            view.desktop_event(Event::Shuffle(false), cx);
+            assert!(view.pending_playback_jobs.is_empty());
+            assert_eq!(view.library.queue.tracks, tracks);
+        }).unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account activation only"]
 fn collection_shuffle_refreshes_actions_only_when_the_account_changes() -> Result<()> {
     use crate::app::{AccountOperation, BrowserConnection, PlaybackQuery};
