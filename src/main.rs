@@ -15,6 +15,7 @@ mod media_controls;
 #[cfg_attr(windows, path = "os_windows.rs")]
 mod os;
 mod player;
+mod playlist_choices;
 mod playlist_form;
 mod queue_source;
 mod search;

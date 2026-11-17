@@ -21,7 +21,7 @@ Only its intrinsic size is changed to 71 by 24 pixels.
 Icons in assets/icons from Google Material Icons, Copyright Google LLC,
 licensed under Apache License 2.0 (LICENSE-APACHE).
 Source: https://github.com/google/material-design-icons
-  Unmodified: album, description, link, playlist-add, radio and play-next
+  Unmodified: album, description, link, playlist-add, playlist-pin ("push_pin"), radio and play-next
   (Material "playlist_play").
   Adapted: menu, person, thumb-up and thumb-up-filled (Material "thumb_up"),
   and thumb-down (thumb-up rotated).

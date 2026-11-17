@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::catalog::{BrowseChoice, LibraryFilters};
+use crate::playlist_choices::{Choices, LIKED_MUSIC_ART};
 
 #[derive(Clone, PartialEq)]
 pub(in crate::app) struct Search {
@@ -80,6 +81,7 @@ pub(in crate::app) enum Query {
     Library(Section),
     SidebarPlaylists,
     SidebarMore(Continuation),
+    PlaylistChoices(Vec<String>),
     /// The current page again in another order, replacing it.
     Reload(Continuation),
     Revalidate(Box<Query>),
@@ -88,11 +90,13 @@ impl Query {
     pub(in crate::app) fn target(&self) -> CatalogTarget {
         match self {
             Self::SidebarPlaylists | Self::SidebarMore(_) => CatalogTarget::Sidebar,
+            Self::PlaylistChoices(_) => CatalogTarget::PlaylistChoices,
             Self::Revalidate(query) => query.target(),
             _ => CatalogTarget::Page,
         }
     }
 }
+#[derive(Clone)]
 pub(in crate::app) struct Job {
     pub(in crate::app) id: u64,
     pub(in crate::app) account_revision: u64,
@@ -112,13 +116,24 @@ pub(in crate::app) struct CatalogResult {
     pub(in crate::app) session_rejected: bool,
     pub(in crate::app) target: CatalogTarget,
 }
+pub(in crate::app) struct PlaylistChoicesResult {
+    pub(in crate::app) job: Job,
+    pub(in crate::app) result: Result<Choices, String>,
+    pub(in crate::app) session_rejected: bool,
+}
+
+enum CatalogEvent {
+    Page(Box<CatalogResult>),
+    PlaylistChoices(Box<PlaylistChoicesResult>),
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum CatalogTarget {
     Page,
     Sidebar,
+    PlaylistChoices,
 }
 impl CatalogTarget {
-    pub(in crate::app) const ALL: [Self; 2] = [Self::Page, Self::Sidebar];
+    pub(in crate::app) const ALL: [Self; 3] = [Self::Page, Self::Sidebar, Self::PlaylistChoices];
 }
 struct RestoringRequest {
     id: u64,
@@ -136,6 +151,8 @@ pub(in crate::app) struct CatalogRequests {
     pub(in crate::app) loading: [bool; CatalogTarget::ALL.len()],
     pub(in crate::app) jobs: async_channel::Sender<Job>,
     pub(in crate::app) pending: async_channel::Receiver<Job>,
+    pub(in crate::app) playlist_choices: Option<Choices>,
+    pub(in crate::app) playlist_choices_error: Option<String>,
     restoring: Option<RestoringCatalog>,
 }
 impl CatalogRequests {
@@ -146,6 +163,8 @@ impl CatalogRequests {
             loading: [false; CatalogTarget::ALL.len()],
             jobs,
             pending,
+            playlist_choices: None,
+            playlist_choices_error: None,
             restoring: None,
         }
     }
@@ -289,6 +308,10 @@ impl CatalogRequests {
     pub(in crate::app) fn cancel(&mut self, target: CatalogTarget) {
         self.generations[target as usize].fetch_add(1, Ordering::Relaxed);
         self.loading[target as usize] = false;
+        if target == CatalogTarget::PlaylistChoices {
+            self.playlist_choices = None;
+            self.playlist_choices_error = None;
+        }
     }
 
     pub(in crate::app) fn finish(&mut self, target: CatalogTarget, id: u64) -> bool {
@@ -410,6 +433,8 @@ impl Music {
         );
         if target == CatalogTarget::Sidebar {
             self.sidebar_error = result.err();
+        } else if target == CatalogTarget::PlaylistChoices {
+            self.catalog_requests.playlist_choices_error = result.err();
         } else if target == CatalogTarget::Page {
             self.sync.page_error = result.err();
             if let Some(error) = &self.sync.page_error {
@@ -778,6 +803,49 @@ impl Music {
         cx.notify();
     }
 
+    pub(in crate::app) fn playlist_choices_result(
+        &mut self,
+        response: PlaylistChoicesResult,
+        cx: &mut Context<Self>,
+    ) {
+        let Query::PlaylistChoices(video_ids) = &response.job.query else {
+            return;
+        };
+        let Some(Overlay::PlaylistPicker { tracks, .. }) = &self.overlay else {
+            return;
+        };
+        if response.job.account_revision != self.account_revision
+            || !self.account.as_ref().is_some_and(|account| {
+                response
+                    .job
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| Arc::ptr_eq(session, &account.session))
+            })
+            || !tracks.iter().map(|track| &track.id).eq(video_ids)
+            || !self
+                .catalog_requests
+                .finish(CatalogTarget::PlaylistChoices, response.job.id)
+        {
+            return;
+        }
+        if response.job.account_generation != self.account_generation {
+            self.refresh_playlist_choices(cx);
+            return;
+        }
+        if response.session_rejected {
+            self.refresh_session(false, cx);
+        }
+        match response.result {
+            Ok(choices) => {
+                self.catalog_requests.playlist_choices = Some(choices);
+                self.catalog_requests.playlist_choices_error = None;
+            }
+            Err(error) => self.catalog_requests.playlist_choices_error = Some(error),
+        }
+        cx.notify();
+    }
+
     pub(in crate::app) fn catalog_result(&mut self, result: CatalogResult, cx: &mut Context<Self>) {
         // Quarantine early responses before finish(), refresh, ratings, page/cache,
         // or sidebar state can observe them. Activation consumes each held request.
@@ -947,7 +1015,7 @@ impl CatalogRequests {
     )]
     pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let catalog_requests = CatalogRequests::new();
-        let (results, completed) = async_channel::unbounded::<CatalogResult>();
+        let (results, completed) = async_channel::unbounded::<CatalogEvent>();
         // Blocking reads can't be interrupted once discarded. Startup sends Home
         // and the sidebar before verification, so keep a worker beyond those two
         // free for whatever replaces them (the guest fallback or the next page).
@@ -962,6 +1030,34 @@ impl CatalogRequests {
                     while let Ok(job) = receiver.recv_blocking() {
                         let target = job.query.target();
                         if generations[target as usize].load(Ordering::Relaxed) != job.id {
+                            continue;
+                        }
+                        if let Query::PlaylistChoices(video_ids) = &job.query {
+                            let result = catalog
+                                .as_ref()
+                                .map_err(|error| anyhow::anyhow!("{error:#}"))
+                                .and_then(|catalog| {
+                                    catalog
+                                        .for_session(job.session.clone())
+                                        .playlist_choices(video_ids)
+                                });
+                            if generations[target as usize].load(Ordering::Relaxed) != job.id {
+                                continue;
+                            }
+                            let session_rejected =
+                                result.as_ref().is_err_and(auth::session_was_rejected);
+                            if results
+                                .send_blocking(CatalogEvent::PlaylistChoices(Box::new(
+                                    PlaylistChoicesResult {
+                                        job,
+                                        result: result.map_err(|error| format!("{error:#}")),
+                                        session_rejected,
+                                    },
+                                )))
+                                .is_err()
+                            {
+                                break;
+                            }
                             continue;
                         }
                         let append =
@@ -985,6 +1081,9 @@ impl CatalogRequests {
                                     }
                                     Query::Revalidate(_) => {
                                         Err(anyhow::anyhow!("Nested revalidation"))
+                                    }
+                                    Query::PlaylistChoices(_) => {
+                                        Err(anyhow::anyhow!("Invalid playlist destination request"))
                                     }
                                     Query::Search(search) => catalog.search_filtered(
                                         &search.query,
@@ -1012,7 +1111,7 @@ impl CatalogRequests {
                             result.as_ref().is_err_and(auth::session_was_rejected);
                         let result = result.map_err(|error| format!("{error:#}"));
                         if results
-                            .send_blocking(CatalogResult {
+                            .send_blocking(CatalogEvent::Page(Box::new(CatalogResult {
                                 id: job.id,
                                 account_revision: job.account_revision,
                                 account_generation: job.account_generation,
@@ -1022,7 +1121,7 @@ impl CatalogRequests {
                                 result,
                                 session_rejected,
                                 target,
-                            })
+                            })))
                             .is_err()
                         {
                             break;
@@ -1034,7 +1133,12 @@ impl CatalogRequests {
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(result) = completed.recv().await {
                 if view
-                    .update_in(cx, |view, _, cx| view.catalog_result(result, cx))
+                    .update_in(cx, |view, _, cx| match result {
+                        CatalogEvent::Page(result) => view.catalog_result(*result, cx),
+                        CatalogEvent::PlaylistChoices(result) => {
+                            view.playlist_choices_result(*result, cx)
+                        }
+                    })
                     .is_err()
                 {
                     break;
@@ -1045,10 +1149,6 @@ impl CatalogRequests {
         catalog_requests
     }
 }
-
-/// The art the web shows for Liked Music, which guests keep locally.
-const LIKED_MUSIC_ART: &str =
-    "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-songs-delhi-192.png";
 
 /// The library chips a guest can fill from saved collections.
 const LOCAL_SECTIONS: [Section; 4] = [

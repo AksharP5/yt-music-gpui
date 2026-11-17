@@ -465,8 +465,13 @@ impl Music {
                 self.notice = Some("Saving to YouTube Music…".into());
                 true
             }
-            Err(_) => {
+            Err(async_channel::TrySendError::Full(_)) => {
                 self.error = Some("Too many pending changes. Wait for them to finish.".into());
+                false
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                self.error =
+                    Some("The account connection stopped. Restart the app to reconnect.".into());
                 false
             }
         };
@@ -827,6 +832,7 @@ impl Music {
                                             // Rebind only this verified account's queue; discard other in-flight reads.
                                             view.catalog_requests.cancel(CatalogTarget::Page);
                                             view.catalog_requests.cancel(CatalogTarget::Sidebar);
+                                            view.catalog_requests.cancel(CatalogTarget::PlaylistChoices);
                                             if let Some(expected) = &previous_session
                                                 && let Err(error) = view.queue_source.renew_session(expected, session.clone())
                                             { view.queue_source.cancel(); view.error = Some(error); }
