@@ -682,6 +682,7 @@ impl fmt::Debug for Continuation {
 pub struct Page {
     pub title: String,
     pub header: Option<PageHeader>,
+    pub background: Option<String>,
     pub shelves: Vec<Shelf>,
     pub continuation: Option<Continuation>,
     pub editable: bool,
@@ -1971,6 +1972,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
                 })
                 .unwrap_or_default(),
         }),
+        background: None,
         shelves,
         continuation,
         editable: editable_header.is_some(),
@@ -2144,6 +2146,7 @@ fn library_filters(data: &Value) -> Option<LibraryFilters> {
 
 pub(crate) fn parse_home(data: &Value, title: &str) -> Result<Page> {
     let mut page = parse_page(data, title)?;
+    page.background = thumbnail(&data["background"]);
     page.chips = home_choices(data)?;
     Ok(page)
 }
@@ -2990,6 +2993,7 @@ mod tests {
         let mut page = Page {
             title: "Mixed results".into(),
             header: None,
+            background: None,
             shelves: Vec::new(),
             continuation: None,
             editable: false,
@@ -3786,6 +3790,37 @@ mod tests {
             assert!(message.contains("invalid page visitor"));
             assert!(!message.contains("private-visitor") && !message.contains("injected"));
         }
+    }
+
+    #[test]
+    fn home_background_uses_only_the_page_artwork() {
+        let mut response = json!({
+            "background":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{
+                "url":"https://yt3.googleusercontent.com/home=w1440-h810-l90-rj",
+                "width":1440,"height":810
+            }]}}},
+            "contents":[{"musicCarouselShelfRenderer":{"contents":[{"musicTwoRowItemRenderer":{
+                "title":{"simpleText":"A playlist"},
+                "navigationEndpoint":{"browseEndpoint":{"browseId":"VLplaylist"}},
+                "thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{
+                    "url":"https://yt3.googleusercontent.com/card=w226-h226-l90-rj","width":226,"height":226
+                }]}}},
+                "thumbnailOverlay":{"musicItemThumbnailOverlayRenderer":{"background":{
+                    "verticalGradient":{"gradientLayerColors":["2147483648","0","0"]}
+                }}}
+            }}]}}]
+        });
+        let page = parse_home(&response, "Home").unwrap();
+        assert_eq!(
+            page.background.as_deref(),
+            Some("https://yt3.googleusercontent.com/home=w1440-h810-l90-rj")
+        );
+        assert_eq!(
+            page.shelves[0].items[0].thumbnail(),
+            Some("https://yt3.googleusercontent.com/card=w226-h226-l90-rj")
+        );
+        response.as_object_mut().unwrap().remove("background");
+        assert!(parse_home(&response, "Home").unwrap().background.is_none());
     }
 
     fn home_filter_fixture(selected: bool) -> Value {

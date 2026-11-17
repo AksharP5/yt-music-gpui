@@ -76,7 +76,6 @@ impl Music {
             guide_width + if width < 1150. { 56. } else { inset }
         };
         // Only an expanded, unscrolled guide has its own header background.
-        let home_band = self.route.is_home() && !self.player_open && !scrolled;
         div()
             .h(px(64.))
             .w_full()
@@ -84,7 +83,6 @@ impl Music {
             .relative()
             .flex()
             .items_center()
-            .when(home_band, |d| d.bg(rgb(0x14252c)))
             .when(!compact && !scrolled, |header| {
                 header.child(
                     div()
@@ -98,7 +96,7 @@ impl Music {
                         .border_color(self.theme.border),
                 )
             })
-            .when(!home_band && (scrolled || !self.immersive_header()), |d| {
+            .when(scrolled || !self.immersive_header(), |d| {
                 d.bg(self.theme.bg)
             })
             .child(
