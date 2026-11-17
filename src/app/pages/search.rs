@@ -175,17 +175,23 @@ impl Music {
                         "featured-play",
                         "play",
                         "Play",
-                        collection.details.play.clone(),
+                        PlaybackQuery::collection(collection, PlaybackOrder::Original),
                     ))
                 };
                 let shuffle = Some((
                     "featured-shuffle",
                     "shuffle",
                     "Shuffle",
-                    collection.details.shuffle.clone(),
+                    PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
                 ));
-                let mix =
-                    artist.then(|| ("featured-mix", "mix", "Mix", collection.details.mix.clone()));
+                let mix = artist.then(|| {
+                    (
+                        "featured-mix",
+                        "mix",
+                        "Mix",
+                        collection.details.mix.clone().map(PlaybackQuery::Playlist),
+                    )
+                });
                 // Playlists lead with Shuffle on the web; albums with Play.
                 let order = if collection.id.starts_with("VL") {
                     [shuffle, play, mix]
@@ -193,16 +199,15 @@ impl Music {
                     [play, shuffle, mix]
                 };
                 let width = if artist { 125. } else { 137. };
-                for (position, (id, glyph, label, target)) in
-                    order.into_iter().flatten().enumerate()
+                for (position, (id, glyph, label, query)) in order.into_iter().flatten().enumerate()
                 {
-                    let Some(target) = target else { continue };
+                    let Some(query) = query else { continue };
                     actions = actions.child(
                         result_action(id, glyph, label, position == 0, width, self.theme).on_click(
                             cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&view.focus, cx);
-                                view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                                view.start_queue(query.clone(), cx);
                             }),
                         ),
                     );

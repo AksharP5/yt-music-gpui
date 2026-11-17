@@ -16,7 +16,7 @@ use crate::{
         VideoAttachment, VideoQuality, VideoStatus,
     },
     playlist_form::{PlaylistForm, PlaylistFormEvent},
-    queue_source::{self, PageRequest},
+    queue_source::{self, PageRequest, PlaybackOrder},
     search::{SearchFilter, SearchScope},
     search_box::{SearchBox, SearchBoxEvent},
     song_text::{self, Content as SongText, Query as TextQuery},

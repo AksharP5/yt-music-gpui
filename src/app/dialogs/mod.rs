@@ -946,29 +946,33 @@ impl Music {
                 }),
             );
         } else if let Overlay::Collection(collection) = kind {
-            for (id, label, target) in [
+            for (id, label, query) in [
                 (
                     "menu-shuffle",
                     "Shuffle play",
-                    collection.details.shuffle.clone(),
+                    PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
                 ),
-                ("menu-radio", "Start mix", collection.details.mix.clone()),
+                (
+                    "menu-radio",
+                    "Start mix",
+                    collection.details.mix.clone().map(PlaybackQuery::Playlist),
+                ),
             ] {
-                if let Some(target) = target {
+                if let Some(query) = query {
                     actions.push(self.menu_action(id, label, cx, move |view, window, cx| {
                         view.close_overlay(window, cx);
-                        view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                        view.start_queue(query.clone(), cx);
                     }));
                 }
             }
-            if let Some(target) = collection.details.play.clone() {
+            if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Original) {
                 actions.push(self.menu_action(
                     "collection-play",
                     "Play",
                     cx,
                     move |view, window, cx| {
                         view.close_overlay(window, cx);
-                        view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                        view.start_queue(query.clone(), cx);
                     },
                 ));
             }

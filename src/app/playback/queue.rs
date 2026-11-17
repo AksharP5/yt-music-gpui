@@ -213,6 +213,7 @@ impl Music {
                 id,
                 account_revision,
                 update,
+                mut collection,
                 result,
                 session_rejected,
             } => {
@@ -259,6 +260,10 @@ impl Music {
                                 }
                             };
                         if replaced {
+                            if !fresh && let Some(collection) = &mut collection {
+                                collection.clear_actions();
+                            }
+                            self.library.queue.collection = collection;
                             self.reset_radio();
                             let session =
                                 self.account.as_ref().map(|account| account.session.clone());
@@ -435,6 +440,15 @@ impl Music {
             request,
             session,
         );
+        if let Route::Browse(link) = &self.route {
+            self.library.queue.collection = self.page.header.as_ref().and_then(|header| {
+                queue_source::CollectionPlayback::new(
+                    &link.id,
+                    &header.collection,
+                    PlaybackOrder::Original,
+                )
+            });
+        }
         self.play_current(cx);
     }
 
@@ -677,6 +691,7 @@ impl Music {
             &self.watch_pending,
             Some(
                 PlaybackQuery::Playlist(_)
+                    | PlaybackQuery::Collection(_)
                     | PlaybackQuery::Watch {
                         mode: WatchMode::Radio,
                         ..
@@ -942,6 +957,7 @@ impl PlaybackChannels {
                                 id: job.id,
                                 account_revision: job.account_revision,
                                 update: mode.into(),
+                                collection: None,
                                 session_rejected,
                                 result: result.map_err(|error| format!("{error:#}")),
                             }
@@ -956,6 +972,24 @@ impl PlaybackChannels {
                                 id: job.id,
                                 account_revision: job.account_revision,
                                 update: QueueUpdate::Replace,
+                                collection: None,
+                                session_rejected,
+                                result: result.map_err(|error| format!("{error:#}")),
+                            }
+                        }
+                        PlaybackQuery::Collection(mut collection) => {
+                            let result = catalog
+                                .and_then(|catalog| {
+                                    catalog.watch_playlist(collection.target(&catalog)?)
+                                })
+                                .map(Box::new);
+                            let session_rejected =
+                                result.as_ref().is_err_and(auth::session_was_rejected);
+                            PlaybackResult::Watch {
+                                id: job.id,
+                                account_revision: job.account_revision,
+                                update: QueueUpdate::Replace,
+                                collection: Some(collection),
                                 session_rejected,
                                 result: result.map_err(|error| format!("{error:#}")),
                             }

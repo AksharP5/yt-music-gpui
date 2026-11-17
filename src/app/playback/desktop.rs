@@ -25,6 +25,7 @@ impl Music {
                 &self.watch_pending,
                 Some(
                     PlaybackQuery::Playlist(_)
+                        | PlaybackQuery::Collection(_)
                         | PlaybackQuery::Watch {
                             mode: WatchMode::Issued | WatchMode::Radio,
                             ..

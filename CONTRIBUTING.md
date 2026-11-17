@@ -73,6 +73,12 @@ The Comments check reads public guest comments during muted playback, exercises 
 
 Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
 
+Album and playlist queues retain their independently issued Play and Shuffle actions. Toggling reloads the chosen source order and starts playback, as on the web, including restoring entries removed from Up next. Service-shuffled pages keep the service order and do not enable local eager continuation loading. Saved queues retain only the collection ID and order; restart or account changes require fresh actions. The native `collection_shuffle_toggles_pending_requests_and_ignores_stale_results` check covers rapid toggles, failures, late replies, background details reads and account recovery. A separate public guest integration check reloads actions after serialization and verifies both orders without accessing an account or playing media:
+
+```sh
+bin/test -- --ignored --exact queue_source::tests::restored_collection_refreshes_its_actions_and_loads_both_playback_orders
+```
+
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
 At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline. Search top-result captures check stacked cards at column widths of 592 and 720 pixels and two-column cards at 860 pixels. At 956, 1280 and 1920 pixels, it captures search and player chrome, including the Autoplay header and hover handles. It opens the compact player controls with a pointer and dismisses them with Escape.

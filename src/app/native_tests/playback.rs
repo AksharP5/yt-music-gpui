@@ -14,6 +14,197 @@ fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> cr
 }
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playlist responses only"]
+fn collection_shuffle_toggles_pending_requests_and_ignores_stale_results() -> Result<()> {
+    use crate::app::{
+        AccountOperation, PlaybackIntent, PlaybackQuery, PlaybackResult, QueueUpdate,
+    };
+    use crate::queue_source::{CollectionPlayback, PlaybackOrder};
+    use std::sync::atomic::Ordering;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let details = crate::catalog::parse_page(&serde_json::json!({
+            "header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Synthetic playlist"},"buttons":[
+                {"musicPlayButtonRenderer":{"playNavigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"PLsynthetic","params":"original%3D"}}}},
+                {"menuRenderer":{"items":[{"menuNavigationItemRenderer":{"icon":{"iconType":"MUSIC_SHUFFLE"},"navigationEndpoint":{"watchPlaylistEndpoint":{"playlistId":"PLsynthetic","params":"shuffle%3D"}}}}]}}
+            ]}},"contents":[]
+        }), "Synthetic playlist").unwrap().header.unwrap().collection;
+        let source =
+            CollectionPlayback::new("VLPLsynthetic", &details, PlaybackOrder::Original).unwrap();
+        let tracks = continuation_page(0..3, None).tracks();
+        let watch = |shuffled| {
+            let queue = if shuffled {
+                vec![tracks[1].clone(), tracks[2].clone(), tracks[0].clone()]
+            } else {
+                tracks.clone()
+            };
+            crate::watch::Watch {
+                current: Some(queue[0].clone()),
+                current_index: Some(0),
+                queue,
+                source: Some("Synthetic playlist".into()),
+                lyrics: None,
+                related: None,
+                comments: None,
+                alternatives: None,
+                continuation: None,
+                source_target: None,
+            }
+        };
+        window
+            .update(cx, |view, window, cx| {
+                let (jobs, pending) = async_channel::bounded(1);
+                view.playback_jobs = jobs;
+                view.pending_playback_jobs = pending;
+                view.account = None;
+                view.account_operation = None;
+                view.library.autoplay = false;
+                view.library.queue.replace(tracks.clone(), 2);
+                view.library.queue.collection = Some(source.clone());
+                view.library.queue.playing_from = Some("Synthetic playlist".into());
+                view.player_open = true;
+                view.position = 14.7;
+                view.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                view.error = None;
+                window.focus(&view.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "collection-shuffle-before");
+            })
+            .unwrap();
+        super::render::key(window, cx, "s").await;
+        let first = window.update(cx, |view, _, _| {
+            assert_eq!(view.position, 0.);
+            assert!(matches!(view.playback, Playback::Loading { paused: false, .. }));
+            let job = view.pending_playback_jobs.try_recv().unwrap();
+            assert!(matches!(&job.query, PlaybackQuery::Collection(source) if source.order == PlaybackOrder::Shuffled));
+            job
+        }).unwrap();
+        super::render::key(window, cx, "s").await;
+        window.update(cx, |view, _, cx| {
+            let latest = view.pending_playback_jobs.try_recv().unwrap();
+            assert!(matches!(&latest.query, PlaybackQuery::Collection(source) if source.order == PlaybackOrder::Original));
+            assert!(latest.id > first.id);
+            view.playback_result(PlaybackResult::Watch {
+                id:first.id, account_revision:first.account_revision, update:QueueUpdate::Replace,
+                collection:Some(source.toggled()), result:Ok(Box::new(watch(true))), session_rejected:false,
+            },cx);
+            assert_eq!(view.library.queue.index, Some(2));
+            assert_eq!(view.library.queue.collection.as_ref().unwrap().order, PlaybackOrder::Original);
+            view.playback_result(PlaybackResult::Watch {
+                id:latest.id, account_revision:latest.account_revision, update:QueueUpdate::Replace,
+                collection:Some(source.clone()), result:Err("Synthetic unavailable playlist".into()), session_rejected:false,
+            },cx);
+            assert_eq!(view.library.queue.index, Some(2));
+            assert_eq!(view.error.as_deref(), Some("Synthetic unavailable playlist"));
+            view.error = None;
+        }).unwrap();
+        super::render::key(window, cx, "s").await;
+        window
+            .update(cx, |view, _, cx| {
+                let job = view.pending_playback_jobs.try_recv().unwrap();
+                let PlaybackQuery::Collection(collection) = job.query else {
+                    panic!("Shuffle needs its collection source")
+                };
+                view.playback_result(
+                    PlaybackResult::Watch {
+                        id: job.id,
+                        account_revision: job.account_revision,
+                        update: QueueUpdate::Replace,
+                        collection: Some(collection),
+                        result: Ok(Box::new(watch(true))),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+                assert_eq!(view.library.queue.tracks, watch(true).queue);
+                assert_eq!(view.library.queue.index, Some(0));
+                assert!(
+                    !view.library.queue.shuffled,
+                    "Service queues must not enable local reshuffling or eager continuation loading"
+                );
+                assert_eq!(
+                    view.library.queue.collection.as_ref().unwrap().order,
+                    PlaybackOrder::Shuffled
+                );
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                super::render::capture(window, "collection-shuffle-active");
+                view.remove_queue_track(1, cx);
+                assert_eq!(view.library.queue.tracks.len(), 2);
+                // A current-song details read must not hide or replace the queue's source.
+                view.playback_request(
+                    PlaybackQuery::Watch {
+                        track: Box::new(view.library.queue.current().unwrap().clone()),
+                        mode: crate::watch::WatchMode::Details,
+                    },
+                    cx,
+                );
+                view.pending_playback_jobs.try_recv().unwrap();
+            })
+            .unwrap();
+        super::render::key(window, cx, "s").await;
+        window
+            .update(cx, |view, _, cx| {
+                let job = view.pending_playback_jobs.try_recv().unwrap();
+                let PlaybackQuery::Collection(collection) = job.query else {
+                    panic!("Unshuffle needs its collection source")
+                };
+                assert_eq!(collection.order, PlaybackOrder::Original);
+                view.playback_result(
+                    PlaybackResult::Watch {
+                        id: job.id,
+                        account_revision: job.account_revision,
+                        update: QueueUpdate::Replace,
+                        collection: Some(collection),
+                        result: Ok(Box::new(watch(false))),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+                assert_eq!(view.library.queue.tracks, tracks);
+                assert_eq!(view.library.queue.index, Some(0));
+                view.library.queue =
+                    serde_json::from_value(serde_json::to_value(&view.library.queue).unwrap())
+                        .unwrap();
+                view.account_operation = Some(AccountOperation::Refreshing {
+                    operation: auth::Operation::default(),
+                    retry_change: false,
+                    resume: None,
+                });
+                view.shuffle_queue(cx);
+                view.shuffle_queue(cx);
+                let Some(AccountOperation::Refreshing {
+                    resume:
+                        Some(PlaybackIntent::Queue {
+                            query: PlaybackQuery::Collection(collection),
+                            ..
+                        }),
+                    ..
+                }) = &view.account_operation
+                else {
+                    panic!("Account recovery must retain the latest shuffle action")
+                };
+                assert_eq!(collection.order, PlaybackOrder::Original);
+                assert!(view.pending_playback_jobs.is_empty());
+                assert!(view.playback_generation.load(Ordering::Relaxed) > job.id);
+                view.account_operation = None;
+            })
+            .unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic queue and local connection failures only"]
 fn natural_advancement_retries_a_failed_prefetch_and_continues_the_queue() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
