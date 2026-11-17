@@ -554,6 +554,7 @@ impl Music {
         } else {
             self.account_operation = Some(AccountOperation::Disconnecting(operation));
         }
+        self.publish_desktop();
         cx.notify();
     }
 

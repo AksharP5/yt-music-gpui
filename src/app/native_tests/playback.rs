@@ -64,6 +64,128 @@ fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests()
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account and playlist commands only"]
+fn signing_out_cancels_pending_shuffle_in_desktop_controls() -> Result<()> {
+    use crate::{
+        app::{PlaybackResult, QueueUpdate},
+        media_controls::{Event, MediaControls},
+    };
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let connection = zbus::blocking::Connection::session().unwrap();
+        let bus = zbus::blocking::fdo::DBusProxy::new(&connection).unwrap();
+        let name = "org.mpris.MediaPlayer2.yt_music_gpui";
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bus.name_has_owner(name.try_into().unwrap()).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "The initial desktop service must stop"
+            );
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        let commands = window
+            .update(cx, |view, _, cx| {
+                let (jobs, pending) = async_channel::bounded(1);
+                view.playback_jobs = jobs;
+                view.pending_playback_jobs = pending;
+                let (commands, pending) = async_channel::bounded(1);
+                view.account_commands = commands;
+                view.account = Some(super::account::connection(super::account::session(
+                    "shuffle-signout",
+                )));
+                view.account_operation = None;
+                view.watch_pending = None;
+                view.library.autoplay = false;
+                view.library
+                    .queue
+                    .replace(continuation_page(0..3, None).tracks(), 1);
+                view.library.queue.collection = Some(collection_source());
+                view.media_controls = Some(MediaControls::new().unwrap());
+                view.notify_playback(cx);
+                pending
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bus.name_has_owner(name.try_into().unwrap()).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "The test desktop service must start"
+            );
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        let properties = zbus::blocking::Proxy::new(
+            &connection,
+            name,
+            "/org/mpris/MediaPlayer2",
+            "org.freedesktop.DBus.Properties",
+        )
+        .unwrap();
+        let shuffle = || {
+            let value: zbus::zvariant::OwnedValue = properties
+                .call("Get", &("org.mpris.MediaPlayer2.Player", "Shuffle"))
+                .unwrap();
+            bool::try_from(value).unwrap()
+        };
+        assert!(!shuffle());
+        let job = window
+            .update(cx, |view, _, cx| {
+                view.desktop_event(Event::Shuffle(true), cx);
+                view.pending_playback_jobs.try_recv().unwrap()
+            })
+            .unwrap();
+        assert!(shuffle());
+        window
+            .update(cx, |view, _, cx| view.disconnect_account(cx))
+            .unwrap();
+        assert!(
+            !shuffle(),
+            "Sign-out must publish the restored original order"
+        );
+        let crate::account::Command::Disconnect { operation, .. } = commands.try_recv().unwrap()
+        else {
+            panic!("Sign-out must request account cleanup")
+        };
+        window
+            .update(cx, |view, window, cx| {
+                view.account_event(
+                    crate::account::Event::Disconnected {
+                        operation,
+                        result: Ok(()),
+                    },
+                    window,
+                    cx,
+                );
+                view.playback_result(
+                    PlaybackResult::Watch {
+                        id: job.id,
+                        account_revision: job.account_revision,
+                        update: QueueUpdate::Replace,
+                        collection: Some(collection_source().toggled()),
+                        result: Err("Late cancelled shuffle".into()),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+                view.desktop_event(Event::Shuffle(false), cx);
+                assert!(view.account.is_none());
+                assert!(view.watch_pending.is_none());
+                assert_eq!(
+                    view.library.queue.collection.as_ref().unwrap().order,
+                    PlaybackOrder::Original
+                );
+                assert!(view.pending_playback_jobs.is_empty());
+            })
+            .unwrap();
+        assert!(!shuffle());
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account activation only"]
 fn collection_shuffle_refreshes_actions_only_when_the_account_changes() -> Result<()> {
     use crate::app::{AccountOperation, BrowserConnection, PlaybackQuery};
