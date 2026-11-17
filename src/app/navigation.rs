@@ -1003,6 +1003,7 @@ impl Music {
                                 .append_rows(self.list_rows.len() - previous_rows);
                         }
                     }
+                    self.update_playlist_order_snapshot();
                 } else {
                     self.sync.page_coverage = retained_coverage.unwrap_or(sync::PageCoverage {
                         first_page_len: page.shelves.len(),

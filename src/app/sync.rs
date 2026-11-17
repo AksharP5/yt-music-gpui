@@ -459,19 +459,32 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     } = mutation
         && playlist(id)
     {
-        let found = page.shelves.iter().enumerate().find_map(|(s, shelf)| shelf.items.iter().position(|item| matches!(item, Item::Track(track) if track.details.set_video_id.as_ref() == Some(set_video_id))).map(|i| (s,i)));
-        if let Some((s, i)) = found {
-            let item = page.shelves[s].items.remove(i);
-            let target = before.as_ref().and_then(|before| page.shelves.iter().enumerate().find_map(|(s, shelf)| shelf.items.iter().position(|item| matches!(item, Item::Track(track) if track.details.set_video_id.as_ref() == Some(before))).map(|i| (s,i))));
-            if let Some((s, i)) = target {
-                page.shelves[s].items.insert(i, item);
-            } else if before.is_none() && page.continuation.is_none() {
-                if let Some(shelf) = page.shelves.last_mut() {
-                    shelf.items.push(item);
-                }
-            } else {
-                page.shelves[s].items.insert(i, item);
+        let position = |id: &str| {
+            page.shelves.iter().flat_map(|shelf| &shelf.items).position(|item| matches!(item, Item::Track(track) if track.details.set_video_id.as_deref() == Some(id)))
+        };
+        let Some(from) = position(set_video_id) else {
+            return;
+        };
+        let target = match before {
+            Some(before) => position(before),
+            None if page.continuation.is_none() => {
+                Some(page.shelves.iter().map(|shelf| shelf.items.len()).sum())
             }
+            None => None,
+        };
+        let Some(to) = target else { return };
+        let sizes: Vec<_> = page.shelves.iter().map(|shelf| shelf.items.len()).collect();
+        let mut items: Vec<_> = page
+            .shelves
+            .iter_mut()
+            .flat_map(|shelf| shelf.items.drain(..))
+            .collect();
+        let moved = items.remove(from);
+        items.insert(to - usize::from(to > from), moved);
+        let mut items = items.into_iter();
+        // Shelves are page boundaries. A cross-page move displaces a row into the next page.
+        for (shelf, count) in page.shelves.iter_mut().zip(sizes) {
+            shelf.items.extend(items.by_ref().take(count));
         }
     }
 }
@@ -504,6 +517,24 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) -> 
 }
 
 impl Music {
+    fn playlist_pages<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> impl Iterator<Item = (&'a Page, PageCoverage)> + 'a {
+        let id = id.trim_start_matches("VL");
+        std::iter::once((&self.page, &self.route, self.sync.page_coverage))
+            .chain(
+                self.back
+                    .iter()
+                    .rev()
+                    .filter_map(|state| Some((state.page.as_ref()?, &state.route, state.coverage))),
+            )
+            .filter_map(move |(page, route, coverage)| {
+                matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id)
+                    .then_some((page, coverage))
+            })
+    }
+
     pub(super) fn replay_playlist_edits(
         &self,
         page: &mut Page,
@@ -525,17 +556,64 @@ impl Music {
             if refresh.additions.is_empty() {
                 continue;
             }
-            let sources: Vec<_> = std::iter::once((&self.page, &self.route)).chain(
-                self.back.iter().filter_map(|state| Some((state.page.as_ref()?, &state.route)))
-            ).filter(|(_, route)| matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == refresh.id))
-                .flat_map(|(loaded, _)| &loaded.shelves).flat_map(|shelf| &shelf.items)
+            let sources: Vec<_> = self
+                .playlist_pages(&refresh.id)
+                .flat_map(|(loaded, _)| &loaded.shelves)
+                .flat_map(|shelf| &shelf.items)
                 .filter_map(|item| match item {
-                    Item::Track(track) if track.details.set_video_id.as_ref().is_some_and(|id| refresh.additions.contains(id)) => Some(track.clone()),
+                    Item::Track(track)
+                        if track
+                            .details
+                            .set_video_id
+                            .as_ref()
+                            .is_some_and(|id| refresh.additions.contains(id)) =>
+                    {
+                        Some(track.clone())
+                    }
                     _ => None,
-                }).collect();
+                })
+                .collect();
+            let missing = sources.iter().any(|source| {
+                !page.shelves.iter().flat_map(|shelf| &shelf.items).any(|item| matches!(item, Item::Track(track) if track.details.set_video_id == source.details.set_video_id))
+            });
+            if first_page && page.continuation.is_some() && missing
+                && let Some((loaded, coverage)) = self.playlist_pages(&refresh.id).find(|(loaded, _)| {
+                    loaded.continuation.is_none() && sources.iter().all(|source| {
+                        loaded.shelves.iter().flat_map(|shelf| &shelf.items).any(|item| matches!(item, Item::Track(track) if track.details.set_video_id == source.details.set_video_id))
+                    })
+                })
+            {
+                page.shelves = loaded.shelves.clone();
+                page.continuation = loaded.continuation.clone();
+                *retained = Some(coverage);
+                patched = true;
+            }
             patched |= append_added(page, &self.route, &refresh.id, &sources);
         }
         patched
+    }
+
+    pub(super) fn update_playlist_order_snapshot(&mut self) {
+        let Route::Browse(link) = &self.route else {
+            return;
+        };
+        let coverage = self.sync.page_coverage;
+        for refresh in self
+            .sync
+            .playlist_refreshes
+            .iter_mut()
+            .chain(self.sync.playlist_failures.values_mut())
+        {
+            if refresh.id == link.id.trim_start_matches("VL")
+                && let Some(order) = &mut refresh.order
+                && crate::catalog::playlist_order_visible(&self.page, &order.page) == Some(true)
+            {
+                *order = Arc::new(PlaylistOrder {
+                    page: self.page.clone(),
+                    coverage,
+                });
+            }
+        }
     }
 
     pub(super) fn page_anchor(&self) -> PageAnchor {
@@ -804,12 +882,12 @@ impl Music {
     }
 
     pub(super) fn playlist_order_snapshot(&self, id: &str) -> Option<PlaylistOrder> {
-        std::iter::once((&self.page, &self.route, self.sync.page_coverage)).chain(
-            self.back.iter().rev().filter_map(|state| Some((state.page.as_ref()?, &state.route, state.coverage)))
-        ).find_map(|(page, route, coverage)| {
-            matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
-                .then(|| PlaylistOrder { page: page.clone(), coverage })
-        })
+        self.playlist_pages(id)
+            .next()
+            .map(|(page, coverage)| PlaylistOrder {
+                page: page.clone(),
+                coverage,
+            })
     }
 
     pub(super) fn refresh_playlist_metadata(

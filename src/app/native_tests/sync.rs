@@ -326,6 +326,150 @@ fn playlist_reload_retains_a_move_until_its_order_is_visible() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_revalidation_keeps_pages_loaded_after_an_edit() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        for failed in [false, true] {
+            let id = if failed { "failed" } else { "pending" };
+            let metadata = window
+                .update(cx, |view, window, cx| {
+                    view.navigate(Route::Browse(BrowseLink::new(format!("VL{id}"), id)), cx);
+                    super::navigation::reply(view, playlist(50, true, "150 tracks"), cx);
+                    view.prefetch_page(50, 50, 0, cx);
+                    super::navigation::reply(
+                        view,
+                        response(&[("Songs", (50..100).collect())], Some("page-three"), true),
+                        cx,
+                    );
+                    super::navigation::confirm(
+                        view,
+                        window,
+                        Mutation::MoveInPlaylist {
+                            id: id.into(),
+                            set_video_id: "occurrence-75".into(),
+                            before: Some("occurrence-60".into()),
+                        },
+                        cx,
+                    );
+                    let mut metadata = Some(view.catalog_requests.pending.try_recv().unwrap());
+                    if failed {
+                        deliver(
+                            view,
+                            metadata.take().unwrap(),
+                            Err("Readback failed; refresh the playlist".into()),
+                            cx,
+                        );
+                    }
+                    view.prefetch_page(100, 100, 0, cx);
+                    super::navigation::reply(
+                        view,
+                        response(&[("Songs", (100..150).collect())], None, true),
+                        cx,
+                    );
+                    assert_eq!(view.rows.len(), 150);
+                    view.detail_list.state.scroll_to(ListOffset {
+                        item_ix: 121,
+                        offset_in_item: px(8.),
+                    });
+                    cx.notify();
+                    metadata
+                })
+                .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+            let before = window
+                .update(cx, |view, window, cx| {
+                    let before = view.detail_list.state.logical_scroll_top();
+                    assert_eq!(before.item_ix, 121);
+                    super::render::capture(window, &format!("playlist-loaded-{id}-before"));
+                    view.revalidate_page(cx);
+                    let first_page = view.catalog_requests.pending.try_recv().unwrap();
+                    deliver(view, first_page, Ok(playlist(50, true, "150 tracks")), cx);
+                    assert_eq!(
+                        view.rows.len(),
+                        150,
+                        "Revalidation must keep the page loaded after the edit: {id}"
+                    );
+                    assert_eq!(view.rows[120].id(), "00000000120");
+                    assert!(view.page.continuation.is_none());
+                    if let Some(metadata) = metadata {
+                        deliver(
+                            view,
+                            metadata,
+                            Err("Readback failed; refresh the playlist".into()),
+                            cx,
+                        );
+                    }
+                    before
+                })
+                .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+            window
+                .update(cx, |view, window, _| {
+                    let after = view.detail_list.state.logical_scroll_top();
+                    assert_eq!(
+                        after.item_ix, before.item_ix,
+                        "The loaded-page scroll anchor must survive revalidation"
+                    );
+                    assert_eq!(after.offset_in_item, before.offset_in_item);
+                    super::render::capture(window, &format!("playlist-loaded-{id}-after"));
+                })
+                .unwrap();
+        }
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_move_across_a_page_boundary_keeps_the_displaced_song() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+                super::navigation::reply(view, playlist(50, true, "150 tracks"), cx);
+                view.prefetch_page(50, 50, 0, cx);
+                super::navigation::reply(
+                    view,
+                    response(&[("Songs", (50..100).collect())], Some("page-three"), true),
+                    cx,
+                );
+                super::navigation::confirm(
+                    view,
+                    window,
+                    Mutation::MoveInPlaylist {
+                        id: "alpha".into(),
+                        set_video_id: "occurrence-50".into(),
+                        before: Some("occurrence-49".into()),
+                    },
+                    cx,
+                );
+                let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                let mut fresh = playlist(49, true, "150 tracks");
+                let moved = view
+                    .page
+                    .tracks()
+                    .into_iter()
+                    .find(|track| track.details.set_video_id.as_deref() == Some("occurrence-50"))
+                    .unwrap();
+                fresh.shelves[0]
+                    .items
+                    .push(crate::catalog::Item::Track(moved.clone()));
+                deliver(view, metadata, Ok(fresh.clone()), cx);
+                view.revalidate_page(cx);
+                let first_page = view.catalog_requests.pending.try_recv().unwrap();
+                deliver(view, first_page, Ok(fresh), cx);
+                assert_eq!(
+                    view.rows.len(),
+                    100,
+                    "A first-page refresh must keep the displaced last song of that page"
+                );
+                assert_eq!(view.rows[49].id(), "00000000050");
+                assert_eq!(view.rows[50].id(), "00000000049");
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playlist_move_revalidation_keeps_loaded_page_boundaries() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window
@@ -386,8 +530,10 @@ fn playlist_reload_cannot_settle_a_move_beyond_its_first_page() -> Result<()> {
                     response(&[("Songs", (50..100).collect())], Some("page-three"), true),
                     cx,
                 );
-                view.list_scroll
-                    .scroll_to_item_strict(75, ScrollStrategy::Top);
+                view.detail_list.state.scroll_to(ListOffset {
+                    item_ix: 76,
+                    offset_in_item: px(8.),
+                });
                 super::navigation::confirm(
                     view,
                     window,
@@ -428,47 +574,75 @@ fn playlist_reload_keeps_a_known_added_row_when_readback_fails() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window
             .update(cx, |view, window, cx| {
-                view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
-                super::navigation::reply(view, playlist(1, false, "1 track"), cx);
-                view.account_event(
-                    account::Event::Applied {
-                        session: view.account.as_ref().unwrap().session.clone(),
-                        mutation: Box::new(Mutation::AddToPlaylist {
-                            id: "alpha".into(),
-                            video_ids: vec!["00000000000".into()],
-                            duplicates: true,
-                        }),
-                        result: Ok(Effect::PlaylistAdded {
-                            additions: vec![("00000000000".into(), "acknowledged-append".into())],
-                            toast: None,
-                        }),
-                        session_rejected: false,
-                    },
-                    window,
-                    cx,
-                );
-                let metadata = view.catalog_requests.pending.try_recv().unwrap();
-                assert_eq!(view.rows.len(), 2);
-                let (page_read, guide_read) = reload_jobs(view, cx);
-                deliver(view, page_read, Ok(playlist(1, false, "1 track")), cx);
-                assert_eq!(
-                    view.rows.len(),
-                    2,
-                    "A stale complete Reload must retain the acknowledged added row"
-                );
-                deliver(
-                    view,
-                    metadata,
-                    Err("Readback failed; refresh the playlist".into()),
-                    cx,
-                );
-                deliver(view, guide_read, Ok(guide("alpha", "1 track")), cx);
-                assert_eq!(view.rows.len(), 2);
-                assert_eq!(
-                    view.page.tracks()[1].details.set_video_id.as_deref(),
-                    Some("acknowledged-append")
-                );
-                assert!(view.forward_page.as_ref().unwrap().fetched_at.is_none());
+                for partial in [false, true] {
+                    let id = if partial { "beta" } else { "alpha" };
+                    view.navigate(Route::Browse(BrowseLink::new(format!("VL{id}"), id)), cx);
+                    let original = if partial { 100 } else { 1 };
+                    if partial {
+                        super::navigation::reply(view, playlist(50, true, "100 tracks"), cx);
+                        view.prefetch_page(50, 50, 0, cx);
+                        super::navigation::reply(
+                            view,
+                            response(&[("Songs", (50..100).collect())], None, true),
+                            cx,
+                        );
+                    } else {
+                        super::navigation::reply(view, playlist(1, false, "1 track"), cx);
+                    }
+                    view.account_event(
+                        account::Event::Applied {
+                            session: view.account.as_ref().unwrap().session.clone(),
+                            mutation: Box::new(Mutation::AddToPlaylist {
+                                id: id.into(),
+                                video_ids: vec!["00000000000".into()],
+                                duplicates: true,
+                            }),
+                            result: Ok(Effect::PlaylistAdded {
+                                additions: vec![(
+                                    "00000000000".into(),
+                                    "acknowledged-append".into(),
+                                )],
+                                toast: None,
+                            }),
+                            session_rejected: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                    assert_eq!(view.rows.len(), original + 1);
+                    let (page_read, guide_read) = reload_jobs(view, cx);
+                    let stale = if partial {
+                        playlist(50, true, "100 tracks")
+                    } else {
+                        playlist(1, false, "1 track")
+                    };
+                    deliver(view, page_read, Ok(stale), cx);
+                    assert_eq!(
+                        view.rows.len(),
+                        original + 1,
+                        "A stale Reload must retain the acknowledged added row, partial={partial}"
+                    );
+                    deliver(
+                        view,
+                        metadata,
+                        Err("Readback failed; refresh the playlist".into()),
+                        cx,
+                    );
+                    deliver(view, guide_read, Ok(guide(id, "1 track")), cx);
+                    assert_eq!(view.rows.len(), original + 1);
+                    assert_eq!(
+                        view.page
+                            .tracks()
+                            .last()
+                            .unwrap()
+                            .details
+                            .set_video_id
+                            .as_deref(),
+                        Some("acknowledged-append")
+                    );
+                    assert!(view.forward_page.as_ref().unwrap().fetched_at.is_none());
+                }
             })
             .unwrap();
     })
