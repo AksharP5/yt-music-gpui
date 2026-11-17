@@ -605,6 +605,17 @@ pub struct PageHeader {
     pub subscriber_count: String,
 }
 
+impl PageHeader {
+    pub(crate) fn track_count(&self) -> Option<&str> {
+        // Catalog requests use English. Views and duration can surround the count.
+        self.stats.split('•').map(str::trim).find(|part| {
+            [" track", " tracks", " song", " songs"]
+                .iter()
+                .any(|suffix| part.ends_with(suffix))
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Continuation {
     token: String,

@@ -66,7 +66,7 @@ impl PlaylistRefresh {
 pub(super) struct PlaylistMetadata {
     id: String,
     stats: String,
-    owner: String,
+    count: Option<String>,
     thumbnail: Option<String>,
     background: Option<String>,
 }
@@ -76,19 +76,11 @@ impl PlaylistMetadata {
         let header = page.header.ok_or_else(|| {
             "Playlist saved, but its details are unavailable. Refresh the playlist.".to_owned()
         })?;
-        let owner = if header.owner.is_empty() {
-            match header.artist {
-                Some(crate::catalog::HeaderArtist::Link(link)) => link.title,
-                Some(crate::catalog::HeaderArtist::Text(owner)) => owner,
-                None => String::new(),
-            }
-        } else {
-            header.owner
-        };
+        let count = header.track_count().map(str::to_owned);
         Ok(Self {
             id,
             stats: header.stats,
-            owner,
+            count,
             thumbnail: header.thumbnail,
             background: page.background,
         })
@@ -109,15 +101,11 @@ impl PlaylistMetadata {
             if playlist.id.trim_start_matches("VL") != self.id {
                 continue;
             }
-            // The playlist's second subtitle starts with its displayed count,
-            // followed by its duration. Preserve that service wording.
-            let count = self.stats.split('•').next().unwrap_or_default().trim();
-            if !count.is_empty() {
-                playlist.subtitle = if self.owner.is_empty() {
-                    count.to_owned()
-                } else {
-                    format!("{} • {count}", self.owner)
-                };
+            if let Some(count) = &self.count {
+                playlist.subtitle = playlist.subtitle.rsplit_once(" • ").map_or_else(
+                    || count.clone(),
+                    |(prefix, _)| format!("{prefix} • {count}"),
+                );
             }
             playlist.thumbnail = self.thumbnail.clone();
         }
@@ -759,11 +747,19 @@ impl Music {
                 ) {
                     metadata.apply(page, route);
                 }
+                self.page_cache.retain(|entry| !matches!(&entry.route, Route::Browse(link) if link.id.trim_start_matches("VL") == metadata.id));
+                if matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == metadata.id)
+                    && let Some(active) = &mut self.forward_page
+                {
+                    active.fetched_at = None;
+                }
                 metadata.apply_sidebar(&mut self.sidebar_playlists);
-                self.sync
-                    .sidebar_changes
-                    .retain(|change| change.id != metadata.id);
-                self.sync.sidebar_changes.push(metadata);
+                if self.catalog_requests.is_loading(CatalogTarget::Sidebar) {
+                    self.sync
+                        .sidebar_changes
+                        .retain(|change| change.id != metadata.id);
+                    self.sync.sidebar_changes.push(metadata);
+                }
             }
             Err(error) if self.error.is_none() => {
                 self.sync.playlist_metadata_error = Some((refresh.id, error.clone()));
@@ -771,9 +767,39 @@ impl Music {
             }
             Err(_) => {}
         }
-        self.request(Query::Revalidate(Box::new(Query::SidebarPlaylists)), cx);
         self.request_playlist_metadata(cx);
         cx.notify();
+    }
+
+    fn cancel_playlist_refresh(&mut self, id: &str, cx: &mut Context<Self>) {
+        let id = id.trim_start_matches("VL");
+        let active = self
+            .sync
+            .playlist_refreshes
+            .front()
+            .is_some_and(|refresh| refresh.id == id);
+        self.sync
+            .playlist_refreshes
+            .retain(|refresh| refresh.id != id);
+        self.sync.sidebar_changes.retain(|change| change.id != id);
+        self.sync.page_changes.retain(
+            |change| !matches!(change, PageChange::PlaylistMetadata(metadata) if metadata.id == id),
+        );
+        if self
+            .sync
+            .playlist_metadata_error
+            .as_ref()
+            .is_some_and(|(playlist, _)| playlist == id)
+            && let Some((_, error)) = self.sync.playlist_metadata_error.take()
+            && self.error.as_ref() == Some(&error)
+        {
+            self.error = None;
+        }
+        if active {
+            self.catalog_requests
+                .cancel(CatalogTarget::PlaylistMetadata);
+            self.request_playlist_metadata(cx);
+        }
     }
 
     pub(super) fn clear_playlist_metadata_error(&mut self) {
@@ -817,6 +843,7 @@ impl Music {
             }
         }
         if let Mutation::DeletePlaylist { id } = mutation {
+            self.cancel_playlist_refresh(id, cx);
             let mut index = 0;
             let first_page_len = &mut self.sync.sidebar_coverage.first_page_len;
             let boundary = *first_page_len;
@@ -844,7 +871,7 @@ impl Music {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{PageCoverage, SyncState, merge_page, needs_refresh, patch_page};
+    use super::{PageCoverage, PlaylistMetadata, SyncState, merge_page, needs_refresh, patch_page};
     use crate::{
         account::Mutation,
         app::Route,
@@ -852,6 +879,37 @@ pub(super) mod tests {
     };
     use serde_json::json;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn playlist_guide_keeps_its_owner_and_uses_tracks_instead_of_views() {
+        for (stats, expected) in [
+            ("3 views • 2 tracks • 5 minutes", "2 tracks"),
+            ("3 views • 0 tracks", "0 tracks"),
+            ("2 songs • 5 minutes", "2 songs"),
+        ] {
+            let page = crate::catalog::parse_page(
+                &json!({"header":{"musicResponsiveHeaderRenderer":{
+                "title":{"simpleText":"Playlist"}, "secondSubtitle":{"simpleText":stats},
+                "facepile":{"avatarStackViewModel":{"text":{"content":"Different header owner"}}}
+            }},"contents":[]}),
+                "Playlist",
+            )
+            .unwrap();
+            let metadata = PlaylistMetadata::from_page("playlist".into(), page).unwrap();
+            let mut playlists = vec![Collection {
+                id: "VLplaylist".into(),
+                title: "Playlist".into(),
+                subtitle: "Original service owner • 3 tracks".into(),
+                thumbnail: None,
+                details: Default::default(),
+            }];
+            metadata.apply_sidebar(&mut playlists);
+            assert_eq!(
+                playlists[0].subtitle,
+                format!("Original service owner • {expected}")
+            );
+        }
+    }
 
     pub(in crate::app) fn page(count: usize, continuation: bool) -> Page {
         let mut page = crate::catalog::parse_page(&json!({"contents":[],"nextContinuationData":if continuation { json!({"continuation":"next"}) } else { serde_json::Value::Null }}), "Playlist").unwrap();

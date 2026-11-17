@@ -58,6 +58,62 @@ fn deliver(view: &mut Music, job: Job, result: Result<Page, String>, cx: &mut Co
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_refreshes_expire_cached_pages_and_cancel_deleted_playlists() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            let track = view.page.tracks()[0].clone();
+            view.account_event(account::Event::Applied {
+                session:view.account.as_ref().unwrap().session.clone(),
+                mutation:Box::new(Mutation::AddToPlaylist { id:"alpha".into(), video_ids:vec![track.id.clone()], duplicates:false }),
+                result:Ok(Effect::PlaylistAdded { additions:vec![(track.id,"added-occurrence".into())], toast:None }), session_rejected:false,
+            }, window, cx);
+            let metadata = view.catalog_requests.pending.try_recv().unwrap();
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            super::navigation::reply(view, playlist(0, false, "0 tracks"), cx);
+            view.navigate(Route::Explore, cx);
+            super::navigation::reply(view, page(1, false), cx);
+            assert!(view.page_cache.iter().any(|entry| matches!(&entry.route, Route::Browse(link) if link.id=="VLalpha")), "The lagging destination must have entered the forward cache");
+            let mut fresh = playlist(1, false, "1 track");
+            let crate::catalog::Item::Track(added) = &mut fresh.shelves[0].items[0] else { panic!() };
+            added.details.set_video_id = Some("added-occurrence".into());
+            deliver(view, metadata, Ok(fresh.clone()), cx);
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            assert!(view.rows.is_empty(), "Forward must not reuse the stale empty playlist");
+            assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), Query::Browse(_)));
+            assert_eq!(view.rows.len(), 1);
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "1 track");
+
+            view.refresh_playlist_metadata("alpha", Vec::new(), None, cx);
+            let metadata = view.catalog_requests.pending.try_recv().unwrap();
+            deliver(view, metadata, Ok(fresh), cx);
+            assert!(view.forward_page.as_ref().unwrap().fetched_at.is_none(), "Metadata alone cannot certify the active page's full rows for caching");
+
+            super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
+                id:"alpha".into(), video_id:"00000000000".into(), set_video_id:"added-occurrence".into(),
+            }, cx);
+            let deleted_read = view.catalog_requests.pending.try_recv().unwrap();
+            view.refresh_playlist_metadata("beta", Vec::new(), None, cx);
+            view.refresh_playlist_metadata("gamma", Vec::new(), None, cx);
+            super::navigation::confirm(view, window, Mutation::DeletePlaylist { id:"beta".into() }, cx);
+            assert_eq!(view.sync.playlist_refreshes.iter().map(|refresh| refresh.id.as_str()).collect::<Vec<_>>(), ["alpha", "gamma"], "Deleting a queued playlist removes only that work");
+            assert_eq!(view.catalog_requests.generations[CatalogTarget::PlaylistMetadata as usize].load(Ordering::Relaxed), deleted_read.id);
+            super::navigation::confirm(view, window, Mutation::DeletePlaylist { id:"alpha".into() }, cx);
+            let next = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+                .find(|job| matches!(&job.query, Query::PlaylistMetadata(refresh) if refresh.id=="gamma"))
+                .expect("Deleting the active playlist must start the next retained read");
+            deliver(view, deleted_read, Err("Deleted playlist no longer exists".into()), cx);
+            assert!(view.error.is_none(), "A deleted playlist's late read must not put an error on Library");
+            let guide_generation = view.catalog_requests.generations[CatalogTarget::Sidebar as usize].load(Ordering::Relaxed);
+            deliver(view, next, Ok(playlist(0, false, "0 tracks")), cx);
+            assert!(view.sync.playlist_refreshes.is_empty());
+            assert!(view.error.is_none());
+            assert_eq!(view.catalog_requests.generations[CatalogTarget::Sidebar as usize].load(Ordering::Relaxed), guide_generation, "Finishing content readback must not reload guide membership");
+        }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playlist_refreshes_keep_independent_edits_and_scope_failures() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window.update(cx, |view, window, cx| {
@@ -113,7 +169,9 @@ fn playlist_refreshes_keep_independent_edits_and_scope_failures() -> Result<()> 
             assert_eq!(view.page.privacy.as_deref(), Some("PUBLIC"));
             assert_eq!(view.page.header.as_ref().unwrap().collection.saved, Some(true), "Readback owns totals and cover, not a newer save state");
             assert_eq!(view.page.tracks()[0].details.set_video_id.as_deref(), Some("occurrence-2"));
-            let beta_job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+            let requests:Vec<_> = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
+            assert!(!requests.iter().any(|job| job.query.target()==CatalogTarget::Sidebar), "Content edits patch guide details without reloading membership");
+            let beta_job = requests.into_iter()
                 .find(|job| matches!(&job.query, Query::PlaylistMetadata(refresh) if refresh.id=="beta"))
                 .expect("Finishing Alpha must start Beta's retained refresh");
 
@@ -122,6 +180,7 @@ fn playlist_refreshes_keep_independent_edits_and_scope_failures() -> Result<()> 
             deliver(view, beta_job, Ok(playlist(0, false, "0 tracks")), cx);
             assert!(view.rows.is_empty());
             assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks");
+            assert!(view.catalog_requests.pending.is_empty(), "The second edited playlist must not trigger a guide read that can roll back the first");
             view.go_back(cx);
             assert_eq!(view.page.header.as_ref().unwrap().stats, "2 tracks", "Back retains the other playlist's verified totals");
             assert_eq!(view.page.title, "Renamed Alpha");
@@ -168,6 +227,8 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
                 serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"1 track"})).unwrap(),
             ];
             view.sync.sidebar_coverage = crate::app::sync::PageCoverage { first_page_len:1, continued:true };
+            view.request(Query::Revalidate(Box::new(Query::SidebarPlaylists)), cx);
+            let older_guide = view.catalog_requests.pending.try_recv().unwrap();
             view.revalidate_page(cx);
             let older_page = view.catalog_requests.pending.try_recv().unwrap();
             let track = view.page.tracks()[0].clone();
@@ -199,7 +260,7 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
             }, cx);
             assert!(view.rows.is_empty(), "An older page response must keep the confirmed removal");
             assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks", "An older page response must keep verified totals");
-            let job = view.catalog_requests.pending.try_recv().expect("The settled playlist refreshes the guide");
+            let job = older_guide;
             assert!(job.query.target() == CatalogTarget::Sidebar);
             let mut guide = page(0, true);
             guide.shelves[0].items.push(crate::catalog::Item::Collection(view.sidebar_playlists[0].clone()));
@@ -225,6 +286,8 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
             let before = view.detail_list.state.logical_scroll_top();
             assert_eq!(before.item_ix, 451);
             let anchor = view.rows[450].id().to_owned();
+            view.request(Query::Revalidate(Box::new(Query::SidebarPlaylists)), cx);
+            let older_guide = view.catalog_requests.pending.try_recv().unwrap();
             let track = view.page.tracks()[0].clone();
             view.account_event(account::Event::Applied {
                 session:view.account.as_ref().unwrap().session.clone(),
@@ -248,7 +311,7 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
             let after = view.detail_list.state.logical_scroll_top();
             assert_eq!(after.item_ix, 450, "The visible occurrence stays in place after removing an earlier row");
             assert_eq!(after.offset_in_item, before.offset_in_item);
-            let job = view.catalog_requests.pending.try_recv().unwrap();
+            let job = older_guide;
             let mut guide = page(0, false);
             guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"500 tracks"})).unwrap()));
             view.catalog_result(CatalogResult {
