@@ -55,7 +55,7 @@ impl Music {
             track_id: self.active_id,
             position: self.position,
             advancing: self.playback.is_advancing(),
-            volume: self.library.volume,
+            volume: self.library.effective_volume(),
             rate: self.library.speed,
             repeat: self.library.repeat,
             can_play: self.player.is_some() && (!queue.tracks.is_empty() || waiting),

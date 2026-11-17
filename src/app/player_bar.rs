@@ -89,7 +89,17 @@ impl Music {
     }
 
     pub(in crate::app) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
-        self.set_volume(if self.library.volume > 0. { 0. } else { 60. }, cx);
+        if self.library.effective_volume() == 0. {
+            self.library.muted = false;
+            if self.library.volume == 0. {
+                self.library.volume = 60.;
+            }
+        } else {
+            self.library.muted = true;
+        }
+        let volume = self.library.effective_volume();
+        self.player_command(|player| player.set_volume(volume));
+        self.notify_playback(cx);
         self.save_preferences();
     }
 
@@ -444,7 +454,7 @@ impl Music {
                     )
                     .child(tinted_control(
                         "mute-toggle",
-                        if self.library.volume == 0. {
+                        if self.library.effective_volume() == 0. {
                             "mute"
                         } else {
                             "volume"
