@@ -983,12 +983,7 @@ impl Music {
         let reflected = if pending {
             strict
         } else {
-            order != Some(false)
-                && crate::catalog::playlist_metadata_visible(
-                    page,
-                    &refresh.additions,
-                    &refresh.removals,
-                )
+            crate::catalog::playlist_metadata_visible(page, &refresh.additions, &refresh.removals)
         };
         if account_generation < refresh.account_generation || !reflected {
             return false;

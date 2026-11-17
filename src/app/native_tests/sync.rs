@@ -326,6 +326,63 @@ fn playlist_reload_retains_a_move_until_its_order_is_visible() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn failed_move_readback_can_adopt_a_later_server_order_on_reload() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+                super::navigation::reply(view, playlist(3, false, "3 tracks"), cx);
+                super::navigation::confirm(
+                    view,
+                    window,
+                    Mutation::MoveInPlaylist {
+                        id: "alpha".into(),
+                        set_video_id: "occurrence-2".into(),
+                        before: Some("occurrence-0".into()),
+                    },
+                    cx,
+                );
+                let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                deliver(
+                    view,
+                    metadata,
+                    Err("Readback failed; refresh the playlist".into()),
+                    cx,
+                );
+                assert_eq!(view.rows[0].id(), "00000000002");
+                let (page_read, guide_read) = reload_jobs(view, cx);
+                // Another client removed the moved song after the failed readback.
+                deliver(view, page_read, Ok(playlist(2, false, "2 tracks")), cx);
+                deliver(view, guide_read, Ok(guide("alpha", "3 tracks")), cx);
+                assert!(
+                    view.error.is_none(),
+                    "An explicit Reload must recover from a failed move readback"
+                );
+                assert_eq!(
+                    view.rows.iter().map(|row| row.id()).collect::<Vec<_>>(),
+                    ["00000000000", "00000000001"],
+                    "Reload must adopt the server order instead of restoring the removed song"
+                );
+                assert_eq!(view.page.header.as_ref().unwrap().stats, "2 tracks");
+                assert_eq!(view.sidebar_playlists[0].subtitle, "2 tracks");
+                assert!(view.sync.playlist_failures.is_empty());
+                assert!(
+                    view.forward_page.as_ref().unwrap().fetched_at.is_none(),
+                    "A recovery without matching order evidence stays out of the forward cache"
+                );
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-failed-move-reloaded")
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn failed_long_playlist_readback_can_recover_through_reload() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window.update(cx, |view, window, cx| {
