@@ -4,6 +4,73 @@ use super::super::*;
 use super::PageLayout;
 use super::Tier;
 
+#[derive(Clone, Copy, PartialEq)]
+struct ShelfSize {
+    width: f32,
+    text_size: f32,
+    subtitle_lines: usize,
+    video: bool,
+}
+
+pub(in crate::app) struct ShelfHeight {
+    size: ShelfSize,
+    height: f32,
+}
+
+fn measure_shelf_height(shelf: &Shelf, size: ShelfSize, window: &Window) -> f32 {
+    let line_height = size.text_size * 1.2;
+    let text_height = |text: &str, width: f32, weight, clamp| {
+        let run = TextRun {
+            len: text.len(),
+            font: Font {
+                weight,
+                ..font("Roboto")
+            },
+            ..Default::default()
+        };
+        match window.text_system().shape_text(
+            text.to_owned().into(),
+            px(size.text_size),
+            &[run],
+            Some(px(width)),
+            Some(clamp),
+        ) {
+            Ok(lines) => lines
+                .iter()
+                .map(|line| f32::from(line.size(px(line_height)).height))
+                .sum::<f32>(),
+            Err(error) => {
+                eprintln!("Could not measure shelf text: {error:#}");
+                line_height * clamp as f32
+            }
+        }
+    };
+    shelf
+        .items
+        .iter()
+        .map(|item| {
+            let explicit = match item {
+                Item::Track(track) => track.details.explicit,
+                Item::Collection(collection) => collection.details.explicit,
+                Item::Navigation(_) => false,
+            };
+            let title = text_height(item.title(), size.width, FontWeight::MEDIUM, 2);
+            let subtitle = text_height(
+                item.subtitle(),
+                size.width - if explicit { 20. } else { 0. },
+                FontWeight::NORMAL,
+                size.subtitle_lines,
+            );
+            let art = if size.video {
+                size.width * 9. / 16.
+            } else {
+                size.width
+            };
+            art + 19. + title + subtitle
+        })
+        .fold(0., f32::max)
+}
+
 impl Music {
     pub(in crate::app) fn navigation(
         &self,
@@ -35,6 +102,8 @@ impl Music {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        #[cfg(test)]
+        let started = Instant::now();
         let shelf = &self.page.shelves[index];
         let title = shelf.title.clone();
         let more = shelf.more.clone();
@@ -71,62 +140,28 @@ impl Music {
         // Include offscreen text when sizing the carousel so its height stays
         // steady when a longer title scrolls out of the rendered columns.
         let card_height = if rows == 1 {
-            let line_height = page.text_size() * 1.2;
-            let text_height = |text: &str, width: f32, weight, clamp| {
-                let run = TextRun {
-                    len: text.len(),
-                    font: Font {
-                        weight,
-                        ..font("Roboto")
-                    },
-                    ..Default::default()
-                };
-                match window.text_system().shape_text(
-                    text.to_owned().into(),
-                    px(page.text_size()),
-                    &[run],
-                    Some(px(width)),
-                    Some(clamp),
-                ) {
-                    Ok(lines) => lines
-                        .iter()
-                        .map(|line| f32::from(line.size(px(line_height)).height))
-                        .sum::<f32>(),
-                    Err(error) => {
-                        eprintln!("Could not measure shelf text: {error:#}");
-                        line_height * clamp as f32
-                    }
-                }
+            let size = ShelfSize {
+                width,
+                text_size: page.text_size(),
+                subtitle_lines: if album && layout == ShelfLayout::Cards {
+                    1
+                } else {
+                    2
+                },
+                video: layout == ShelfLayout::Videos,
             };
-            let subtitle_lines = if album && layout == ShelfLayout::Cards {
-                1
+            if let Some(cached) = self.shelf_heights.get(index).and_then(Option::as_ref)
+                && cached.size == size
+            {
+                cached.height
             } else {
-                2
-            };
-            shelf
-                .items
-                .iter()
-                .map(|item| {
-                    let explicit = match item {
-                        Item::Track(track) => track.details.explicit,
-                        Item::Collection(collection) => collection.details.explicit,
-                        Item::Navigation(_) => false,
-                    };
-                    let title = text_height(item.title(), width, FontWeight::MEDIUM, 2);
-                    let subtitle = text_height(
-                        item.subtitle(),
-                        width - if explicit { 20. } else { 0. },
-                        FontWeight::NORMAL,
-                        subtitle_lines,
-                    );
-                    let art = if layout == ShelfLayout::Videos {
-                        width * 9. / 16.
-                    } else {
-                        width
-                    };
-                    art + 19. + title + subtitle
-                })
-                .fold(0., f32::max)
+                let height = measure_shelf_height(shelf, size, window);
+                if self.shelf_heights.len() <= index {
+                    self.shelf_heights.resize_with(index + 1, || None);
+                }
+                self.shelf_heights[index] = Some(ShelfHeight { size, height });
+                height
+            }
         } else {
             0.
         };
@@ -210,7 +245,7 @@ impl Music {
         let header_height = (heading_size * 1.2).max(36.);
         let previous = scroll.clone();
         let next = scroll.clone();
-        div()
+        let element = div()
             .id(("shelf", index))
             .w_full()
             .min_w_0()
@@ -305,7 +340,12 @@ impl Music {
                     ),
             )
             .child(contents)
-            .into_any_element()
+            .into_any_element();
+        #[cfg(test)]
+        if index == 0 {
+            self.shelf_render_times.push(started.elapsed());
+        }
+        element
     }
 }
 

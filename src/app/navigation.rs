@@ -632,6 +632,7 @@ impl Music {
     }
 
     pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) {
+        self.shelf_heights.truncate(first_shelf);
         let sectioned = self.page.header.is_some();
         let browse_sections = self.browse_sections();
         let search_all =

@@ -86,6 +86,8 @@ pub struct Music {
     renders: usize,
     #[cfg(test)]
     focus_restores: usize,
+    #[cfg(test)]
+    shelf_render_times: Vec<std::time::Duration>,
     content_view: Entity<MusicContent>,
     player_bar: Entity<PlayerBar>,
     theme: Theme,
@@ -112,6 +114,7 @@ pub struct Music {
     rows: Vec<Item>,
     list_rows: Vec<ListRow>,
     shelf_scroll: HashMap<usize, ScrollHandle>,
+    shelf_heights: Vec<Option<pages::shelves::ShelfHeight>>,
     list_scroll: UniformListScrollHandle,
     detail_list: DetailList,
     // None follows the window width until the guide is toggled.
