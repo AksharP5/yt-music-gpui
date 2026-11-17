@@ -148,7 +148,8 @@ impl Music {
                 .cursor_pointer()
                 .child(self.page.description.clone())
                 .on_click(cx.listener(|view, _, window, cx| {
-                    window.focus(&view.focus, cx);
+                    view.overlay_return_focus = window.focused(cx);
+                    window.focus(&view.overlay_focus, cx);
                     view.overlay = Some(Overlay::Description {
                         title: view.page.title.clone(),
                         text: view.page.description.clone(),
@@ -238,7 +239,8 @@ impl Music {
                     .cursor_pointer()
                     .child("Chapters")
                     .on_click(cx.listener(move |view, _, window, cx| {
-                        window.focus(&view.focus, cx);
+                        view.overlay_return_focus = window.focused(cx);
+                        window.focus(&view.overlay_focus, cx);
                         view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
                         cx.notify();
                     })),
