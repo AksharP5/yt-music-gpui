@@ -2381,7 +2381,19 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
     Ok(choices)
 }
 
-pub(crate) fn playlist_metadata_visible(
+fn playlist_metadata_visible(page: &Page, additions: &[String], removals: &[String]) -> bool {
+    playlist_occurrences_visible(
+        page,
+        if page.continuation.is_some() {
+            &[]
+        } else {
+            additions
+        },
+        removals,
+    )
+}
+
+pub(crate) fn playlist_occurrences_visible(
     page: &Page,
     additions: &[String],
     removals: &[String],
@@ -2398,10 +2410,9 @@ pub(crate) fn playlist_metadata_visible(
     !removals
         .iter()
         .any(|removed| occurrences.contains(removed.as_str()))
-        && (page.continuation.is_some()
-            || additions
-                .iter()
-                .all(|added| occurrences.contains(added.as_str())))
+        && additions
+            .iter()
+            .all(|added| occurrences.contains(added.as_str()))
 }
 
 #[cfg(test)]

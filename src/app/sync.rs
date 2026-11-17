@@ -46,6 +46,7 @@ pub(in crate::app) struct PlaylistRefresh {
     pub id: String,
     pub additions: Vec<String>,
     pub removals: Vec<String>,
+    pub account_generation: u64,
 }
 
 impl PlaylistRefresh {
@@ -703,6 +704,7 @@ impl Music {
             .enumerate()
             .find(|(_, refresh)| refresh.id == id)
         {
+            refresh.account_generation = self.account_generation;
             refresh.merge(additions, removal);
             if index > 0 {
                 return;
@@ -712,6 +714,7 @@ impl Music {
                 id: id.to_owned(),
                 additions: Vec::new(),
                 removals: Vec::new(),
+                account_generation: self.account_generation,
             };
             refresh.merge(additions, removal);
             self.sync.playlist_refreshes.push_back(refresh);
@@ -776,9 +779,14 @@ impl Music {
         }
     }
 
-    pub(super) fn playlist_reloaded(&mut self, page: &Page, cx: &mut Context<Self>) {
+    pub(super) fn playlist_reloaded(
+        &mut self,
+        page: &Page,
+        account_generation: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Route::Browse(link) = &self.route else {
-            return;
+            return true;
         };
         let id = link.id.trim_start_matches("VL");
         let Some(refresh) = self
@@ -794,17 +802,26 @@ impl Music {
                     .filter(|refresh| refresh.id == id)
             })
         else {
-            return;
+            return true;
         };
         // Check the unpatched response. Replayed local removals cannot prove
         // that the service has caught up with the acknowledged edit.
-        if !crate::catalog::playlist_metadata_visible(page, &refresh.additions, &refresh.removals) {
-            return;
+        if account_generation < refresh.account_generation
+            || (page.continuation.is_some() && !refresh.removals.is_empty())
+            || !crate::catalog::playlist_occurrences_visible(
+                page,
+                &refresh.additions,
+                &refresh.removals,
+            )
+        {
+            return false;
         }
         if let Ok(metadata) = PlaylistMetadata::from_page(refresh.id.clone(), page) {
             self.cancel_playlist_refresh(&metadata.id, cx);
             self.publish_playlist_metadata(metadata);
+            return true;
         }
+        false
     }
 
     fn cancel_playlist_refresh(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -835,16 +852,6 @@ impl Music {
             self.catalog_requests
                 .cancel(CatalogTarget::PlaylistMetadata);
             self.request_playlist_metadata(cx);
-        }
-    }
-
-    pub(super) fn clear_playlist_metadata_error(&mut self) {
-        if self.sync.playlist_metadata_error.as_ref().is_some_and(|(refresh, _)| {
-            matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == refresh.id)
-        }) && let Some((_, error)) = self.sync.playlist_metadata_error.take()
-            && self.error.as_ref() == Some(&error)
-        {
-            self.error = None;
         }
     }
 

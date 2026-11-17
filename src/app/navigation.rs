@@ -400,7 +400,6 @@ impl Music {
             self.sync.sidebar_changes.clear();
         }
         if target == CatalogTarget::Page {
-            self.clear_playlist_metadata_error();
             if let Some(page) = &mut self.forward_page
                 && page.list_id == self.list_id
             {
@@ -914,9 +913,9 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
-                if !result.append && self.sync.page_reload.is_some() {
-                    self.playlist_reloaded(&page, cx);
-                }
+                let reload_verified = result.append
+                    || self.sync.page_reload.is_none()
+                    || self.playlist_reloaded(&page, result.account_generation, cx);
                 // The view now has newer content for this route than any cached copy,
                 // however the user leaves it (link, Back, or another Back).
                 self.page_cache.retain(|entry| {
@@ -952,7 +951,8 @@ impl Music {
                         self.ratings.insert(track.id.clone(), rating);
                     }
                 }
-                self.sync.page_fetched_at = (!metadata_replayed).then(Instant::now);
+                self.sync.page_fetched_at =
+                    (!metadata_replayed && reload_verified).then(Instant::now);
                 if let Some(active) = &mut self.forward_page
                     && active.list_id == self.list_id
                     && !result.append

@@ -96,25 +96,33 @@ fn playlist_metadata_cannot_make_an_older_page_cacheable() -> Result<()> {
 fn playlist_reload_supersedes_older_readback_failures() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window.update(cx, |view, window, cx| {
-            for (id, failure_first, fresh) in [("before",true,true),("after",false,true),("stale",false,false),("stale-before",true,false)] {
+            for (id, failure_phase, fresh) in [("visible-fresh",0,true),("visible-stale",0,false),("before",1,true),("after",2,true),("stale",2,false),("stale-before",1,false)] {
                 view.error = None;
                 view.navigate(Route::Browse(BrowseLink::new(format!("VL{id}"), id)), cx);
                 super::navigation::reply(view, playlist(1, false, "1 track"), cx);
+                view.sidebar_playlists = vec![serde_json::from_value(json!({"id":format!("VL{id}"),"title":id,"subtitle":"1 track"})).unwrap()];
                 super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
                     id:id.into(), video_id:"00000000000".into(), set_video_id:"occurrence-0".into(),
                 }, cx);
                 let mut metadata = Some(view.catalog_requests.pending.try_recv().unwrap());
+                if failure_phase == 0 {
+                    deliver(view, metadata.take().unwrap(), Err("Older playlist details failed".into()), cx);
+                }
                 view.reload_current_page(cx);
+                if failure_phase == 0 {
+                    assert!(view.sync.playlist_metadata_error.is_some(), "Reload must retain failed occurrence checks until its response is verified");
+                }
                 let jobs:Vec<_> = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
                 let mut page_read = None;
+                let mut guide_read = None;
                 for job in jobs {
                     match job.query.target() {
                         CatalogTarget::Page => page_read = Some(job),
-                        CatalogTarget::Sidebar => deliver(view, job, Ok(page(0, false)), cx),
+                        CatalogTarget::Sidebar => guide_read = Some(job),
                         _ => panic!("Unexpected reload job"),
                     }
                 }
-                if failure_first {
+                if failure_phase == 1 {
                     deliver(view, metadata.take().unwrap(), Err("Older playlist details failed".into()), cx);
                 }
                 let response = if fresh { playlist(0, false, "0 tracks") } else { playlist(1, false, "1 track") };
@@ -122,13 +130,85 @@ fn playlist_reload_supersedes_older_readback_failures() -> Result<()> {
                 if let Some(metadata) = metadata {
                     deliver(view, metadata, Err("Older playlist details failed".into()), cx);
                 }
+                let mut guide = page(0, false);
+                guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":format!("VL{id}"),"title":id,"subtitle":"1 track"})).unwrap()));
+                deliver(view, guide_read.unwrap(), Ok(guide), cx);
                 if fresh {
                     assert!(view.error.is_none(), "A successful Reload must supersede older readback feedback: {id}: {:?}", view.error);
                     assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks");
+                    assert_eq!(view.sidebar_playlists[0].subtitle, "0 tracks", "A verified Reload must update the guide even after readback already failed");
                 } else {
                     assert_eq!(view.error.as_deref(), Some("Older playlist details failed"), "A lagging Reload must not hide an unresolved readback failure");
+                    view.navigate(Route::Explore, cx);
+                    if view.catalog_requests.is_loading(CatalogTarget::Page) { super::navigation::reply(view, page(1, false), cx); }
+                    view.navigate(Route::Browse(BrowseLink::new(format!("VL{id}"), id)), cx);
+                    assert!(view.catalog_requests.is_loading(CatalogTarget::Page), "A known-lagging Reload must not enter the forward cache");
+                    super::navigation::reply(view, playlist(0, false, "0 tracks"), cx);
                 }
             }
+        }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_reload_cannot_settle_an_edit_acknowledged_after_it_started() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            super::navigation::reply(view, playlist(3, false, "3 tracks"), cx);
+            view.reload_current_page(cx);
+            let jobs:Vec<_> = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
+            let mut older_page = None;
+            for job in jobs {
+                if job.query.target() == CatalogTarget::Page { older_page = Some(job); }
+                else { deliver(view, job, Ok(page(0, false)), cx); }
+            }
+            super::navigation::confirm(view, window, Mutation::MoveInPlaylist {
+                id:"alpha".into(), set_video_id:"occurrence-2".into(), before:Some("occurrence-0".into()),
+            }, cx);
+            let metadata = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(metadata.query.target() == CatalogTarget::PlaylistMetadata);
+            deliver(view, older_page.unwrap(), Ok(playlist(3, false, "3 tracks")), cx);
+            assert!(view.catalog_requests.is_loading(CatalogTarget::PlaylistMetadata), "A pre-edit Reload cannot cancel the post-edit readback, even when the edit has no occurrence checks");
+            let mut fresh = playlist(3, false, "3 tracks");
+            fresh.header.as_mut().unwrap().thumbnail = Some("synthetic-new-cover".into());
+            deliver(view, metadata, Ok(fresh), cx);
+            assert_eq!(view.page.header.as_ref().unwrap().thumbnail.as_deref(), Some("synthetic-new-cover"));
+        }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn partial_playlist_reload_keeps_queued_addition_readback() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            super::navigation::reply(view, playlist(1, false, "1 track"), cx);
+            super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
+                id:"alpha".into(), video_id:"00000000000".into(), set_video_id:"occurrence-0".into(),
+            }, cx);
+            let alpha = view.catalog_requests.pending.try_recv().unwrap();
+            view.navigate(Route::Browse(BrowseLink::new("VLbeta", "Beta")), cx);
+            super::navigation::reply(view, playlist(50, true, "500 tracks"), cx);
+            view.account_event(account::Event::Applied {
+                session:view.account.as_ref().unwrap().session.clone(),
+                mutation:Box::new(Mutation::AddToPlaylist { id:"beta".into(), video_ids:vec!["00000000000".into()], duplicates:true }),
+                result:Ok(Effect::PlaylistAdded { additions:vec![("00000000000".into(),"new-occurrence".into())], toast:None }), session_rejected:false,
+            }, window, cx);
+            view.reload_current_page(cx);
+            let jobs:Vec<_> = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
+            for job in jobs {
+                let response = if job.query.target()==CatalogTarget::Page { playlist(50, true, "500 tracks") } else { page(0, false) };
+                deliver(view, job, Ok(response), cx);
+            }
+            assert_eq!(view.sync.playlist_refreshes.iter().map(|refresh| refresh.id.as_str()).collect::<Vec<_>>(), ["alpha","beta"], "A partial Reload missing the new occurrence cannot remove Beta's queued readback");
+            deliver(view, alpha, Ok(playlist(0, false, "0 tracks")), cx);
+            let beta = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(&beta.query, Query::PlaylistMetadata(refresh) if refresh.id=="beta"));
+            deliver(view, beta, Ok(playlist(50, true, "501 tracks")), cx);
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "501 tracks");
         }).unwrap();
     })
 }
@@ -330,10 +410,11 @@ fn playlist_refreshes_keep_independent_edits_and_scope_failures() -> Result<()> 
             deliver(view, job, Err("Details refresh failed".into()), cx);
             assert_eq!(view.error.as_deref(), Some("Details refresh failed"));
             view.reload_current_page(cx);
-            assert!(view.error.is_none(), "Reload clears its playlist's refresh error");
-            assert!(view.sync.playlist_metadata_error.is_none());
+            assert_eq!(view.error.as_deref(), Some("Details refresh failed"), "Reload retains its warning until the response verifies the edit");
+            assert!(view.sync.playlist_metadata_error.is_some());
             super::navigation::reply(view, playlist(2, false, "2 tracks"), cx);
             assert!(view.error.is_none());
+            assert!(view.sync.playlist_metadata_error.is_none());
         }).unwrap();
     })
 }
