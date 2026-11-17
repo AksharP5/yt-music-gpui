@@ -81,7 +81,7 @@ bin/test -- --ignored --exact queue_source::tests::restored_collection_refreshes
 
 MPRIS Shuffle uses the same album or playlist source as the player bar. Repeated requests for the same pending order do not reload it, and a rapid on/off pair keeps the last request. `desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests` checks these commands in a native window. Queues without a reversible collection source still reject enabling persistent shuffle through MPRIS.
 
-`signing_out_cancels_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property before and after sign-out cancels a synthetic pending request, including a late reply.
+`account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 

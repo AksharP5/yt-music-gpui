@@ -66,11 +66,21 @@ fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests()
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account and playlist commands only"]
-fn signing_out_cancels_pending_shuffle_in_desktop_controls() -> Result<()> {
+fn account_changes_cancel_pending_shuffle_in_desktop_controls() -> Result<()> {
     use crate::{
-        app::{PlaybackResult, QueueUpdate},
+        app::{AccountOperation, BrowserConnection, PlaybackResult, QueueUpdate},
         media_controls::{Event, MediaControls},
+        player::{Player, PlayerOptions},
     };
+    #[derive(Clone, Copy, Debug)]
+    enum Transition {
+        SignOut,
+        SignIn,
+        Restore,
+        CancelRefresh,
+        SwitchAccount,
+    }
+    use Transition::*;
 
     super::navigation::check_cache_window(async |window, cx| {
         let connection = zbus::blocking::Connection::session().unwrap();
@@ -86,26 +96,17 @@ fn signing_out_cancels_pending_shuffle_in_desktop_controls() -> Result<()> {
                 .timer(Duration::from_millis(10))
                 .await;
         }
-        let commands = window
-            .update(cx, |view, _, cx| {
-                let (jobs, pending) = async_channel::bounded(1);
-                view.playback_jobs = jobs;
-                view.pending_playback_jobs = pending;
-                let (commands, pending) = async_channel::bounded(1);
-                view.account_commands = commands;
-                view.account = Some(super::account::connection(super::account::session(
-                    "shuffle-signout",
-                )));
-                view.account_operation = None;
-                view.watch_pending = None;
-                view.library.autoplay = false;
-                view.library
-                    .queue
-                    .replace(continuation_page(0..3, None).tracks(), 1);
-                view.library.queue.collection = Some(collection_source());
+        window
+            .update(cx, |view, _, _| {
                 view.media_controls = Some(MediaControls::new().unwrap());
-                view.notify_playback(cx);
-                pending
+                view.player = Some(
+                    Player::new(PlayerOptions {
+                        audio_output: Some("null".into()),
+                        volume: 0.,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -131,57 +132,170 @@ fn signing_out_cancels_pending_shuffle_in_desktop_controls() -> Result<()> {
                 .unwrap();
             bool::try_from(value).unwrap()
         };
-        assert!(!shuffle());
-        let job = window
-            .update(cx, |view, _, cx| {
-                view.desktop_event(Event::Shuffle(true), cx);
-                view.pending_playback_jobs.try_recv().unwrap()
-            })
-            .unwrap();
-        assert!(shuffle());
-        window
-            .update(cx, |view, _, cx| view.disconnect_account(cx))
-            .unwrap();
+        let mut observed = Vec::new();
+        for transition in [SignOut, SignIn, Restore, CancelRefresh, SwitchAccount] {
+            let operation = auth::Operation::default();
+            let commands = window
+                .update(cx, |view, _, cx| {
+                    let (jobs, pending) = async_channel::bounded(1);
+                    view.playback_jobs = jobs;
+                    view.pending_playback_jobs = pending;
+                    let (commands, pending) = async_channel::bounded(8);
+                    view.account_commands = commands;
+                    view.account = Some(super::account::connection(super::account::session(
+                        "shuffle-before",
+                    )));
+                    view.account_operation = match transition {
+                        SignOut => None,
+                        SignIn => Some(AccountOperation::Connecting(
+                            operation.clone(),
+                            BrowserConnection::Reading(serde_json::from_value(serde_json::json!({
+                                "browser":"Synthetic browser","name":"Synthetic profile","path":"/synthetic/profile"
+                            })).unwrap()),
+                        )),
+                        Restore => Some(AccountOperation::Restoring(operation.clone())),
+                        CancelRefresh => Some(AccountOperation::Refreshing {
+                            operation: operation.clone(),
+                            retry_change: false,
+                            resume: None,
+                        }),
+                        SwitchAccount => Some(AccountOperation::Refreshing {
+                            operation: operation.clone(),
+                            retry_change: false,
+                            resume: None,
+                        }),
+                    };
+                    view.overlay = None;
+                    view.watch_pending = None;
+                    view.library.autoplay = false;
+                    view.library
+                        .queue
+                        .replace(continuation_page(0..3, None).tracks(), 1);
+                    view.library.queue.collection = Some(collection_source());
+                    view.notify_playback(cx);
+                    pending
+                })
+                .unwrap();
+            assert!(!shuffle());
+            let job = window
+                .update(cx, |view, _, cx| {
+                    view.desktop_event(Event::Shuffle(true), cx);
+                    view.pending_playback_jobs.try_recv().ok()
+                })
+                .unwrap();
+            assert!(
+                shuffle(),
+                "Pending shuffle must be published for {transition:?}"
+            );
+            window
+                .update(cx, |view, window, cx| match transition {
+                    SignOut => view.disconnect_account(cx),
+                    SignIn | Restore => {
+                        view.account_event(
+                            crate::account::Event::Connected {
+                                operation: operation.clone(),
+                                result: Ok(Some(super::account::connection(
+                                    super::account::session("shuffle-after"),
+                                ))),
+                                save_session: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(matches!(
+                            view.account_operation,
+                            Some(AccountOperation::Activating { .. })
+                        ));
+                    }
+                    CancelRefresh => view.cancel_connection(cx),
+                    SwitchAccount => {
+                        view.account_event(
+                            crate::account::Event::Connected {
+                                operation: operation.clone(),
+                                result: Err("Synthetic refresh failure".into()),
+                                save_session: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(matches!(
+                            view.account_operation,
+                            Some(AccountOperation::RefreshFailed { resume: Some(_) })
+                        ));
+                        view.connect_account(window, cx);
+                        assert!(matches!(
+                            view.account_operation,
+                            Some(AccountOperation::Connecting(_, _))
+                        ));
+                    }
+                })
+                .unwrap();
+            let immediate = shuffle();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while window
+                .update(cx, |view, _, _| {
+                    matches!(
+                        view.account_operation,
+                        Some(AccountOperation::Activating { .. })
+                    )
+                })
+                .unwrap()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "Synthetic activation must finish"
+                );
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+            }
+            window
+                .update(cx, |view, window, cx| {
+                    if matches!(transition, SignOut) {
+                        let crate::account::Command::Disconnect { operation, .. } =
+                            commands.try_recv().unwrap()
+                        else {
+                            panic!("Sign-out must request account cleanup")
+                        };
+                        view.account_event(
+                            crate::account::Event::Disconnected {
+                                operation,
+                                result: Ok(()),
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    if let Some(job) = job {
+                        view.playback_result(
+                            PlaybackResult::Watch {
+                                id: job.id,
+                                account_revision: job.account_revision,
+                                update: QueueUpdate::Replace,
+                                collection: Some(collection_source().toggled()),
+                                result: Err("Late cancelled shuffle".into()),
+                                session_rejected: false,
+                            },
+                            cx,
+                        );
+                    }
+                    view.desktop_event(Event::Shuffle(false), cx);
+                    assert!(view.watch_pending.is_none());
+                    assert_eq!(
+                        view.library.queue.collection.as_ref().unwrap().order,
+                        PlaybackOrder::Original
+                    );
+                    assert!(view.pending_playback_jobs.is_empty());
+                })
+                .unwrap();
+            observed.push((transition, immediate, shuffle()));
+        }
         assert!(
-            !shuffle(),
-            "Sign-out must publish the restored original order"
+            observed
+                .iter()
+                .all(|(_, immediate, settled)| !immediate && !settled),
+            "Cancelled shuffle must publish Original immediately and after late replies: {observed:?}"
         );
-        let crate::account::Command::Disconnect { operation, .. } = commands.try_recv().unwrap()
-        else {
-            panic!("Sign-out must request account cleanup")
-        };
-        window
-            .update(cx, |view, window, cx| {
-                view.account_event(
-                    crate::account::Event::Disconnected {
-                        operation,
-                        result: Ok(()),
-                    },
-                    window,
-                    cx,
-                );
-                view.playback_result(
-                    PlaybackResult::Watch {
-                        id: job.id,
-                        account_revision: job.account_revision,
-                        update: QueueUpdate::Replace,
-                        collection: Some(collection_source().toggled()),
-                        result: Err("Late cancelled shuffle".into()),
-                        session_rejected: false,
-                    },
-                    cx,
-                );
-                view.desktop_event(Event::Shuffle(false), cx);
-                assert!(view.account.is_none());
-                assert!(view.watch_pending.is_none());
-                assert_eq!(
-                    view.library.queue.collection.as_ref().unwrap().order,
-                    PlaybackOrder::Original
-                );
-                assert!(view.pending_playback_jobs.is_empty());
-            })
-            .unwrap();
-        assert!(!shuffle());
     })
 }
 
