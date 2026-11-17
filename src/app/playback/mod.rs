@@ -16,6 +16,14 @@ pub(in crate::app) enum PlaybackQuery {
 }
 
 impl PlaybackQuery {
+    pub(in crate::app) fn mix(collection: &Collection) -> Option<Self> {
+        let target = collection.details.mix.clone()?;
+        Some(
+            queue_source::CollectionPlayback::mix(&collection.id, &collection.details)
+                .map_or(Self::Playlist(target), Self::Collection),
+        )
+    }
+
     pub(in crate::app) fn collection(
         collection: &Collection,
         order: queue_source::PlaybackOrder,

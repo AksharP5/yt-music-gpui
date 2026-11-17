@@ -236,7 +236,7 @@ impl fmt::Debug for WatchTarget {
 pub struct PlaylistTarget(WatchTarget);
 
 impl PlaylistTarget {
-    fn from_navigation(navigation: &Value) -> Option<Self> {
+    pub(crate) fn from_navigation(navigation: &Value) -> Option<Self> {
         let endpoint = match (
             navigation.get("watchPlaylistEndpoint"),
             navigation.get("watchEndpoint"),
@@ -252,6 +252,12 @@ impl PlaylistTarget {
     pub(crate) fn request(&self) -> Value {
         self.0.body()
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct PlaybackActions {
+    pub play: Arc<PlaylistTarget>,
+    pub shuffle: Arc<PlaylistTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

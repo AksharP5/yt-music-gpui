@@ -184,14 +184,8 @@ impl Music {
                     "Shuffle",
                     PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
                 ));
-                let mix = artist.then(|| {
-                    (
-                        "featured-mix",
-                        "mix",
-                        "Mix",
-                        collection.details.mix.clone().map(PlaybackQuery::Playlist),
-                    )
-                });
+                let mix =
+                    artist.then(|| ("featured-mix", "mix", "Mix", PlaybackQuery::mix(collection)));
                 // Playlists lead with Shuffle on the web; albums with Play.
                 let order = if collection.id.starts_with("VL") {
                     [shuffle, play, mix]

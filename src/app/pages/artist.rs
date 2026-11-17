@@ -38,11 +38,16 @@ impl Music {
             .items_center()
             .flex_wrap()
             .gap(px(8.));
-        for (id, label, glyph, target) in [
-            ("artist-shuffle", "Shuffle", "shuffle", header.shuffle),
-            ("artist-mix", "Mix", "mix", header.mix),
+        for (id, label, glyph, query) in [
+            (
+                "artist-shuffle",
+                "Shuffle",
+                "shuffle",
+                PlaybackQuery::collection(&artist, PlaybackOrder::Shuffled),
+            ),
+            ("artist-mix", "Mix", "mix", PlaybackQuery::mix(&artist)),
         ] {
-            if let Some(target) = target {
+            if let Some(query) = query {
                 actions = actions.child(
                     div()
                         .id(id)
@@ -62,7 +67,7 @@ impl Music {
                         .child(icon(glyph, 24., rgb(0x0f0f0f).into()))
                         .child(label)
                         .on_click(cx.listener(move |view, _, _, cx| {
-                            view.start_queue(PlaybackQuery::Playlist(target.clone()), cx);
+                            view.start_queue(query.clone(), cx);
                         })),
                 );
             }

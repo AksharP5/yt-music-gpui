@@ -2001,6 +2001,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 alternatives: None,
                 continuation: None,
                 source_target: None,
+                shuffle: None,
             });
             music.select_player_tab(PlayerTab::UpNext, cx);
             music

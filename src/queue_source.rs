@@ -1,8 +1,8 @@
 use crate::{
     auth::{self, Session},
     catalog::{
-        BrowseLink, Catalog, CollectionDetails, Continuation, Item, Page, PlaylistTarget, Track,
-        WatchTarget,
+        BrowseLink, Catalog, CollectionDetails, Continuation, Item, Page, PlaybackActions,
+        PlaylistTarget, Track, WatchTarget,
     },
     library::Queue,
     search::{SearchFilter, SearchScope},
@@ -36,40 +36,81 @@ pub(crate) enum PlaybackOrder {
     Shuffled,
 }
 
-/// A collection's issued Play and Shuffle actions. Saved queues keep only its
-/// public browse ID and order; actions are refreshed under the current account.
+/// Saved queues retain the public browse ID, chosen order and artist action,
+/// never issued actions. Actions are refreshed under the current account.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CollectionPlayback {
     id: String,
     pub order: PlaybackOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artist_action: Option<ArtistAction>,
     #[serde(skip)]
-    actions: Option<Arc<CollectionActions>>,
+    actions: Option<CollectionActions>,
 }
 
-#[derive(Debug, PartialEq)]
-struct CollectionActions {
-    play: Arc<PlaylistTarget>,
-    shuffle: Arc<PlaylistTarget>,
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum ArtistAction {
+    Shuffle,
+    Mix,
 }
 
-impl CollectionActions {
-    fn new(details: &CollectionDetails) -> Option<Self> {
-        Some(Self {
-            play: details.play.clone()?,
-            shuffle: details.shuffle.clone()?,
-        })
+impl ArtistAction {
+    fn target(self, details: &CollectionDetails) -> Option<Arc<PlaylistTarget>> {
+        match self {
+            Self::Shuffle => &details.shuffle,
+            Self::Mix => &details.mix,
+        }
+        .clone()
     }
+
+    fn order(self) -> PlaybackOrder {
+        match self {
+            Self::Shuffle => PlaybackOrder::Shuffled,
+            Self::Mix => PlaybackOrder::Original,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CollectionActions {
+    Initial(Arc<PlaylistTarget>),
+    Pair(Arc<PlaybackActions>),
 }
 
 impl CollectionPlayback {
     pub fn new(id: &str, details: &CollectionDetails, order: PlaybackOrder) -> Option<Self> {
+        if id.starts_with("UC") {
+            return (order == PlaybackOrder::Shuffled)
+                .then(|| Self::artist(id, details, ArtistAction::Shuffle))
+                .flatten();
+        }
         if !id.starts_with("VL") && !id.starts_with("MPREb") {
             return None;
         }
         Some(Self {
             id: id.to_owned(),
             order,
-            actions: Some(Arc::new(CollectionActions::new(details)?)),
+            artist_action: None,
+            actions: Some(CollectionActions::Pair(Arc::new(PlaybackActions {
+                play: details.play.clone()?,
+                shuffle: details.shuffle.clone()?,
+            }))),
+        })
+    }
+
+    pub fn mix(id: &str, details: &CollectionDetails) -> Option<Self> {
+        if !id.starts_with("UC") {
+            return None;
+        }
+        Self::artist(id, details, ArtistAction::Mix)
+    }
+
+    fn artist(id: &str, details: &CollectionDetails, action: ArtistAction) -> Option<Self> {
+        Some(Self {
+            id: id.to_owned(),
+            order: action.order(),
+            artist_action: Some(action),
+            actions: Some(CollectionActions::Initial(action.target(details)?)),
         })
     }
 
@@ -90,21 +131,57 @@ impl CollectionPlayback {
     pub fn target(&mut self, catalog: &Catalog) -> Result<&PlaylistTarget> {
         if self.actions.is_none() {
             let page = catalog.browse(&BrowseLink::new(&self.id, "Queued collection"))?;
-            self.actions = page
-                .header
-                .as_ref()
-                .and_then(|header| CollectionActions::new(&header.collection))
-                .map(Arc::new);
+            if let Some(header) = page.header {
+                self.actions = if let Some(action) = self.artist_action {
+                    match action {
+                        ArtistAction::Shuffle => header.shuffle,
+                        ArtistAction::Mix => header.mix,
+                    }
+                    .map(CollectionActions::Initial)
+                } else {
+                    Self::new(&self.id, &header.collection, self.order)
+                        .and_then(|source| source.actions)
+                };
+            }
+        }
+        if let (Some(action), Some(CollectionActions::Initial(target))) =
+            (self.artist_action, &self.actions)
+            && action.order() != self.order
+        {
+            let watch = catalog.watch_playlist(target)?;
+            let shuffle = watch.shuffle.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "YouTube Music did not provide Shuffle controls for this artist queue"
+                )
+            })?;
+            self.actions = Some(CollectionActions::Pair(shuffle.actions));
         }
         let actions = self.actions.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "YouTube Music did not provide Play and Shuffle actions for this collection"
-            )
+            anyhow::anyhow!("YouTube Music did not provide playback actions for this collection")
         })?;
-        Ok(match self.order {
-            PlaybackOrder::Original => &actions.play,
-            PlaybackOrder::Shuffled => &actions.shuffle,
+        Ok(match actions {
+            CollectionActions::Initial(target) => target,
+            CollectionActions::Pair(actions) => match self.order {
+                PlaybackOrder::Original => &actions.play,
+                PlaybackOrder::Shuffled => &actions.shuffle,
+            },
         })
+    }
+
+    pub fn apply_watch(&mut self, watch: &Watch) -> bool {
+        if self.artist_action.is_none() {
+            return true;
+        }
+        let Some(shuffle) = &watch.shuffle else {
+            return false;
+        };
+        self.order = if shuffle.shuffled {
+            PlaybackOrder::Shuffled
+        } else {
+            PlaybackOrder::Original
+        };
+        self.actions = Some(CollectionActions::Pair(shuffle.actions.clone()));
+        true
     }
 }
 
@@ -766,7 +843,9 @@ mod tests {
         let restored: CollectionPlayback = serde_json::from_value(saved).unwrap();
         assert!(restored.actions.is_none());
         assert_eq!(restored.order, PlaybackOrder::Shuffled);
-        assert!(CollectionPlayback::new("UCartist", &details, PlaybackOrder::Original).is_none());
+        assert!(
+            CollectionPlayback::new("unsupported", &details, PlaybackOrder::Original).is_none()
+        );
         let mut queue = Queue {
             collection: Some(shuffled),
             ..Default::default()
@@ -800,6 +879,133 @@ mod tests {
             shuffled.queue.len(),
             watch.queue.len()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn artist_shuffle_retains_queue_controls_without_persisting_them() {
+        let target = |playlist: &str, params: &str| {
+            Arc::new(
+                PlaylistTarget::from_navigation(&json!({
+                    "watchEndpoint":{"playlistId":playlist,"params":params}
+                }))
+                .unwrap(),
+            )
+        };
+        let details = CollectionDetails {
+            shuffle: Some(target("RDAOartist", "header-shuffle%3D")),
+            mix: Some(target("RDEMartist", "header-mix%3D")),
+            ..Default::default()
+        };
+        let catalog = Catalog::new().unwrap();
+        for (mut source, origin, playlist, initial_order) in [
+            (
+                CollectionPlayback::new("UCartist", &details, PlaybackOrder::Shuffled).unwrap(),
+                "Shuffle",
+                "RDAOartist",
+                PlaybackOrder::Shuffled,
+            ),
+            (
+                CollectionPlayback::mix("UCartist", &details).unwrap(),
+                "Mix",
+                "RDEMartist",
+                PlaybackOrder::Original,
+            ),
+        ] {
+            assert_eq!(
+                source.target(&catalog).unwrap().request()["playlistId"],
+                playlist
+            );
+            assert!(
+                !source.apply_watch(&watch(&["abcdefghijk"], None, None)),
+                "Missing toggle controls must fall back to ordinary playback"
+            );
+            let mut response = watch(&["abcdefghijk"], None, None);
+            response.shuffle = Some(crate::watch::QueueShuffle {
+                shuffled: initial_order == PlaybackOrder::Shuffled,
+                actions: Arc::new(PlaybackActions {
+                    play: target(playlist, "queue-original%3D"),
+                    shuffle: target(playlist, "queue-shuffle%3D"),
+                }),
+            });
+            assert!(source.apply_watch(&response));
+            let mut toggled = source.toggled();
+            let expected = if initial_order == PlaybackOrder::Shuffled {
+                "queue-original%3D"
+            } else {
+                "queue-shuffle%3D"
+            };
+            assert_eq!(
+                toggled.target(&catalog).unwrap().request(),
+                json!({"playlistId":playlist,"params":expected})
+            );
+            let saved = serde_json::to_value(&source).unwrap();
+            assert_eq!(
+                saved,
+                json!({"id":"UCartist","order":initial_order,"artist_action":origin})
+            );
+            let restored: CollectionPlayback = serde_json::from_value(saved).unwrap();
+            assert!(restored.actions.is_none());
+            response.shuffle.as_mut().unwrap().shuffled = false;
+            assert!(source.apply_watch(&response));
+            assert_eq!(
+                source.order,
+                PlaybackOrder::Original,
+                "The response owns the confirmed order"
+            );
+        }
+        assert!(CollectionPlayback::new("UCartist", &details, PlaybackOrder::Original).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires network; public guest artist only, no account or playback"]
+    fn artist_queues_refresh_both_orders_for_shuffle_and_mix() -> Result<()> {
+        let id = "UCLEcrRNFiDrhwENdwVI-ZPQ";
+        let catalog = Catalog::new()?;
+        let header = catalog
+            .browse(&BrowseLink::new(id, "Vitamin String Quartet"))?
+            .header
+            .unwrap();
+        let details = CollectionDetails {
+            shuffle: header.shuffle,
+            mix: header.mix,
+            ..Default::default()
+        };
+        for mut source in [
+            CollectionPlayback::new(id, &details, PlaybackOrder::Shuffled).unwrap(),
+            CollectionPlayback::mix(id, &details).unwrap(),
+        ] {
+            let watch = catalog.watch_playlist(source.target(&catalog)?)?;
+            ensure!(
+                source.apply_watch(&watch),
+                "Artist queue must supply toggle actions"
+            );
+            ensure!(
+                !watch.queue.is_empty() && watch.current.is_some(),
+                "Artist queue must be playable"
+            );
+            let initial = source.order;
+            let mut toggled = source.toggled();
+            let requested = toggled.order;
+            let watch = catalog.watch_playlist(toggled.target(&catalog)?)?;
+            ensure!(
+                toggled.apply_watch(&watch) && toggled.order == requested,
+                "Toggle must return the requested order"
+            );
+            let saved = serde_json::to_value(&toggled)?;
+            let mut restored: CollectionPlayback = serde_json::from_value(saved)?;
+            let watch = catalog.watch_playlist(restored.target(&catalog)?)?;
+            ensure!(
+                restored.apply_watch(&watch) && restored.order == requested,
+                "Restart must refresh the same artist action and order"
+            );
+            println!(
+                "ARTIST_QUEUE guest=true origin={:?} initial={initial:?} toggled={requested:?} restored={:?} rows={}",
+                source.artist_action,
+                restored.order,
+                watch.queue.len()
+            );
+        }
         Ok(())
     }
 

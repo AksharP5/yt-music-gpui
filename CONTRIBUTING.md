@@ -79,7 +79,9 @@ Album and playlist queues retain their independently issued Play and Shuffle act
 bin/test -- --ignored --exact queue_source::tests::restored_collection_refreshes_its_actions_and_loads_both_playback_orders
 ```
 
-MPRIS Shuffle uses the same album or playlist source as the player bar. Repeated requests for the same pending order do not reload it, and a rapid on/off pair keeps the last request. `desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests` checks these commands in a native window. Queues without a reversible collection source still reject enabling persistent shuffle through MPRIS.
+Artist Shuffle and Mix starts retain the queue's independently issued toggle actions and confirmed order. Their saved state also records which artist action to refresh. Restart and account changes fetch that action again, then obtain fresh queue controls when the requested order differs. Missing controls fall back to ordinary playback. The public guest `artist_queues_refresh_both_orders_for_shuffle_and_mix` integration check covers both starts, toggles and restart without playing media. The native account activation regression covers initial artist actions and accepted queue controls across account switches, guest sign-in and same-account refresh.
+
+MPRIS Shuffle uses the same album, playlist or artist source as the player bar. Repeated requests for the same pending order do not reload it, and a rapid on/off pair keeps the last request. `desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests` checks these commands in a native window. Queues without a reversible collection source still reject enabling persistent shuffle through MPRIS.
 
 `account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 
