@@ -755,10 +755,6 @@ impl Music {
                     changed = false;
                 }
             }
-            PlayerEvent::Volume(volume) => {
-                changed = self.library.volume.round() != volume.round();
-                self.library.volume = volume.clamp(0., 100.);
-            }
             PlayerEvent::Speed(speed) => {
                 changed = self.library.speed != speed;
                 self.library.speed = speed;
@@ -901,10 +897,11 @@ impl Music {
 
     pub(in crate::app) fn set_volume(&mut self, volume: f64, cx: &mut Context<Self>) -> bool {
         let volume = volume.clamp(0., 100.).round();
-        if self.library.volume == volume {
+        if self.library.volume == volume && !self.library.muted {
             return false;
         }
         self.library.volume = volume;
+        self.library.muted = false;
         self.player_command(|player| player.set_volume(volume));
         self.notify_playback(cx);
         true

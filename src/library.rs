@@ -43,6 +43,7 @@ pub struct Library {
     pub repeat: Repeat,
     pub autoplay: bool,
     pub volume: f64,
+    pub muted: bool,
     pub speed: PlaybackSpeed,
     pub quality: AudioQuality,
     pub video: bool,
@@ -61,6 +62,7 @@ impl Default for Library {
             repeat: Repeat::default(),
             autoplay: true,
             volume: 0.,
+            muted: false,
             speed: PlaybackSpeed::default(),
             quality: AudioQuality::default(),
             video: false,
@@ -75,6 +77,9 @@ impl Library {
             volume: 60.,
             ..Default::default()
         }
+    }
+    pub fn effective_volume(&self) -> f64 {
+        if self.muted { 0. } else { self.volume }
     }
     pub fn music_autoplay(&self) -> bool {
         self.autoplay
@@ -332,6 +337,7 @@ struct Preferences {
     repeat: Repeat,
     autoplay: bool,
     volume: f64,
+    muted: bool,
     speed: PlaybackSpeed,
     quality: AudioQuality,
     video: bool,
@@ -344,6 +350,7 @@ impl From<&Library> for Preferences {
             repeat: library.repeat,
             autoplay: library.autoplay,
             volume: library.volume,
+            muted: library.muted,
             speed: library.speed,
             quality: library.quality,
             video: library.video,
@@ -357,6 +364,7 @@ impl Preferences {
         library.repeat = self.repeat;
         library.autoplay = self.autoplay;
         library.volume = self.volume;
+        library.muted = self.muted;
         library.speed = self.speed;
         library.quality = self.quality;
         library.video = self.video;
@@ -590,23 +598,28 @@ mod tests {
         store.save(&library).unwrap();
         let (writer, errors) = LibraryWriter::new(store);
         library.volume = 17.;
+        library.muted = true;
         writer.save_preferences(&library);
         drop(writer);
         assert!(errors.is_empty());
         let saved: Library = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved.volume, 17.);
+        assert!(saved.muted);
+        assert_eq!(saved.effective_volume(), 0.);
         assert_eq!(saved.queue.tracks, library.queue.tracks);
         let (writer, errors) = LibraryWriter::new(Store { path: path.clone() });
         library.queue.tracks.push(track("new-tail"));
         writer.save(&library);
         for n in 0..100 {
             library.volume = n as f64;
+            library.muted = n % 2 == 0;
             writer.save_preferences(&library);
         }
         drop(writer);
         assert!(errors.is_empty());
         let saved: Library = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved.volume, 99.);
+        assert!(!saved.muted);
         assert_eq!(saved.queue.tracks, library.queue.tracks);
     }
 
@@ -751,6 +764,9 @@ mod tests {
     fn playback_preferences_migrate_and_round_trip() {
         assert!(Library::default().autoplay);
         assert!(Library::new().autoplay);
+        assert_eq!(Library::new().effective_volume(), 60.);
+        let silent: Library = serde_json::from_value(serde_json::json!({ "volume": 0. })).unwrap();
+        assert_eq!(silent.effective_volume(), 0.);
         let migrated: Library = serde_json::from_value(serde_json::json!({
             "volume": 37., "repeat": "All", "liked": [track("saved")]
         }))
@@ -761,10 +777,14 @@ mod tests {
         assert!(!migrated.video);
         assert_eq!(migrated.video_quality, VideoQuality::P720);
         assert_eq!(migrated.volume, 37.);
+        assert!(!migrated.muted);
+        assert_eq!(migrated.effective_volume(), 37.);
         assert_eq!(migrated.repeat, Repeat::All);
         assert_eq!(migrated.liked[0].id, "saved");
         let library = Library {
             autoplay: false,
+            volume: 37.,
+            muted: true,
             quality: AudioQuality::High,
             video: true,
             video_quality: VideoQuality::P1080,
@@ -772,11 +792,16 @@ mod tests {
         };
         let saved = serde_json::to_value(library).unwrap();
         assert_eq!(saved["autoplay"], false);
+        assert_eq!(saved["volume"], 37.);
+        assert_eq!(saved["muted"], true);
         assert_eq!(saved["quality"], "high");
         assert_eq!(saved["video"], true);
         assert_eq!(saved["video_quality"], "1080p");
         let restored = serde_json::from_value::<Library>(saved).unwrap();
         assert!(!restored.autoplay);
+        assert!(restored.muted);
+        assert_eq!(restored.volume, 37.);
+        assert_eq!(restored.effective_volume(), 0.);
         assert_eq!(restored.quality, AudioQuality::High);
         assert!(restored.video);
         assert_eq!(restored.video_quality, VideoQuality::P1080);

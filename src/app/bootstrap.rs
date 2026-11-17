@@ -82,7 +82,7 @@ impl Music {
         .detach();
         let (player, mut error) = match Player::new(PlayerOptions {
             credentials: None,
-            volume: library.volume,
+            volume: library.effective_volume(),
             speed: library.speed,
             ..Default::default()
         }) {
