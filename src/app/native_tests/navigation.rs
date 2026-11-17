@@ -45,7 +45,12 @@ pub(super) fn reply(view: &mut Music, page: Page, cx: &mut Context<Music>) -> Qu
     job.query
 }
 
-fn confirm(view: &mut Music, window: &mut Window, mutation: Mutation, cx: &mut Context<Music>) {
+pub(super) fn confirm(
+    view: &mut Music,
+    window: &mut Window,
+    mutation: Mutation,
+    cx: &mut Context<Music>,
+) {
     view.account_event(
         account::Event::Applied {
             session: view.account.as_ref().unwrap().session.clone(),
@@ -258,13 +263,11 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                 );
                 let requests: Vec<_> =
                     std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
-                assert_eq!(
-                    requests.len(),
-                    1,
-                    "Missing any metadata must supersede the older read"
-                );
-                assert!(requests[0].id > older_read.id);
-                assert!(matches!(requests[0].query, Query::Revalidate(_)));
+                let pages:Vec<_> = requests.iter().filter(|job| job.query.target()==CatalogTarget::Page).collect();
+                assert_eq!(pages.len(), 1, "Missing song metadata must supersede the older page read");
+                assert!(pages[0].id > older_read.id);
+                assert!(matches!(pages[0].query, Query::Revalidate(_)));
+                assert!(requests.iter().any(|job| matches!(&job.query, Query::PlaylistMetadata(refresh) if refresh.id=="destination")));
                 view.catalog_requests.cancel(CatalogTarget::Page);
 
                 view.navigate(Route::Explore, cx);
@@ -286,10 +289,9 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                     window,
                     cx,
                 );
-                assert!(
-                    view.catalog_requests.pending.is_empty(),
-                    "An inactive destination needs no immediate read"
-                );
+                let requests:Vec<_> = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).collect();
+                assert!(!requests.iter().any(|job| job.query.target()==CatalogTarget::Page), "An inactive destination needs no page read");
+                assert!(requests.iter().any(|job| matches!(&job.query, Query::PlaylistMetadata(refresh) if refresh.id=="destination")), "Its guide details still refresh");
                 view.navigate(
                     Route::Browse(BrowseLink::new("VLdestination", "Destination")),
                     cx,

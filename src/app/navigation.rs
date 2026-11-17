@@ -82,11 +82,7 @@ pub(in crate::app) enum Query {
     SidebarPlaylists,
     SidebarMore(Continuation),
     PlaylistChoices(Vec<String>),
-    PlaylistMetadata {
-        id: String,
-        additions: Vec<String>,
-        removal: Option<String>,
-    },
+    PlaylistMetadata(sync::PlaylistRefresh),
     /// The current page again in another order, replacing it.
     Reload(Continuation),
     Revalidate(Box<Query>),
@@ -96,7 +92,7 @@ impl Query {
         match self {
             Self::SidebarPlaylists | Self::SidebarMore(_) => CatalogTarget::Sidebar,
             Self::PlaylistChoices(_) => CatalogTarget::PlaylistChoices,
-            Self::PlaylistMetadata { .. } => CatalogTarget::PlaylistMetadata,
+            Self::PlaylistMetadata(_) => CatalogTarget::PlaylistMetadata,
             Self::Revalidate(query) => query.target(),
             _ => CatalogTarget::Page,
         }
@@ -401,6 +397,7 @@ impl Music {
     pub(in crate::app) fn request(&mut self, query: Query, cx: &mut Context<Self>) {
         let target = query.target();
         if target == CatalogTarget::Page {
+            self.clear_playlist_metadata_error();
             if let Some(page) = &mut self.forward_page
                 && page.list_id == self.list_id
             {
@@ -455,8 +452,8 @@ impl Music {
         } else if target == CatalogTarget::PlaylistMetadata
             && let Err(error) = result
         {
-            self.sync.metadata_playlist = None;
-            self.error = Some(error);
+            self.sync.playlist_refreshes.clear();
+            self.error.get_or_insert(error);
         }
         cx.notify();
     }
@@ -1109,14 +1106,10 @@ impl CatalogRequests {
                                     Query::PlaylistChoices(_) => {
                                         Err(anyhow::anyhow!("Invalid playlist destination request"))
                                     }
-                                    Query::PlaylistMetadata {
-                                        id,
-                                        additions,
-                                        removal,
-                                    } => catalog.playlist_metadata(
-                                        id,
-                                        additions,
-                                        removal.as_deref(),
+                                    Query::PlaylistMetadata(refresh) => catalog.playlist_metadata(
+                                        &refresh.id,
+                                        &refresh.additions,
+                                        &refresh.removals,
                                         || {
                                             generations[target as usize].load(Ordering::Relaxed)
                                                 == job.id

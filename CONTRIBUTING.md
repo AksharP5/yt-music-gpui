@@ -56,7 +56,9 @@ CI runs the same checks on every pull request. `bin/build` and `bin/test` use tw
 
 ## Integration tests
 
-Confirmed playlist additions, removals and moves refresh header details separately from the loaded songs, then refresh the guide. The read retries up to five times when the returned occurrences prove that YouTube still has the old content. It does not scan continuations or repeat a write. Native checks cover last-song totals, retaining 500 loaded songs and the visible occurrence, and clearing the reconnect message when an explicit retry is accepted.
+Confirmed playlist additions, removals and moves refresh totals and covers separately from loaded songs. Refreshes are queued per playlist and combine unresolved occurrence checks for repeated edits. Verified details survive older page and guide responses, including playlists in the loaded guide tail. Cookie renewal cancels the old session's reads and pending refreshes. The read retries up to five times when returned occurrences prove that YouTube still has old content. It does not scan continuations or repeat a write; a partial first response cannot verify an append outside that response.
+
+Native checks cover last-song totals, retaining 500 loaded songs and the visible occurrence, overlapping edits and reads, cookie renewal, scoped refresh errors, and clearing the reconnect message when an explicit retry is accepted. Accepting an edit keeps any unresolved page-loading error visible.
 
 Tests that need the network, libmpv, yt-dlp, a keyring or a desktop session are marked `#[ignore]`, and each one says what it needs. List them with `bin/test -- --ignored --list` and run one by name:
 

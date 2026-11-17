@@ -813,7 +813,7 @@ impl Catalog {
         &self,
         id: &str,
         additions: &[String],
-        removal: Option<&str>,
+        removals: &[String],
         current: impl Fn() -> bool,
     ) -> Result<Page> {
         let link = BrowseLink::new(format!("VL{}", id.trim_start_matches("VL")), "Playlist");
@@ -822,7 +822,7 @@ impl Catalog {
         for attempt in 0..5 {
             ensure!(current(), "Playlist refresh was superseded");
             let page = self.browse(&link)?;
-            if page.header.is_some() && playlist_metadata_visible(&page, additions, removal) {
+            if page.header.is_some() && playlist_metadata_visible(&page, additions, removals) {
                 return Ok(page);
             }
             if attempt < 4 {
@@ -2370,7 +2370,7 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
     Ok(choices)
 }
 
-fn playlist_metadata_visible(page: &Page, additions: &[String], removal: Option<&str>) -> bool {
+fn playlist_metadata_visible(page: &Page, additions: &[String], removals: &[String]) -> bool {
     let occurrences: HashSet<_> = page
         .shelves
         .iter()
@@ -2380,7 +2380,9 @@ fn playlist_metadata_visible(page: &Page, additions: &[String], removal: Option<
             _ => None,
         })
         .collect();
-    !removal.is_some_and(|removed| occurrences.contains(removed))
+    !removals
+        .iter()
+        .any(|removed| occurrences.contains(removed.as_str()))
         && (page.continuation.is_some()
             || additions
                 .iter()
@@ -2405,22 +2407,39 @@ mod tests {
             more: None,
             items: vec![Item::Track(track.clone())],
         });
-        assert!(!playlist_metadata_visible(&page, &[], Some("occurrence-0")));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &[],
+            &["occurrence-0".into()]
+        ));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &[],
+            &["already-gone".into(), "occurrence-0".into()]
+        ));
         assert!(!playlist_metadata_visible(
             &page,
             &["new-occurrence".into()],
-            None
+            &[]
         ));
         page.shelves[0].items.clear();
-        assert!(playlist_metadata_visible(&page, &[], Some("occurrence-0")));
+        assert!(playlist_metadata_visible(
+            &page,
+            &[],
+            &["occurrence-0".into()]
+        ));
         page.shelves[0].items.push(Item::Track(track));
         page.continuation = Some(Continuation::new("tail"));
         assert!(playlist_metadata_visible(
             &page,
             &["tail-occurrence".into()],
-            None
+            &[]
         ));
-        assert!(!playlist_metadata_visible(&page, &[], Some("occurrence-0")));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &[],
+            &["occurrence-0".into()]
+        ));
         page.shelves[0].items[0] = Item::Track({
             let mut track = page.tracks()[0].clone();
             track.details.set_video_id = Some("new-occurrence".into());
@@ -2429,7 +2448,7 @@ mod tests {
         assert!(playlist_metadata_visible(
             &page,
             &["new-occurrence".into()],
-            None
+            &[]
         ));
     }
 

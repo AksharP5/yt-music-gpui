@@ -13,7 +13,9 @@ pub(in crate::app) struct SyncState {
     pub page_coverage: PageCoverage,
     pub page_error: Option<String>,
     pub page_reload: Option<PageReload>,
-    pub metadata_playlist: Option<String>,
+    pub playlist_refreshes: VecDeque<PlaylistRefresh>,
+    pub playlist_metadata_error: Option<(String, String)>,
+    sidebar_changes: Vec<PlaylistMetadata>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -25,6 +27,7 @@ pub(in crate::app) struct PageCoverage {
 pub(super) enum PageChange {
     Confirmed(Box<Mutation>),
     PlaylistAdded { id: String, tracks: Vec<Track> },
+    PlaylistMetadata(PlaylistMetadata),
 }
 
 impl PageChange {
@@ -32,6 +35,91 @@ impl PageChange {
         match self {
             Self::Confirmed(mutation) => patch_page(page, route, &mutation),
             Self::PlaylistAdded { id, tracks } => append_added(page, route, &id, &tracks),
+            Self::PlaylistMetadata(metadata) => metadata.apply(page, route),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::app) struct PlaylistRefresh {
+    pub id: String,
+    pub additions: Vec<String>,
+    pub removals: Vec<String>,
+}
+
+impl PlaylistRefresh {
+    fn merge(&mut self, additions: Vec<String>, removal: Option<String>) {
+        self.removals.retain(|id| !additions.contains(id));
+        self.additions.extend(additions);
+        self.additions.sort_unstable();
+        self.additions.dedup();
+        if let Some(removal) = removal {
+            self.additions.retain(|id| id != &removal);
+            if !self.removals.contains(&removal) {
+                self.removals.push(removal);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct PlaylistMetadata {
+    id: String,
+    stats: String,
+    owner: String,
+    thumbnail: Option<String>,
+    background: Option<String>,
+}
+
+impl PlaylistMetadata {
+    fn from_page(id: String, page: Page) -> Result<Self, String> {
+        let header = page.header.ok_or_else(|| {
+            "Playlist saved, but its details are unavailable. Refresh the playlist.".to_owned()
+        })?;
+        let owner = if header.owner.is_empty() {
+            match header.artist {
+                Some(crate::catalog::HeaderArtist::Link(link)) => link.title,
+                Some(crate::catalog::HeaderArtist::Text(owner)) => owner,
+                None => String::new(),
+            }
+        } else {
+            header.owner
+        };
+        Ok(Self {
+            id,
+            stats: header.stats,
+            owner,
+            thumbnail: header.thumbnail,
+            background: page.background,
+        })
+    }
+
+    fn apply(&self, page: &mut Page, route: &Route) {
+        if matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == self.id) {
+            if let Some(header) = &mut page.header {
+                header.stats = self.stats.clone();
+                header.thumbnail = self.thumbnail.clone();
+            }
+            page.background = self.background.clone();
+        }
+    }
+
+    fn apply_sidebar(&self, playlists: &mut [Collection]) {
+        for playlist in playlists {
+            if playlist.id.trim_start_matches("VL") != self.id {
+                continue;
+            }
+            // The playlist's second subtitle starts with its displayed count,
+            // followed by its duration. Preserve that service wording.
+            let count = self.stats.split('•').next().unwrap_or_default().trim();
+            if !count.is_empty() {
+                playlist.subtitle = if self.owner.is_empty() {
+                    count.to_owned()
+                } else {
+                    format!("{} • {count}", self.owner)
+                };
+            }
+            playlist.thumbnail = self.thumbnail.clone();
         }
     }
 }
@@ -122,6 +210,12 @@ pub(super) fn merge_page(loaded: &mut Page, mut fresh: Page, coverage: &mut Page
 }
 
 impl SyncState {
+    pub(super) fn cancel_playlist_refreshes(&mut self) {
+        self.playlist_refreshes.clear();
+        self.playlist_metadata_error = None;
+        self.sidebar_changes.clear();
+    }
+
     pub(super) fn update_sidebar(
         &mut self,
         playlists: &mut Vec<Collection>,
@@ -153,6 +247,9 @@ impl SyncState {
             );
             self.sidebar_coverage.continued = true;
             self.sidebar_continuation = page.continuation;
+            for change in &self.sidebar_changes {
+                change.apply_sidebar(playlists);
+            }
             return;
         }
         if !revalidate {
@@ -167,6 +264,9 @@ impl SyncState {
         );
         if !preserve_tail {
             self.sidebar_continuation = page.continuation;
+        }
+        for change in self.sidebar_changes.drain(..) {
+            change.apply_sidebar(playlists);
         }
     }
 }
@@ -604,15 +704,37 @@ impl Music {
         removal: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.sync.metadata_playlist = Some(id.to_owned());
-        self.request(
-            Query::PlaylistMetadata {
+        let id = id.trim_start_matches("VL");
+        if let Some((index, refresh)) = self
+            .sync
+            .playlist_refreshes
+            .iter_mut()
+            .enumerate()
+            .find(|(_, refresh)| refresh.id == id)
+        {
+            refresh.merge(additions, removal);
+            if index > 0 {
+                return;
+            }
+        } else {
+            let mut refresh = PlaylistRefresh {
                 id: id.to_owned(),
-                additions,
-                removal,
-            },
-            cx,
-        );
+                additions: Vec::new(),
+                removals: Vec::new(),
+            };
+            refresh.merge(additions, removal);
+            self.sync.playlist_refreshes.push_back(refresh);
+            if self.sync.playlist_refreshes.len() > 1 {
+                return;
+            }
+        }
+        self.request_playlist_metadata(cx);
+    }
+
+    fn request_playlist_metadata(&mut self, cx: &mut Context<Self>) {
+        if let Some(refresh) = self.sync.playlist_refreshes.front() {
+            self.request(Query::PlaylistMetadata(refresh.clone()), cx);
+        }
     }
 
     pub(super) fn playlist_metadata_result(
@@ -620,29 +742,48 @@ impl Music {
         result: Result<Page, String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.sync.metadata_playlist.take() else {
+        let Some(refresh) = self.sync.playlist_refreshes.pop_front() else {
             return;
         };
-        match result {
-            Ok(fresh) => {
-                // The confirmed occurrence patch owns the rows. A metadata read
-                // must not replace loaded continuations or undo a newer edit.
+        match result.and_then(|page| PlaylistMetadata::from_page(refresh.id.clone(), page)) {
+            Ok(metadata) => {
+                if self.catalog_requests.is_loading(CatalogTarget::Page) {
+                    self.sync
+                        .page_changes
+                        .push(PageChange::PlaylistMetadata(metadata.clone()));
+                }
                 for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
                     self.back
                         .iter_mut()
                         .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
                 ) {
-                    if matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
-                    {
-                        page.header = fresh.header.clone();
-                        page.background = fresh.background.clone();
-                    }
+                    metadata.apply(page, route);
                 }
+                metadata.apply_sidebar(&mut self.sidebar_playlists);
+                self.sync
+                    .sidebar_changes
+                    .retain(|change| change.id != metadata.id);
+                self.sync.sidebar_changes.push(metadata);
             }
-            Err(error) => self.error = Some(error),
+            Err(error) if self.error.is_none() => {
+                self.sync.playlist_metadata_error = Some((refresh.id, error.clone()));
+                self.error = Some(error);
+            }
+            Err(_) => {}
         }
         self.request(Query::Revalidate(Box::new(Query::SidebarPlaylists)), cx);
+        self.request_playlist_metadata(cx);
         cx.notify();
+    }
+
+    pub(super) fn clear_playlist_metadata_error(&mut self) {
+        if self.sync.playlist_metadata_error.as_ref().is_some_and(|(id, _)| {
+            matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id)
+        }) && let Some((_, error)) = self.sync.playlist_metadata_error.take()
+            && self.error.as_ref() == Some(&error)
+        {
+            self.error = None;
+        }
     }
 
     #[expect(clippy::expect_used, reason = "every library route has a section")]

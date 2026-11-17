@@ -2,15 +2,17 @@
 use crate::app::sync::tests::{page, response};
 use crate::{
     account::{self, Connection, Effect, Mutation},
-    app::{CatalogRequests, CatalogResult, CatalogTarget, Music, Overlay, Query, Route, Startup},
+    app::{
+        CatalogRequests, CatalogResult, CatalogTarget, Job, Music, Overlay, Query, Route, Startup,
+    },
     assets::Assets,
     auth::{self, Session},
-    catalog::{Account, BrowseLink, Rating},
+    catalog::{Account, BrowseLink, Page, Rating},
     track_state,
 };
 use anyhow::{Result, ensure};
 use gpui::{
-    AppContext, Bounds, KeyDownEvent, Keystroke, ListOffset, Modifiers, ScrollStrategy,
+    AppContext, Bounds, Context, KeyDownEvent, Keystroke, ListOffset, Modifiers, ScrollStrategy,
     TitlebarOptions, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
 use serde_json::json;
@@ -22,6 +24,130 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+fn playlist(rows: usize, continued: bool, stats: &str) -> Page {
+    let mut page = page(rows, continued);
+    page.header = crate::catalog::parse_page(
+        &json!({"header":{"musicResponsiveHeaderRenderer":{
+        "title":{"simpleText":"Sync validation playlist"}, "secondSubtitle":{"simpleText":stats},
+        "facepile":{"avatarStackViewModel":{"text":{"content":"Fixture owner"}}}
+    }},"contents":[]}),
+        "Playlist",
+    )
+    .unwrap()
+    .header;
+    page
+}
+
+fn deliver(view: &mut Music, job: Job, result: Result<Page, String>, cx: &mut Context<Music>) {
+    view.catalog_result(
+        CatalogResult {
+            id: job.id,
+            account_revision: job.account_revision,
+            account_generation: job.account_generation,
+            history_generation: job.history_generation,
+            append: matches!(job.query, Query::More { .. } | Query::SidebarMore(_)),
+            revalidate: matches!(job.query, Query::Revalidate(_)),
+            result,
+            session_rejected: false,
+            target: job.query.target(),
+        },
+        cx,
+    );
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_refreshes_keep_independent_edits_and_scope_failures() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            view.navigate(Route::Browse(BrowseLink::new("VLalpha", "Alpha")), cx);
+            super::navigation::reply(view, playlist(3, false, "3 tracks"), cx);
+            super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
+                id:"alpha".into(), video_id:"00000000000".into(), set_video_id:"occurrence-0".into(),
+            }, cx);
+            let older_alpha = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(&older_alpha.query, Query::PlaylistMetadata(refresh) if refresh.id=="alpha"));
+
+            view.navigate(Route::Browse(BrowseLink::new("VLbeta", "Beta")), cx);
+            super::navigation::reply(view, playlist(1, false, "1 track"), cx);
+            super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
+                id:"beta".into(), video_id:"00000000000".into(), set_video_id:"occurrence-0".into(),
+            }, cx);
+            let beta = view.page.clone();
+            assert!(view.catalog_requests.pending.is_empty(), "Editing Beta must not cancel Alpha's pending readback");
+            assert_eq!(view.sync.playlist_refreshes.len(), 2);
+            assert_eq!(view.catalog_requests.generations[CatalogTarget::PlaylistMetadata as usize].load(Ordering::Relaxed), older_alpha.id);
+
+            view.go_back(cx);
+            let loaded = view.page.clone();
+            super::navigation::reply(view, loaded, cx);
+            super::navigation::confirm(view, window, Mutation::MoveInPlaylist {
+                id:"alpha".into(), set_video_id:"occurrence-2".into(), before:Some("occurrence-1".into()),
+            }, cx);
+            let moved_alpha = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(&moved_alpha.query, Query::PlaylistMetadata(refresh) if refresh.id=="alpha" && refresh.removals==["occurrence-0"]), "A move must keep the earlier removal's readback check");
+            view.account_event(account::Event::Applied {
+                session:view.account.as_ref().unwrap().session.clone(),
+                mutation:Box::new(Mutation::AddToPlaylist { id:"alpha".into(), video_ids:vec!["00000000001".into()], duplicates:true }),
+                result:Ok(Effect::PlaylistAdded { additions:vec![("00000000001".into(),"new-occurrence".into())], toast:None }), session_rejected:false,
+            }, window, cx);
+            let added_alpha = view.catalog_requests.pending.try_recv().unwrap();
+            super::navigation::confirm(view, window, Mutation::RemoveFromPlaylist {
+                id:"alpha".into(), video_id:"00000000001".into(), set_video_id:"new-occurrence".into(),
+            }, cx);
+            let alpha = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(matches!(&alpha.query, Query::PlaylistMetadata(refresh) if refresh.additions.is_empty() && refresh.removals.contains(&"occurrence-0".into()) && refresh.removals.contains(&"new-occurrence".into())), "Quickly undoing an addition keeps satisfiable readback checks");
+            deliver(view, older_alpha, Err("Superseded metadata failure".into()), cx);
+            deliver(view, moved_alpha, Err("Superseded move readback".into()), cx);
+            deliver(view, added_alpha, Err("Superseded addition readback".into()), cx);
+            assert!(view.error.is_none(), "An obsolete readback cannot publish an error or consume the current refresh");
+
+            super::navigation::confirm(view, window, Mutation::EditPlaylist {
+                id:"alpha".into(), title:"Renamed Alpha".into(), description:"New description".into(), privacy:account::Privacy::Public,
+            }, cx);
+            let collection = serde_json::from_value(json!({"id":"VLalpha", "title":"Renamed Alpha", "subtitle":"Playlist"})).unwrap();
+            super::navigation::confirm(view, window, Mutation::CollectionLibrary { collection, save:true }, cx);
+            deliver(view, alpha, Ok(playlist(2, false, "2 tracks")), cx);
+            assert_eq!(view.page.title, "Renamed Alpha");
+            assert_eq!(view.page.privacy.as_deref(), Some("PUBLIC"));
+            assert_eq!(view.page.header.as_ref().unwrap().collection.saved, Some(true), "Readback owns totals and cover, not a newer save state");
+            assert_eq!(view.page.tracks()[0].details.set_video_id.as_deref(), Some("occurrence-2"));
+            let beta_job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+                .find(|job| matches!(&job.query, Query::PlaylistMetadata(refresh) if refresh.id=="beta"))
+                .expect("Finishing Alpha must start Beta's retained refresh");
+
+            view.navigate(Route::Browse(BrowseLink::new("VLbeta", "Beta")), cx);
+            super::navigation::reply(view, beta, cx);
+            deliver(view, beta_job, Ok(playlist(0, false, "0 tracks")), cx);
+            assert!(view.rows.is_empty());
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks");
+            view.go_back(cx);
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "2 tracks", "Back retains the other playlist's verified totals");
+            assert_eq!(view.page.title, "Renamed Alpha");
+            let loaded = view.page.clone();
+            super::navigation::reply(view, loaded, cx);
+
+            view.refresh_playlist_metadata("alpha", Vec::new(), None, cx);
+            let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).find(|job| job.query.target()==CatalogTarget::PlaylistMetadata).unwrap();
+            view.error = Some("A newer save failed".into());
+            deliver(view, job, Err("Older details refresh failed".into()), cx);
+            assert_eq!(view.error.as_deref(), Some("A newer save failed"));
+            assert!(view.sync.playlist_metadata_error.is_none());
+
+            view.error = None;
+            view.refresh_playlist_metadata("alpha", Vec::new(), None, cx);
+            let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).find(|job| job.query.target()==CatalogTarget::PlaylistMetadata).unwrap();
+            deliver(view, job, Err("Details refresh failed".into()), cx);
+            assert_eq!(view.error.as_deref(), Some("Details refresh failed"));
+            view.reload_current_page(cx);
+            assert!(view.error.is_none(), "Reload clears its playlist's refresh error");
+            assert!(view.sync.playlist_metadata_error.is_none());
+            super::navigation::reply(view, playlist(2, false, "2 tracks"), cx);
+            assert!(view.error.is_none());
+        }).unwrap();
+    })
+}
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
@@ -37,7 +163,13 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
                 "secondSubtitle":{"simpleText":"1 track • 2 minutes, 17 seconds"}
             }},"contents":[]}), "Playlist").unwrap().header;
             super::navigation::reply(view, initial.clone(), cx);
-            view.sidebar_playlists = vec![serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"1 track"})).unwrap()];
+            view.sidebar_playlists = vec![
+                serde_json::from_value(json!({"id":"VLprefix", "title":"First loaded playlist", "subtitle":"10 tracks"})).unwrap(),
+                serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"1 track"})).unwrap(),
+            ];
+            view.sync.sidebar_coverage = crate::app::sync::PageCoverage { first_page_len:1, continued:true };
+            view.revalidate_page(cx);
+            let older_page = view.catalog_requests.pending.try_recv().unwrap();
             let track = view.page.tracks()[0].clone();
             let removal = Mutation::RemoveFromPlaylist { id:"synthetic".into(), video_id:track.id, set_video_id:"occurrence-0".into() };
             assert!(view.mutate(removal.clone(), cx));
@@ -48,8 +180,8 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
             }, window, cx);
             assert!(view.rows.is_empty(), "Confirmed removal immediately removes the row");
             let job = view.catalog_requests.pending.try_recv().expect("Confirmed removal refreshes the playlist details");
-            assert!(matches!(&job.query, Query::PlaylistMetadata { id, removal:Some(occurrence), .. } if id=="synthetic" && occurrence=="occurrence-0"));
-            let mut fresh = initial;
+            assert!(matches!(&job.query, Query::PlaylistMetadata(refresh) if refresh.id=="synthetic" && refresh.removals==["occurrence-0"]));
+            let mut fresh = initial.clone();
             // Keep an old row in this response to prove that metadata publication
             // cannot undo the confirmed edit, even if service reads disagree.
             fresh.header.as_mut().unwrap().stats = "0 tracks".into();
@@ -60,16 +192,23 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
             }, cx);
             assert!(view.rows.is_empty());
             assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks");
+            view.catalog_result(CatalogResult {
+                id:older_page.id, account_revision:older_page.account_revision, account_generation:older_page.account_generation,
+                history_generation:older_page.history_generation, append:false, revalidate:true,
+                result:Ok(initial), session_rejected:false, target:CatalogTarget::Page,
+            }, cx);
+            assert!(view.rows.is_empty(), "An older page response must keep the confirmed removal");
+            assert_eq!(view.page.header.as_ref().unwrap().stats, "0 tracks", "An older page response must keep verified totals");
             let job = view.catalog_requests.pending.try_recv().expect("The settled playlist refreshes the guide");
             assert!(job.query.target() == CatalogTarget::Sidebar);
-            let mut guide = page(0, false);
-            guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"0 tracks"})).unwrap()));
+            let mut guide = page(0, true);
+            guide.shelves[0].items.push(crate::catalog::Item::Collection(view.sidebar_playlists[0].clone()));
             view.catalog_result(CatalogResult {
                 id:job.id, account_revision:job.account_revision, account_generation:job.account_generation,
                 history_generation:job.history_generation, append:false, revalidate:true,
                 result:Ok(guide), session_rejected:false, target:CatalogTarget::Sidebar,
             }, cx);
-            assert_eq!(view.sidebar_playlists[0].subtitle, "0 tracks");
+            assert_eq!(view.sidebar_playlists[1].subtitle, "0 tracks", "A playlist in the loaded guide tail must update without scanning it again");
             assert!(view.error.is_none());
             assert!(view.catalog_requests.pending.is_empty());
 
@@ -111,12 +250,13 @@ fn playlist_edits_refresh_details_without_replacing_loaded_songs() -> Result<()>
             assert_eq!(after.offset_in_item, before.offset_in_item);
             let job = view.catalog_requests.pending.try_recv().unwrap();
             let mut guide = page(0, false);
-            guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"499 tracks"})).unwrap()));
+            guide.shelves[0].items.push(crate::catalog::Item::Collection(serde_json::from_value(json!({"id":"VLsynthetic", "title":"Sync validation playlist", "subtitle":"500 tracks"})).unwrap()));
             view.catalog_result(CatalogResult {
                 id:job.id, account_revision:job.account_revision, account_generation:job.account_generation,
                 history_generation:job.history_generation, append:false, revalidate:true,
                 result:Ok(guide), session_rejected:false, target:job.query.target(),
             }, cx);
+            assert_eq!(view.sidebar_playlists[0].subtitle, "499 tracks", "A lagging guide reply must keep verified totals");
             cx.notify();
         }).unwrap();
         super::render::wait_for_presented_frame(window, cx).await;
@@ -282,6 +422,8 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 let job = view.catalog_requests.pending.try_recv().unwrap();
                 view.catalog_result(CatalogResult { id:job.id,account_revision:view.account_revision,account_generation:view.account_generation,history_generation:view.history_generation,append:true,revalidate:false,result:Err("Synthetic page failure".into()),session_rejected:false,target:CatalogTarget::Page },cx);
                 view.error = Some("Another playback failure".into());
+                assert!(view.mutate(Mutation::RateSong { track:view.page.tracks()[0].clone(), rating:Rating::Like },cx));
+                assert_eq!(view.error,view.sync.page_error,"An accepted edit must leave the page failure and its retry path visible");
                 view.prefetch_page(500,500,12,cx);
                 assert!(view.catalog_requests.pending.try_recv().is_err(),"Page errors block automatic retry even if playback replaces the banner");
                 view.list_scroll.scroll_to_item_strict(450,ScrollStrategy::Top);
