@@ -130,7 +130,7 @@ impl Music {
                     .on_click(cx.listener(|view, _, window, cx| {
                         window.focus(&view.focus, cx);
                         if view.account.is_some() {
-                            view.playlist_form(false, None, window, cx);
+                            view.playlist_form(false, Vec::new(), window, cx);
                         } else {
                             view.connect_account(window, cx);
                         }

@@ -139,7 +139,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 assert_eq!(view.sidebar_playlists.len(),2);
                 assert!(view.sync.sidebar_continuation.is_none());
                 let session = view.account.as_ref().unwrap().session.clone();
-                view.account_event(account::Event::Applied { session,mutation:Box::new(Mutation::CreatePlaylist { title:"New playlist".into(),description:String::new(),privacy:account::Privacy::Private,initial_video_id:None }),result:Ok(Effect::CreatedPlaylist { id:"created".into() }),session_rejected:false },window,cx);
+                view.account_event(account::Event::Applied { session,mutation:Box::new(Mutation::CreatePlaylist { title:"New playlist".into(),description:String::new(),privacy:account::Privacy::Private,initial_video_ids:Vec::new() }),result:Ok(Effect::CreatedPlaylist { id:"created".into() }),session_rejected:false },window,cx);
                 assert!(std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok()).any(|job| job.query.target()==CatalogTarget::Sidebar),"Creating a playlist reloads sidebar membership");
                 let session = view.account.as_ref().unwrap().session.clone();
                 view.account_event(account::Event::Applied { session,mutation:Box::new(Mutation::DeletePlaylist { id:"first".into() }),result:Ok(Effect::Changed),session_rejected:false },window,cx);
