@@ -3,6 +3,7 @@
 mod account;
 mod keyboard;
 mod navigation;
+mod performance;
 mod playback;
 pub(in crate::app) mod render;
 mod restart;

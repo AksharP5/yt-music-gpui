@@ -81,6 +81,8 @@ It verifies that track actions appear on keyboard focus without moving the title
 
 Render-count measurements wait for idle artwork and playback/catalog requests, then presented frames with stable counters. A window-bounds notification invalidates the measurement interval and starts it again; any redraw during an interval with stable bounds still fails the assertion.
 
+The carousel check measures release-mode shelf construction across 40 presented redraws with 20, 100 and 500 album cards, reporting cold time and warm mean/p50/p95 in microseconds. It also checks horizontal wheel input, offscreen title changes and responsive heights. In the fresh private environment described below, run `bin/test --release -- --ignored --exact app::native_tests::performance::carousel_render_work_and_height_stay_bounded_while_scrolling --nocapture`. These timings cover shelf construction, not total frame time or song startup. Shelf heights reuse their text measurements until content or layout changes.
+
 These tests use Cargo's unoptimized test profile with debug assertions, the same assertions enabled by `cargo run`. The render check includes a Home response with selected and unselected chips and a network error at 956px, then clicks its dismiss button. Run each test in a separate process and fresh environment. GPUI's native application loop cannot be restarted within one test process. This recipe also gives the playback check a synthetic yt-dlp version mismatch, to exercise the guest fallback notice without an account:
 
 ```sh

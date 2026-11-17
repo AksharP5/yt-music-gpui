@@ -1214,6 +1214,7 @@ async fn scrolled_artist_survives_tab(
                 };
                 album.title = "Random Access Memories (Drumless Edition)".into();
             }
+            music.rebuild_rows();
             music.detail_list.state.remeasure();
             music.detail_list.state.scroll_to(gpui::ListOffset {
                 item_ix: albums_row,

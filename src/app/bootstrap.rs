@@ -319,6 +319,9 @@ impl Music {
             rows: Vec::new(),
             list_rows: Vec::new(),
             shelf_scroll: HashMap::new(),
+            shelf_heights: Vec::new(),
+            #[cfg(test)]
+            shelf_render_times: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
             detail_list: DetailList::new(),
             sidebar_collapsed: None,
