@@ -208,6 +208,7 @@ pub struct Event {
     id: u64,
     result: Result<QueuePage, String>,
     session_rejected: bool,
+    retryable: bool,
     session: Option<Arc<Session>>,
 }
 impl Event {
@@ -216,10 +217,21 @@ impl Event {
     }
 }
 
+fn transient_read_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.status().map_or_else(
+                || !error.is_builder() && !error.is_decode(),
+                |status| status.is_server_error() || matches!(status.as_u16(), 408 | 429),
+            )
+        })
+    })
+}
+
 enum State {
     Ready,
     Loading(u64),
-    Failed(String),
+    Failed { error: String, retryable: bool },
 }
 
 struct Source {
@@ -228,6 +240,7 @@ struct Source {
     session: Option<Arc<Session>>,
     seen: HashSet<String>,
     state: State,
+    retried: bool,
 }
 
 pub struct Worker {
@@ -271,6 +284,8 @@ impl Worker {
                     }
                     let result = load(&request);
                     let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                    let retryable =
+                        !session_rejected && result.as_ref().is_err_and(transient_read_failure);
                     let result = result.map_err(|error| format!("{error:#}"));
                     if request.id == current.load(Ordering::Acquire)
                         && events
@@ -278,6 +293,7 @@ impl Worker {
                                 id: request.id,
                                 result,
                                 session_rejected,
+                                retryable,
                                 session: request.session,
                             })
                             .is_err()
@@ -296,6 +312,24 @@ impl Worker {
             },
             completed,
         )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_page_loader(
+        mut load: impl FnMut() -> Result<Page> + Send + 'static,
+    ) -> (Self, async_channel::Receiver<Event>) {
+        Self::spawn(move |_| {
+            let page = load()?;
+            Ok(QueuePage {
+                tracks: page.tracks(),
+                continuation: page
+                    .continuation
+                    .map(|continuation| SourceContinuation::Page {
+                        page: PageRequest::Browse,
+                        continuation,
+                    }),
+            })
+        })
     }
 
     /// Capture the page at Play all time, independently of later browsing.
@@ -384,10 +418,11 @@ impl Worker {
             continuation,
             session,
             state: State::Ready,
+            retried: false,
         });
     }
 
-    /// True means a page is pending. Only an explicit retry retries a failed page.
+    /// True means a page is pending. A failed page needs a retry or queue advancement.
     pub fn load(&mut self, session: Option<&Arc<Session>>, retry: bool) -> Result<bool, String> {
         let Some(source) = &mut self.source else {
             return Ok(false);
@@ -400,7 +435,7 @@ impl Worker {
         }
         match &source.state {
             State::Loading(_) => return Ok(true),
-            State::Failed(error) if !retry => return Err(error.clone()),
+            State::Failed { error, .. } if !retry => return Err(error.clone()),
             _ => {}
         }
         let id = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -411,7 +446,10 @@ impl Worker {
         };
         if self.requests.force_send(request).is_err() {
             let error = "The queue connection stopped. Restart the app to reconnect.".to_owned();
-            source.state = State::Failed(error.clone());
+            source.state = State::Failed {
+                error: error.clone(),
+                retryable: false,
+            };
             return Err(error);
         }
         source.state = State::Loading(id);
@@ -451,7 +489,15 @@ impl Worker {
         let mut page = match event.result {
             Ok(page) => page,
             Err(error) => {
-                source.state = State::Failed(error.clone());
+                source.state = State::Failed {
+                    error: error.clone(),
+                    retryable: event.retryable,
+                };
+                if event.retryable && !source.retried {
+                    source.retried = true;
+                    self.load(session, true)?;
+                    return Ok(false);
+                }
                 return Err(error);
             }
         };
@@ -460,7 +506,10 @@ impl Worker {
         {
             let error = "YouTube Music repeated a queue page. Open the playlist again to continue."
                 .to_owned();
-            source.state = State::Failed(error.clone());
+            source.state = State::Failed {
+                error: error.clone(),
+                retryable: false,
+            };
             return Err(error);
         }
         let generated = queue
@@ -490,6 +539,7 @@ impl Worker {
             Some(continuation) => {
                 source.continuation = continuation;
                 source.state = State::Ready;
+                source.retried = false;
             }
             None => {
                 self.source = None;
@@ -518,6 +568,25 @@ impl Worker {
         self.source.is_some()
     }
 
+    pub fn error(&self) -> Option<&str> {
+        match &self.source.as_ref()?.state {
+            State::Failed { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    pub fn retryable_failure(&self) -> bool {
+        self.source.as_ref().is_some_and(|source| {
+            matches!(
+                source.state,
+                State::Failed {
+                    retryable: true,
+                    ..
+                }
+            )
+        })
+    }
+
     /// Rebind only after verified same-account renewal and player activation.
     pub fn renew_session(
         &mut self,
@@ -540,6 +609,7 @@ impl Worker {
         let _ = self.pending.try_recv();
         source.session = Some(next);
         source.state = State::Ready;
+        source.retried = false;
         Ok(true)
     }
 
@@ -1223,6 +1293,119 @@ mod tests {
             assert!(queue.incomplete);
             assert!(!worker.load(current, true).unwrap());
         }
+    }
+
+    #[test]
+    fn transient_failures_retry_once_per_page_without_appending_twice() {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut calls = 0;
+        let (mut worker, completed) = Worker::spawn(move |_| {
+            calls += 1;
+            match calls {
+                1 | 3 => Err(client
+                    .get("http://127.0.0.1:0")
+                    .send()
+                    .unwrap_err()
+                    .without_url()
+                    .into()),
+                2 => Ok(next_page(&["a"], Some("second"))),
+                4 => Ok(next_page(&["a", "tail"], None)),
+                _ => panic!("A continuation must have at most one automatic retry"),
+            }
+        });
+        let mut queue = Queue::default();
+        worker.replace_queue(
+            &mut queue,
+            &page(&["a", "a"], Some("first")),
+            1,
+            PageRequest::Browse,
+            None,
+        );
+        for _ in 0..2 {
+            worker.load(None, false).unwrap();
+            let before = queue.tracks.clone();
+            assert!(
+                !worker
+                    .apply(completed.recv_blocking().unwrap(), &mut queue, None)
+                    .unwrap(),
+                "A transient failure must start one retry instead of ending the queue"
+            );
+            assert!(worker.error().is_none());
+            assert_eq!(queue.tracks, before);
+            assert!(
+                worker
+                    .apply(completed.recv_blocking().unwrap(), &mut queue, None)
+                    .unwrap()
+            );
+        }
+        assert_eq!(ids(&queue), ["a", "a", "a", "a", "tail"]);
+        assert_eq!(queue.index, Some(1));
+        assert!(!queue.incomplete);
+        assert!(!worker.can_continue());
+        assert!(completed.try_recv().is_err());
+    }
+
+    #[test]
+    fn exhausted_transient_recovery_waits_for_an_explicit_retry() {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let (called, calls) = mpsc::channel();
+        let mut attempt = 0;
+        let (mut worker, completed) = Worker::spawn(move |_| {
+            attempt += 1;
+            called.send(attempt).unwrap();
+            if attempt <= 2 {
+                return Err(client
+                    .get("http://127.0.0.1:0")
+                    .send()
+                    .unwrap_err()
+                    .without_url()
+                    .into());
+            }
+            Ok(next_page(&["tail"], None))
+        });
+        let mut queue = Queue::default();
+        worker.replace_queue(
+            &mut queue,
+            &page(&["loaded"], Some("tail")),
+            0,
+            PageRequest::Browse,
+            None,
+        );
+        worker.load(None, false).unwrap();
+        assert!(
+            !worker
+                .apply(completed.recv_blocking().unwrap(), &mut queue, None)
+                .unwrap()
+        );
+        let error = worker
+            .apply(completed.recv_blocking().unwrap(), &mut queue, None)
+            .unwrap_err();
+        assert_eq!(worker.error(), Some(error.as_str()));
+        assert!(worker.retryable_failure());
+        assert_eq!(calls.try_iter().collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(ids(&queue), ["loaded"]);
+        assert!(queue.incomplete);
+        assert_eq!(worker.load(None, false).unwrap_err(), error);
+        assert!(completed.try_recv().is_err());
+        assert!(calls.try_recv().is_err());
+        worker.load(None, true).unwrap();
+        assert!(
+            worker
+                .apply(completed.recv_blocking().unwrap(), &mut queue, None)
+                .unwrap()
+        );
+        assert_eq!(calls.try_recv().unwrap(), 3);
+        assert_eq!(ids(&queue), ["loaded", "tail"]);
+        assert!(!queue.incomplete);
+        assert!(worker.error().is_none());
     }
 
     #[test]

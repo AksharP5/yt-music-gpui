@@ -657,6 +657,13 @@ impl Music {
             return;
         }
 
+        if self.queue_waiting.is_some() && self.queue_source.error().is_some() {
+            if let Some(intent) = &mut self.queue_waiting {
+                intent.playback = intent.playback.with_pause(false);
+            }
+            self.retry_queue(cx);
+            return;
+        }
         if let Some(intent) = self
             .queue_waiting
             .as_mut()
