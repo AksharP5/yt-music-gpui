@@ -314,6 +314,7 @@ impl Music {
                     Some("Could not reconnect. Choose Switch account in your profile menu.".into());
             }
         }
+        self.publish_desktop();
         cx.notify();
         true
     }
@@ -409,6 +410,7 @@ impl Music {
             }
             Err(_) => self.error = Some("Could not start sign-in. Try again.".into()),
         }
+        self.publish_desktop();
         cx.notify();
     }
 
@@ -435,6 +437,7 @@ impl Music {
         self.notice = None;
         self.error = None;
         self.load_guest_home(cx);
+        self.publish_desktop();
         cx.notify();
     }
 
@@ -554,6 +557,7 @@ impl Music {
         } else {
             self.account_operation = Some(AccountOperation::Disconnecting(operation));
         }
+        self.publish_desktop();
         cx.notify();
     }
 
@@ -743,6 +747,7 @@ impl Music {
                                     cx,
                                 );
                             }
+                            self.publish_desktop();
                             cx.notify();
                             return;
                         }
@@ -774,6 +779,7 @@ impl Music {
                                     "Could not activate playback credentials: {error:#}"
                                 ));
                                 self.load_guest_home(cx);
+                                self.publish_desktop();
                                 cx.notify();
                                 return;
                             }
@@ -885,6 +891,7 @@ impl Music {
                                     }
                                 }
                                 view.load_guest_home(cx);
+                                view.publish_desktop();
                                 cx.notify();
                             });
                         }).detach();
@@ -1087,6 +1094,7 @@ impl Music {
             }
         }
         self.load_guest_home(cx);
+        self.publish_desktop();
         cx.notify();
     }
 }
