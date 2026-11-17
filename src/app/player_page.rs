@@ -373,7 +373,12 @@ impl Music {
             .when_some(
                 self.error
                     .clone()
-                    .filter(|_| !matches!(self.overlay, Some(Overlay::SignIn))),
+                    .filter(|error| {
+                        !matches!(self.overlay, Some(Overlay::SignIn))
+                            && !(self.player_page.tab == PlayerTab::UpNext
+                                && self.account_operation.is_none()
+                                && self.queue_source.error() == Some(error.as_str()))
+                    }),
                 |main, error| {
                     main.child(
                         div()

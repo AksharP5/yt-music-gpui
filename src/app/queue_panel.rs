@@ -169,9 +169,15 @@ impl Music {
                             .flex()
                             .items_center()
                             .gap(px(12.))
-                            .text_size(px(12.))
+                            .text_size(px(14.))
                             .text_color(theme.muted)
-                            .child(div().flex_1().min_w_0().child(error))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .child(pages::error_summary(&error)),
+                            )
                             .child(
                                 div()
                                     .id("retry-queue")
