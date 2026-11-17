@@ -81,6 +81,7 @@ fn properties(state: &State) -> Properties {
         ("Volume", (state.volume / 100.).into()),
         ("Rate", f64::from(state.rate).into()),
         ("LoopStatus", owned(repeat_name(state.repeat))),
+        ("Shuffle", state.shuffle.unwrap_or(false).into()),
         ("CanPlay", state.can_play.into()),
         ("CanPause", state.can_pause.into()),
         ("CanGoNext", state.can_go_next.into()),
@@ -366,12 +367,15 @@ impl DesktopPlayer {
         };
         self.send(Event::LoopStatus(repeat))
     }
-    #[zbus(property(emits_changed_signal = "false"))]
+    #[zbus(property)]
     fn shuffle(&self) -> bool {
-        false
+        self.published().state.shuffle.unwrap_or(false)
     }
     #[zbus(property)]
     fn set_shuffle(&self, shuffle: bool) -> fdo::Result<()> {
+        if self.published().state.shuffle.is_some() {
+            return self.send(Event::Shuffle(shuffle));
+        }
         if shuffle {
             return Err(unsupported("Persistent shuffle"));
         }
@@ -629,6 +633,35 @@ mod tests {
         assert_eq!(player.volume(), 0.6);
         assert_eq!(player.rate(), 1.);
         assert_eq!(player.loop_status(), "None");
+    }
+
+    #[test]
+    fn shuffle_requests_preserve_rapid_changes_and_publish_only_app_state() {
+        let (mpris, player, updates) = fixture();
+        let mut state = State {
+            shuffle: Some(false),
+            ..playing()
+        };
+        mpris.publish(state.clone());
+        updates.try_recv().unwrap();
+        for shuffle in [true, false, false] {
+            player.set_shuffle(shuffle).unwrap();
+            assert_eq!(mpris.events.try_recv().unwrap(), Event::Shuffle(shuffle));
+        }
+        assert!(!player.shuffle());
+        assert!(updates.try_recv().is_err());
+        state.shuffle = Some(true);
+        mpris.publish(state.clone());
+        updates.try_recv().unwrap();
+        assert!(player.shuffle());
+        assert!(bool::try_from(properties(&state).get("Shuffle").unwrap()).unwrap());
+        mpris.publish(state.clone());
+        assert!(updates.try_recv().is_err());
+        state.shuffle = None;
+        mpris.publish(state.clone());
+        updates.try_recv().unwrap();
+        assert!(!player.shuffle());
+        assert!(!bool::try_from(properties(&state).get("Shuffle").unwrap()).unwrap());
     }
 
     #[test]

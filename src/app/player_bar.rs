@@ -71,7 +71,7 @@ fn tinted_control(
 }
 
 impl Music {
-    fn collection_playback(&self) -> Option<&queue_source::CollectionPlayback> {
+    pub(in crate::app) fn collection_playback(&self) -> Option<&queue_source::CollectionPlayback> {
         let pending = self
             .watch_pending
             .as_ref()

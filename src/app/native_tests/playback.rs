@@ -24,6 +24,282 @@ fn collection_source() -> CollectionPlayback {
 }
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playlist commands only"]
+fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests() -> Result<()> {
+    use crate::{app::PlaybackQuery, media_controls::Event};
+
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, _, cx| {
+            let (jobs, pending) = async_channel::bounded(4);
+            view.playback_jobs = jobs;
+            view.pending_playback_jobs = pending;
+            view.account = None;
+            view.account_operation = None;
+            view.watch_pending = None;
+            view.library.autoplay = false;
+            view.library.queue.replace(continuation_page(0..3, None).tracks(), 1);
+            view.library.queue.collection = Some(collection_source());
+            view.desktop_event(Event::Shuffle(false), cx);
+            assert!(view.pending_playback_jobs.is_empty());
+            view.desktop_event(Event::Shuffle(true), cx);
+            view.desktop_event(Event::Shuffle(true), cx);
+            let shuffled = view.pending_playback_jobs.try_recv().unwrap();
+            assert!(matches!(shuffled.query, PlaybackQuery::Collection(source) if source.order == PlaybackOrder::Shuffled));
+            assert!(view.pending_playback_jobs.is_empty());
+            view.desktop_event(Event::Shuffle(false), cx);
+            view.desktop_event(Event::Shuffle(false), cx);
+            let original = view.pending_playback_jobs.try_recv().unwrap();
+            assert!(matches!(original.query, PlaybackQuery::Collection(source) if source.order == PlaybackOrder::Original));
+            assert!(original.id > shuffled.id);
+            assert!(view.pending_playback_jobs.is_empty());
+            view.watch_pending = None;
+            view.library.queue.collection = None;
+            let tracks = view.library.queue.tracks.clone();
+            view.desktop_event(Event::Shuffle(true), cx);
+            view.desktop_event(Event::Shuffle(false), cx);
+            assert!(view.pending_playback_jobs.is_empty());
+            assert_eq!(view.library.queue.tracks, tracks);
+        }).unwrap();
+    })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account and playlist commands only"]
+fn account_changes_cancel_pending_shuffle_in_desktop_controls() -> Result<()> {
+    use crate::{
+        app::{AccountOperation, BrowserConnection, PlaybackResult, QueueUpdate},
+        media_controls::{Event, MediaControls},
+        player::{Player, PlayerOptions},
+    };
+    #[derive(Clone, Copy, Debug)]
+    enum Transition {
+        SignOut,
+        SignIn,
+        Restore,
+        CancelRefresh,
+        SwitchAccount,
+    }
+    use Transition::*;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let connection = zbus::blocking::Connection::session().unwrap();
+        let bus = zbus::blocking::fdo::DBusProxy::new(&connection).unwrap();
+        let name = "org.mpris.MediaPlayer2.yt_music_gpui";
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bus.name_has_owner(name.try_into().unwrap()).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "The initial desktop service must stop"
+            );
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        window
+            .update(cx, |view, _, _| {
+                view.media_controls = Some(MediaControls::new().unwrap());
+                view.player = Some(
+                    Player::new(PlayerOptions {
+                        audio_output: Some("null".into()),
+                        volume: 0.,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bus.name_has_owner(name.try_into().unwrap()).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "The test desktop service must start"
+            );
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        let properties = zbus::blocking::Proxy::new(
+            &connection,
+            name,
+            "/org/mpris/MediaPlayer2",
+            "org.freedesktop.DBus.Properties",
+        )
+        .unwrap();
+        let shuffle = || {
+            let value: zbus::zvariant::OwnedValue = properties
+                .call("Get", &("org.mpris.MediaPlayer2.Player", "Shuffle"))
+                .unwrap();
+            bool::try_from(value).unwrap()
+        };
+        let mut observed = Vec::new();
+        for transition in [SignOut, SignIn, Restore, CancelRefresh, SwitchAccount] {
+            let operation = auth::Operation::default();
+            let commands = window
+                .update(cx, |view, _, cx| {
+                    let (jobs, pending) = async_channel::bounded(1);
+                    view.playback_jobs = jobs;
+                    view.pending_playback_jobs = pending;
+                    let (commands, pending) = async_channel::bounded(8);
+                    view.account_commands = commands;
+                    view.account = Some(super::account::connection(super::account::session(
+                        "shuffle-before",
+                    )));
+                    view.account_operation = match transition {
+                        SignOut => None,
+                        SignIn => Some(AccountOperation::Connecting(
+                            operation.clone(),
+                            BrowserConnection::Reading(serde_json::from_value(serde_json::json!({
+                                "browser":"Synthetic browser","name":"Synthetic profile","path":"/synthetic/profile"
+                            })).unwrap()),
+                        )),
+                        Restore => Some(AccountOperation::Restoring(operation.clone())),
+                        CancelRefresh => Some(AccountOperation::Refreshing {
+                            operation: operation.clone(),
+                            retry_change: false,
+                            resume: None,
+                        }),
+                        SwitchAccount => Some(AccountOperation::Refreshing {
+                            operation: operation.clone(),
+                            retry_change: false,
+                            resume: None,
+                        }),
+                    };
+                    view.overlay = None;
+                    view.watch_pending = None;
+                    view.library.autoplay = false;
+                    view.library
+                        .queue
+                        .replace(continuation_page(0..3, None).tracks(), 1);
+                    view.library.queue.collection = Some(collection_source());
+                    view.notify_playback(cx);
+                    pending
+                })
+                .unwrap();
+            assert!(!shuffle());
+            let job = window
+                .update(cx, |view, _, cx| {
+                    view.desktop_event(Event::Shuffle(true), cx);
+                    view.pending_playback_jobs.try_recv().ok()
+                })
+                .unwrap();
+            assert!(
+                shuffle(),
+                "Pending shuffle must be published for {transition:?}"
+            );
+            window
+                .update(cx, |view, window, cx| match transition {
+                    SignOut => view.disconnect_account(cx),
+                    SignIn | Restore => {
+                        view.account_event(
+                            crate::account::Event::Connected {
+                                operation: operation.clone(),
+                                result: Ok(Some(super::account::connection(
+                                    super::account::session("shuffle-after"),
+                                ))),
+                                save_session: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(matches!(
+                            view.account_operation,
+                            Some(AccountOperation::Activating { .. })
+                        ));
+                    }
+                    CancelRefresh => view.cancel_connection(cx),
+                    SwitchAccount => {
+                        view.account_event(
+                            crate::account::Event::Connected {
+                                operation: operation.clone(),
+                                result: Err("Synthetic refresh failure".into()),
+                                save_session: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(matches!(
+                            view.account_operation,
+                            Some(AccountOperation::RefreshFailed { resume: Some(_) })
+                        ));
+                        view.connect_account(window, cx);
+                        assert!(matches!(
+                            view.account_operation,
+                            Some(AccountOperation::Connecting(_, _))
+                        ));
+                    }
+                })
+                .unwrap();
+            let immediate = shuffle();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while window
+                .update(cx, |view, _, _| {
+                    matches!(
+                        view.account_operation,
+                        Some(AccountOperation::Activating { .. })
+                    )
+                })
+                .unwrap()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "Synthetic activation must finish"
+                );
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+            }
+            window
+                .update(cx, |view, window, cx| {
+                    if matches!(transition, SignOut) {
+                        let crate::account::Command::Disconnect { operation, .. } =
+                            commands.try_recv().unwrap()
+                        else {
+                            panic!("Sign-out must request account cleanup")
+                        };
+                        view.account_event(
+                            crate::account::Event::Disconnected {
+                                operation,
+                                result: Ok(()),
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    if let Some(job) = job {
+                        view.playback_result(
+                            PlaybackResult::Watch {
+                                id: job.id,
+                                account_revision: job.account_revision,
+                                update: QueueUpdate::Replace,
+                                collection: Some(collection_source().toggled()),
+                                result: Err("Late cancelled shuffle".into()),
+                                session_rejected: false,
+                            },
+                            cx,
+                        );
+                    }
+                    view.desktop_event(Event::Shuffle(false), cx);
+                    assert!(view.watch_pending.is_none());
+                    assert_eq!(
+                        view.library.queue.collection.as_ref().unwrap().order,
+                        PlaybackOrder::Original
+                    );
+                    assert!(view.pending_playback_jobs.is_empty());
+                })
+                .unwrap();
+            observed.push((transition, immediate, shuffle()));
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|(_, immediate, settled)| !immediate && !settled),
+            "Cancelled shuffle must publish Original immediately and after late replies: {observed:?}"
+        );
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account activation only"]
 fn collection_shuffle_refreshes_actions_only_when_the_account_changes() -> Result<()> {
     use crate::app::{AccountOperation, BrowserConnection, PlaybackQuery};

@@ -39,6 +39,7 @@ pub enum Event {
     Volume(f64),
     Rate(PlaybackSpeed),
     LoopStatus(Repeat),
+    Shuffle(bool),
     Error(String),
 }
 
@@ -91,6 +92,8 @@ pub struct State {
     pub volume: f64,
     pub rate: PlaybackSpeed,
     pub repeat: Repeat,
+    /// None when the current queue cannot restore its original order.
+    pub shuffle: Option<bool>,
     pub can_play: bool,
     pub can_pause: bool,
     pub can_go_next: bool,
@@ -109,6 +112,7 @@ impl Default for State {
             volume: 60.,
             rate: PlaybackSpeed::default(),
             repeat: Repeat::Off,
+            shuffle: None,
             can_play: false,
             can_pause: false,
             can_go_next: false,
@@ -126,6 +130,7 @@ impl State {
             && self.volume == other.volume
             && self.rate == other.rate
             && self.repeat == other.repeat
+            && self.shuffle == other.shuffle
             && self.can_play == other.can_play
             && self.can_pause == other.can_pause
             && self.can_go_next == other.can_go_next

@@ -59,6 +59,9 @@ impl Music {
             volume: self.library.effective_volume(),
             rate: self.library.speed,
             repeat: self.library.repeat,
+            shuffle: self
+                .collection_playback()
+                .map(|collection| collection.order == queue_source::PlaybackOrder::Shuffled),
             can_play: self.player.is_some() && (!queue.tracks.is_empty() || waiting),
             can_pause: self.active_id.is_some() || waiting,
             can_go_next: self.player.is_some() && can_go_next,
@@ -121,6 +124,14 @@ impl Music {
             media_controls::Event::LoopStatus(repeat) => {
                 self.library.repeat = repeat;
                 self.save_preferences();
+            }
+            media_controls::Event::Shuffle(shuffle) => {
+                if self.collection_playback().is_some_and(|collection| {
+                    (collection.order == queue_source::PlaybackOrder::Shuffled) != shuffle
+                }) {
+                    self.shuffle_queue(cx);
+                }
+                return;
             }
             media_controls::Event::Error(error) => self.error = Some(error),
         }
