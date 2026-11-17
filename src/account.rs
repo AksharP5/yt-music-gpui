@@ -1019,6 +1019,7 @@ mod tests {
     fn playlist_page(occurrences: &[&str]) -> Page {
         Page {
             header: None,
+            background: None,
             title: "Renamed".into(),
             description: "Updated description".into(),
             privacy: Some("PRIVATE".into()),

@@ -538,6 +538,7 @@ impl Music {
         self.notice = None;
         self.page.shelves.clear();
         self.page.header = None;
+        self.page.background = None;
         self.page.continuation = None;
         self.page.editable = false;
         self.page.description.clear();
@@ -745,6 +746,7 @@ impl Music {
         self.page = Page {
             title: title.into(),
             header: None,
+            background: None,
             shelves: vec![Shelf {
                 layout: ShelfLayout::Cards,
                 title: String::new(),

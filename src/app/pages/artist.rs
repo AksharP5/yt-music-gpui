@@ -198,13 +198,15 @@ impl Music {
         self.page.header.as_ref()?.thumbnail.clone()
     }
 
-    /// Artist and collection pages draw behind a transparent header.
+    /// Artwork-backed pages draw behind a transparent header.
     pub(in crate::app) fn immersive_header(&self) -> bool {
-        !self.player_open && (self.route.is_artist() || self.wash_url().is_some())
+        !self.player_open
+            && (self.route.is_artist()
+                || self.wash_url().is_some()
+                || (self.route.is_home() && self.page.background.is_some()))
     }
 
-    /// Backgrounds behind the page and transparent guide/header. Artist and
-    /// collection artwork scrolls away with the page.
+    /// Artwork behind the page and transparent guide/header scrolls with the page.
     pub(in crate::app) fn page_background(
         &mut self,
         compact: bool,
@@ -218,22 +220,35 @@ impl Music {
         }
         let scrolled = f32::from(self.detail_list.state.scroll_px_offset_for_scrollbar().y);
         if self.route.is_home() {
-            let wash = 300.;
-            if scrolled <= -wash {
+            // Home uses sharp art over 49vh and a 50vh darkening gradient.
+            let art = height * 0.49;
+            if scrolled <= -art {
                 return None;
             }
+            let url = self.page.background.as_deref()?;
+            let image = self.artwork.get(url, size(px(width), px(art)))?;
             return Some(
                 div()
                     .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(64. + scrolled))
-                    .h(px(wash))
-                    .bg(linear_gradient(
-                        180.,
-                        linear_color_stop(rgb(0x14252c), 0.),
-                        linear_color_stop(self.theme.bg, 1.),
-                    )),
+                    .top(px(scrolled))
+                    .h(px(art))
+                    .overflow_hidden()
+                    .child(img(image).size_full().object_fit(ObjectFit::Cover))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(height * 0.5))
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(rgba(0x00000099), 0.),
+                                linear_color_stop(self.theme.bg, 1.),
+                            )),
+                    ),
             );
         }
         let left = if compact { 72. } else { 240. };

@@ -306,6 +306,7 @@ impl Music {
             page: Page {
                 title: "Home".into(),
                 header: None,
+                background: None,
                 shelves: Vec::new(),
                 continuation: None,
                 editable: false,

@@ -1682,6 +1682,136 @@ async fn responsive_explore(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     }
 }
 
+const HOME_BACKGROUND_URL: &str = "https://i.ytimg.com/vi/native-home-background/cover.png";
+
+async fn home_background(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    use crate::app::Route;
+
+    let url = HOME_BACKGROUND_URL;
+    window
+        .update(cx, |music, window, cx| {
+            window.resize(size(px(1280.), px(800.)));
+            music.sidebar_collapsed = None;
+            music.account = None;
+            music.catalog_requests = crate::app::CatalogRequests::new();
+            music.player_open = false;
+            music.library.queue = Default::default();
+            music.route = Route::Home;
+            music.page = crate::catalog::parse_home(
+                &serde_json::json!({"contents":[],"background":{"musicThumbnailRenderer":{
+                    "thumbnail":{"thumbnails":[{"url":url,"width":1280,"height":720}]}
+                }}}),
+                "Home",
+            )
+            .unwrap();
+            let shelves = crate::app::sync::tests::page(6, false).shelves;
+            music.page.shelves = vec![shelves[0].clone(); 8];
+            music.error = None;
+            music.notice = None;
+            music.detail_list = crate::app::DetailList::new();
+            music.rebuild_rows();
+            music.artwork.get(url, size(px(1280.), px(392.)));
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_quiescence(window, cx).await;
+    let baseline = window
+        .update(cx, |music, window, _| {
+            assert!(music.artwork.get(url, size(px(1280.), px(392.))).is_some());
+            capture(window, "home-background-top")
+        })
+        .unwrap();
+    let bg = image::Rgba([3, 3, 3, 255]);
+    assert_eq!(
+        *baseline.get_pixel(100, 4),
+        bg,
+        "Expanded guide stays opaque"
+    );
+    assert!(
+        baseline.get_pixel(1220, 20).0[2] > 50,
+        "Home art reaches behind its header"
+    );
+    assert!(
+        baseline.get_pixel(639, 75).0[0] > baseline.get_pixel(640, 75).0[0] + 40,
+        "Home art keeps its sharp edge"
+    );
+    assert_eq!(*baseline.get_pixel(1220, 400), bg, "Home art ends at 49vh");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position: point(px(1220.), px(500.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-260.))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, window, cx| {
+            let offset = music.detail_list.state.scroll_px_offset_for_scrollbar().y;
+            assert!(
+                (f32::from(offset) + 260.).abs() < 1.,
+                "The Home feed scrolls 260px"
+            );
+            let scrolled = capture(window, "home-background-scrolled");
+            assert_eq!(
+                *scrolled.get_pixel(1220, 20),
+                bg,
+                "Scrolled header stays solid"
+            );
+            assert_eq!(
+                *scrolled.get_pixel(1220, 180),
+                bg,
+                "Home art scrolls with the feed"
+            );
+            music
+                .detail_list
+                .state
+                .scroll_to(gpui::ListOffset::default());
+            music.navigate(Route::Saved, cx);
+            assert!(music.page.background.is_none());
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, window, cx| {
+            let library = capture(window, "home-background-library");
+            assert_eq!(*library.get_pixel(1220, 20), bg);
+            music.go_back(cx);
+            assert_eq!(music.page.background.as_deref(), Some(url));
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |music, window, cx| {
+            let restored = capture(window, "home-background-restored");
+            assert_eq!(restored.get_pixel(1220, 75), baseline.get_pixel(1220, 75));
+            music.page =
+                crate::catalog::parse_home(&serde_json::json!({"contents":[]}), "Home").unwrap();
+            music.rebuild_rows();
+            music.detail_list = crate::app::DetailList::new();
+            cx.notify();
+        })
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+    window
+        .update(cx, |_, window, _| {
+            let empty = capture(window, "home-background-absent");
+            for y in [20, 75, 200] {
+                assert_eq!(
+                    *empty.get_pixel(1220, y),
+                    bg,
+                    "Home without artwork uses the page color"
+                );
+            }
+        })
+        .unwrap();
+    println!("HOME_BACKGROUND loaded=passed scroll=passed navigation=passed absent=passed");
+}
+
 async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     for width in [956., 1920.] {
         for home in [true, false] {
@@ -2053,7 +2183,28 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated XDG runtime/data; set YT_MUSIC_NATIVE_TESTS=1"]
 fn position_samples_only_render_the_player_bar() -> Result<()> {
+    use sha1::{Digest, Sha1};
+
     super::isolate()?;
+    // Seed before the artwork workers first scan the private disk cache.
+    let cache = std::path::PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
+        .join("yt-music-gpui/artwork");
+    std::fs::create_dir_all(&cache).unwrap();
+    image::RgbaImage::from_fn(1280, 720, |x, _| {
+        image::Rgba(if x < 640 {
+            [200, 40, 20, 255]
+        } else {
+            [20, 60, 200, 255]
+        })
+    })
+    .save_with_format(
+        cache.join(format!(
+            "{:x}",
+            Sha1::digest(HOME_BACKGROUND_URL.as_bytes())
+        )),
+        image::ImageFormat::Png,
+    )
+    .unwrap();
     let passed = Arc::new(AtomicBool::new(false));
     let result = passed.clone();
     gpui_platform::application()
@@ -2457,6 +2608,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 search_song_rows(window, cx).await;
                 responsive_search(window, cx).await;
                 responsive_explore(window, cx).await;
+                home_background(window, cx).await;
                 guide_chrome(window, cx).await;
                 player_chrome(window, cx).await;
                 result.store(true, Ordering::SeqCst);
