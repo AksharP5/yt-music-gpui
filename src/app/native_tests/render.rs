@@ -1564,8 +1564,11 @@ async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 capture(window, &format!("search-duration-{width}"))
             })
             .unwrap();
+        // Filter-chip hover can settle between frames; compare all song-row pixels.
         assert!(
-            baseline == changed,
+            (172..415).all(|y| {
+                (left..left + column).all(|x| baseline.get_pixel(x, y) == changed.get_pixel(x, y))
+            }),
             "Search must not repeat duration in a column"
         );
     }
