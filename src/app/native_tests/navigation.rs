@@ -1301,6 +1301,33 @@ fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Res
                 );
             })
             .unwrap();
+        window
+            .update(cx, |view, window, cx| {
+                window.resize(size(px(1280.), px(560.)));
+                view.catalog_requests.playlist_choices_error = Some(
+                    "Could not connect to YouTube Music. Check your connection and try again."
+                        .into(),
+                );
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let compact = window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-scroll-retry-compact")
+            })
+            .unwrap();
+        let panel = compact.get_pixel(450, 280);
+        assert_ne!(
+            compact.get_pixel(450, 0),
+            panel,
+            "The dialog must fit above the top edge"
+        );
+        assert_ne!(
+            compact.get_pixel(450, 559),
+            panel,
+            "Retry and New playlist must fit above the bottom edge"
+        );
     })
 }
 
@@ -1330,10 +1357,13 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
                 let track = view.page.tracks()[0].clone();
                 while view.catalog_requests.pending.try_recv().is_ok() {}
                 view.playlist_picker(vec![track], cx);
+                let requests = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+                    .collect::<Vec<_>>();
                 assert!(
-                    view.catalog_requests.pending.is_empty(),
-                    "Save to playlist must open from the loaded playlists without another read"
+                    requests.len() == 1 && matches!(requests[0].query, Query::PlaylistChoices(_)),
+                    "Loaded rows must appear immediately while the selection's destinations are read"
                 );
+                assert_eq!(view.playlist_picker_choices().destinations[1].title, "Road trip");
             })
             .unwrap();
         for attempt in 0..250 {
@@ -1419,6 +1449,189 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
                 assert!(view.toast.is_none(), "The toast closes after four seconds")
             })
             .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let (commands, submitted) = async_channel::bounded(1);
+        window
+            .update(cx, |view, window, cx| {
+                view.account_commands = commands;
+                view.sidebar_playlists = vec![crate::catalog::Collection {
+                    id: "VLfallback".into(),
+                    title: "Loaded playlist".into(),
+                    subtitle: "3 songs".into(),
+                    thumbnail: None,
+                    details: crate::catalog::CollectionDetails {
+                        editable: true,
+                        ..Default::default()
+                    },
+                }];
+                let track = view.page.tracks()[0].clone();
+                view.ratings.insert(track.id.clone(), Rating::Like);
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(vec![track], cx);
+                let choices = view.playlist_picker_choices();
+                assert_eq!(choices.destinations.len(), 2);
+                assert_eq!(choices.destinations[0].title, "Liked Music");
+                assert!(choices.destinations[0].byline.is_empty());
+                let job = playlist_choices_job(view);
+                let mut returned = view.playlist_picker_choices().into_owned();
+                returned.destinations[0].byline = "4 songs".into();
+                returned.destinations[0].pinned = true;
+                returned.destinations[1].title = "Road trip".into();
+                returned.destinations[1].byline = "8 songs".into();
+                returned.destinations[1].privacy = Some(crate::account::Privacy::Private);
+                view.playlist_choices_result(
+                    crate::app::PlaylistChoicesResult {
+                        job,
+                        result: Ok(returned),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    view.playlist_picker_choices().destinations[1].title,
+                    "Road trip"
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-destinations");
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.refresh_playlist_choices(cx);
+                let job = playlist_choices_job(view);
+                view.playlist_choices_result(
+                    crate::app::PlaylistChoicesResult {
+                        job,
+                        result: Err(
+                            "Could not reach YouTube Music. Check your connection and try again."
+                                .into(),
+                        ),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+                assert!(view.catalog_requests.playlist_choices_error.is_some());
+                assert_eq!(
+                    view.playlist_picker_choices().destinations[1].title,
+                    "Loaded playlist"
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-destinations-retry");
+            })
+            .unwrap();
+        // Close is followed by Liked Music. Enter must save, even if it is already liked.
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "enter").await;
+        let account::Command::Apply { mutation, .. } = submitted.try_recv().unwrap() else {
+            panic!("Expected an explicit Like request")
+        };
+        assert!(
+            matches!(*mutation, Mutation::RateSong { ref track, rating:Rating::Like } if track.id == "00000000000")
+        );
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.overlay.is_none());
+                assert_eq!(view.ratings.get("00000000000"), Some(&Rating::Like));
+                assert!(
+                    !view
+                        .catalog_requests
+                        .is_loading(CatalogTarget::PlaylistChoices)
+                );
+            })
+            .unwrap();
+    })
+}
+
+fn playlist_choices_job(view: &Music) -> crate::app::Job {
+    std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+        .find(|job| job.query.target() == CatalogTarget::PlaylistChoices)
+        .expect("Expected a selection-bound playlist read")
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Result<()> {
+    use crate::playlist_choices::{Choice, Choices, Destination};
+
+    check_cache(|view, window, cx| {
+        let response = |job, title: &str| crate::app::PlaylistChoicesResult {
+            job,
+            result: Ok(Choices {
+                destinations: vec![Choice {
+                    target: Destination::Playlist("PLsynthetic".into()),
+                    title: title.into(),
+                    byline: String::new(),
+                    thumbnail: None,
+                    privacy: None,
+                    pinned: false,
+                }],
+                empty: None,
+            }),
+            session_rejected: false,
+        };
+        let tracks = view.page.tracks()[..2].to_vec();
+        view.playlist_picker(tracks.clone(), cx);
+        let old = playlist_choices_job(view);
+        view.close_overlay(window, cx);
+        view.playlist_choices_result(response(old.clone(), "Closed"), cx);
+        assert!(view.catalog_requests.playlist_choices.is_none());
+
+        view.playlist_picker(tracks.clone(), cx);
+        let current = playlist_choices_job(view);
+        view.playlist_choices_result(response(old, "Reopened"), cx);
+        assert!(view.catalog_requests.playlist_choices.is_none());
+        assert!(
+            view.catalog_requests
+                .is_loading(CatalogTarget::PlaylistChoices)
+        );
+
+        let mut reversed = current.clone();
+        reversed.query =
+            Query::PlaylistChoices(tracks.iter().rev().map(|track| track.id.clone()).collect());
+        view.playlist_choices_result(response(reversed, "Wrong song order"), cx);
+        assert!(view.catalog_requests.playlist_choices.is_none());
+
+        let mut wrong_session = current.clone();
+        wrong_session.session = Some(Arc::new((**current.session.as_ref().unwrap()).clone()));
+        view.playlist_choices_result(response(wrong_session, "Different session"), cx);
+        assert!(view.catalog_requests.playlist_choices.is_none());
+
+        view.account_generation = view.account_generation.wrapping_add(1);
+        view.playlist_choices_result(response(current, "Before another edit"), cx);
+        assert!(view.catalog_requests.playlist_choices.is_none());
+        let refreshed = playlist_choices_job(view);
+        view.account.as_mut().unwrap().session =
+            Arc::new((**refreshed.session.as_ref().unwrap()).clone());
+        view.clear_account_state(cx);
+        view.playlist_picker(tracks, cx);
+        let new_account = playlist_choices_job(view);
+        view.playlist_choices_result(response(refreshed, "Before account refresh"), cx);
+        assert!(view.playlist_picker_choices().destinations.is_empty());
+        view.playlist_choices_result(response(new_account, "Current destinations"), cx);
+        assert_eq!(
+            view.playlist_picker_choices().destinations[0].title,
+            "Current destinations"
+        );
+        assert!(
+            !view
+                .catalog_requests
+                .is_loading(CatalogTarget::PlaylistChoices)
+        );
     })
 }
 

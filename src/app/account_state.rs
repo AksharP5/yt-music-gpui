@@ -827,6 +827,7 @@ impl Music {
                                             // Rebind only this verified account's queue; discard other in-flight reads.
                                             view.catalog_requests.cancel(CatalogTarget::Page);
                                             view.catalog_requests.cancel(CatalogTarget::Sidebar);
+                                            view.catalog_requests.cancel(CatalogTarget::PlaylistChoices);
                                             if let Some(expected) = &previous_session
                                                 && let Err(error) = view.queue_source.renew_session(expected, session.clone())
                                             { view.queue_source.cancel(); view.error = Some(error); }

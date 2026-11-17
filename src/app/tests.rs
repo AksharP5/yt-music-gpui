@@ -182,7 +182,7 @@ fn page_refresh_preserves_sidebar_requests() {
     requests.request(Query::Explore, 0, 0, 0, None).unwrap();
     let pending = std::iter::from_fn(|| requests.pending.try_recv().ok()).collect::<Vec<_>>();
     assert_eq!(pending.len(), 2);
-    for target in CatalogTarget::ALL {
+    for target in [CatalogTarget::Page, CatalogTarget::Sidebar] {
         assert_eq!(
             pending
                 .iter()

@@ -116,6 +116,9 @@ impl AssetSource for Assets {
             "playlist-add" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/playlist-add.svg"
             ))),
+            "playlist-pin" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/playlist-pin.svg"
+            ))),
             "play-next" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/play-next.svg"
             ))),
