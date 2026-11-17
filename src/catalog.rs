@@ -2423,7 +2423,7 @@ pub(crate) fn playlist_occurrences_visible(
             .all(|added| occurrences.contains(added.as_str()))
 }
 
-/// Compare the known prefix after all acknowledged moves, allowing unrelated new rows.
+/// Compare retained row order. A matching short prefix cannot verify the loaded order.
 pub(crate) fn playlist_order_visible(page: &Page, order: &Page) -> Option<bool> {
     fn occurrences(page: &Page) -> Vec<&str> {
         page.shelves
@@ -2444,7 +2444,15 @@ pub(crate) fn playlist_order_visible(page: &Page, order: &Page) -> Option<bool> 
     if visible.is_empty() {
         return None;
     }
-    Some(expected.into_iter().take(visible.len()).eq(visible))
+    if !expected
+        .iter()
+        .copied()
+        .take(visible.len())
+        .eq(visible.iter().copied())
+    {
+        return Some(false);
+    }
+    (expected.len() == visible.len()).then_some(true)
 }
 
 #[cfg(test)]
@@ -2493,12 +2501,18 @@ mod tests {
         );
         assert_eq!(
             playlist_order_visible(&page(&[450, 0], true), &order),
-            Some(true)
+            None,
+            "A matching short prefix cannot certify the retained loaded order"
         );
         assert_eq!(
             playlist_order_visible(&page(&[999, 450, 0], true), &order),
+            None,
+            "Unrelated rows do not provide evidence for the missing known rows"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[999, 450, 0, 1, 2], false), &order),
             Some(true),
-            "An unrelated new row may precede the acknowledged order"
+            "Unrelated new rows may precede a fully verified retained order"
         );
         assert_eq!(
             playlist_order_visible(&page(&[998, 999], true), &order),

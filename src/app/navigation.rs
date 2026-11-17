@@ -923,12 +923,17 @@ impl Music {
                         || !entry.route.same_page(&self.route)
                 });
                 let mut replayed_changes = false;
+                let mut retained_coverage = None;
                 for change in self.sync.page_changes.drain(..) {
-                    replayed_changes |= change.apply(&mut page, &self.route, !result.append);
+                    replayed_changes |= change.apply(
+                        &mut page,
+                        &self.route,
+                        !result.append,
+                        &mut retained_coverage,
+                    );
                 }
                 replayed_changes |=
-                    self.sync
-                        .replay_playlist_edits(&mut page, &self.route, !result.append);
+                    self.replay_playlist_edits(&mut page, !result.append, &mut retained_coverage);
                 for track in page
                     .shelves
                     .iter()
@@ -968,11 +973,11 @@ impl Music {
                 self.sync.page_error = None;
                 if result.revalidate {
                     let anchor = self.page_anchor();
-                    if self.sync.page_reload.is_some() {
-                        self.sync.page_coverage = sync::PageCoverage {
+                    if self.sync.page_reload.is_some() || retained_coverage.is_some() {
+                        self.sync.page_coverage = retained_coverage.unwrap_or(sync::PageCoverage {
                             first_page_len: page.shelves.len(),
                             continued: false,
-                        };
+                        });
                         self.page = page;
                     } else {
                         sync::merge_page(&mut self.page, page, &mut self.sync.page_coverage);
@@ -999,10 +1004,10 @@ impl Music {
                         }
                     }
                 } else {
-                    self.sync.page_coverage = sync::PageCoverage {
+                    self.sync.page_coverage = retained_coverage.unwrap_or(sync::PageCoverage {
                         first_page_len: page.shelves.len(),
                         continued: false,
-                    };
+                    });
                     self.page = page;
                     if matches!(self.overlay, Some(Overlay::Track { .. })) {
                         self.overlay = None;
@@ -1123,7 +1128,7 @@ impl CatalogRequests {
                                         &refresh.id,
                                         &refresh.additions,
                                         &refresh.removals,
-                                        refresh.order.as_deref(),
+                                        refresh.order.as_ref().map(|order| &order.page),
                                         || {
                                             generations[target as usize].load(Ordering::Relaxed)
                                                 == job.id

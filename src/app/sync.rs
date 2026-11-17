@@ -33,12 +33,20 @@ pub(super) enum PageChange {
 }
 
 impl PageChange {
-    pub(super) fn apply(self, page: &mut Page, route: &Route, first_page: bool) -> bool {
+    pub(super) fn apply(
+        self,
+        page: &mut Page,
+        route: &Route,
+        first_page: bool,
+        retained: &mut Option<PageCoverage>,
+    ) -> bool {
         match self {
             Self::Confirmed(mutation) => patch_page(page, route, &mutation),
             Self::PlaylistAdded { id, tracks } => return append_added(page, route, &id, &tracks),
             Self::PlaylistMetadata(metadata) => return metadata.apply(page, route),
-            Self::PlaylistEdits(refresh) => return refresh.apply(page, route, first_page),
+            Self::PlaylistEdits(refresh) => {
+                return refresh.apply(page, route, first_page, retained);
+            }
         }
         false
     }
@@ -50,12 +58,23 @@ pub(in crate::app) struct PlaylistRefresh {
     pub additions: Vec<String>,
     pub removals: Vec<String>,
     // Retain final rows: replaying a sequence of moves can change its result.
-    pub order: Option<Arc<Page>>,
+    pub order: Option<Arc<PlaylistOrder>>,
     pub account_generation: u64,
 }
 
+#[derive(Clone)]
+pub(in crate::app) struct PlaylistOrder {
+    pub page: Page,
+    coverage: PageCoverage,
+}
+
 impl PlaylistRefresh {
-    fn merge(&mut self, additions: Vec<String>, removal: Option<String>, order: Option<Page>) {
+    fn merge(
+        &mut self,
+        additions: Vec<String>,
+        removal: Option<String>,
+        order: Option<PlaylistOrder>,
+    ) {
         if let Some(order) = order {
             self.order = Some(Arc::new(order));
         }
@@ -65,7 +84,7 @@ impl PlaylistRefresh {
         self.additions.dedup();
         if let Some(removal) = removal {
             if let Some(order) = &mut self.order {
-                for shelf in &mut Arc::make_mut(order).shelves {
+                for shelf in &mut Arc::make_mut(order).page.shelves {
                     shelf.items.retain(|item| !matches!(item, Item::Track(track) if track.details.set_video_id.as_ref() == Some(&removal)));
                 }
             }
@@ -76,17 +95,24 @@ impl PlaylistRefresh {
         }
     }
 
-    fn apply(&self, page: &mut Page, route: &Route, first_page: bool) -> bool {
+    fn apply(
+        &self,
+        page: &mut Page,
+        route: &Route,
+        first_page: bool,
+        retained: &mut Option<PageCoverage>,
+    ) -> bool {
         if !matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == self.id) {
             return false;
         }
         let mut patched = false;
         if first_page
             && let Some(order) = &self.order
-            && crate::catalog::playlist_order_visible(page, order) == Some(false)
+            && crate::catalog::playlist_order_visible(page, &order.page) != Some(true)
         {
-            page.shelves = order.shelves.clone();
-            page.continuation = order.continuation.clone();
+            page.shelves = order.page.shelves.clone();
+            page.continuation = order.page.continuation.clone();
+            *retained = Some(order.coverage);
             patched = true;
         }
         for shelf in &mut page.shelves {
@@ -241,23 +267,6 @@ impl SyncState {
         self.playlist_failures.clear();
         self.playlist_metadata_error = None;
         self.sidebar_changes.clear();
-    }
-
-    pub(super) fn replay_playlist_edits(
-        &self,
-        page: &mut Page,
-        route: &Route,
-        first_page: bool,
-    ) -> bool {
-        let mut patched = false;
-        for refresh in self
-            .playlist_refreshes
-            .iter()
-            .chain(self.playlist_failures.values())
-        {
-            patched |= refresh.apply(page, route, first_page);
-        }
-        patched
     }
 
     pub(super) fn update_sidebar(
@@ -495,6 +504,40 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) -> 
 }
 
 impl Music {
+    pub(super) fn replay_playlist_edits(
+        &self,
+        page: &mut Page,
+        first_page: bool,
+        retained: &mut Option<PageCoverage>,
+    ) -> bool {
+        let mut patched = false;
+        for refresh in self
+            .sync
+            .playlist_refreshes
+            .iter()
+            .chain(self.sync.playlist_failures.values())
+        {
+            if !matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == refresh.id)
+            {
+                continue;
+            }
+            patched |= refresh.apply(page, &self.route, first_page, retained);
+            if refresh.additions.is_empty() {
+                continue;
+            }
+            let sources: Vec<_> = std::iter::once((&self.page, &self.route)).chain(
+                self.back.iter().filter_map(|state| Some((state.page.as_ref()?, &state.route)))
+            ).filter(|(_, route)| matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == refresh.id))
+                .flat_map(|(loaded, _)| &loaded.shelves).flat_map(|shelf| &shelf.items)
+                .filter_map(|item| match item {
+                    Item::Track(track) if track.details.set_video_id.as_ref().is_some_and(|id| refresh.additions.contains(id)) => Some(track.clone()),
+                    _ => None,
+                }).collect();
+            patched |= append_added(page, &self.route, &refresh.id, &sources);
+        }
+        patched
+    }
+
     pub(super) fn page_anchor(&self) -> PageAnchor {
         let home = self.route.is_home() || matches!(self.route, Route::Explore);
         let detailed = home || self.grouped_rows();
@@ -760,12 +803,12 @@ impl Music {
         }
     }
 
-    pub(super) fn playlist_order_snapshot(&self, id: &str) -> Option<Page> {
-        std::iter::once((&self.page, &self.route)).chain(
-            self.back.iter().rev().filter_map(|state| Some((state.page.as_ref()?, &state.route)))
-        ).find_map(|(page, route)| {
+    pub(super) fn playlist_order_snapshot(&self, id: &str) -> Option<PlaylistOrder> {
+        std::iter::once((&self.page, &self.route, self.sync.page_coverage)).chain(
+            self.back.iter().rev().filter_map(|state| Some((state.page.as_ref()?, &state.route, state.coverage)))
+        ).find_map(|(page, route, coverage)| {
             matches!(route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
-                .then(|| page.clone())
+                .then(|| PlaylistOrder { page: page.clone(), coverage })
         })
     }
 
@@ -774,7 +817,7 @@ impl Music {
         id: &str,
         additions: Vec<String>,
         removal: Option<String>,
-        order: Option<Page>,
+        order: Option<PlaylistOrder>,
         cx: &mut Context<Self>,
     ) {
         let id = id.trim_start_matches("VL");
@@ -893,7 +936,12 @@ impl Music {
                 if let Some(order) = &mut refresh.order {
                     let route =
                         Route::Browse(BrowseLink::new(format!("VL{}", refresh.id), "Playlist"));
-                    append_added(Arc::make_mut(order), &route, &refresh.id, &sources);
+                    append_added(
+                        &mut Arc::make_mut(order).page,
+                        &route,
+                        &refresh.id,
+                        &sources,
+                    );
                 }
                 self.clear_playlist_failure(&refresh.id);
                 self.publish_playlist_metadata(metadata, &refresh);
@@ -971,7 +1019,7 @@ impl Music {
         // Check the unpatched response. Replayed local removals cannot prove
         // that the service has caught up with the acknowledged edit.
         let order = refresh.order.as_ref().map_or(Some(true), |order| {
-            crate::catalog::playlist_order_visible(page, order)
+            crate::catalog::playlist_order_visible(page, &order.page)
         });
         let strict = !(page.continuation.is_some() && !refresh.removals.is_empty())
             && order == Some(true)
@@ -1073,7 +1121,7 @@ impl Music {
         {
             if let Some(order) = &mut refresh.order {
                 let route = Route::Browse(BrowseLink::new(format!("VL{}", refresh.id), "Playlist"));
-                patch_page(Arc::make_mut(order), &route, mutation);
+                patch_page(&mut Arc::make_mut(order).page, &route, mutation);
             }
         }
         if let Mutation::DeletePlaylist { id } = mutation {

@@ -175,7 +175,7 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                     "renewed",
                     Vec::new(),
                     Some("old-occurrence".into()),
-                    Some(view.page.clone()),
+                    view.playlist_order_snapshot("renewed"),
                     cx,
                 );
                 let failed = view.catalog_requests.pending.try_recv().unwrap();
