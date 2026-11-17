@@ -979,17 +979,18 @@ impl PlaybackChannels {
                         }
                         PlaybackQuery::Collection(mut collection) => {
                             let result = catalog
-                                .and_then(|catalog| {
-                                    catalog.watch_playlist(collection.target(&catalog)?)
-                                })
+                                .and_then(|catalog| collection.watch(&catalog))
                                 .map(Box::new);
                             let session_rejected =
                                 result.as_ref().is_err_and(auth::session_was_rejected);
+                            let retained = result
+                                .as_ref()
+                                .is_ok_and(|watch| collection.apply_watch(watch));
                             PlaybackResult::Watch {
                                 id: job.id,
                                 account_revision: job.account_revision,
                                 update: QueueUpdate::Replace,
-                                collection: Some(collection),
+                                collection: retained.then_some(collection),
                                 session_rejected,
                                 result: result.map_err(|error| format!("{error:#}")),
                             }

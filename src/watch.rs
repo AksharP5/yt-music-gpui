@@ -1,8 +1,9 @@
 use crate::{
     auth::Session,
     catalog::{
-        Catalog, PODCAST_EPISODE, PlaylistTarget, Track, duration, episode_context, episode_header,
-        text, thumbnail, track_details, valid_service_params, valid_video_id,
+        Catalog, PODCAST_EPISODE, PlaybackActions, PlaylistTarget, Track, duration,
+        episode_context, episode_header, text, thumbnail, track_details, valid_service_params,
+        valid_video_id,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -22,6 +23,32 @@ pub struct Watch {
     pub alternatives: Option<Box<MediaPair>>,
     pub continuation: Option<WatchContinuation>,
     pub source_target: Option<crate::catalog::WatchTarget>,
+    pub(crate) shuffle: Option<QueueShuffle>,
+}
+
+#[derive(Clone)]
+pub(crate) struct QueueShuffle {
+    pub shuffled: bool,
+    pub actions: Arc<PlaybackActions>,
+}
+
+impl QueueShuffle {
+    fn parse(panel: &Value) -> Option<Self> {
+        let toggle = panel.pointer("/shuffleToggleButton/toggleButtonRenderer")?;
+        Some(Self {
+            shuffled: toggle
+                .get("isToggled")
+                .map_or(Some(false), Value::as_bool)?,
+            actions: Arc::new(PlaybackActions {
+                play: Arc::new(PlaylistTarget::from_navigation(
+                    &toggle["toggledServiceEndpoint"],
+                )?),
+                shuffle: Arc::new(PlaylistTarget::from_navigation(
+                    &toggle["defaultServiceEndpoint"],
+                )?),
+            }),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -332,6 +359,7 @@ fn parse_watch(
         related,
         comments: crate::comments::watch_comments(response, session.clone())?,
         alternatives,
+        shuffle: QueueShuffle::parse(panel),
         continuation: watch_continuation(panel, request, session),
     })
 }
@@ -548,6 +576,43 @@ mod tests {
             thumbnail: None,
             details: Default::default(),
         }
+    }
+
+    #[test]
+    fn queue_shuffle_uses_both_issued_actions_and_the_returned_state() {
+        let mut panel = json!({"shuffleToggleButton":{"toggleButtonRenderer":{
+            "isToggled":true,
+            "defaultServiceEndpoint":{"watchPlaylistEndpoint":{"playlistId":"RDAOartist","params":"shuffle%3D","index":7}},
+            "toggledServiceEndpoint":{"watchPlaylistEndpoint":{"playlistId":"RDAOartist","params":"original%3D"}}
+        }}});
+        let parse = |panel: &Value| {
+            let mut response = watch_response(json!([row("abcdefghijk", true)]));
+            response["contents"]["singleColumnMusicWatchNextResultsRenderer"]["tabbedRenderer"]["watchNextTabbedResultsRenderer"]
+                ["tabs"][1]["tabRenderer"]["content"]["musicQueueRenderer"]["content"]["playlistPanelRenderer"]
+                ["shuffleToggleButton"] = panel["shuffleToggleButton"].clone();
+            parse_playlist_watch(&response, json!({"playlistId":"RDAOartist"}), None)
+                .unwrap()
+                .shuffle
+        };
+        let shuffle = parse(&panel).unwrap();
+        assert!(shuffle.shuffled);
+        assert_eq!(
+            shuffle.actions.play.request(),
+            json!({"playlistId":"RDAOartist","params":"original%3D"})
+        );
+        assert_eq!(
+            shuffle.actions.shuffle.request(),
+            json!({"playlistId":"RDAOartist","params":"shuffle%3D","index":7})
+        );
+        let toggle = &mut panel["shuffleToggleButton"]["toggleButtonRenderer"];
+        toggle.as_object_mut().unwrap().remove("isToggled");
+        assert!(!parse(&panel).unwrap().shuffled);
+        panel["shuffleToggleButton"]["toggleButtonRenderer"]["isToggled"] = json!("false");
+        assert!(parse(&panel).is_none());
+        panel["shuffleToggleButton"]["toggleButtonRenderer"]["isToggled"] = json!(false);
+        panel["shuffleToggleButton"]["toggleButtonRenderer"]["toggledServiceEndpoint"] =
+            json!({"watchEndpoint":{"videoId":"abcdefghijk"}});
+        assert!(parse(&panel).is_none());
     }
 
     #[test]

@@ -952,11 +952,7 @@ impl Music {
                     "Shuffle play",
                     PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
                 ),
-                (
-                    "menu-radio",
-                    "Start mix",
-                    collection.details.mix.clone().map(PlaybackQuery::Playlist),
-                ),
+                ("menu-radio", "Start mix", PlaybackQuery::mix(collection)),
             ] {
                 if let Some(query) = query {
                     actions.push(self.menu_action(id, label, cx, move |view, window, cx| {

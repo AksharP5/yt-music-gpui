@@ -23,13 +23,71 @@ fn collection_source() -> CollectionPlayback {
     CollectionPlayback::new("VLPLsynthetic", &details, PlaybackOrder::Original).unwrap()
 }
 
+fn artist_source(mix: bool, paired: bool) -> CollectionPlayback {
+    use crate::{
+        catalog::{CollectionDetails, PlaybackActions, PlaylistTarget},
+        watch::QueueShuffle,
+    };
+    use std::sync::Arc;
+    let target = |playlist: &str, params: &str| {
+        Arc::new(
+            PlaylistTarget::from_navigation(&serde_json::json!({
+                "watchPlaylistEndpoint":{"playlistId":playlist,"params":params}
+            }))
+            .unwrap(),
+        )
+    };
+    let details = CollectionDetails {
+        shuffle: Some(target("RDAOsynthetic", "header-shuffle%3D")),
+        mix: Some(target("RDEMsynthetic", "header-mix%3D")),
+        ..Default::default()
+    };
+    let mut source = if mix {
+        CollectionPlayback::mix("UCsynthetic", &details).unwrap()
+    } else {
+        CollectionPlayback::new("UCsynthetic", &details, PlaybackOrder::Shuffled).unwrap()
+    };
+    if paired {
+        let playlist = if mix {
+            "RDEMsynthetic"
+        } else {
+            "RDAOsynthetic"
+        };
+        source.apply_watch(&crate::watch::Watch {
+            current: None,
+            current_index: None,
+            queue: Vec::new(),
+            source: None,
+            lyrics: None,
+            related: None,
+            comments: None,
+            alternatives: None,
+            continuation: None,
+            source_target: None,
+            shuffle: Some(QueueShuffle {
+                shuffled: false,
+                actions: Arc::new(PlaybackActions {
+                    play: target(playlist, "queue-original%3D"),
+                    shuffle: target(playlist, "queue-shuffle%3D"),
+                }),
+            }),
+        });
+    }
+    source
+}
+
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playlist commands only"]
 fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests() -> Result<()> {
     use crate::{app::PlaybackQuery, media_controls::Event};
 
     super::navigation::check_cache_window(async |window, cx| {
-        window.update(cx, |view, _, cx| {
+        for source in [
+            collection_source(),
+            artist_source(false, true),
+            artist_source(true, true),
+        ] {
+            window.update(cx, |view, _, cx| {
             let (jobs, pending) = async_channel::bounded(4);
             view.playback_jobs = jobs;
             view.pending_playback_jobs = pending;
@@ -38,7 +96,7 @@ fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests()
             view.watch_pending = None;
             view.library.autoplay = false;
             view.library.queue.replace(continuation_page(0..3, None).tracks(), 1);
-            view.library.queue.collection = Some(collection_source());
+            view.library.queue.collection = Some(source);
             view.desktop_event(Event::Shuffle(false), cx);
             assert!(view.pending_playback_jobs.is_empty());
             view.desktop_event(Event::Shuffle(true), cx);
@@ -60,6 +118,7 @@ fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests()
             assert!(view.pending_playback_jobs.is_empty());
             assert_eq!(view.library.queue.tracks, tracks);
         }).unwrap();
+        }
     })
 }
 
@@ -307,16 +366,37 @@ fn collection_shuffle_refreshes_actions_only_when_the_account_changes() -> Resul
     use std::sync::Arc;
 
     super::navigation::check_cache_window(async |window, cx| {
-        for (guest, same_account) in [(false, false), (true, false), (false, true)] {
-            let source = collection_source();
-            let old = super::account::session("old-actions");
-            let mut fields = serde_json::to_value(&*old).unwrap();
-            fields["client_version"] = serde_json::json!("new-session");
-            if !same_account {
-                fields["data_sync_id"] = serde_json::json!("different-user||");
-            }
-            let next = Arc::new(serde_json::from_value::<auth::Session>(fields).unwrap());
-            window.update(cx, |view, window, cx| {
+        for (source, expected_saved) in [
+            (
+                collection_source(),
+                serde_json::json!({"id":"VLPLsynthetic","order":"Shuffled"}),
+            ),
+            (
+                artist_source(false, false),
+                serde_json::json!({"id":"UCsynthetic","order":"Original","artist_action":"Shuffle"}),
+            ),
+            (
+                artist_source(false, true),
+                serde_json::json!({"id":"UCsynthetic","order":"Shuffled","artist_action":"Shuffle"}),
+            ),
+            (
+                artist_source(true, false),
+                serde_json::json!({"id":"UCsynthetic","order":"Shuffled","artist_action":"Mix"}),
+            ),
+            (
+                artist_source(true, true),
+                serde_json::json!({"id":"UCsynthetic","order":"Shuffled","artist_action":"Mix"}),
+            ),
+        ] {
+            for (guest, same_account) in [(false, false), (true, false), (false, true)] {
+                let old = super::account::session("old-actions");
+                let mut fields = serde_json::to_value(&*old).unwrap();
+                fields["client_version"] = serde_json::json!("new-session");
+                if !same_account {
+                    fields["data_sync_id"] = serde_json::json!("different-user||");
+                }
+                let next = Arc::new(serde_json::from_value::<auth::Session>(fields).unwrap());
+                window.update(cx, |view, window, cx| {
                 if view.player.is_none() {
                     view.player = Some(Player::new(PlayerOptions { audio_output:Some("null".into()), volume:0., ..Default::default() }).unwrap());
                 }
@@ -343,36 +423,37 @@ fn collection_shuffle_refreshes_actions_only_when_the_account_changes() -> Resul
                 view.shuffle_queue(cx);
                 assert!(view.pending_playback_jobs.is_empty());
             }).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while window
-                .update(cx, |view, _, _| {
-                    matches!(
-                        view.account_operation,
-                        Some(AccountOperation::Activating { .. })
-                    )
-                })
-                .unwrap()
-            {
-                assert!(
-                    Instant::now() < deadline,
-                    "Synthetic player must acknowledge account activation"
-                );
-                cx.background_executor()
-                    .timer(Duration::from_millis(10))
-                    .await;
-            }
-            window.update(cx, |view,_,_| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while window
+                    .update(cx, |view, _, _| {
+                        matches!(
+                            view.account_operation,
+                            Some(AccountOperation::Activating { .. })
+                        )
+                    })
+                    .unwrap()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Synthetic player must acknowledge account activation"
+                    );
+                    cx.background_executor()
+                        .timer(Duration::from_millis(10))
+                        .await;
+                }
+                window.update(cx, |view,_,_| {
                 let job = view.pending_playback_jobs.try_recv().unwrap();
                 assert!(job.session.is_some_and(|session| Arc::ptr_eq(&session,&next)));
                 let PlaybackQuery::Collection(collection) = job.query else { panic!("Activation must replay the requested collection order") };
                 let expected = if same_account {
                     source.toggled()
                 } else {
-                    serde_json::from_value(serde_json::json!({"id":"VLPLsynthetic","order":"Shuffled"})).unwrap()
+                    serde_json::from_value(expected_saved.clone()).unwrap()
                 };
                 assert_eq!(collection,expected,"A new account must refresh actions; the same account can retain its issued pair");
                 assert!(view.pending_playback_jobs.is_empty());
             }).unwrap();
+            }
         }
     })
 }
@@ -405,6 +486,7 @@ fn collection_shuffle_toggles_pending_requests_and_ignores_stale_results() -> Re
                 alternatives: None,
                 continuation: None,
                 source_target: None,
+                shuffle: None,
             }
         };
         window
