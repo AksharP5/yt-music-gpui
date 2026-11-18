@@ -238,6 +238,7 @@ impl Music {
         window.focus(&self.overlay_focus, cx);
         self.overlay_anchor = Some(window.mouse_position());
         self.overlay_button = None;
+        self.menu_scroll = ScrollHandle::new();
         if self.account.is_some() {
             self.prefetch_playlist_covers();
         }
@@ -280,6 +281,7 @@ impl Music {
         window.focus(&self.overlay_focus, cx);
         self.overlay_anchor = Some(window.mouse_position());
         self.overlay_button = None;
+        self.menu_scroll = ScrollHandle::new();
         self.overlay = Some(Overlay::Collection(collection));
         let view = cx.weak_entity();
         window.on_next_frame(move |window, cx| {
@@ -345,6 +347,24 @@ impl Music {
             index.map_or(0, |index| (index + 1) % controls.len())
         };
         window.focus(&controls[next], cx);
+        // The scroll children start with the hidden title and optional episode subtitle.
+        let menu_preamble = match &self.overlay {
+            Some(Overlay::Track { track, .. }) => Some(
+                1 + usize::from(
+                    track
+                        .details
+                        .episode
+                        .as_ref()
+                        .is_some_and(|episode| !episode.subtitle.is_empty()),
+                ),
+            ),
+            Some(Overlay::Collection(_)) => Some(1),
+            _ => None,
+        };
+        if let Some(preamble) = menu_preamble {
+            self.menu_scroll.scroll_to_item(next + preamble);
+            cx.notify();
+        }
         if picker && self.picker_focus.focused(window).is_some() {
             let index = if backward {
                 self.playlist_picker_choices().len().saturating_sub(1)
@@ -1199,7 +1219,8 @@ impl Music {
                                 .px(px(0.))
                                 .py(px(16.))
                                 .rounded(px(2.))
-                                .max_h(viewport.height - px(16.)),
+                                .max_h(viewport.height - px(16.))
+                                .track_scroll(&self.menu_scroll),
                         ),
                 )
                 .into_any_element();
