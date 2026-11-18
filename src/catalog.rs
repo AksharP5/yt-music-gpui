@@ -729,7 +729,7 @@ pub(crate) struct PlaylistSuggestions {
     pub auto_reload_when_empty: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Page {
     pub title: String,
     pub header: Option<PageHeader>,

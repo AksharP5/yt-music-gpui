@@ -36,6 +36,20 @@ impl Render for MusicContent {
 }
 
 impl Music {
+    fn mouse_history(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.is_none()
+            && !self.sort_menu
+            && let MouseButton::Navigate(direction) = event.button
+        {
+            self.navigate_history(direction, cx);
+        }
+    }
+
     pub(super) fn restore_keyboard_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A scroll request can land between frames. The target handle is already focused,
         // but its virtual row has not entered the dispatch tree yet.
@@ -207,14 +221,13 @@ impl Render for Music {
                     view.drag_to(event.position, cx);
                 }
             }))
-            // The mouse's side Back button works like Alt+Left.
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
-                cx.listener(|view, _, _, cx| {
-                    if view.overlay.is_none() && !view.sort_menu {
-                        view.go_back(cx);
-                    }
-                }),
+                cx.listener(Self::mouse_history),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(Self::mouse_history),
             )
             .on_mouse_up(
                 MouseButton::Left,
