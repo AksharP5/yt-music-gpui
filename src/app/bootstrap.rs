@@ -264,6 +264,15 @@ impl Music {
                         Item::Navigation(link) => view.navigate(Route::Browse(link), cx),
                     }
                 }
+                SearchBoxEvent::SessionRejected(session) => {
+                    if view
+                        .account
+                        .as_ref()
+                        .is_some_and(|account| Arc::ptr_eq(&account.session, session))
+                    {
+                        view.refresh_session(false, cx);
+                    }
+                }
                 SearchBoxEvent::Blur => window.focus(&view.focus, cx),
             });
         let activation = cx.observe_window_activation(window, Self::window_activated);
