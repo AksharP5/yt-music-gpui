@@ -530,8 +530,10 @@ impl Music {
                 .is_some_and(|watch| watch.comments.is_none())
             {
                 "Comments are turned off"
-            } else {
+            } else if state.pending.is_some() || self.track_details_pending() {
                 "Loading…"
+            } else {
+                "Comments are unavailable"
             };
             return related_message(message.into(), self.theme);
         }
