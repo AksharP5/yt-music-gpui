@@ -132,7 +132,7 @@ def directory(path, create=False):
 def read_file(path):
     parent = directory(path.parent)
     try:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         with os.fdopen(fd, 'rb') as file:
             info = os.fstat(file.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
@@ -212,6 +212,15 @@ try:
                        if len(line.split()) == 2 and line.split()[1] == name]
             if matches != [[checksum, name]]:
                 raise ValueError('Upstream checksum differs from the reviewed pin')
+    elif action == 'reuse-ytdlp':
+        checksum, output = args
+        try:
+            installed = read_file(targets['yt-dlp'])
+        except (OSError, ValueError):
+            sys.exit(1)
+        if digest(installed) != checksum:
+            sys.exit(1)
+        Path(output).write_bytes(installed)
     elif action == 'deno':
         archive, output = map(Path, args)
         with zipfile.ZipFile(archive) as z:
@@ -328,9 +337,11 @@ PY
         printf '%s\n' 'Uninstalled. Library, settings and saved account were kept.'
         exit 0
     fi
-    download() { curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
+    require_curl() { command -v curl >/dev/null 2>&1 || packages curl; }
+    download() {
+        require_curl && curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"
+    }
     if [ "$action" = install ]; then
-        command -v curl >/dev/null 2>&1 || { packages curl || exit 1; }
         if [ -n "$archive" ]; then
             # Inputs live apart from the installer's own files, so a local archive
             # named like one of them cannot replace it before verification.
@@ -341,6 +352,7 @@ PY
             archive="$input"
         else
             # Resolve latest once, so a release published mid-install cannot mix assets.
+            require_curl || exit 1
             effective="$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
                 https://github.com/AksharP5/yt-music-gpui/releases/latest)"
             tag="${effective##*/}"
@@ -354,9 +366,11 @@ PY
         fi
         helper unpack "$archive" "$work/archive.sha256" "$work/stage" > "$work/pins"
         { read -r ytdlp_version; read -r ytdlp_hash; read -r deno_version; read -r deno_hash; read -r deno_size; } < "$work/pins"
-        download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/yt-dlp" "$work/yt-dlp"
-        download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/SHA2-256SUMS" "$work/ytdlp-sums"
-        helper verify "$work/yt-dlp" "$ytdlp_hash" "$work/ytdlp-sums" yt-dlp
+        if ! helper reuse-ytdlp "$ytdlp_hash" "$work/yt-dlp"; then
+            download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/yt-dlp" "$work/yt-dlp"
+            download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/SHA2-256SUMS" "$work/ytdlp-sums"
+            helper verify "$work/yt-dlp" "$ytdlp_hash" "$work/ytdlp-sums" yt-dlp
+        fi
         runtime_zip="$work/yt-dlp"
     else
         runtime_zip="$private_dir/yt-dlp"
