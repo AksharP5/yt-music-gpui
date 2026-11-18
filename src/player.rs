@@ -6071,6 +6071,64 @@ os.kill(os.getpid(), signal.SIGSTOP)
         path
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "timing sample with libmpv, yt-dlp, local silent audio and no network"]
+    fn measure_local_guest_playback() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let tracks = [
+            silent_audio(first.path(), 10),
+            silent_audio(second.path(), 10),
+        ];
+        let mut first_play = Vec::new();
+        let mut switches = Vec::new();
+        for _ in 0..5 {
+            let player = Player::new(PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            for trial in 0..=40 {
+                let file = &tracks[trial % tracks.len()];
+                let start = Instant::now();
+                let id = player
+                    .play_url(
+                        file.to_string_lossy().into_owned(),
+                        "Synthetic silence",
+                        PlayOptions::default(),
+                    )
+                    .unwrap();
+                let elapsed = loop {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "Track never advanced"
+                    );
+                    match player.try_recv() {
+                        Some(PlayerEvent::Position { track_id, seconds })
+                            if track_id == id && seconds > 0. =>
+                        {
+                            break start.elapsed().as_secs_f64() * 1000.;
+                        }
+                        Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                        Some(_) => {}
+                        None => thread::sleep(Duration::from_millis(1)),
+                    }
+                };
+                if trial == 0 {
+                    first_play.push(elapsed);
+                } else {
+                    switches.push(elapsed);
+                }
+            }
+        }
+        println!(
+            "playback_samples {}",
+            json!({"first_position_ms": first_play, "warm_switch_ms": switches})
+        );
+    }
+
     #[test]
     #[ignore = "requires libmpv; uses local silent audio, null audio and no network"]
     fn plays_with_the_installed_libmpv() {

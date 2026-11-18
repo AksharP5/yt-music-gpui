@@ -108,6 +108,35 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+      - name: Measure local guest playback
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          runtime=$(mktemp -d /dev/shm/yt-music-playback.XXXXXX)
+          XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$RUNNER_TEMP/yt-music-playback-data" PATH="$PWD/dist/helpers:$PATH" \
+            player-test/yt-music-gpui-tests --ignored --exact \
+              player::tests::measure_local_guest_playback --nocapture | tee "$runtime/samples.log"
+          python3 - "$runtime/samples.log" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import statistics
+          import sys
+
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          prefix = "playback_samples "
+          sample, = (json.loads(line.split(prefix, 1)[1]) for line in lines if prefix in line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print("### Local guest playback on Linux", file=summary)
+              print("", file=summary)
+              print("| Play request to first advancing position | Samples | Median |", file=summary)
+              print("| --- | ---: | ---: |", file=summary)
+              for label, key in [("First play", "first_position_ms"), ("Warm switch", "warm_switch_ms")]:
+                  values = sample[key]
+                  print(f"| {label} | {len(values)} | {statistics.median(values):.1f} ms |", file=summary)
+              print("", file=summary)
+          PY
+
       - name: Compare stripped binary size with the branch base
         if: github.event_name == 'workflow_dispatch'
         run: |
