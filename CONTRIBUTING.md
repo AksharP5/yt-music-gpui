@@ -27,6 +27,8 @@ bin/install
 
 `bin/install` copies the app to `~/.local/bin` and the launcher, icon and licenses under `${XDG_DATA_HOME:-~/.local/share}`. It does not install dependencies or the reviewed yt-dlp; with any other yt-dlp version, signed-in lookups fall back to guest extraction. Signed-in playback also needs Deno; Node, Bun and QuickJS are never used (see [SECURITY.md](SECURITY.md)).
 
+`yt-music-gpui --version` prints the app version on the first line, followed by the detected yt-dlp and Deno paths. Use `yt-music-gpui --version | head -n 1` for just the version line.
+
 ## How playback works
 
 A clicked song first uses a native, cookie-free player request that skips the watch page and doesn't wait on yt-dlp. The next song is prepared in the background; when signed in with High audio quality, that uses your account through yt-dlp to keep Premium audio. Video above 1080p also uses yt-dlp. If the native request fails or needs JavaScript to decode a stream URL, the same play falls back to yt-dlp, and a stream that fails to open retries through yt-dlp.
@@ -83,7 +85,7 @@ The native window tests live in `src/app/native_tests/` and `src/app/player_page
 
 The Comments check reads public guest comments during muted playback, exercises sorting and keyboard controls, and verifies that a 500-comment list renders only the visible rows. Set `YT_MUSIC_COMMENTS_PROFILE=1` to run `bin/profile PID 30` for two paired Up next/Comments samples. Panel crops are captured at 1280×800 and 1920×1080. Deterministic comments also check that Read more follows four rendered lines after wrapping and resizing.
 
-Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
+Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. The New playlist footer must stay clear of scrolling rows. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
 
 Album and playlist queues retain their independently issued Play and Shuffle actions. Toggling reloads the chosen source order and starts playback, as on the web, including restoring entries removed from Up next. Service-shuffled pages keep the service order and do not enable local eager continuation loading. Saved queues retain only the collection ID and order; restart or account changes require fresh actions. The native `collection_shuffle_toggles_pending_requests_and_ignores_stale_results` check covers rapid toggles, failures, late replies, background details reads and account recovery. `collection_shuffle_refreshes_actions_only_when_the_account_changes` completes synthetic player activation for account switches, guest sign-in and same-account refresh. A separate public guest integration check reloads actions after serialization and verifies both orders without accessing an account or playing media:
 

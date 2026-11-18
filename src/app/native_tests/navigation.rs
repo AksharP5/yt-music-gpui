@@ -1310,6 +1310,14 @@ fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Res
                     changed > 100,
                     "The right side must scroll the playlist rows"
                 );
+                assert!(
+                    before.enumerate_pixels().all(|(x, y, pixel)| {
+                        !(458..822).contains(&x)
+                            || !(675..727).contains(&y)
+                            || image.get_pixel(x, y) == pixel
+                    }),
+                    "Scrolling playlist rows must not paint into the New playlist footer"
+                );
             }
         }
         cx.update_window(window.into(), |_, window, cx| {
@@ -1718,16 +1726,16 @@ fn playlist_picker_shows_a_rejected_save_inside_the_dialog() -> Result<()> {
             })
             .unwrap();
         let x = after.width() / 2 - 190;
-        let y = after.height() / 2 + 150;
-        assert_ne!(
-            before.get_pixel(x, y),
-            after.get_pixel(x, y),
+        let center = after.height() / 2;
+        let footer = before.get_pixel(x, center + 90);
+        let bottom = |frame: &image::RgbaImage| {
+            (center..frame.height())
+                .rfind(|&y| frame.get_pixel(x, y) == footer)
+                .unwrap()
+        };
+        assert!(
+            bottom(&after) > bottom(&before),
             "A rejected save must visibly expand the picker with its error"
-        );
-        assert_eq!(
-            after.get_pixel(x, y),
-            after.get_pixel(x, y - 50),
-            "The submission error must be inside the visible dialog"
         );
         assert!(
             (0..after.height())

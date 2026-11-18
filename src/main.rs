@@ -29,6 +29,16 @@ mod video;
 mod watch;
 
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use std::io::{self, Write};
+
+fn print_cli(output: std::fmt::Arguments<'_>) {
+    if let Err(error) = io::stdout().lock().write_fmt(output)
+        && error.kind() != io::ErrorKind::BrokenPipe
+    {
+        eprintln!("Could not write command output: {error}");
+        std::process::exit(1);
+    }
+}
 
 fn shutdown_on_signal(cx: &mut App) -> std::io::Result<()> {
     let signal = shutdown::listen()?;
@@ -63,13 +73,12 @@ fn main() {
                 std::process::exit(2);
             }
             "--help" | "-h" => {
-                println!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading the saved account\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts."
-                );
+                print_cli(format_args!(
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading the saved account\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts.\n"
+                ));
                 return;
             }
             "--version" | "-V" => {
-                println!("yt-music-gpui {}", env!("CARGO_PKG_VERSION"));
                 // Which helpers passed the trust checks, for bug reports and package tests.
                 let ytdlp = player::find_ytdlp().map(|path| path.display().to_string());
                 // yt-dlp looks for Deno on PATH unless the app passes a trusted copy.
@@ -80,11 +89,13 @@ fn main() {
                         })
                         .find(|path| path.is_file())
                 });
-                println!("yt-dlp: {}", ytdlp.as_deref().unwrap_or("not found"));
-                match deno {
-                    Some(path) => println!("deno: {}", path.display()),
-                    None => println!("deno: not found"),
-                }
+                let deno = deno.map(|path| path.display().to_string());
+                print_cli(format_args!(
+                    "yt-music-gpui {}\nyt-dlp: {}\ndeno: {}\n",
+                    env!("CARGO_PKG_VERSION"),
+                    ytdlp.as_deref().unwrap_or("not found"),
+                    deno.as_deref().unwrap_or("not found"),
+                ));
                 return;
             }
             _ => {

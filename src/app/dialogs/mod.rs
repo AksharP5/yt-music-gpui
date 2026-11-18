@@ -1192,8 +1192,7 @@ impl Music {
 }
 
 impl Music {
-    /// YouTube Music's Save to playlist dialog: covers, titles and bylines under "All
-    /// playlists", with New playlist floating over the list's end.
+    /// Covers, titles and bylines under "All playlists", with a fixed New playlist footer.
     fn playlist_picker_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let theme = self.theme;
         let divider = gpui::white().opacity(0.1);
@@ -1204,13 +1203,14 @@ impl Music {
         let choices = self.playlist_picker_choices();
         let count = choices.destinations.len();
         let viewport: f32 = window.viewport_size().height.into();
-        let list_height = (count as f32 * PICKER_ROW + PICKER_LIST_TOP + PICKER_ROW)
-            .min(viewport * 0.75 - PICKER_HEADING);
+        let list_height = (count as f32 * PICKER_ROW + PICKER_LIST_TOP)
+            .min((viewport * 0.75 - PICKER_HEADING - PICKER_FOOTER).max(0.));
         let mut body = div()
             .id("overlay-body")
             .relative()
             .w(px(386.))
             .max_h(px(viewport - 32.))
+            .pb(px(PICKER_FOOTER))
             .flex()
             .flex_col()
             .bg(theme.panel)
@@ -1398,15 +1398,14 @@ impl Music {
                     .w_full()
                     .h(px(list_height))
                     .min_h_0()
-                    .pt(px(PICKER_LIST_TOP))
-                    .pb(px(PICKER_ROW)),
+                    .pt(px(PICKER_LIST_TOP)),
                 );
         } else if let Some(empty) = &choices.empty {
             body = body.child(
                 div()
                     .px(px(24.))
                     .pt(px(24.))
-                    .pb(px(80.))
+                    .pb(px(16.))
                     .text_size(px(16.))
                     .child(empty.title.clone())
                     .when(!empty.detail.is_empty(), |body| {
@@ -1419,8 +1418,6 @@ impl Music {
                         )
                     }),
             );
-        } else {
-            body = body.child(div().h(px(PICKER_ROW)));
         }
         if let Some(error) =
             submission_error.or(self.catalog_requests.playlist_choices_error.as_ref())
@@ -1428,7 +1425,6 @@ impl Music {
             body = body.child(
                 div()
                     .px(px(24.))
-                    .pb(px(PICKER_ROW))
                     .flex_shrink_0()
                     .text_size(px(14.))
                     .text_color(theme.muted)
@@ -1526,6 +1522,8 @@ const PICKER_COVER: f32 = 44.;
 const PICKER_LIST_TOP: f32 = 7.;
 /// The "All playlists" heading with its top margin.
 const PICKER_HEADING: f32 = 37.;
+/// Space reserved below the list for the New playlist button.
+const PICKER_FOOTER: f32 = 64.;
 /// Enough covers to fill the dialog's first screen.
 const PICKER_PREFETCH: usize = 8;
 
