@@ -88,7 +88,7 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | ? | Keyboard shortcuts |
 | Ctrl Q | Quit |
 
-Previous restarts the current song once playback has passed three seconds. The desktop media control follows the same rule. A desktop seek past the end of a song advances when Next is available. If there’s no next song, both Next and that seek leave the current song playing.
+Previous restarts the current song once playback has passed three seconds. In the first three seconds, it only acts when there is an earlier song. The player, keyboard shortcuts, and desktop controls follow the same rule. A desktop seek past the end of a song advances when Next is available. If there’s no next song, both Next and that seek leave the current song playing.
 
 Right-click a song, card or collection for its menu. Use ↑ and ↓ to move between actions or Home and End to jump to the first or last action. The menu scrolls to the focused action.
 
