@@ -2722,7 +2722,7 @@ fn saving_a_queue_keeps_its_songs_after_playback_changes() -> Result<()> {
                 }
                 view.library.queue.replace(tracks.clone(), 0);
                 window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(view.library.queue.tracks.clone(), cx);
+                view.playlist_picker(view.library.queue.tracks.to_vec(), cx);
                 let _ = playlist_choices_job(view);
                 tracks
             })

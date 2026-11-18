@@ -138,7 +138,7 @@ impl Music {
                                     .is_some_and(|current| current.id == track.id) =>
                             {
                                 apply_track_details(
-                                    &mut view.library.queue.tracks,
+                                    view.library.queue.tracks_mut(),
                                     &mut view.ratings,
                                     &track,
                                     !view.sync.rating_overrides.contains(&track.id),

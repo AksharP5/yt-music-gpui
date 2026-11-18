@@ -92,7 +92,7 @@ impl Music {
         for track in self
             .library
             .queue
-            .tracks
+            .tracks_mut()
             .iter_mut()
             .chain(&mut self.library.recent)
             .chain(&mut self.library.liked)
@@ -116,7 +116,7 @@ impl Music {
                     .is_some_and(|track| track.id == resume.video_id) =>
             {
                 if same_account && let Some(index) = self.library.queue.index {
-                    self.library.queue.tracks[index].details.watch = resume.watch;
+                    self.library.queue.tracks_mut()[index].details.watch = resume.watch;
                 }
                 if let Some(mut intent) = resume.advance {
                     intent.playback = intent.playback.with_pause(resume.paused);
@@ -881,7 +881,7 @@ impl Music {
                                             view.ratings.clear();
                                             view.pending_mutations.clear();
                                             view.clear_suggestions();
-                                            for track in &mut view.library.queue.tracks { track.details.clear_account_state(); }
+                                            for track in view.library.queue.tracks_mut() { track.details.clear_account_state(); }
                                             if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. })) {
                                                 view.overlay = None;
                                             }
@@ -966,7 +966,7 @@ impl Music {
                     Ok(effect) => {
                         let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
                         acknowledge_song_change(
-                            self.library.queue.tracks.iter_mut(),
+                            self.library.queue.tracks_mut().iter_mut(),
                             &mut self.ratings,
                             &mutation,
                         );
@@ -1123,7 +1123,9 @@ impl Music {
                         .is_some_and(|track| track.id == video_id)
                     && let Some(index) = self.library.queue.index
                 {
-                    self.library.queue.tracks[index].details.resume_seconds = Some(seconds);
+                    self.library.queue.tracks_mut()[index]
+                        .details
+                        .resume_seconds = Some(seconds);
                     self.resume_account_position(cx);
                 }
                 if session_rejected {

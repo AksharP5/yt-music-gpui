@@ -856,7 +856,10 @@ impl Music {
     }
 
     pub(super) fn overlay_ratings(&mut self) {
-        for track in self.library.queue.tracks.iter_mut().chain(
+        if self.sync.rating_overrides.is_empty() {
+            return;
+        }
+        for track in self.library.queue.tracks_mut().iter_mut().chain(
             self.page
                 .shelves
                 .iter_mut()

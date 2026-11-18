@@ -199,7 +199,7 @@ impl CollectionPlayback {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SavedSource {
     target: SavedTarget,
-    loaded: Vec<String>,
+    loaded: Arc<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -513,7 +513,7 @@ impl Worker {
         if let PageRequest::Collection(id) = &request {
             queue.source = Some(SavedSource {
                 target: SavedTarget::Browse(id.clone()),
-                loaded: queue.tracks.iter().map(|track| track.id.clone()).collect(),
+                loaded: Arc::new(queue.tracks.iter().map(|track| track.id.clone()).collect()),
             });
         }
         self.set_source(
@@ -537,7 +537,7 @@ impl Worker {
     ) {
         queue.source = watch.source_target.clone().map(|target| SavedSource {
             target: SavedTarget::Watch(target),
-            loaded: watch.queue.iter().map(|track| track.id.clone()).collect(),
+            loaded: Arc::new(watch.queue.iter().map(|track| track.id.clone()).collect()),
         });
         self.set_source(
             queue,
@@ -693,9 +693,10 @@ impl Worker {
                     .collect();
                 page.tracks.retain(|track| seen.insert(track.id.clone()));
             }
-            saved
-                .loaded
-                .extend(page.tracks.iter().map(|track| track.id.clone()));
+            if !page.tracks.is_empty() {
+                Arc::make_mut(&mut saved.loaded)
+                    .extend(page.tracks.iter().map(|track| track.id.clone()));
+            }
         }
         queue.append_source(page.tracks);
         queue.incomplete = page.continuation.is_some();
@@ -1944,7 +1945,7 @@ mod tests {
             PageRequest::Browse,
             Some(session()),
         );
-        queue.tracks.insert(1, track("play-next"));
+        queue.tracks_mut().insert(1, track("play-next"));
         assert!(!queue.remove(2));
         queue.shuffle_upcoming();
         let loaded = queue.tracks.clone();
@@ -2008,7 +2009,7 @@ mod tests {
                             old_session,
                         );
                     }
-                    queue.tracks.insert(8, track("manual-next"));
+                    queue.tracks_mut().insert(8, track("manual-next"));
                     queue.remove(15);
                     queue.move_track(35, 9);
                     if shuffled {
@@ -2038,7 +2039,7 @@ mod tests {
                     let (mut worker, events) = Worker::spawn(move |request| {
                         assert!(same_session(request.session.as_ref(), current.as_ref()));
                         if let SourceContinuation::Restore(saved) = &request.continuation {
-                            assert_eq!(saved.loaded, source_tracks[..100]);
+                            assert_eq!(saved.loaded.as_slice(), &source_tracks[..100]);
                             // A fresh session may use different page boundaries.
                             let first: Vec<&str> =
                                 source_tracks[..60].iter().map(String::as_str).collect();
@@ -2068,7 +2069,7 @@ mod tests {
                     assert_eq!(queue.shuffled, shuffled);
                     assert!(!queue.incomplete);
                     if !shuffled {
-                        assert_eq!(&queue.tracks[..100], &before);
+                        assert_eq!(&queue.tracks[..100], before.as_slice());
                         queue.select(99);
                         assert!(queue.advance(Repeat::Off, false));
                         assert_eq!(queue.current().unwrap().id, original[100]);
@@ -2092,7 +2093,7 @@ mod tests {
         for changed in [true, false] {
             let saved = SavedSource {
                 target: SavedTarget::Browse("VLPLsynthetic".into()),
-                loaded: vec!["a".into(), "a".into(), "b".into()],
+                loaded: Arc::new(vec!["a".into(), "a".into(), "b".into()]),
             };
             let mut queue = Queue::default();
             queue.replace(vec![track("a"), track("manual"), track("b")], 2);
@@ -2156,7 +2157,7 @@ mod tests {
                 let (mut worker, _) = Worker::spawn(|_| panic!());
                 worker.attach_watch(&mut queue, &watch, Some(session()));
                 queue.remove(1);
-                queue.tracks.insert(1, track("manual-next"));
+                queue.tracks_mut().insert(1, track("manual-next"));
                 queue.move_track(2, 1);
                 if shuffled {
                     queue.shuffle_upcoming();
@@ -2224,7 +2225,7 @@ mod tests {
                         "Shuffling an endless mix must not eagerly load every page"
                     );
                 }
-                assert_eq!(&queue.tracks[..before.len()], &before);
+                assert_eq!(&queue.tracks[..before.len()], before.as_slice());
                 let mut appended = ids(&queue)[before.len()..].to_vec();
                 appended.sort_unstable();
                 assert_eq!(appended, ["fresh-first", "fresh-next"]);
@@ -2301,7 +2302,7 @@ mod tests {
                     "Public mix ended without fresh recommendations"
                 );
             }
-            assert_eq!(&queue.tracks[..cached.len()], &cached);
+            assert_eq!(&queue.tracks[..cached.len()], cached.as_slice());
             let mut seen: HashSet<_> = cached.iter().map(|track| &track.id).collect();
             assert!(
                 queue.tracks[cached.len()..]
