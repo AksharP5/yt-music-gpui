@@ -65,8 +65,7 @@ impl Music {
             can_play: self.player.is_some() && (!queue.tracks.is_empty() || waiting),
             can_pause: self.active_id.is_some() || waiting,
             can_go_next: self.player.is_some() && can_go_next,
-            can_go_previous: self.player.is_some()
-                && (queue.index.is_some_and(|index| index > 0) || self.position > 3.),
+            can_go_previous: self.can_go_previous(),
             can_seek: self.seekable
                 && self.active_id.is_some()
                 && !matches!(self.playback, Playback::Stopped | Playback::Loading { .. }),

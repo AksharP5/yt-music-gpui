@@ -1,6 +1,7 @@
 //! Watch workers, queue changes, autoplay, and track advancement.
 
 use super::super::*;
+use super::PREVIOUS_RESTART_SECONDS;
 
 impl Music {
     pub(in crate::app) fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
@@ -796,13 +797,13 @@ impl Music {
             .or(self.autoplay_waiting.take())
             .map_or(self.playback, |intent| intent.playback);
         if self.active_id.is_none() {
-            if self.playback_position() <= 3. {
+            if self.playback_position() <= PREVIOUS_RESTART_SECONDS {
                 self.library.queue.previous();
             }
             self.follow_queue_selection(playback, cx);
             return;
         }
-        if self.playback_position() > 3. {
+        if self.playback_position() > PREVIOUS_RESTART_SECONDS {
             self.seek_current(0., cx);
         } else if self.library.queue.previous() {
             self.follow_queue_selection(playback, cx);
