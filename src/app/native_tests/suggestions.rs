@@ -273,6 +273,10 @@ fn related_playlist_cards_open_the_rendered_collection() -> Result<()> {
                 window
                     .update(cx, |view, _, cx| {
                         let carousel = &view.shelf_scroll[&view.page.shelves.len()];
+                        let row =
+                            view.list_rows.len() - 1 + usize::from(view.detail_list.inline_header);
+                        let bounds = view.detail_list.state.bounds_for_item(row).unwrap();
+                        assert!(carousel.bounds().size.width <= bounds.size.width + px(8.));
                         assert!(carousel.max_offset().x > px(40.));
                         carousel.set_offset(point(px(-40.), px(0.)));
                         view.refresh_suggestions(cx);

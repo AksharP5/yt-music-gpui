@@ -128,7 +128,8 @@ impl Music {
             .all(|item| matches!(item, Item::Navigation(_)));
         let page = self.page_layout(window);
         let album = matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"));
-        let available = if album && page.tier >= Tier::Wide {
+        let related = index >= self.page.shelves.len();
+        let available = if (album || related) && page.tier >= Tier::Wide {
             page.collection_columns().1
         } else {
             page.column
