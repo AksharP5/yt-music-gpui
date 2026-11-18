@@ -879,16 +879,19 @@ impl Music {
             self.play_current_resuming(playback.is_paused(), WatchMode::Details, cx);
             return;
         }
-        self.duration = self
-            .library
-            .queue
-            .current()
-            .and_then(|track| track.duration)
-            .unwrap_or(0) as f64;
+        self.duration = self.selected_track_duration();
         self.stop_playback(cx);
         self.refresh_current_account(cx);
         self.prefetch_queue(cx);
         self.save();
+    }
+
+    fn selected_track_duration(&self) -> f64 {
+        self.library
+            .queue
+            .current()
+            .and_then(|track| track.duration)
+            .unwrap_or(0) as f64
     }
 
     pub(in crate::app) fn enqueue(&mut self, track: Track, cx: &mut Context<Self>) {
@@ -916,9 +919,12 @@ impl Music {
             .map_or(self.playback, |intent| intent.playback);
         let unloaded_next =
             self.library.queue.incomplete && index + 1 == self.library.queue.tracks.len();
-        if self.library.queue.remove(index) {
+        if self.library.queue.index == Some(index) && self.library.queue.current().is_some() {
             self.stop_playback(cx);
+        }
+        if self.library.queue.remove(index) {
             if unloaded_next {
+                self.duration = self.selected_track_duration();
                 self.advance_queue(
                     QueueAdvance {
                         natural: false,
