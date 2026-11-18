@@ -1,11 +1,11 @@
 use super::{
     CatalogRequests, CatalogTarget, DetailList, Playback, Query, QueueUpdate,
-    acknowledge_song_change, adopt_watch_queue, apply_track_details, playlist_move_down,
+    acknowledge_song_change, adopt_watch_queue, apply_track_details, playlist_move_targets,
     visible_cards,
 };
 use crate::{
     account::Mutation,
-    catalog::{Rating, Track},
+    catalog::{BrowseLink, Item, Rating, Track},
     library::Queue,
     watch::Watch,
 };
@@ -351,27 +351,44 @@ fn acknowledged_library_changes_update_both_visible_copies_without_a_queue_match
 }
 
 #[test]
-fn moving_down_requires_the_successor_or_a_confirmed_playlist_end() {
-    let mut tracks: Vec<Track> = ["first", "second", "third"]
-        .into_iter()
-        .map(|occurrence| {
-            let mut track: Track = serde_json::from_value(serde_json::json!({
-                "id": "abcdefghijk", "title": "Repeated song", "artist": "Artist"
-            }))
-            .unwrap();
-            track.details.set_video_id = Some(occurrence.into());
-            track
-        })
-        .collect();
+fn playlist_move_targets_use_occurrences_and_respect_the_loaded_boundary() {
+    let track = |occurrence: Option<&str>| {
+        let mut track: Track = serde_json::from_value(serde_json::json!({
+            "id": "abcdefghijk", "title": "Repeated song", "artist": "Artist"
+        }))
+        .unwrap();
+        track.details.set_video_id = occurrence.map(str::to_owned);
+        Item::Track(track)
+    };
+    let more = || Item::Navigation(BrowseLink::new("VLrelated", "Related"));
+    let mut rows = [
+        track(Some("first")),
+        more(),
+        track(Some("second")),
+        more(),
+        track(Some("third")),
+        more(),
+    ];
     assert_eq!(
-        playlist_move_down(&tracks, 0, true),
-        Some(Some("third".into()))
+        playlist_move_targets(&rows, 0, true),
+        [None, Some(Some("third"))]
     );
-    assert_eq!(playlist_move_down(&tracks, 1, true), None);
-    assert_eq!(playlist_move_down(&tracks, 1, false), Some(None));
-    assert_eq!(playlist_move_down(&tracks, 2, false), None);
-    tracks[2].details.set_video_id = None;
-    assert_eq!(playlist_move_down(&tracks, 0, false), None);
+    assert_eq!(
+        playlist_move_targets(&rows, 2, true),
+        [Some(Some("first")), None]
+    );
+    assert_eq!(
+        playlist_move_targets(&rows, 2, false),
+        [Some(Some("first")), Some(None)]
+    );
+    assert_eq!(
+        playlist_move_targets(&rows, 4, false),
+        [Some(Some("second")), None]
+    );
+    assert_eq!(playlist_move_targets(&rows, 5, false), [None, None]);
+
+    rows[4] = track(None);
+    assert_eq!(playlist_move_targets(&rows, 0, false), [None, None]);
 }
 
 #[test]

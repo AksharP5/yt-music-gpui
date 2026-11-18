@@ -868,7 +868,7 @@ impl Music {
                         },
                     ));
                 }
-                if index.is_some()
+                if let Some(index) = index
                     && self.page.editable
                     && let Route::Browse(link) = &self.route
                     && let Some(set_id) = &track.details.set_video_id
@@ -892,48 +892,27 @@ impl Music {
                             );
                         },
                     ));
-                    if let Some(index) = index.and_then(|index| self.page.track_index(index)) {
-                        let tracks = self.page.tracks();
-                        for (key, label, before) in [
-                            (
-                                "menu-move-up",
-                                "Move up",
-                                index
-                                    .checked_sub(1)
-                                    .and_then(|i| tracks.get(i))
-                                    .and_then(|track| track.details.set_video_id.clone())
-                                    .map(Some),
-                            ),
-                            (
-                                "menu-move-down",
-                                "Move down",
-                                playlist_move_down(
-                                    &tracks,
-                                    index,
-                                    self.page.continuation.is_some(),
-                                ),
-                            ),
-                        ] {
-                            if let Some(before) = before {
-                                let playlist = link.id.clone();
-                                let set = set_id.clone();
-                                actions.push(self.menu_action(
-                                    key,
-                                    label,
-                                    cx,
-                                    move |view, _, cx| {
-                                        view.overlay = None;
-                                        view.mutate(
-                                            Mutation::MoveInPlaylist {
-                                                id: playlist.clone(),
-                                                set_video_id: set.clone(),
-                                                before: before.clone(),
-                                            },
-                                            cx,
-                                        );
+                    let [up, down] =
+                        playlist_move_targets(&self.rows, *index, self.page.continuation.is_some());
+                    for (key, label, before) in [
+                        ("menu-move-up", "Move up", up),
+                        ("menu-move-down", "Move down", down),
+                    ] {
+                        if let Some(before) = before {
+                            let before = before.map(str::to_owned);
+                            let playlist = link.id.clone();
+                            let set = set_id.clone();
+                            actions.push(self.menu_action(key, label, cx, move |view, _, cx| {
+                                view.overlay = None;
+                                view.mutate(
+                                    Mutation::MoveInPlaylist {
+                                        id: playlist.clone(),
+                                        set_video_id: set.clone(),
+                                        before: before.clone(),
                                     },
-                                ));
-                            }
+                                    cx,
+                                );
+                            }));
                         }
                     }
                 }
@@ -1600,17 +1579,34 @@ fn menu_origin(
     point(x, y)
 }
 
-pub(in crate::app) fn playlist_move_down(
-    tracks: &[Track],
+pub(in crate::app) fn playlist_move_targets(
+    rows: &[Item],
     index: usize,
     has_more: bool,
-) -> Option<Option<String>> {
-    tracks.get(index + 1)?;
-    match tracks.get(index + 2) {
-        Some(successor) => successor.details.set_video_id.clone().map(Some),
-        None if !has_more => Some(None),
-        None => None,
+) -> [Option<Option<&str>>; 2] {
+    let Some((before, [Item::Track(_), after @ ..])) = rows.split_at_checked(index) else {
+        return [None, None];
+    };
+    fn track(item: &Item) -> Option<&Track> {
+        match item {
+            Item::Track(track) => Some(track),
+            _ => None,
+        }
     }
+
+    let up = before
+        .iter()
+        .rev()
+        .find_map(track)
+        .and_then(|track| track.details.set_video_id.as_deref())
+        .map(Some);
+    let mut following = after.iter().filter_map(track);
+    let down = match (following.next(), following.next()) {
+        (Some(_), Some(successor)) => successor.details.set_video_id.as_deref().map(Some),
+        (Some(_), None) if !has_more => Some(None),
+        _ => None,
+    };
+    [up, down]
 }
 
 #[cfg(test)]
