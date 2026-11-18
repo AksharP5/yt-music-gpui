@@ -221,12 +221,12 @@ impl Music {
                 )
             })
             .when(
-                (ready || self.account_operation.is_none()) && self.error.is_some(),
+                ready || (self.account_operation.is_none() && self.error.is_some()),
                 |body| {
                     body.child(
                         div().mt(px(24.)).flex().justify_end().child(
                             div()
-                                .id("retry-sign-in")
+                                .id("check-sign-in")
                                 .keyboard_control(self.theme)
                                 .px(px(16.))
                                 .h(px(36.))
@@ -236,7 +236,11 @@ impl Music {
                                 .bg(self.theme.text)
                                 .text_color(self.theme.bg)
                                 .cursor_pointer()
-                                .child("Try again")
+                                .child(if self.error.is_some() {
+                                    "Try again"
+                                } else {
+                                    "Check sign-in"
+                                })
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.connect_account(window, cx)
                                 })),
