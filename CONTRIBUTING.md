@@ -111,7 +111,7 @@ Artist Shuffle and Mix starts retain the queue's independently issued toggle act
 
 MPRIS Shuffle uses the same album, playlist or artist source as the player bar. Repeated requests for the same pending order do not reload it, and a rapid on/off pair keeps the last request. `desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests` checks these commands in a native window. Queues without a reversible collection source still reject enabling persistent shuffle through MPRIS.
 
-`desktop_metadata_follows_stopped_queue_selection` presses J and K in a native window and checks the selected song and its duration through a private D-Bus service, including a song without a known duration. It also switches between Song and Video and checks each version’s duration while playback stays stopped.
+`desktop_metadata_follows_stopped_queue_selection` presses J and K in a native window and checks the selected song and its duration through a private D-Bus service, including a song without a known duration. A second native check removes the last loaded song in a partial queue and verifies that the desktop sees the selected song and its duration both while waiting and after more songs arrive. It also switches between Song and Video and checks each version’s duration while playback stays stopped.
 
 `account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 

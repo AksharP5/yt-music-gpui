@@ -177,6 +177,83 @@ async fn start_test_desktop_controls(
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
+fn removing_the_last_loaded_song_updates_desktop_metadata_while_loading_more() -> Result<()> {
+    use crate::catalog::Item;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let connection = start_test_desktop_controls(window, cx).await;
+        let (source, events) = crate::queue_source::Worker::with_page_loader(|| {
+            let mut tail = continuation_page(2..3, None);
+            let Item::Track(track) = &mut tail.shelves[0].items[0] else {
+                panic!("Expected one song in the continuation");
+            };
+            track.duration = Some(64);
+            Ok(tail)
+        });
+        window
+            .update(cx, move |view, _, _| {
+                view.account = None;
+                view.account_operation = None;
+                view.library.autoplay = false;
+                view.queue_source = source;
+                view.queue_source.replace_queue(
+                    &mut view.library.queue,
+                    &continuation_page(0..2, Some("tail")),
+                    1,
+                    PageRequest::Browse,
+                    None,
+                );
+                let tracks = view.library.queue.tracks_mut();
+                tracks[0].duration = Some(83);
+                tracks[1].duration = Some(232);
+                view.duration = 232.;
+                view.publish_desktop();
+            })
+            .unwrap();
+
+        let player = zbus::blocking::proxy::Builder::<zbus::blocking::Proxy<'_>>::new(&connection)
+            .destination(DESKTOP_PLAYER_NAME)
+            .unwrap()
+            .path("/org/mpris/MediaPlayer2")
+            .unwrap()
+            .interface("org.mpris.MediaPlayer2.Player")
+            .unwrap()
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .unwrap();
+        let current = || {
+            let metadata: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+                player.get_property("Metadata").unwrap();
+            (
+                <&str>::try_from(&metadata["xesam:title"])
+                    .unwrap()
+                    .to_owned(),
+                i64::try_from(&metadata["mpris:length"]).unwrap(),
+            )
+        };
+        assert_eq!(current(), ("Song 2".into(), 232_000_000));
+        window
+            .update(cx, |view, _, cx| {
+                view.remove_queue_track(1, cx);
+                assert!(view.queue_waiting.is_some());
+            })
+            .unwrap();
+        assert_eq!(current(), ("Song 1".into(), 83_000_000));
+
+        let event = events.recv().await.unwrap();
+        window
+            .update(cx, move |view, _, cx| {
+                view.queue_source_result(event, cx);
+                assert_eq!(view.playback, Playback::Stopped);
+            })
+            .unwrap();
+        assert_eq!(current(), ("Song 3".into(), 64_000_000));
+    })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
 fn desktop_metadata_follows_stopped_queue_selection() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         let connection = start_test_desktop_controls(window, cx).await;
