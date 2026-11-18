@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use std::ops::Range;
 
 pub(crate) const LIKED_MUSIC_ART: &str =
     "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-songs-delhi-192.png";
@@ -38,6 +39,47 @@ pub(crate) struct Choices {
     pub empty: Option<Empty>,
 }
 
+pub(crate) enum ChoiceList<'a> {
+    Server(&'a Choices),
+    Library {
+        playlists: &'a [Collection],
+        tracks: &'a [Track],
+    },
+}
+
+impl ChoiceList<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Server(choices) => choices.destinations.len(),
+            Self::Library { playlists, tracks } => provisional(playlists, tracks).count(),
+        }
+    }
+
+    pub fn empty_message(&self) -> Option<&Empty> {
+        match self {
+            Self::Server(choices) => choices.empty.as_ref(),
+            Self::Library { .. } => None,
+        }
+    }
+
+    pub fn rows(&self, range: Range<usize>) -> Vec<Choice> {
+        match self {
+            Self::Server(choices) => choices
+                .destinations
+                .iter()
+                .skip(range.start)
+                .take(range.len())
+                .cloned()
+                .collect(),
+            Self::Library { playlists, tracks } => provisional(playlists, tracks)
+                .skip(range.start)
+                .take(range.len())
+                .map(Choice::from)
+                .collect(),
+        }
+    }
+}
+
 impl Catalog {
     pub(crate) fn playlist_choices(&self, video_ids: &[String]) -> Result<Choices> {
         ensure!(self.session.is_some(), "Sign in to load your playlists");
@@ -64,36 +106,49 @@ fn playlist_id(id: &str) -> Option<&str> {
     .then_some(id)
 }
 
-pub(crate) fn provisional(playlists: &[Collection], tracks: &[Track]) -> Choices {
-    let mut destinations = Vec::new();
-    if matches!(tracks, [track] if track.details.episode.is_none()) {
-        destinations.push(Choice {
-            target: Destination::LikedMusic,
-            title: "Liked Music".into(),
-            byline: String::new(),
-            thumbnail: Some(LIKED_MUSIC_ART.into()),
-            privacy: None,
-            pinned: false,
-        });
-    }
-    destinations.extend(playlists.iter().filter_map(|playlist| {
-        if !playlist.details.editable {
-            return None;
+enum ProvisionalChoice<'a> {
+    LikedMusic,
+    Playlist(&'a Collection, &'a str),
+}
+
+impl From<ProvisionalChoice<'_>> for Choice {
+    fn from(row: ProvisionalChoice<'_>) -> Self {
+        match row {
+            ProvisionalChoice::LikedMusic => Self {
+                target: Destination::LikedMusic,
+                title: "Liked Music".into(),
+                byline: String::new(),
+                thumbnail: Some(LIKED_MUSIC_ART.into()),
+                privacy: None,
+                pinned: false,
+            },
+            ProvisionalChoice::Playlist(playlist, id) => Self {
+                target: Destination::Playlist(id.into()),
+                title: playlist.title.clone(),
+                byline: playlist.subtitle.clone(),
+                thumbnail: playlist.thumbnail.clone(),
+                privacy: None,
+                pinned: false,
+            },
         }
-        let id = playlist_id(&playlist.id).filter(|id| *id != "LM")?;
-        Some(Choice {
-            target: Destination::Playlist(id.into()),
-            title: playlist.title.clone(),
-            byline: playlist.subtitle.clone(),
-            thumbnail: playlist.thumbnail.clone(),
-            privacy: None,
-            pinned: false,
-        })
-    }));
-    Choices {
-        destinations,
-        empty: None,
     }
+}
+
+fn provisional<'a>(
+    playlists: &'a [Collection],
+    tracks: &[Track],
+) -> impl Iterator<Item = ProvisionalChoice<'a>> + use<'a> {
+    let liked = matches!(tracks, [track] if track.details.episode.is_none())
+        .then_some(ProvisionalChoice::LikedMusic);
+    liked.into_iter().chain(
+        playlists
+            .iter()
+            .filter(|playlist| playlist.details.editable)
+            .filter_map(|playlist| {
+                let id = playlist_id(&playlist.id).filter(|id| *id != "LM")?;
+                Some(ProvisionalChoice::Playlist(playlist, id))
+            }),
+    )
 }
 
 pub(crate) fn parse(response: &Value, video_ids: &[String]) -> Result<Choices> {
@@ -215,17 +270,46 @@ mod tests {
             "id":"abcdefghijk", "title":"A song", "artist":"An artist"
         }))
         .unwrap();
-        let choices = provisional(&[], &[song.clone()]);
-        assert_eq!(choices.destinations[0].target, Destination::LikedMusic);
-        assert!(choices.destinations[0].byline.is_empty());
-        assert!(!choices.destinations[0].pinned);
+        let choice = Choice::from(provisional(&[], &[song.clone()]).next().unwrap());
+        assert_eq!(choice.target, Destination::LikedMusic);
+        assert!(choice.byline.is_empty());
+        assert!(!choice.pinned);
         assert!(
             provisional(&[], &[song.clone(), song.clone()])
-                .destinations
-                .is_empty()
+                .next()
+                .is_none()
         );
         song.details.episode = Some(Box::default());
-        assert!(provisional(&[], &[song]).destinations.is_empty());
+        assert!(provisional(&[], &[song]).next().is_none());
+    }
+
+    #[test]
+    fn provisional_ranges_count_only_editable_destinations() {
+        let playlist = |id: &str, editable| Collection {
+            id: id.into(),
+            title: id.into(),
+            subtitle: String::new(),
+            thumbnail: None,
+            details: crate::catalog::CollectionDetails {
+                editable,
+                ..Default::default()
+            },
+        };
+        let playlists = [
+            playlist("VLfirst", true),
+            playlist("VLnot-editable", false),
+            playlist("VL/invalid", true),
+            playlist("VLLM", true),
+            playlist("VLlast", true),
+        ];
+        let choices = ChoiceList::Library {
+            playlists: &playlists,
+            tracks: &[],
+        };
+        assert_eq!(choices.len(), 2);
+        let rows = choices.rows(1..3);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, Destination::Playlist("last".into()));
     }
 
     #[test]

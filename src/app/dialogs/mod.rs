@@ -4,8 +4,7 @@ pub(in crate::app) mod account;
 pub(in crate::app) mod settings;
 
 use super::*;
-use crate::playlist_choices::{self, Choices, Destination};
-use std::borrow::Cow;
+use crate::playlist_choices::{ChoiceList, Destination};
 
 // Music holds a single overlay, so the inline song in `Track` costs nothing worth a box.
 #[allow(clippy::large_enum_variant)]
@@ -150,18 +149,18 @@ impl Music {
         self.request(Query::PlaylistChoices(video_ids), cx);
     }
 
-    pub(in crate::app) fn playlist_picker_choices(&self) -> Cow<'_, Choices> {
+    pub(in crate::app) fn playlist_picker_choices(&self) -> ChoiceList<'_> {
         if let Some(choices) = &self.catalog_requests.playlist_choices {
-            return Cow::Borrowed(choices);
+            return ChoiceList::Server(choices);
         }
         let tracks = match &self.overlay {
             Some(Overlay::PlaylistPicker { tracks, .. }) => tracks.as_slice(),
             _ => &[],
         };
-        Cow::Owned(playlist_choices::provisional(
-            &self.sidebar_playlists,
+        ChoiceList::Library {
+            playlists: &self.sidebar_playlists,
             tracks,
-        ))
+        }
     }
 
     /// The covers the Save to playlist dialog shows first, warmed while its menu is open.
@@ -1201,7 +1200,7 @@ impl Music {
             _ => None,
         };
         let choices = self.playlist_picker_choices();
-        let count = choices.destinations.len();
+        let count = choices.len();
         let viewport: f32 = window.viewport_size().height.into();
         let list_height = (count as f32 * PICKER_ROW + PICKER_LIST_TOP)
             .min((viewport * 0.75 - PICKER_HEADING - PICKER_FOOTER).max(0.));
@@ -1260,21 +1259,13 @@ impl Music {
                         "playlist-choices",
                         count,
                         cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
-                            let choices = {
-                                let choices = view.playlist_picker_choices();
-                                range
-                                    .filter_map(|index| {
-                                        choices
-                                            .destinations
-                                            .get(index)
-                                            .cloned()
-                                            .map(|choice| (index, choice))
-                                    })
-                                    .collect::<Vec<_>>()
-                            };
+                            let start = range.start;
+                            let choices = view.playlist_picker_choices().rows(range);
                             choices
                                 .into_iter()
-                                .map(|(index, choice)| {
+                                .enumerate()
+                                .map(|(offset, choice)| {
+                                    let index = start + offset;
                                     let cover = choice.thumbnail.as_deref().and_then(|url| {
                                         view.artwork
                                             .get(url, size(px(PICKER_COVER), px(PICKER_COVER)))
@@ -1400,7 +1391,7 @@ impl Music {
                     .min_h_0()
                     .pt(px(PICKER_LIST_TOP)),
                 );
-        } else if let Some(empty) = &choices.empty {
+        } else if let Some(empty) = choices.empty_message() {
             body = body.child(
                 div()
                     .px(px(24.))
