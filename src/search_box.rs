@@ -1,4 +1,5 @@
 use crate::{
+    app::HEADER_HEIGHT,
     auth::{self, Session},
     catalog::{Catalog, Item},
     input::{InputEvent, SearchInput},
@@ -51,6 +52,7 @@ pub struct SearchBox {
     input: Entity<SearchInput>,
     session: Option<Arc<Session>>,
     suggestions: Vec<Suggestion>,
+    suggestion_scroll: ScrollHandle,
     /// The row reached with the arrow keys. Enter opens it instead of the typed text;
     /// the pointer only highlights rows, like the web.
     selected: Option<usize>,
@@ -111,6 +113,7 @@ impl SearchBox {
             input,
             session: None,
             suggestions: Vec::new(),
+            suggestion_scroll: ScrollHandle::new(),
             selected: None,
             artwork: None,
             error,
@@ -213,6 +216,9 @@ impl SearchBox {
     fn invalidate(&mut self, cx: &mut Context<Self>) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.debounce = None;
+        if !self.suggestions.is_empty() || self.error.is_some() {
+            self.suggestion_scroll = ScrollHandle::new();
+        }
         self.suggestions.clear();
         self.selected = None;
         self.error = None;
@@ -436,16 +442,17 @@ impl SearchBox {
         if self.suggestions.is_empty() || event.keystroke.modifiers.modified() {
             return;
         }
-        self.selected = match event.keystroke.key.as_str() {
-            "down" => Some(
-                self.selected
-                    .map_or(0, |index| (index + 1) % self.suggestions.len()),
-            ),
-            "up" => Some(self.selected.map_or(self.suggestions.len() - 1, |index| {
+        let index = match event.keystroke.key.as_str() {
+            "down" => self
+                .selected
+                .map_or(0, |index| (index + 1) % self.suggestions.len()),
+            "up" => self.selected.map_or(self.suggestions.len() - 1, |index| {
                 (index + self.suggestions.len() - 1) % self.suggestions.len()
-            })),
+            }),
             _ => return,
         };
+        self.selected = Some(index);
+        self.suggestion_scroll.scroll_to_item(index);
         cx.stop_propagation();
         cx.notify();
     }
@@ -533,6 +540,10 @@ impl Render for SearchBox {
                 .top(px(HEIGHT - 2.))
                 .left(px(-1.))
                 .right(px(-1.))
+                // The dropdown starts within the header, leaving a bottom inset.
+                .max_h((window.viewport_size().height - px(HEADER_HEIGHT)).max(px(0.)))
+                .overflow_y_scroll()
+                .track_scroll(&self.suggestion_scroll)
                 .py(px(8.))
                 .rounded_b(px(8.))
                 .bg(rgb(0x030303))

@@ -77,7 +77,7 @@ impl Music {
         };
         // Only an expanded, unscrolled guide has its own header background.
         div()
-            .h(px(64.))
+            .h(px(HEADER_HEIGHT))
             .w_full()
             .flex_shrink_0()
             .relative()
