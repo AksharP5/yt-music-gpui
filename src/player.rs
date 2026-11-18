@@ -192,6 +192,7 @@ pub struct PlayOptions {
 
 pub struct PlayerOptions {
     pub credentials: Option<PlaybackCredentials>,
+    pub check_account_at_startup: bool,
     pub volume: f64,
     pub speed: PlaybackSpeed,
     pub audio_output: Option<String>,
@@ -201,6 +202,7 @@ impl Default for PlayerOptions {
     fn default() -> Self {
         Self {
             credentials: None,
+            check_account_at_startup: false,
             volume: 60.,
             speed: PlaybackSpeed::default(),
             audio_output: None,
@@ -1072,11 +1074,11 @@ fn account_playback_supported(ytdlp: &Path) -> bool {
 
 fn account_credentials(
     source: Option<PlaybackCredentials>,
-    supported: bool,
+    supported: impl FnOnce() -> bool,
     warned: bool,
     notice: &mut Option<String>,
 ) -> Option<PlaybackCredentials> {
-    if supported || source.is_none() {
+    if source.is_none() || supported() {
         *notice = None;
         return source;
     }
@@ -1952,12 +1954,16 @@ fn run(
     let runtime = playback_runtime(&private_runtime()?)?;
     let socket_path = ipc_path(runtime.path())?;
     let plugin_dir = write_account_extractor(runtime.path())?;
-    let account_supported = account_playback_supported(ytdlp);
+    let mut account_supported = options
+        .check_account_at_startup
+        .then(|| account_playback_supported(ytdlp));
+    let mut supports_account =
+        || *account_supported.get_or_insert_with(|| account_playback_supported(ytdlp));
     let mut account_warned = false;
     let mut account_notice = None;
     let mut credentials = account_credentials(
         options.credentials.take(),
-        account_supported,
+        &mut supports_account,
         account_warned,
         &mut account_notice,
     )
@@ -2140,7 +2146,7 @@ fn run(
                     state.upcoming = None;
                     let next = account_credentials(
                         next,
-                        account_supported,
+                        &mut supports_account,
                         account_warned,
                         &mut account_notice,
                     );
@@ -3020,7 +3026,7 @@ mod tests {
             assert!(
                 account_credentials(
                     Some(synthetic_credentials("INVENTED")),
-                    false,
+                    || false,
                     false,
                     &mut notice
                 )
@@ -3036,7 +3042,7 @@ mod tests {
         assert!(
             account_credentials(
                 Some(synthetic_credentials("INVENTED")),
-                false,
+                || false,
                 true,
                 &mut notice
             )
@@ -3049,7 +3055,7 @@ mod tests {
         assert!(
             account_credentials(
                 Some(synthetic_credentials("INVENTED")),
-                true,
+                || true,
                 false,
                 &mut notice
             )
@@ -3057,11 +3063,16 @@ mod tests {
         );
         account_credentials(
             Some(synthetic_credentials("INVENTED")),
-            false,
+            || false,
             false,
             &mut notice,
         );
-        account_credentials(None, false, false, &mut notice);
+        account_credentials(
+            None,
+            || panic!("sign-out must not probe account support"),
+            false,
+            &mut notice,
+        );
         assert!(
             notice.is_none(),
             "sign-out must cancel an undisplayed account notice"
@@ -5966,6 +5977,76 @@ os.kill(os.getpid(), signal.SIGSTOP)
             if trial == 1 {
                 measure("playing");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires libmpv and a synthetic local extractor, no network or audio output"]
+    fn playback_checks_the_account_version_once_when_needed() {
+        for check_account_at_startup in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let extractor = directory.path().join("extractor");
+            let probes = directory.path().join("version-probes");
+            let script = format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "[ \"$3\" = --version ] || exit 1\n",
+                    "echo probe >> \"$(dirname \"$0\")/version-probes\"\n",
+                    "echo {}\n",
+                ),
+                REVIEWED_YTDLP,
+            );
+            fs::write(&extractor, script).unwrap();
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = silent_audio(directory.path(), 10);
+            let player = Player::with_extractor(
+                PlayerOptions {
+                    check_account_at_startup,
+                    volume: 0.,
+                    audio_output: Some("null".into()),
+                    ..Default::default()
+                },
+                extractor,
+            )
+            .unwrap();
+            let id = player
+                .play_url(
+                    path.to_string_lossy().into_owned(),
+                    "Synthetic guest",
+                    PlayOptions::default(),
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(Instant::now() < deadline, "Guest playback did not advance");
+                match player.try_recv() {
+                    Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                    Some(PlayerEvent::Position { track_id, seconds })
+                        if track_id == id && seconds > 0. =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            assert_eq!(probes.exists(), check_account_at_startup);
+            for value in ["INVENTED_FIRST", "INVENTED_SECOND"] {
+                player
+                    .set_credentials(synthetic_credentials(value))
+                    .unwrap()
+                    .recv_blocking()
+                    .unwrap()
+                    .unwrap();
+                player
+                    .clear_credentials()
+                    .unwrap()
+                    .recv_blocking()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(fs::read_to_string(probes).unwrap(), "probe\n");
         }
     }
 

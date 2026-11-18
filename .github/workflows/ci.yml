@@ -29,7 +29,10 @@ jobs:
       - run: bin/test-install
       # Ubuntu 24.04 ships the oldest libmpv the packages accept (0.37).
       - name: Play through the distro libmpv
-        run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
+        run: >-
+          bin/test -- --ignored --exact
+          player::tests::plays_with_the_installed_libmpv
+          player::tests::playback_checks_the_account_version_once_when_needed
       - uses: actions/setup-python@v7
         id: python
         with:

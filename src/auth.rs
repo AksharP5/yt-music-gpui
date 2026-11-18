@@ -159,6 +159,13 @@ struct Cookie {
 }
 
 impl Session {
+    /// A saved account usually has a keyring marker or a private session file.
+    pub(crate) fn has_saved_account() -> bool {
+        crate::dirs::data().is_some_and(|directory| {
+            directory.join(MARKER).is_file() || directory.join(SESSION_FILE).is_file()
+        })
+    }
+
     /// Called on the account worker. The OS keyring may ask the user to unlock it.
     pub fn load(operation: &Operation) -> Result<Option<Self>> {
         let mut command = Command::new("/usr/bin/secret-tool");
