@@ -9,8 +9,10 @@ pub(super) struct Suggestions {
     pub tracks: Vec<PlaylistSuggestion>,
     reload: Option<Continuation>,
     pub related: Vec<Shelf>,
+    pub(super) related_scroll: HashMap<usize, ScrollHandle>,
     pub error: Option<String>,
     pub(super) focus: VirtualListFocus,
+    pub(super) refresh_focus: FocusHandle,
     auto_reload_when_empty: bool,
     added_during_read: HashSet<String>,
 }
@@ -55,8 +57,6 @@ impl Music {
         self.catalog_requests.cancel(CatalogTarget::Suggestions);
         if self.suggestions.take().is_some() {
             self.shelf_heights.truncate(self.page.shelves.len());
-            self.shelf_scroll
-                .retain(|index, _| *index < self.page.shelves.len());
             self.refresh_suggestion_rows();
         }
     }
@@ -89,8 +89,10 @@ impl Music {
             tracks: Vec::new(),
             reload: None,
             related: Vec::new(),
+            related_scroll: HashMap::new(),
             error: None,
             focus: VirtualListFocus::default(),
+            refresh_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             auto_reload_when_empty: false,
             added_during_read: HashSet::new(),
         });
@@ -122,6 +124,7 @@ impl Music {
     pub(super) fn suggestions_result(
         &mut self,
         response: SuggestionsResult,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         let Query::PlaylistSuggestions { playlist, .. } = &response.job.query else {
@@ -159,6 +162,7 @@ impl Music {
                     suggestions.auto_reload_when_empty = batch.auto_reload_when_empty;
                     if let Some(related) = batch.related {
                         suggestions.related = related;
+                        suggestions.related_scroll.clear();
                         self.shelf_heights.truncate(self.page.shelves.len());
                     }
                     suggestions.error = None;
@@ -168,6 +172,11 @@ impl Music {
             suggestions.added_during_read.clear();
         }
         self.refresh_suggestion_rows();
+        if let Some(suggestions) = &self.suggestions
+            && suggestions.refresh_focus.is_focused(window)
+        {
+            self.reveal_suggestion_control(None);
+        }
         cx.notify();
     }
 
@@ -334,13 +343,10 @@ impl Music {
 
     pub(super) fn suggestions_footer(&mut self, inset: f32, cx: &Context<Self>) -> AnyElement {
         let loading = self.catalog_requests.is_loading(CatalogTarget::Suggestions);
-        let Some(suggestions) = &mut self.suggestions else {
+        let Some(suggestions) = &self.suggestions else {
             return div().into_any_element();
         };
-        let focus = suggestions
-            .focus
-            .handle(suggestions.tracks.len() * 2, cx)
-            .tab_stop(!loading);
+        let focus = suggestions.refresh_focus.clone().tab_stop(!loading);
         let error = suggestions.error.clone();
         div()
             .w_full()
@@ -387,8 +393,12 @@ impl Music {
         let Some(suggestions) = &self.suggestions else {
             return false;
         };
-        let count = suggestions.tracks.len() * 2 + 1;
-        let Some(control) = suggestions.focus.focused(window) else {
+        let refresh = suggestions.tracks.len() * 2;
+        let control = if suggestions.refresh_focus.is_focused(window) {
+            refresh
+        } else if let Some(control) = suggestions.focus.focused(window) {
+            control
+        } else {
             return false;
         };
         let next = if reverse {
@@ -396,15 +406,25 @@ impl Music {
                 .rev()
                 .find(|index| self.suggestion_control_enabled(*index))
         } else {
-            (control + 1..count).find(|index| self.suggestion_control_enabled(*index))
+            (control + 1..=refresh).find(|index| self.suggestion_control_enabled(*index))
         };
         let Some(control) = next else { return false };
         if let Some(suggestions) = &mut self.suggestions {
-            suggestions.focus.focus(control, window, cx);
+            if control == refresh {
+                window.focus(&suggestions.refresh_focus, cx);
+            } else {
+                suggestions.focus.focus(control, window, cx);
+            }
         }
+        self.reveal_suggestion_control((control != refresh).then_some(control / 2));
+        cx.notify();
+        true
+    }
+
+    fn reveal_suggestion_control(&self, track: Option<usize>) {
         let row = self.list_rows.iter().rposition(|row| match row {
-            ListRow::Suggestion(index) => control / 2 == *index && control + 1 < count,
-            ListRow::SuggestionsFooter => control + 1 == count,
+            ListRow::Suggestion(index) => track == Some(*index),
+            ListRow::SuggestionsFooter => track.is_none(),
             _ => false,
         });
         if let Some(row) = row {
@@ -418,8 +438,6 @@ impl Music {
                 });
             }
         }
-        cx.notify();
-        true
     }
 
     fn suggestion_control_enabled(&self, control: usize) -> bool {

@@ -177,7 +177,13 @@ impl Music {
         } else {
             0.
         };
-        let scroll = self.shelf_scroll.entry(index).or_default().clone();
+        let scroll = if let Some(index) = index.checked_sub(self.page.shelves.len())
+            && let Some(suggestions) = &mut self.suggestions
+        {
+            suggestions.related_scroll.entry(index).or_default().clone()
+        } else {
+            self.shelf_scroll.entry(index).or_default().clone()
+        };
         let range = visible_cards(count, (-scroll.offset().x).into(), available, width + gap);
         let stride = width + gap;
         let overflows = count as f32 * stride - gap > available + 1.;

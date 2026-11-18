@@ -511,6 +511,7 @@ impl Music {
                 sort: active.sort.clone(),
             });
         }
+        self.clear_suggestions();
         if self.route != route {
             let cached = (!self.rows.is_empty()
                 || (!self.catalog_requests.is_loading(CatalogTarget::Page)
@@ -560,7 +561,6 @@ impl Music {
     }
 
     fn load_route(&mut self, route: Route, cached: Option<CachedPage>, cx: &mut Context<Self>) {
-        self.clear_suggestions();
         self.focus_after_navigation(cx);
         self.artwork.cancel_pending();
         self.player_open = false;
@@ -1265,12 +1265,14 @@ impl CatalogRequests {
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(result) = completed.recv().await {
                 if view
-                    .update_in(cx, |view, _, cx| match result {
+                    .update_in(cx, |view, window, cx| match result {
                         CatalogEvent::Page(result) => view.catalog_result(*result, cx),
                         CatalogEvent::PlaylistChoices(result) => {
                             view.playlist_choices_result(*result, cx)
                         }
-                        CatalogEvent::Suggestions(result) => view.suggestions_result(*result, cx),
+                        CatalogEvent::Suggestions(result) => {
+                            view.suggestions_result(*result, window, cx)
+                        }
                     })
                     .is_err()
                 {
