@@ -2631,3 +2631,95 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires an isolated X11 desktop and ImageMagick to read player panel frames"]
+fn player_tabs_stop_loading_when_track_details_fail() -> Result<()> {
+    use crate::app::playback::{PlaybackQuery, PlaybackResult, QueueUpdate};
+    use crate::watch::WatchMode;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let (jobs, submitted) = async_channel::bounded(1);
+        let song: crate::catalog::Track = serde_json::from_value(serde_json::json!({
+            "id": "dQw4w9WgXcQ", "title": "Synthetic song", "artist": "Synthetic artist"
+        }))
+        .unwrap();
+        window
+            .update(cx, |music, _, cx| {
+                music.account = None;
+                music.player_open = true;
+                music.library.queue.replace(vec![song.clone()], 0);
+                music.active_id = Some(1);
+                music.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                music.playback_jobs = jobs;
+                music.pending_playback_jobs = submitted.clone();
+                cx.notify();
+            })
+            .unwrap();
+
+        let mut unchanged = Vec::new();
+        for tab in [PlayerTab::Lyrics, PlayerTab::Comments, PlayerTab::Related] {
+            window
+                .update(cx, |music, _, cx| {
+                    music.select_player_tab(tab, cx);
+                    music.playback_request(
+                        PlaybackQuery::Watch {
+                            track: Box::new(song.clone()),
+                            mode: WatchMode::Details,
+                        },
+                        cx,
+                    );
+                })
+                .unwrap();
+            let job = submitted.try_recv().unwrap();
+            wait_for_presented_frame(window, cx).await;
+            let pending = window
+                .update(cx, |_, window, _| {
+                    capture(window, &format!("panel-{tab:?}-pending"))
+                })
+                .unwrap();
+
+            window
+                .update(cx, |music, _, cx| {
+                    music.playback_result(
+                        PlaybackResult::Watch {
+                            id: job.id,
+                            account_revision: job.account_revision,
+                            update: QueueUpdate::Preserve,
+                            collection: None,
+                            result: Err("Fixture watch read failed".into()),
+                            session_rejected: false,
+                        },
+                        cx,
+                    );
+                    assert!(music.watch_pending.is_none());
+                    assert_eq!(music.player_page.selected_tab(), tab);
+                    assert!(music.playback.is_paused());
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            let unavailable = window
+                .update(cx, |_, window, _| {
+                    capture(window, &format!("panel-{tab:?}-unavailable"))
+                })
+                .unwrap();
+
+            // The player panels occupy the rightmost third of this window. Compare
+            // directly below the tabs, away from the playback notice and controls.
+            let left = pending.width() * 2 / 3;
+            let content = |frame: &image::RgbaImage| {
+                image::imageops::crop_imm(frame, left, 155, frame.width() - left, 45).to_image()
+            };
+            if content(&pending) == content(&unavailable) {
+                unchanged.push(tab);
+            }
+        }
+        assert!(
+            unchanged.is_empty(),
+            "Panels still show Loading: {unchanged:?}"
+        );
+    })
+}

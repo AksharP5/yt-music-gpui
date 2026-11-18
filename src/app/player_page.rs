@@ -230,6 +230,10 @@ impl Music {
             .filter(|watch| watch.current.as_ref().is_some_and(|w| w.id == current.id))
     }
 
+    fn track_details_pending(&self) -> bool {
+        self.watch_pending.is_some() && self.current_watch().is_none()
+    }
+
     fn tab_source(&self, tab: PlayerTab) -> Option<String> {
         let watch = self.current_watch()?;
         match tab {
@@ -666,11 +670,10 @@ impl Music {
         let lyrics = match loaded.and_then(|loaded| loaded.result.as_ref()) {
             Some(Ok(SongText::Lyrics(lyrics))) => lyrics,
             Some(Err(error)) => return message(error),
-            Some(Ok(_)) => return message("Lyrics are not available for this song"),
-            None if self.current_watch().is_some() && loaded.is_none() => {
-                return message("Lyrics are not available for this song");
+            None if loaded.is_some() || self.track_details_pending() => {
+                return message("Loading…");
             }
-            None => return message("Loading…"),
+            Some(Ok(_)) | None => return message("Lyrics are not available for this song"),
         };
         div()
             .id(SharedString::from(format!(
@@ -702,8 +705,10 @@ impl Music {
         match loaded.and_then(|loaded| loaded.result.as_ref()) {
             Some(Ok(SongText::Related(_))) => {}
             Some(Err(error)) => return related_message(error.clone(), self.theme),
-            Some(Ok(_)) => return related_message("Nothing related yet".into(), self.theme),
-            None => return related_message("Loading…".into(), self.theme),
+            None if loaded.is_some() || self.track_details_pending() => {
+                return related_message("Loading…".into(), self.theme);
+            }
+            Some(Ok(_)) | None => return related_message("Nothing related yet".into(), self.theme),
         }
         list(
             self.player_page.related_list.clone(),
