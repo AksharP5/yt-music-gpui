@@ -1,4 +1,4 @@
-name: Ubuntu mirror comparison
+name: Ubuntu mirror setup validation
 
 on:
   workflow_dispatch:
@@ -7,23 +7,36 @@ permissions:
   contents: read
 
 jobs:
-  compare:
+  verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 6
+    timeout-minutes: 9
     steps:
-      - name: Compare downloads on this runner
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Exercise the observed EC2 mirror list
         shell: bash
         run: |
-          awk '/^URIs:/ {print}' /etc/apt/sources.list.d/ubuntu.sources
-          object=/ubuntu/dists/noble/main/binary-amd64/Packages.xz
-          for mirror in us-east-2.ec2.archive.ubuntu.com azure.archive.ubuntu.com azure.archive.ubuntu.com us-east-2.ec2.archive.ubuntu.com; do
-            metrics=$(curl --silent --show-error --fail --max-time 55 --output /dev/null \
-              --write-out '%{http_code} %{size_download} %{time_total} %{speed_download}' \
-              "http://${mirror}${object}") && result=0 || result=$?
-            printf '%s %s %s\n' "$mirror" "$result" "$metrics" | tee -a comparison.tsv
-          done
-          summary="$GITHUB_STEP_SUMMARY"
-          printf '| Mirror | Curl exit | HTTP | Bytes | Seconds | Bytes per second |\n| --- | ---: | ---: | ---: | ---: | ---: |\n' >> "$summary"
-          while read -r mirror result code bytes seconds speed; do
-            printf '| %s | %s | %s | %s | %s | %s |\n' "$mirror" "$result" "$code" "$bytes" "$seconds" "$speed" >> "$summary"
-          done < comparison.tsv
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test -f /etc/apt/apt-mirrors.txt
+          printf '%s\tpriority:%d\n' \
+            'http://us-east-2.ec2.archive.ubuntu.com/ubuntu/' 1 \
+            'https://archive.ubuntu.com/ubuntu/' 2 \
+            'https://security.ubuntu.com/ubuntu/' 3 \
+            | sudo tee /etc/apt/apt-mirrors.txt
+      - uses: ./.github/actions/setup
+        with:
+          cache: 'false'
+      - name: Verify installation and mirror order
+        shell: bash
+        run: |
+          mirror_list=$(cat /etc/apt/apt-mirrors.txt)
+          printf '%s\n' "$mirror_list"
+          expected=$(printf '%s\tpriority:%d\n' \
+            'http://azure.archive.ubuntu.com/ubuntu/' 1 \
+            'http://us-east-2.ec2.archive.ubuntu.com/ubuntu/' 4 \
+            'https://archive.ubuntu.com/ubuntu/' 2 \
+            'https://security.ubuntu.com/ubuntu/' 3)
+          test "$mirror_list" = "$expected"
+          pkg-config --exists mpv egl wayland-client x11 fontconfig
+          dpkg-query -W libmpv-dev libmpv2
