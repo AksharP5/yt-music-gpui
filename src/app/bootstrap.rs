@@ -338,6 +338,7 @@ impl Music {
             sidebar_error: None,
             sidebar_scroll: UniformListScrollHandle::new(),
             back: Vec::new(),
+            forward: Vec::new(),
             page_cache: VecDeque::new(),
             forward_page: Some(ForwardPage::new(0, 0, 0)),
             list_id: 0,

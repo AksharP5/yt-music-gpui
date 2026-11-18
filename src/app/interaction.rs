@@ -21,6 +21,7 @@ pub(in crate::app) const SHORTCUTS: &[(&str, &str)] = &[
     ("F", "Video fullscreen"),
     ("Ctrl R", "Reload the page"),
     ("Alt ← or mouse Back", "Back"),
+    ("Alt → or mouse Forward", "Forward"),
     (
         "Escape",
         "Close a dialog, fullscreen, the player page or search",
@@ -147,9 +148,14 @@ impl Music {
             && !modifiers.platform
             && !modifiers.function
             && !modifiers.shift
-            && key == "left"
+            && matches!(key, "left" | "right")
         {
-            self.go_back(cx);
+            let direction = if key == "left" {
+                NavigationDirection::Back
+            } else {
+                NavigationDirection::Forward
+            };
+            self.navigate_history(direction, cx);
             return;
         }
         if self.search.focus_handle(cx).is_focused(window) {

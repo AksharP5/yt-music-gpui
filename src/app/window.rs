@@ -207,13 +207,14 @@ impl Render for Music {
                     view.drag_to(event.position, cx);
                 }
             }))
-            // The mouse's side Back button works like Alt+Left.
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|view, _, _, cx| view.go_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
                 cx.listener(|view, _, _, cx| {
-                    if view.overlay.is_none() && !view.sort_menu {
-                        view.go_back(cx);
-                    }
+                    view.navigate_history(NavigationDirection::Forward, cx);
                 }),
             )
             .on_mouse_up(

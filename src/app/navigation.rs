@@ -513,23 +513,9 @@ impl Music {
         }
         self.clear_suggestions();
         if self.route != route {
-            let cached = (!self.rows.is_empty()
-                || (!self.catalog_requests.is_loading(CatalogTarget::Page)
-                    && self.sync.page_error.is_none()))
-            .then(|| self.page.clone());
-            self.back.push(NavigationState {
-                route: self.route.clone(),
-                page: cached,
-                fetched_at: self.sync.page_fetched_at,
-                coverage: self.sync.page_coverage,
-                page_error: self.sync.page_error.take(),
-                list_scroll: std::mem::replace(
-                    &mut self.list_scroll,
-                    UniformListScrollHandle::new(),
-                ),
-                shelf_scroll: std::mem::take(&mut self.shelf_scroll),
-                detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
-            });
+            self.forward.clear();
+            let state = self.take_navigation_state();
+            self.back.push(state);
             if self.back.len() > 12 {
                 self.back.remove(0);
             }
@@ -558,6 +544,22 @@ impl Music {
             self.history_generation,
         ));
         self.load_route(route, cached, cx);
+    }
+
+    fn take_navigation_state(&mut self) -> NavigationState {
+        let loaded = !self.rows.is_empty()
+            || (!self.catalog_requests.is_loading(CatalogTarget::Page)
+                && self.sync.page_error.is_none());
+        NavigationState {
+            route: self.route.clone(),
+            page: loaded.then(|| std::mem::take(&mut self.page)),
+            fetched_at: self.sync.page_fetched_at,
+            coverage: self.sync.page_coverage,
+            page_error: self.sync.page_error.take(),
+            list_scroll: std::mem::replace(&mut self.list_scroll, UniformListScrollHandle::new()),
+            shelf_scroll: std::mem::take(&mut self.shelf_scroll),
+            detail_list: std::mem::replace(&mut self.detail_list, DetailList::new()),
+        }
     }
 
     fn load_route(&mut self, route: Route, cached: Option<CachedPage>, cx: &mut Context<Self>) {
@@ -811,14 +813,38 @@ impl Music {
     }
 
     pub(in crate::app) fn go_back(&mut self, cx: &mut Context<Self>) {
-        self.focus_after_navigation(cx);
-        if self.player_open {
+        self.navigate_history(NavigationDirection::Back, cx);
+    }
+
+    pub(in crate::app) fn navigate_history(
+        &mut self,
+        direction: NavigationDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.is_some() || self.sort_menu {
+            return;
+        }
+        if direction == NavigationDirection::Back && self.player_open {
+            self.focus_after_navigation(cx);
             self.player_open = false;
             cx.notify();
             return;
         }
-        let Some(state) = self.back.pop() else { return };
+        let state = match direction {
+            NavigationDirection::Back => self.back.pop(),
+            NavigationDirection::Forward => self.forward.pop(),
+        };
+        let Some(state) = state else { return };
+        self.focus_after_navigation(cx);
         self.clear_suggestions();
+        let previous = self.take_navigation_state();
+        match direction {
+            NavigationDirection::Back => self.forward.push(previous),
+            NavigationDirection::Forward => self.back.push(previous),
+        }
+        self.player_open = false;
+        self.sync.page_reload = None;
+        self.sync.page_changes.clear();
         if let Some(page) = state.page {
             self.catalog_requests.cancel(CatalogTarget::Page);
             self.artwork.cancel_pending();
