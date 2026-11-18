@@ -70,6 +70,8 @@ An explicit Reload must start after acknowledgement. While readback is pending, 
 
 Native checks cover last-song totals, retaining 500 loaded songs and the visible occurrence, overlapping edits and reads, cookie renewal, scoped refresh errors, and clearing the reconnect message when an explicit retry is accepted. Accepting an edit keeps any unresolved page-loading error visible.
 
+A failed page continuation keeps its warning when a dialog clears or replaces general feedback. Dismissing another warning reveals the continuation warning. Dismissing the continuation warning enables automatic paging again.
+
 Tests that need the network, libmpv, yt-dlp, a keyring or a desktop session are marked `#[ignore]`, and each one says what it needs. List them with `bin/test -- --ignored --list` and run one by name:
 
 ```sh

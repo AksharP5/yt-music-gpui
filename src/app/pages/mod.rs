@@ -460,7 +460,7 @@ impl Music {
         }
         content = self.library_filters(content, inset, cx);
         if !matches!(self.overlay, Some(Overlay::SignIn))
-            && let Some(error) = &self.error
+            && let Some(error) = self.error.as_ref().or(self.sync.page_error.as_ref())
         {
             let detail = SharedString::from(error.clone());
             let theme = self.theme;
@@ -494,8 +494,10 @@ impl Music {
                         button("dismiss-error", "close", self.theme)
                             .flex_shrink_0()
                             .on_click(cx.listener(|view, _, _, cx| {
+                                if view.error.is_none() || view.error == view.sync.page_error {
+                                    view.sync.page_error = None;
+                                }
                                 view.error = None;
-                                view.sync.page_error = None;
                                 cx.notify();
                             })),
                     ),
