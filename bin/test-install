@@ -26,9 +26,9 @@ class InstallerTests(unittest.TestCase):
         self.helper = self.root / 'helper.py'
         self.helper.write_text(HELPER)
 
-    def helper_run(self, *args):
+    def helper_run(self, *args, timeout=None):
         return subprocess.run(['python3', '-I', '-B', str(self.helper), *map(str, args)],
-                              env=self.env, capture_output=True, text=True, check=False)
+                              env=self.env, capture_output=True, text=True, check=False, timeout=timeout)
 
     def archive(self, extra=None):
         archive = self.root / 'yt-music-gpui-0.1.0-x86_64-linux.tar.gz'
@@ -89,11 +89,15 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('Upstream checksum differs', result.stderr)
 
     def test_reuses_only_a_trusted_ytdlp_matching_the_release_pin(self):
-        private = self.home / '.local/share/yt-music-gpui'
-        private.mkdir(parents=True)
+        local = self.home / '.local'
+        share = local / 'share'
+        private = share / 'yt-music-gpui'
+        for directory in [local, share, private]:
+            directory.mkdir(mode=0o700)
         installed = private / 'yt-dlp'
         original = b'reviewed fixture'
         installed.write_bytes(original)
+        installed.chmod(0o600)
         checksum = hashlib.sha256(original).hexdigest()
         staged = self.root / 'staged-ytdlp'
         args = ['reuse-ytdlp', checksum, staged]
@@ -109,6 +113,12 @@ class InstallerTests(unittest.TestCase):
                 installed.chmod(mode)
                 self.assertNotEqual(self.helper_run(*args).returncode, 0)
                 self.assertFalse(staged.exists())
+
+        installed.unlink()
+        os.mkfifo(installed, mode=0o600)
+        result = self.helper_run(*args, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(staged.exists())
 
     def test_truncated_pipe_does_no_work(self):
         invocation = SCRIPT.rindex('\n(install_main')

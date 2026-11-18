@@ -40,7 +40,7 @@ curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/in
 
 The script installs into your home folder, tells you which system packages are missing and asks before using sudo. Run it again to upgrade.
 
-If you already have the release tarball and its matching `.sha256` file, use `sh install.sh --archive /path/to/release.tar.gz`. This can upgrade offline when the verified yt-dlp and a compatible Deno are already installed.
+If you already have the release tarball and its matching `.sha256` file, use `sh install.sh --archive /path/to/release.tar.gz`. Offline upgrades require the pinned yt-dlp and a supported Deno. If you use the installer’s private Deno, its version must match the release pin.
 
 To remove the app:
 

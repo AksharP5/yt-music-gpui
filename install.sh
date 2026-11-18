@@ -132,7 +132,7 @@ def directory(path, create=False):
 def read_file(path):
     parent = directory(path.parent)
     try:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         with os.fdopen(fd, 'rb') as file:
             info = os.fstat(file.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
@@ -337,9 +337,11 @@ PY
         printf '%s\n' 'Uninstalled. Library, settings and saved account were kept.'
         exit 0
     fi
-    download() { curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
+    require_curl() { command -v curl >/dev/null 2>&1 || packages curl; }
+    download() {
+        require_curl && curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"
+    }
     if [ "$action" = install ]; then
-        command -v curl >/dev/null 2>&1 || { packages curl || exit 1; }
         if [ -n "$archive" ]; then
             # Inputs live apart from the installer's own files, so a local archive
             # named like one of them cannot replace it before verification.
@@ -350,6 +352,7 @@ PY
             archive="$input"
         else
             # Resolve latest once, so a release published mid-install cannot mix assets.
+            require_curl || exit 1
             effective="$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
                 https://github.com/AksharP5/yt-music-gpui/releases/latest)"
             tag="${effective##*/}"
