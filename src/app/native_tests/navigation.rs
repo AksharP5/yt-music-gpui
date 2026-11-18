@@ -2789,3 +2789,344 @@ fn saving_a_queue_keeps_its_songs_after_playback_changes() -> Result<()> {
         wait_for_presented_frame(window, cx).await;
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn dragging_a_playlist_song_moves_its_occurrence_across_loaded_shelves() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+    use serde_json::json;
+
+    check_cache_window(async |window, cx| {
+        let (commands, submitted) = async_channel::bounded(2);
+        window
+            .update(cx, |view, _, cx| {
+                view.account_commands = commands;
+                view.route = Route::Browse(BrowseLink::new("VLPLdrag", "Editable playlist"));
+                view.page = crate::app::sync::tests::response(
+                    &[("", vec![0, 1]), ("", vec![2, 3])],
+                    None,
+                    true,
+                );
+                view.page.header = crate::catalog::parse_page(
+                    &json!({"header":{"musicResponsiveHeaderRenderer":{
+                        "title":{"simpleText":"Editable playlist"}
+                    }},"contents":[]}),
+                    "Editable playlist",
+                )
+                .unwrap()
+                .header;
+                assert!(view.page.header.is_some());
+                view.page.editable = true;
+                let crate::catalog::Item::Track(duplicate) = &mut view.page.shelves[0].items[1]
+                else {
+                    panic!("Expected a song");
+                };
+                duplicate.id = "00000000000".into();
+                view.rebuild_rows();
+                cx.notify();
+            })
+            .unwrap();
+        for (cancel, partial) in [(false, false), (true, false), (false, true)] {
+            if partial {
+                window
+                    .update(cx, |view, _, cx| {
+                        view.page.continuation = Some(
+                            crate::catalog::Continuation::from_response(
+                                "playlist-drag-unloaded-tail",
+                                &json!({}),
+                                view.account.as_ref().map(|account| account.session.clone()),
+                            )
+                            .unwrap(),
+                        );
+                        cx.notify();
+                    })
+                    .unwrap();
+            }
+            wait_for_presented_frame(window, cx).await;
+            let (start, target) = window
+                .update(cx, |view, window, _| {
+                    let row = |index| {
+                        let ix = view.list_rows.iter().position(|row| {
+                        matches!(row, crate::app::ListRow::Item(item) if *item == index)
+                    }).unwrap() + usize::from(view.detail_list.inline_header);
+                        view.detail_list.state.bounds_for_item(ix).unwrap()
+                    };
+                    let source = row(1);
+                    let target = row(if partial { 3 } else { 2 });
+                    let inset = if view.detail_list.inline_header {
+                        px(view.page_layout(window).inset)
+                    } else {
+                        px(0.)
+                    };
+                    (
+                        point(source.left() + inset + px(28.), source.top() + px(34.)),
+                        point(target.left() + inset + px(180.), target.top() + px(53.)),
+                    )
+                })
+                .unwrap();
+
+            let move_to = |position, pressed_button| {
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button,
+                    modifiers: Default::default(),
+                })
+            };
+            let press = || {
+                PlatformInput::MouseDown(MouseDownEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Default::default(),
+                    first_mouse: false,
+                })
+            };
+            let release = || {
+                PlatformInput::MouseUp(MouseUpEvent {
+                    position: target,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Default::default(),
+                })
+            };
+            for event in [
+                move_to(start, None),
+                press(),
+                move_to(target, Some(MouseButton::Left)),
+            ] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(event, cx)
+                })
+                .unwrap();
+                wait_for_presented_frame(window, cx).await;
+            }
+            window
+                .update(cx, |_, _, cx| {
+                    assert!(cx.has_active_drag(), "The grip must start a playlist drag");
+                })
+                .unwrap();
+            if cancel {
+                super::render::key(window, cx, "escape").await;
+            }
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(release(), cx)
+            })
+            .unwrap();
+            if cancel || partial {
+                assert!(
+                    submitted.is_empty(),
+                    "An aborted drop must not submit a move"
+                );
+                window
+                    .update(cx, |view, _, cx| {
+                        assert!(!cx.has_active_drag());
+                        assert!(view.library.queue.tracks.is_empty());
+                    })
+                    .unwrap();
+                continue;
+            }
+
+            let account::Command::Apply { session, mutation } = submitted
+                .try_recv()
+                .expect("Dragging the second occurrence after Song 3 must save a playlist move")
+            else {
+                panic!("Expected a playlist edit");
+            };
+            assert!(matches!(
+                &*mutation,
+                Mutation::MoveInPlaylist { id, set_video_id, before: Some(before) }
+                    if id == "VLPLdrag" && set_video_id == "occurrence-1" && before == "occurrence-3"
+            ));
+            window
+                .update(cx, |view, window, cx| {
+                    let order = |view: &Music| {
+                        view.page
+                            .tracks()
+                            .into_iter()
+                            .map(|song| song.details.set_video_id.unwrap())
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        order(view),
+                        [
+                            "occurrence-0",
+                            "occurrence-1",
+                            "occurrence-2",
+                            "occurrence-3"
+                        ]
+                    );
+                    assert!(
+                        view.library.queue.tracks.is_empty(),
+                        "Dragging a song must not play it"
+                    );
+                    view.account_event(
+                        account::Event::Applied {
+                            session,
+                            mutation,
+                            result: Ok(Effect::Changed),
+                            session_rejected: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        order(view),
+                        [
+                            "occurrence-0",
+                            "occurrence-2",
+                            "occurrence-1",
+                            "occurrence-3"
+                        ]
+                    );
+                })
+                .unwrap();
+        }
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_drag_scrolls_to_songs_outside_the_original_viewport() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+    use serde_json::json;
+
+    check_cache_window(async |window, cx| {
+        let (commands, submitted) = async_channel::bounded(1);
+        window
+            .update(cx, |view, _, cx| {
+                view.account_commands = commands;
+                view.route = Route::Browse(BrowseLink::new("VLPLdrag", "Long playlist"));
+                view.page =
+                    crate::app::sync::tests::response(&[("", (0..100).collect())], None, true);
+                view.page.header = crate::catalog::parse_page(
+                    &json!({"header":{"musicResponsiveHeaderRenderer":{
+                    "title":{"simpleText":"Long playlist"}
+                }},"contents":[]}),
+                    "Long playlist",
+                )
+                .unwrap()
+                .header;
+                view.page.editable = true;
+                view.rebuild_rows();
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+
+        let (start, edge, initial_offset) = window
+            .update(cx, |view, window, _| {
+                let list = &view.detail_list.state;
+                let source = list
+                    .bounds_for_item(1 + usize::from(view.detail_list.inline_header))
+                    .unwrap();
+                let inset = if view.detail_list.inline_header {
+                    px(view.page_layout(window).inset)
+                } else {
+                    px(0.)
+                };
+                let viewport = list.viewport_bounds();
+                let edge = point(
+                    viewport.left() + inset + px(180.),
+                    viewport.bottom() - px(6.),
+                );
+                (
+                    point(source.left() + inset + px(28.), source.top() + px(34.)),
+                    edge,
+                    list.scroll_px_offset_for_scrollbar().y,
+                )
+            })
+            .unwrap();
+
+        let motion = |position, pressed_button| {
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button,
+                modifiers: Default::default(),
+            })
+        };
+        let held = Some(MouseButton::Left);
+        for event in [
+            motion(start, None),
+            PlatformInput::MouseDown(MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            motion(edge, held),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        }
+        window
+            .update(cx, |_, _, cx| assert!(cx.has_active_drag()))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let (drop_at, successor) = loop {
+            let target = window
+                .update(cx, |view, _, _| {
+                    let list = &view.detail_list.state;
+                    let removed = initial_offset - list.scroll_px_offset_for_scrollbar().y;
+                    if removed < px(800.) {
+                        return None;
+                    }
+                    let ix = list.logical_scroll_top().item_ix + 2;
+                    let rect = list.bounds_for_item(ix).unwrap();
+                    let row = &view.list_rows[ix - usize::from(view.detail_list.inline_header)];
+                    let crate::app::ListRow::Item(index) = row else {
+                        panic!("Expected a song row")
+                    };
+                    let crate::catalog::Item::Track(song) = &view.rows[*index] else {
+                        panic!("Expected a song")
+                    };
+                    Some((
+                        point(edge.x, rect.top() + px(14.)),
+                        song.details.set_video_id.clone().unwrap(),
+                    ))
+                })
+                .unwrap();
+            if let Some(target) = target {
+                break target;
+            }
+            if Instant::now() >= deadline {
+                let distance = window
+                    .update(cx, |view, _, _| {
+                        initial_offset - view.detail_list.state.scroll_px_offset_for_scrollbar().y
+                    })
+                    .unwrap();
+                panic!("Holding the dragged song near the bottom scrolled only {distance:?}");
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        };
+
+        for event in [
+            motion(drop_at, held),
+            PlatformInput::MouseUp(MouseUpEvent {
+                position: drop_at,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        }
+        let account::Command::Apply { mutation, .. } = submitted.try_recv().unwrap() else {
+            panic!("Expected an edit after dropping the song");
+        };
+        assert!(matches!(
+            &*mutation, Mutation::MoveInPlaylist { id, set_video_id, before:Some(before) }
+                if id == "VLPLdrag" && set_video_id == "occurrence-1" && *before == successor
+        ));
+    })
+}

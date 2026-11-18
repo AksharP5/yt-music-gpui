@@ -95,6 +95,8 @@ The Comments check reads public guest comments during muted playback, exercises 
 
 Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. The New playlist footer must stay clear of scrolling rows. A rejected destination read keeps the selected song through same-account renewal, refreshes the choices and waits for the user to confirm a save. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
 
+Editable-playlist drag checks move the selected occurrence across loaded shelves, keep the playing queue unchanged, and cancel with Escape or an unavailable drop target. Holding a drag near the list edge scrolls until a song outside the original viewport can be reached.
+
 While Save to playlist waits for the service, it counts the eligible destinations from the loaded guide and copies only the rows requested by the virtual list. The count and row ranges use the same eligibility filter.
 
 Tab and Shift+Tab scroll Save to playlist as focus moves through the destinations. If a service reply moves the focused playlist, the picker scrolls to its new position. A click completes only on the same destination where it started. The native checks cover offscreen selection, a reorder that moves the focused row out of view, and a refresh between mouse-down and mouse-up.
