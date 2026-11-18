@@ -40,7 +40,7 @@ fn render_counts(music: &Music, cx: &App) -> (usize, usize, usize) {
     )
 }
 
-async fn wait_for_quiescence(
+pub(super) async fn wait_for_quiescence(
     window: WindowHandle<Music>,
     cx: &mut AsyncApp,
 ) -> (usize, usize, usize) {

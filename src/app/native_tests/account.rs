@@ -129,7 +129,7 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
     super::navigation::check_cache_window(async |window, cx| {
         let next = session("renewed-navigation");
         let (sender, commands) = async_channel::unbounded();
-        window
+        let stale_metadata = window
             .update(cx, |view, window, cx| {
                 view.account_commands = sender;
                 *view.session.write().unwrap() =
@@ -171,7 +171,34 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                     .unwrap(),
                 );
                 super::navigation::reply(view, tail, cx);
+                view.refresh_playlist_metadata(
+                    "renewed",
+                    Vec::new(),
+                    Some("old-occurrence".into()),
+                    Some("occurrence-0"),
+                    cx,
+                );
+                let failed = view.catalog_requests.pending.try_recv().unwrap();
+                view.catalog_result(
+                    CatalogResult {
+                        id: failed.id,
+                        account_revision: failed.account_revision,
+                        account_generation: failed.account_generation,
+                        history_generation: failed.history_generation,
+                        append: false,
+                        revalidate: false,
+                        result: Err("Old-session readback failed".into()),
+                        session_rejected: false,
+                        target: CatalogTarget::PlaylistMetadata,
+                    },
+                    cx,
+                );
+                assert!(view.sync.playlist_failures.contains_key("renewed"));
+                view.refresh_playlist_metadata("old-other", Vec::new(), None, None, cx);
+                let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(metadata.query, Query::PlaylistMetadata(_)));
                 renew(view, next.clone(), &commands, window, cx);
+                metadata
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -190,6 +217,15 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
         }
         window.update(cx, |view, _, cx| {
             assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &next));
+            assert!(view.sync.playlist_refreshes.is_empty());
+            assert!(view.sync.playlist_failures.is_empty(), "Renewal releases failed readback facts and old-session row snapshots");
+            assert!(!view.catalog_requests.is_loading(CatalogTarget::PlaylistMetadata));
+            assert_ne!(stale_metadata.id,view.catalog_requests.generations[CatalogTarget::PlaylistMetadata as usize].load(Ordering::Relaxed),"Cookie renewal cancels further reads with the old session");
+            view.catalog_result(CatalogResult {
+                id:stale_metadata.id,account_revision:stale_metadata.account_revision,account_generation:stale_metadata.account_generation,history_generation:stale_metadata.history_generation,
+                append:false,revalidate:false,result:Err("Old-session metadata must not publish".into()),session_rejected:false,target:CatalogTarget::PlaylistMetadata,
+            },cx);
+            assert!(view.error.is_none());
             let mut fresh = crate::app::sync::tests::page(100, true);
             fresh.continuation = Some(crate::catalog::Continuation::from_response("renewed-first-tail", &json!({}), Some(next.clone())).unwrap());
             assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), crate::app::Query::Revalidate(_)));
@@ -360,6 +396,12 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 assert!(view.error.is_some(), "The failed edit must remain visible for explicit retry");
                 assert!(!view.refresh_session(false, cx));
                 assert!(commands.is_empty());
+                let retry = Mutation::RateSong { track: track("invalid-first"), rating: Rating::Like };
+                assert!(view.mutate(retry, cx));
+                assert!(view.error.is_none(), "An accepted explicit retry clears the reconnect message");
+                let account::Command::Apply { session, .. } = commands.try_recv().unwrap() else { panic!("Retry must submit one edit"); };
+                assert!(Arc::ptr_eq(&session, &current));
+                assert!(commands.is_empty(), "Recovery never replays an edit automatically");
                 view.next_session_refresh = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
                 let operation = refreshing(view, &commands, cx);
                 view.account_event(account::Event::Connected { operation, result: Ok(Some(connection(current.clone()))), save_session: false }, window, cx);

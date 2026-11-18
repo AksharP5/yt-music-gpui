@@ -472,6 +472,8 @@ impl Music {
         }) {
             Ok(()) => {
                 self.pending_mutations.insert(key);
+                self.error = self.sync.page_error.clone();
+                self.sync.playlist_metadata_error = None;
                 self.notice = Some("Saving to YouTube Music…".into());
                 true
             }
@@ -843,9 +845,8 @@ impl Music {
                                             view.page_cache.clear();
                                             view.forward_page = None;
                                             // Rebind only this verified account's queue; discard other in-flight reads.
-                                            view.catalog_requests.cancel(CatalogTarget::Page);
-                                            view.catalog_requests.cancel(CatalogTarget::Sidebar);
-                                            view.catalog_requests.cancel(CatalogTarget::PlaylistChoices);
+                                            for target in CatalogTarget::ALL { view.catalog_requests.cancel(target); }
+                                            view.sync.cancel_playlist_refreshes();
                                             if let Some(expected) = &previous_session
                                                 && let Err(error) = view.queue_source.renew_session(expected, session.clone())
                                             { view.queue_source.cancel(); view.error = Some(error); }
@@ -978,6 +979,16 @@ impl Music {
                             Effect::PlaylistAdded { additions, toast } => {
                                 if let Mutation::AddToPlaylist { id, .. } = &mutation {
                                     self.patch_added(id, &additions, cx);
+                                    self.refresh_playlist_metadata(
+                                        id,
+                                        additions
+                                            .iter()
+                                            .map(|(_, occurrence)| occurrence.clone())
+                                            .collect(),
+                                        None,
+                                        None,
+                                        cx,
+                                    );
                                     // YouTube's own confirmation, else the web's wording for it.
                                     let toast = toast.or_else(|| {
                                         self.sidebar_playlists
@@ -995,6 +1006,31 @@ impl Music {
                                 }
                             }
                             Effect::Changed => {
+                                match &mutation {
+                                    Mutation::RemoveFromPlaylist {
+                                        id, set_video_id, ..
+                                    } => {
+                                        self.refresh_playlist_metadata(
+                                            id,
+                                            Vec::new(),
+                                            Some(set_video_id.clone()),
+                                            None,
+                                            cx,
+                                        );
+                                    }
+                                    Mutation::MoveInPlaylist {
+                                        id, set_video_id, ..
+                                    } => {
+                                        self.refresh_playlist_metadata(
+                                            id,
+                                            Vec::new(),
+                                            None,
+                                            Some(set_video_id),
+                                            cx,
+                                        );
+                                    }
+                                    _ => {}
+                                }
                                 if deleting {
                                     self.request(
                                         Query::Revalidate(Box::new(Query::SidebarPlaylists)),

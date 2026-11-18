@@ -605,6 +605,17 @@ pub struct PageHeader {
     pub subscriber_count: String,
 }
 
+impl PageHeader {
+    pub(crate) fn track_count(&self) -> Option<&str> {
+        // Catalog requests use English. Views and duration can surround the count.
+        self.stats.split('•').map(str::trim).find(|part| {
+            [" track", " tracks", " song", " songs"]
+                .iter()
+                .any(|suffix| part.ends_with(suffix))
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Continuation {
     token: String,
@@ -807,6 +818,33 @@ impl Catalog {
         }
         apply_episode_page(&mut page, &data, &link.id)?;
         self.bind_page(page, &data, None)
+    }
+
+    pub(crate) fn playlist_metadata(
+        &self,
+        id: &str,
+        additions: &[String],
+        removals: &[String],
+        order: Option<&Page>,
+        current: impl Fn() -> bool,
+    ) -> Result<Page> {
+        let link = BrowseLink::new(format!("VL{}", id.trim_start_matches("VL")), "Playlist");
+        // YouTube can acknowledge an edit before browse reflects it. Only retry
+        // these reads, and never walk a long playlist to verify its totals.
+        for attempt in 0..5 {
+            ensure!(current(), "Playlist refresh was superseded");
+            let page = self.browse(&link)?;
+            if page.header.is_some()
+                && playlist_metadata_visible(&page, additions, removals)
+                && order.is_none_or(|order| playlist_order_visible(&page, order) != Some(false))
+            {
+                return Ok(page);
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        anyhow::bail!("Playlist saved, but its details have not updated yet. Refresh the playlist.")
     }
 
     pub fn more(&self, continuation: &Continuation) -> Result<Page> {
@@ -2347,9 +2385,199 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
     Ok(choices)
 }
 
+pub(crate) fn playlist_metadata_visible(
+    page: &Page,
+    additions: &[String],
+    removals: &[String],
+) -> bool {
+    playlist_occurrences_visible(
+        page,
+        if page.continuation.is_some() {
+            &[]
+        } else {
+            additions
+        },
+        removals,
+    )
+}
+
+pub(crate) fn playlist_occurrences_visible(
+    page: &Page,
+    additions: &[String],
+    removals: &[String],
+) -> bool {
+    let occurrences: HashSet<_> = page
+        .shelves
+        .iter()
+        .flat_map(|shelf| &shelf.items)
+        .filter_map(|item| match item {
+            Item::Track(track) => track.details.set_video_id.as_deref(),
+            _ => None,
+        })
+        .collect();
+    !removals
+        .iter()
+        .any(|removed| occurrences.contains(removed.as_str()))
+        && additions
+            .iter()
+            .all(|added| occurrences.contains(added.as_str()))
+}
+
+/// Compare retained row order. A matching short prefix cannot verify the loaded order.
+pub(crate) fn playlist_order_visible(page: &Page, order: &Page) -> Option<bool> {
+    fn occurrences(page: &Page) -> Vec<&str> {
+        page.shelves
+            .iter()
+            .flat_map(|shelf| &shelf.items)
+            .filter_map(|item| match item {
+                Item::Track(track) => track.details.set_video_id.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }
+    let expected = occurrences(order);
+    let known: HashSet<_> = expected.iter().copied().collect();
+    let visible: Vec<_> = occurrences(page)
+        .into_iter()
+        .filter(|id| known.contains(id))
+        .collect();
+    if visible.is_empty() {
+        return None;
+    }
+    if !expected
+        .iter()
+        .copied()
+        .take(visible.len())
+        .eq(visible.iter().copied())
+    {
+        return Some(false);
+    }
+    (expected.len() == visible.len()).then_some(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_order_evidence_uses_the_final_acknowledged_prefix() {
+        let page = |ids: &[usize], partial: bool| {
+            let mut page = parse_page(&json!({"contents":[]}), "Playlist").unwrap();
+            page.shelves.push(Shelf {
+                title: String::new(),
+                layout: ShelfLayout::Songs,
+                more: None,
+                items: ids
+                    .iter()
+                    .map(|id| {
+                        let mut track: Track = serde_json::from_value(
+                            json!({"id":format!("{id:011}"),"title":"Song","artist":"Artist"}),
+                        )
+                        .unwrap();
+                        track.details.set_video_id = Some(format!("occurrence-{id}"));
+                        Item::Track(track)
+                    })
+                    .collect(),
+            });
+            page.continuation = partial.then(|| Continuation::new("tail"));
+            page
+        };
+        // From 2,0,1: moving 0 before 1, then 1 before 2, ends at 1,2,0.
+        // Replaying both commands on that final order would incorrectly produce 0,1,2.
+        let order = page(&[1, 2, 0], false);
+        assert_eq!(
+            playlist_order_visible(&page(&[1, 2, 0], false), &order),
+            Some(true)
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[2, 0, 1], false), &order),
+            Some(false)
+        );
+        let order = page(&[450, 0, 1, 2], false);
+        assert_eq!(
+            playlist_order_visible(&page(&[0, 1], true), &order),
+            Some(false),
+            "A moved item must appear at the beginning of the known prefix"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[450, 0], true), &order),
+            None,
+            "A matching short prefix cannot certify the retained loaded order"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[999, 450, 0], true), &order),
+            None,
+            "Unrelated rows do not provide evidence for the missing known rows"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[999, 450, 0, 1, 2], false), &order),
+            Some(true),
+            "Unrelated new rows may precede a fully verified retained order"
+        );
+        assert_eq!(
+            playlist_order_visible(&page(&[998, 999], true), &order),
+            None
+        );
+    }
+
+    #[test]
+    fn playlist_metadata_waits_for_the_edited_occurrences_without_scanning_the_tail() {
+        let mut page = parse_page(&json!({"contents":[]}), "Playlist").unwrap();
+        let mut track: Track = serde_json::from_value(
+            json!({"id":"00000000000", "title":"Song", "artist":"Synthetic artist"}),
+        )
+        .unwrap();
+        track.details.set_video_id = Some("occurrence-0".into());
+        page.shelves.push(Shelf {
+            title: String::new(),
+            layout: ShelfLayout::Songs,
+            more: None,
+            items: vec![Item::Track(track.clone())],
+        });
+        assert!(!playlist_metadata_visible(
+            &page,
+            &[],
+            &["occurrence-0".into()]
+        ));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &[],
+            &["already-gone".into(), "occurrence-0".into()]
+        ));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &["new-occurrence".into()],
+            &[]
+        ));
+        page.shelves[0].items.clear();
+        assert!(playlist_metadata_visible(
+            &page,
+            &[],
+            &["occurrence-0".into()]
+        ));
+        page.shelves[0].items.push(Item::Track(track));
+        page.continuation = Some(Continuation::new("tail"));
+        assert!(playlist_metadata_visible(
+            &page,
+            &["tail-occurrence".into()],
+            &[]
+        ));
+        assert!(!playlist_metadata_visible(
+            &page,
+            &[],
+            &["occurrence-0".into()]
+        ));
+        page.shelves[0].items[0] = Item::Track({
+            let mut track = page.tracks()[0].clone();
+            track.details.set_video_id = Some("new-occurrence".into());
+            track
+        });
+        assert!(playlist_metadata_visible(
+            &page,
+            &["new-occurrence".into()],
+            &[]
+        ));
+    }
 
     #[test]
     fn page_heroes_use_the_page_header_and_never_a_song_cover() {
