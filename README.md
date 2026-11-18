@@ -104,7 +104,7 @@ In **Save to playlist**, use Tab and Shift+Tab to move through the destinations.
 
 While dragging a song in **Up next**, press Escape to cancel the move. Press Escape again to close the player page. Leaving Up next, shuffling, or replacing the queue also cancels the move.
 
-In an editable playlist, drag a song by its grip to the top or bottom edge of another row. Escape cancels the drag. **Move up** and **Move down** are also available in the song menu.
+In an editable playlist, drag a song by its grip to the top or bottom edge of another row. Hold it near the top or bottom of the list to scroll to more songs. Escape cancels the drag. **Move up** and **Move down** are also available in the song menu.
 
 In an editable playlist, Tab reveals each Suggestions control as it receives focus. Press Enter on **Refresh** for a new batch or on **Add to playlist** to save a song. Suggested songs stay out of the playlist's count and Play all until YouTube confirms an add. If the song is already saved, use Tab to reach **Add anyway** or Escape to return to the song.
 

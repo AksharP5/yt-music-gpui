@@ -28,10 +28,61 @@ struct PlaylistDrag {
 struct DraggedSong {
     title: SharedString,
     theme: Theme,
+    list: ListState,
+    music: WeakEntity<Music>,
+    visit: PlaylistVisit,
+    scrolled_at: Instant,
+}
+
+impl DraggedSong {
+    fn edge_speed(&self, window: &Window) -> f32 {
+        let viewport = self.list.viewport_bounds();
+        let pointer = window.mouse_position();
+        if !viewport.contains(&pointer) {
+            return 0.;
+        }
+        const EDGE: f32 = 48.;
+        const PIXELS_PER_SECOND: f32 = 720.;
+        let top = f32::from(pointer.y - viewport.top());
+        let bottom = f32::from(viewport.bottom() - pointer.y);
+        PIXELS_PER_SECOND * ((1. - bottom / EDGE).max(0.) - (1. - top / EDGE).max(0.))
+    }
 }
 
 impl Render for DraggedSong {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.edge_speed(window) != 0. {
+            let preview = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                let _ = preview.update(cx, |drag, cx| {
+                    let current = drag
+                        .music
+                        .read_with(cx, |music, _| {
+                            PlaylistVisit::current(music) == drag.visit
+                                && music.editable_playlist().is_some()
+                                && music.overlay.is_none()
+                                && !music.player_open
+                        })
+                        .unwrap_or(false);
+                    if !cx.has_active_drag() || !current {
+                        return;
+                    }
+                    let now = Instant::now();
+                    let elapsed = now
+                        .duration_since(std::mem::replace(&mut drag.scrolled_at, now))
+                        .as_secs_f32()
+                        .min(0.03);
+                    let speed = drag.edge_speed(window);
+                    let old = drag.list.scroll_px_offset_for_scrollbar();
+                    let end = -drag.list.max_offset_for_scrollbar().y.max(px(0.));
+                    let next = (old.y - px(speed * elapsed)).clamp(end, px(0.));
+                    if next != old.y {
+                        drag.list.set_offset_from_scrollbar(point(old.x, next));
+                        window.refresh();
+                    }
+                });
+            });
+        }
         div()
             .max_w(px(260.))
             .px(px(12.))
@@ -62,6 +113,8 @@ impl Music {
 
         let theme = self.theme;
         let visit = PlaylistVisit::current(self);
+        let list = self.detail_list.state.clone();
+        let music = cx.weak_entity();
         let occurrence: Arc<str> = occurrence.into();
         let drag = PlaylistDrag {
             visit,
@@ -86,6 +139,10 @@ impl Music {
                     cx.new(|_| DraggedSong {
                         title: song.title.clone(),
                         theme,
+                        list: list.clone(),
+                        music: music.clone(),
+                        visit: song.visit,
+                        scrolled_at: Instant::now(),
                     })
                 }),
         )
