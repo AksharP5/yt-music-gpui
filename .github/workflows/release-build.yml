@@ -108,6 +108,34 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+      - name: Compare stripped binary size with the branch base
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          base=$(git merge-base HEAD origin/main)
+          candidate=$(stat -c %s target/release/yt-music-gpui)
+          baseline=$candidate
+          if [[ "$base" != "$GITHUB_SHA" ]]; then
+            base_tree="$RUNNER_TEMP/yt-music-release-base"
+            git worktree add --detach "$base_tree" "$base"
+            trap 'git worktree remove "$base_tree"' EXIT
+            export CARGO_TARGET_DIR="$PWD/target"
+            (cd "$base_tree" && cargo build --release --locked)
+            baseline=$(stat -c %s target/release/yt-music-gpui)
+          fi
+          {
+            printf '### Linux x86-64 release size\n\n'
+            printf '| Stripped binary | Bytes |\n| --- | ---: |\n'
+            printf '| Base `%s` | %d |\n' "${base:0:12}" "$baseline"
+            printf '| Candidate `%s` | %d |\n' "${GITHUB_SHA:0:12}" "$candidate"
+            printf '| Change | %+d |\n\n' "$((candidate - baseline))"
+            printf '| Candidate package | Bytes |\n| --- | ---: |\n'
+            for package in dist/*.tar.gz dist/*.deb dist/*.rpm; do
+              size=$(stat -c %s "$package")
+              printf '| `%s` | %d |\n' "${package##*/}" "$size"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
   compatibility:
     needs: build
     runs-on: ubuntu-24.04

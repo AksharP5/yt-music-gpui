@@ -203,6 +203,8 @@ Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only r
 
 Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the same read-only release build workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
 
+The manual preflight summary reports stripped Linux binary size against the branch's common ancestor with `main`. Both builds use `cargo build --release --locked` on the same runner. The summary also lists the sizes of the candidate tarball, Debian package and RPM.
+
 Download the artifact and test the installer without touching an existing installation:
 
 ```sh
