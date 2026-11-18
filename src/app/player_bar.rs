@@ -144,9 +144,8 @@ impl Music {
         let compact = width < 1120.;
         let theme = self.theme;
         let current = self.library.queue.current().cloned();
-        let position = self
-            .drag_position
-            .unwrap_or_else(|| self.playback_position());
+        let seek_position = self.seek_drag_position();
+        let position = seek_position.unwrap_or_else(|| self.playback_position());
         let progress = if self.duration > 0. {
             (position / self.duration).clamp(0., 1.) as f32
         } else {
@@ -281,7 +280,6 @@ impl Music {
                 );
         }
         let seek_bounds = self.seek_bounds.clone();
-        let seeking = self.drag == Some(Drag::Seek);
         div()
             .id("player-bar")
             .h(px(if width < 936. { 64. } else { 72. }))
@@ -305,11 +303,15 @@ impl Music {
                         MouseButton::Left,
                         cx.listener(|view, event: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            view.drag = Some(Drag::Seek);
-                            view.drag_to(event.position, cx);
+                            view.start_seek_drag(event.position, cx);
                         }),
                     )
-                    .child(seek_bar(progress, seek_bounds, seeking, theme)),
+                    .child(seek_bar(
+                        progress,
+                        seek_bounds,
+                        seek_position.is_some(),
+                        theme,
+                    )),
             )
             .child(
                 div()

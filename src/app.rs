@@ -189,7 +189,6 @@ pub struct Music {
     drag: Option<Drag>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
-    drag_position: Option<f64>,
     _subscriptions: Vec<Subscription>,
 }
 
