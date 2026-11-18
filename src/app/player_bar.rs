@@ -98,6 +98,7 @@ impl Music {
     }
 
     pub(in crate::app) fn shuffle_queue(&mut self, cx: &mut Context<Self>) {
+        self.cancel_queue_drag();
         if let Some(collection) = self.collection_playback() {
             self.start_queue(PlaybackQuery::Collection(collection.toggled()), cx);
             return;

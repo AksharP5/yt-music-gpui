@@ -421,6 +421,7 @@ impl Music {
             return;
         }
         if !current {
+            self.cancel_queue_drag();
             self.queue_source.cancel();
             self.queue_waiting = None;
             self.reset_radio();

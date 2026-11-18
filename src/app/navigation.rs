@@ -565,7 +565,7 @@ impl Music {
     fn load_route(&mut self, route: Route, cached: Option<CachedPage>, cx: &mut Context<Self>) {
         self.focus_after_navigation(cx);
         self.artwork.cancel_pending();
-        self.player_open = false;
+        self.close_player_page();
         self.list_id = self.list_id.wrapping_add(1);
         self.list_scroll = UniformListScrollHandle::new();
         self.detail_list = DetailList::new();
@@ -823,7 +823,7 @@ impl Music {
     ) {
         if direction == NavigationDirection::Back && self.player_open {
             self.focus_after_navigation(cx);
-            self.player_open = false;
+            self.close_player_page();
             cx.notify();
             return;
         }
@@ -839,7 +839,7 @@ impl Music {
             NavigationDirection::Back => self.forward.push(previous),
             NavigationDirection::Forward => self.back.push(previous),
         }
-        self.player_open = false;
+        self.close_player_page();
         self.sync.page_reload = None;
         self.sync.page_changes.clear();
         if let Some(page) = state.page {
