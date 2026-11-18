@@ -45,6 +45,7 @@ impl Music {
         self.sync = sync::SyncState::default();
         self.clear_suggestions();
         self.page_cache.clear();
+        self.forward.clear();
         self.forward_page = None;
         self.catalog_requests.reset_account(
             self.account.as_ref().map(|account| &account.session),

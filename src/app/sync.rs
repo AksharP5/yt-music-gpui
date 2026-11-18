@@ -570,6 +570,7 @@ impl Music {
                 self.back
                     .iter()
                     .rev()
+                    .chain(self.forward.iter().rev())
                     .filter_map(|state| Some((state.page.as_ref()?, &state.route, state.coverage))),
             )
             .filter_map(move |(page, route, coverage)| {
@@ -880,6 +881,7 @@ impl Music {
                             .chain(
                                 self.back
                                     .iter()
+                                    .chain(&self.forward)
                                     .filter_map(|state| state.page.as_ref())
                                     .flat_map(|page| &page.shelves)
                                     .flat_map(|shelf| &shelf.items)
@@ -909,7 +911,7 @@ impl Music {
         }
         let anchor = self.page_anchor();
         let changed = append_added(&mut self.page, &self.route, id, sources);
-        for state in &mut self.back {
+        for state in self.back.iter_mut().chain(&mut self.forward) {
             if let Some(page) = &mut state.page {
                 append_added(page, &state.route, id, sources);
             }
@@ -1107,6 +1109,7 @@ impl Music {
         for (page, route) in std::iter::once((&mut self.page, &self.route)).chain(
             self.back
                 .iter_mut()
+                .chain(&mut self.forward)
                 .filter_map(|state| Some((state.page.as_mut()?, &state.route))),
         ) {
             metadata.apply(page, route);
@@ -1251,7 +1254,7 @@ impl Music {
                 .push(PageChange::Confirmed(Box::new(mutation.clone())));
         }
         patch_page(&mut self.page, &self.route, mutation);
-        for state in &mut self.back {
+        for state in self.back.iter_mut().chain(&mut self.forward) {
             if let Some(page) = &mut state.page {
                 patch_page(page, &state.route, mutation);
             }

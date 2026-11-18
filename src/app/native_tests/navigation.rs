@@ -472,12 +472,12 @@ fn explore_pages_keep_their_titled_shelves() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn mouse_back_button_goes_back() -> Result<()> {
+fn history_buttons_restore_visited_pages() -> Result<()> {
     check_cache_window(async |window, cx| {
-        let back = |window: gpui::WindowHandle<Music>, cx: &mut gpui::AsyncApp| {
+        let navigate = |direction, window: gpui::WindowHandle<Music>, cx: &mut gpui::AsyncApp| {
             cx.update_window(window.into(), |_, window, cx| {
                 let position = point(px(640.), px(400.));
-                let button = gpui::MouseButton::Navigate(gpui::NavigationDirection::Back);
+                let button = gpui::MouseButton::Navigate(direction);
                 window.dispatch_event(
                     gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
                         button,
@@ -505,17 +505,100 @@ fn mouse_back_button_goes_back() -> Result<()> {
             .update(cx, |view, _, cx| {
                 view.navigate(playlist.clone(), cx);
                 reply(view, page("Back target", "back-tail"), cx);
+                view.prefetch_page(100, 100, 0, cx);
+                reply(
+                    view,
+                    crate::app::sync::tests::response(
+                        &[("Songs", (100..200).collect())],
+                        Some("loaded-tail"),
+                        true,
+                    ),
+                    cx,
+                );
             })
             .unwrap();
         wait_for_presented_frame(window, cx).await;
-        back(window, cx);
+        navigate(gpui::NavigationDirection::Back, window, cx);
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                assert!(matches!(view.route, Route::Explore));
+                confirm(
+                    view,
+                    window,
+                    Mutation::RemoveFromPlaylist {
+                        id: "back".into(),
+                        set_video_id: "occurrence-149".into(),
+                        video_id: format!("{:011}", 149),
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.overlay = Some(crate::app::Overlay::Help);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        navigate(gpui::NavigationDirection::Forward, window, cx);
+        window
+            .update(cx, |view, _, cx| {
+                assert!(
+                    matches!(view.route, Route::Explore),
+                    "The dialog blocks mouse Forward"
+                );
+                view.overlay = None;
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        navigate(gpui::NavigationDirection::Forward, window, cx);
         wait_for_presented_frame(window, cx).await;
         window
             .update(cx, |view, _, _| {
-                assert!(
-                    matches!(view.route, Route::Explore),
-                    "The mouse's Back button returns to the previous page"
+                assert!(view.route == playlist, "Mouse Forward restores the visit");
+                assert_eq!(
+                    view.rows.len(),
+                    199,
+                    "Forward keeps the loaded tail with confirmed edits"
                 );
+                assert_eq!(
+                    view.page.continuation.as_ref().unwrap().token(),
+                    "loaded-tail"
+                );
+                assert!(
+                    view.page
+                        .tracks()
+                        .iter()
+                        .all(|track| track.id != format!("{:011}", 149))
+                );
+            })
+            .unwrap();
+
+        super::render::key(window, cx, "alt-left").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(matches!(view.route, Route::Explore))
+            })
+            .unwrap();
+        super::render::key(window, cx, "alt-right").await;
+        window
+            .update(cx, |view, _, _| assert!(view.route == playlist))
+            .unwrap();
+
+        super::render::key(window, cx, "alt-left").await;
+        window
+            .update(cx, |view, _, cx| {
+                view.navigate(Route::Library(Section::Songs), cx);
+                reply(view, page("Songs", "songs-tail"), cx);
+            })
+            .unwrap();
+        super::render::key(window, cx, "alt-right").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(matches!(view.route, Route::Library(Section::Songs)));
             })
             .unwrap();
     })

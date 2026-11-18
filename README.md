@@ -83,6 +83,7 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | F | Video fullscreen |
 | Ctrl R | Reload the page |
 | Alt ← or mouse Back | Back |
+| Alt → or mouse Forward | Forward |
 | Escape | Close a dialog, fullscreen, the player page or search |
 | ? | Keyboard shortcuts |
 | Ctrl Q | Quit |
