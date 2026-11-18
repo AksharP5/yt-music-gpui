@@ -22,10 +22,42 @@ pub(super) struct SuggestionsResult {
 }
 
 impl Music {
+    pub(super) fn playlist_rows_end(&self) -> usize {
+        self.list_rows
+            .iter()
+            .rposition(|row| !row.is_suggestion())
+            .map_or(0, |index| index + 1)
+    }
+
+    pub(super) fn append_suggestion_rows(&mut self) {
+        if let Some(suggestions) = &self.suggestions {
+            if self.rows.is_empty() {
+                self.list_rows.push(ListRow::EmptyPlaylist);
+            }
+            self.list_rows.push(ListRow::SuggestionsHeading);
+            self.list_rows
+                .extend((0..suggestions.tracks.len()).map(ListRow::Suggestion));
+            self.list_rows.push(ListRow::SuggestionsFooter);
+            self.list_rows
+                .extend((0..suggestions.related.len()).map(ListRow::Related));
+        }
+    }
+
+    fn refresh_suggestion_rows(&mut self) {
+        let start = self.playlist_rows_end();
+        self.list_rows.truncate(start);
+        self.append_suggestion_rows();
+        self.detail_list
+            .replace_tail(start, self.list_rows.len() - start);
+    }
+
     pub(super) fn clear_suggestions(&mut self) {
         self.catalog_requests.cancel(CatalogTarget::Suggestions);
         if self.suggestions.take().is_some() {
-            self.rebuild_rows();
+            self.shelf_heights.truncate(self.page.shelves.len());
+            self.shelf_scroll
+                .retain(|index, _| *index < self.page.shelves.len());
+            self.refresh_suggestion_rows();
         }
     }
 
@@ -48,7 +80,7 @@ impl Music {
             .header
             .as_ref()
             .and_then(|header| header.suggestions.clone());
-        if !fresh_seed && token.is_none() {
+        if token.is_none() {
             return;
         }
         self.suggestions = Some(Suggestions {
@@ -73,7 +105,7 @@ impl Music {
         suggestions.added_during_read.clear();
         let playlist = suggestions.playlist.clone();
         self.request(Query::PlaylistSuggestions { playlist, token }, cx);
-        self.rebuild_rows();
+        self.refresh_suggestion_rows();
     }
 
     pub(super) fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
@@ -116,7 +148,6 @@ impl Music {
             self.refresh_session(false, cx);
             return;
         }
-        let anchor = self.page_anchor();
         if let Some(suggestions) = &mut self.suggestions {
             match response.result {
                 Ok(mut batch) => {
@@ -128,6 +159,7 @@ impl Music {
                     suggestions.auto_reload_when_empty = batch.auto_reload_when_empty;
                     if let Some(related) = batch.related {
                         suggestions.related = related;
+                        self.shelf_heights.truncate(self.page.shelves.len());
                     }
                     suggestions.error = None;
                 }
@@ -135,8 +167,7 @@ impl Music {
             }
             suggestions.added_during_read.clear();
         }
-        self.rebuild_rows();
-        self.restore_page_anchor(&anchor);
+        self.refresh_suggestion_rows();
         cx.notify();
     }
 
@@ -179,7 +210,7 @@ impl Music {
             }
         }
         let reload = suggestions.tracks.is_empty() && suggestions.auto_reload_when_empty;
-        self.rebuild_rows();
+        self.refresh_suggestion_rows();
         if reload && !loading {
             self.refresh_suggestions(cx);
         }
@@ -191,6 +222,7 @@ impl Music {
         inset: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let enabled = self.suggestion_control_enabled(index * 2 + 1);
         let Some(suggestions) = &mut self.suggestions else {
             return div().into_any_element();
         };
@@ -199,12 +231,10 @@ impl Music {
         };
         let track = suggestion.track.clone();
         let play_focus = suggestions.focus.handle(index * 2, cx);
-        let add_focus = suggestions.focus.handle(index * 2 + 1, cx);
-        let enabled = suggestion.addable
-            && self.account_operation.is_none()
-            && !self
-                .pending_mutations
-                .contains_key(suggestions.playlist.id.trim_start_matches("VL"));
+        let add_focus = suggestions
+            .focus
+            .handle(index * 2 + 1, cx)
+            .tab_stop(enabled);
         let subtitle = track
             .details
             .byline
@@ -285,7 +315,6 @@ impl Music {
             .child(
                 button(("suggestion-add", index), "menu-save-playlist", self.theme)
                     .track_focus(&add_focus)
-                    .tab_stop(enabled)
                     .opacity(if enabled { 1. } else { 0.35 })
                     .on_click(cx.listener(move |view, _, _, cx| {
                         cx.stop_propagation();
@@ -308,7 +337,10 @@ impl Music {
         let Some(suggestions) = &mut self.suggestions else {
             return div().into_any_element();
         };
-        let focus = suggestions.focus.handle(suggestions.tracks.len() * 2, cx);
+        let focus = suggestions
+            .focus
+            .handle(suggestions.tracks.len() * 2, cx)
+            .tab_stop(!loading);
         let error = suggestions.error.clone();
         div()
             .w_full()
@@ -330,7 +362,6 @@ impl Music {
                         .id("suggestions-refresh")
                         .keyboard_control(self.theme)
                         .track_focus(&focus)
-                        .tab_stop(!loading)
                         .px(px(20.))
                         .h(px(36.))
                         .rounded_full()
@@ -353,22 +384,31 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(suggestions) = &mut self.suggestions else {
+        let Some(suggestions) = &self.suggestions else {
             return false;
         };
         let count = suggestions.tracks.len() * 2 + 1;
-        if !suggestions.focus.advance(reverse, count, window, cx) {
-            return false;
-        }
         let Some(control) = suggestions.focus.focused(window) else {
             return false;
         };
-        let row = self.list_rows.iter().position(|row| match row {
+        let next = if reverse {
+            (0..control)
+                .rev()
+                .find(|index| self.suggestion_control_enabled(*index))
+        } else {
+            (control + 1..count).find(|index| self.suggestion_control_enabled(*index))
+        };
+        let Some(control) = next else { return false };
+        if let Some(suggestions) = &mut self.suggestions {
+            suggestions.focus.focus(control, window, cx);
+        }
+        let row = self.list_rows.iter().rposition(|row| match row {
             ListRow::Suggestion(index) => control / 2 == *index && control + 1 < count,
             ListRow::SuggestionsFooter => control + 1 == count,
             _ => false,
         });
         if let Some(row) = row {
+            let row = row + usize::from(self.detail_list.inline_header);
             if self.detail_list.state.bounds_for_item(row).is_some() {
                 self.detail_list.state.scroll_to_reveal_item(row);
             } else {
@@ -380,5 +420,23 @@ impl Music {
         }
         cx.notify();
         true
+    }
+
+    fn suggestion_control_enabled(&self, control: usize) -> bool {
+        let Some(suggestions) = &self.suggestions else {
+            return false;
+        };
+        if control == suggestions.tracks.len() * 2 {
+            return !self.catalog_requests.is_loading(CatalogTarget::Suggestions);
+        }
+        let Some(suggestion) = suggestions.tracks.get(control / 2) else {
+            return false;
+        };
+        control.is_multiple_of(2)
+            || suggestion.addable
+                && self.account_operation.is_none()
+                && !self
+                    .pending_mutations
+                    .contains_key(suggestions.playlist.id.trim_start_matches("VL"))
     }
 }

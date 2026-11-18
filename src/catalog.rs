@@ -5290,10 +5290,24 @@ mod tests {
         let id = std::env::var("YT_MUSIC_LIVE_PLAYLIST")
             .context("Set YT_MUSIC_LIVE_PLAYLIST to an owned playlist")?;
         ensure!(id.starts_with("VLPL"), "Select a playlist browse ID");
-        let session = auth::Session::load(&auth::Operation::default())?
+        let operation = auth::Operation::default();
+        let session = auth::Session::load(&operation)?
             .context("Sign in before running the Suggestions read check")?;
-        let catalog = Catalog::with_session(Some(Arc::new(session)))?;
-        let page = catalog.browse(&BrowseLink::new(&id, "Playlist"))?;
+        let session = Arc::new(session);
+        let mut catalog = Catalog::with_session(Some(session.clone()))?;
+        let playlist = BrowseLink::new(&id, "Playlist");
+        let page = match catalog.browse(&playlist) {
+            Err(error) if auth::session_was_rejected(&error) => {
+                let profile = session.source_profile.as_ref().context(
+                    "The saved session expired and has no browser profile. Reconnect in the app.",
+                )?;
+                let refreshed = profile.read_session(&operation)?;
+                session.require_same_account(&refreshed)?;
+                catalog = catalog.for_session(Some(Arc::new(refreshed)));
+                catalog.browse(&playlist)?
+            }
+            result => result?,
+        };
         ensure!(page.editable, "Select an owned editable playlist");
         let count = page.tracks().len();
         let seed = page
@@ -5313,15 +5327,24 @@ mod tests {
             .context("Suggestions returned no Refresh token")?;
         let next = catalog.playlist_suggestions(reload, &id)?;
         ensure!(!next.tracks.is_empty(), "Refresh returned no rows");
+        ensure!(
+            next.tracks.iter().all(|row| row.addable),
+            "Refresh returned an unusable Add action"
+        );
         ensure!(next.reload.is_some(), "Refresh returned no next token");
         ensure!(
             page.tracks().len() == count,
             "Suggestions changed playlist rows"
         );
         println!(
-            "Suggestions rows={}, refreshed rows={}, playlist rows={count}; read only",
+            "Suggestions rows={}, refreshed rows={}, playlist rows={count}, batch changed={}; read only",
             batch.tracks.len(),
-            next.tracks.len()
+            next.tracks.len(),
+            !batch
+                .tracks
+                .iter()
+                .map(|row| &row.track.id)
+                .eq(next.tracks.iter().map(|row| &row.track.id)),
         );
         Ok(())
     }

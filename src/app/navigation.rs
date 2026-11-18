@@ -673,17 +673,9 @@ impl Music {
         }
     }
 
-    pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) {
-        self.list_rows.retain(|row| {
-            !matches!(
-                row,
-                ListRow::EmptyPlaylist
-                    | ListRow::SuggestionsHeading
-                    | ListRow::Suggestion(_)
-                    | ListRow::SuggestionsFooter
-                    | ListRow::Related(_)
-            )
-        });
+    pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) -> usize {
+        let start = self.playlist_rows_end();
+        self.list_rows.truncate(start);
         self.shelf_heights.truncate(first_shelf);
         let sectioned = self.page.header.is_some();
         let browse_sections = self.browse_sections();
@@ -744,17 +736,8 @@ impl Music {
                 self.list_rows.extend(items.into_iter().map(ListRow::Item));
             }
         }
-        if let Some(suggestions) = &self.suggestions {
-            if self.rows.is_empty() {
-                self.list_rows.push(ListRow::EmptyPlaylist);
-            }
-            self.list_rows.push(ListRow::SuggestionsHeading);
-            self.list_rows
-                .extend((0..suggestions.tracks.len()).map(ListRow::Suggestion));
-            self.list_rows.push(ListRow::SuggestionsFooter);
-            self.list_rows
-                .extend((0..suggestions.related.len()).map(ListRow::Related));
-        }
+        self.append_suggestion_rows();
+        start
     }
 
     pub(in crate::app) fn refresh_local(&mut self) {
@@ -1039,7 +1022,6 @@ impl Music {
                 } else if result.append {
                     self.sync.page_coverage.continued = true;
                     let first_shelf = self.page.shelves.len();
-                    let previous_rows = self.list_rows.len();
                     let was_grouped = self.grouped_rows();
                     self.page.continuation = page.continuation;
                     self.page.shelves.extend(page.shelves);
@@ -1047,14 +1029,10 @@ impl Music {
                     if self.history_groups() || self.grouped_rows() != was_grouped {
                         self.rebuild_rows();
                     } else {
-                        self.append_rows(first_shelf);
+                        let start = self.append_rows(first_shelf);
                         if was_grouped {
-                            if self.suggestions.is_some() {
-                                self.detail_list.reset_rows(self.list_rows.len());
-                            } else {
-                                self.detail_list
-                                    .append_rows(self.list_rows.len() - previous_rows);
-                            }
+                            self.detail_list
+                                .replace_tail(start, self.list_rows.len() - start);
                         }
                     }
                     self.update_playlist_rows_snapshot();

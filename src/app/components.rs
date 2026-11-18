@@ -189,13 +189,7 @@ impl VirtualListFocus {
         });
     }
 
-    pub(in crate::app) fn advance(
-        &mut self,
-        reverse: bool,
-        count: usize,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
+    fn advance(&mut self, reverse: bool, count: usize, window: &mut Window, cx: &mut App) -> bool {
         let Some(current) = self.focused(window) else {
             return false;
         };

@@ -65,6 +65,19 @@ pub(in crate::app) enum ListRow {
     Related(usize),
 }
 
+impl ListRow {
+    pub(in crate::app) fn is_suggestion(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyPlaylist
+                | Self::SuggestionsHeading
+                | Self::Suggestion(_)
+                | Self::SuggestionsFooter
+                | Self::Related(_)
+        )
+    }
+}
+
 /// Space above stacked album and playlist columns: the old back-button row
 /// plus the web's 40px top padding.
 const STACKED_TOP: f32 = 64.;
@@ -85,13 +98,11 @@ impl DetailList {
         self.state.reset(rows + usize::from(self.inline_header));
         self.state.scroll_to(top);
     }
-    pub(in crate::app) fn append_rows(&self, rows: usize) {
-        if rows == 0 {
-            return;
-        }
+    pub(in crate::app) fn replace_tail(&self, start: usize, rows: usize) {
         let top = self.state.logical_scroll_top();
         let end = self.state.item_count();
-        self.state.splice(end..end, rows);
+        self.state
+            .splice(start + usize::from(self.inline_header)..end, rows);
         self.state.scroll_to(top);
     }
     pub(in crate::app) fn set_inline_header(&mut self, inline: bool) {
@@ -304,13 +315,7 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let extra = self.suggestions.as_ref().map_or(0, |suggestions| {
-            suggestions.tracks.len()
-                + suggestions.related.len()
-                + 2
-                + usize::from(self.rows.is_empty())
-        });
-        let playlist_end = self.list_rows.len().saturating_sub(extra);
+        let playlist_end = self.playlist_rows_end();
         self.prefetch_page(index.min(playlist_end), playlist_end, 8, cx);
         match self.list_rows[index] {
             ListRow::Featured(index) => {

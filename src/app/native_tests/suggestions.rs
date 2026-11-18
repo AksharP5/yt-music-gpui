@@ -3,12 +3,21 @@
 use super::navigation::{check_cache_window, reply};
 use crate::{
     account::{self, Effect, Mutation},
-    app::{CatalogTarget, Job, ListRow, Music, Query, Route, suggestions::SuggestionsResult},
-    catalog::{BrowseLink, Continuation, Page, PlaylistSuggestion, PlaylistSuggestions},
+    app::{
+        CatalogTarget, Job, ListRow, Music, Overlay, Query, Route, suggestions::SuggestionsResult,
+    },
+    catalog::{
+        BrowseLink, Collection, Continuation, Item, Page, PlaylistSuggestion, PlaylistSuggestions,
+        Shelf, ShelfLayout,
+    },
 };
 use anyhow::Result;
-use gpui::{Context, ListOffset, px, size};
+use gpui::{
+    AppContext, Context, ListOffset, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
+    point, px, size,
+};
 use serde_json::json;
+use std::time::Instant;
 
 fn playlist(view: &Music, rows: usize) -> Page {
     let mut page = crate::app::sync::tests::page(rows, false);
@@ -165,14 +174,31 @@ fn suggestions_refresh_keeps_playlist_rows_and_discards_late_visits() -> Result<
                     view.suggestions.as_ref().unwrap().focus.focused(window),
                     Some(14)
                 );
+                let row = view.list_rows.iter().position(|row| matches!(row, ListRow::SuggestionsFooter)).unwrap()
+                    + usize::from(view.detail_list.inline_header);
+                let bounds = view.detail_list.state.bounds_for_item(row).unwrap();
+                assert!(bounds.size.height > px(0.) && bounds.bottom() <= window.viewport_size().height,
+                    "Tab must reveal the complete Refresh row, including the inline-header offset: {bounds:?}");
             })
             .unwrap();
         super::render::key(window, cx, "enter").await;
-        window.update(cx, |view, _, cx| {
+        let refresh = window.update(cx, |view, _, _| {
             let refresh = view.catalog_requests.pending.try_recv().unwrap();
             assert!(matches!(&refresh.query, Query::PlaylistSuggestions { token: Some(token), .. } if token.token() == "suggestions-reload"));
-            deliver(view, refresh, Ok(batch(view, "Keyboard refreshed")), cx);
+            refresh
         }).unwrap();
+        super::render::key(window, cx, "shift-tab").await;
+        super::render::key(window, cx, "tab").await;
+        window
+            .update(cx, |view, window, cx| {
+                assert_ne!(
+                    view.suggestions.as_ref().unwrap().focus.focused(window),
+                    Some(14),
+                    "Loading Refresh must not be a Tab stop"
+                );
+                deliver(view, refresh, Ok(batch(view, "Keyboard refreshed")), cx);
+            })
+            .unwrap();
         window
             .update(cx, |view, _, cx| {
                 view.refresh_suggestions(cx);
@@ -188,6 +214,225 @@ fn suggestions_refresh_keeps_playlist_rows_and_discards_late_visits() -> Result<
                 );
             })
             .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn related_playlist_cards_open_the_rendered_collection() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        for keyboard in [false, true] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.navigate(
+                        Route::Browse(BrowseLink::new(
+                            "VLsuggestions-related",
+                            "Suggestions fixture",
+                        )),
+                        cx,
+                    );
+                    reply(view, playlist(view, 3), cx);
+                    let read = view.catalog_requests.pending.try_recv().unwrap();
+                    let mut suggestions = batch(view, "Suggestion");
+                    suggestions.related = Some(vec![Shelf {
+                        title: "Related playlists".into(),
+                        layout: ShelfLayout::Cards,
+                        more: None,
+                        items: (0..if keyboard { 1 } else { 6 })
+                            .map(|index| {
+                                Item::Collection(Collection {
+                                    id: if index == 0 {
+                                        "VLPLrelated".into()
+                                    } else {
+                                        format!("VLPLrelated-{index}")
+                                    },
+                                    title: format!("Related fixture {index}"),
+                                    subtitle: "Fixture owner".into(),
+                                    thumbnail: None,
+                                    details: Default::default(),
+                                })
+                            })
+                            .collect(),
+                    }]);
+                    deliver(view, read, Ok(suggestions), cx);
+                    assert_eq!(view.rows.len(), 3);
+                    assert_eq!(view.page.tracks().len(), 3);
+                    let row = view
+                        .list_rows
+                        .iter()
+                        .position(|row| matches!(row, ListRow::Related(0)))
+                        .unwrap();
+                    view.detail_list.state.scroll_to(ListOffset {
+                        item_ix: row + usize::from(view.detail_list.inline_header),
+                        offset_in_item: px(0.),
+                    });
+                })
+                .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+            if !keyboard {
+                window
+                    .update(cx, |view, _, cx| {
+                        let carousel = &view.shelf_scroll[&view.page.shelves.len()];
+                        assert!(carousel.max_offset().x > px(40.));
+                        carousel.set_offset(point(px(-40.), px(0.)));
+                        view.refresh_suggestions(cx);
+                        let read = view.catalog_requests.pending.try_recv().unwrap();
+                        let mut refreshed = batch(view, "Refreshed suggestion");
+                        refreshed.related = None;
+                        deliver(view, read, Ok(refreshed), cx);
+                    })
+                    .unwrap();
+                super::render::wait_for_presented_frame(window, cx).await;
+                window
+                    .update(cx, |view, _, cx| {
+                        let carousel = &view.shelf_scroll[&view.page.shelves.len()];
+                        assert_eq!(carousel.offset().x, px(-40.));
+                        carousel.set_offset(point(px(0.), px(0.)));
+                        cx.notify();
+                    })
+                    .unwrap();
+                super::render::wait_for_presented_frame(window, cx).await;
+            }
+            let target = window
+                .update(cx, |view, _, _| {
+                    let row = view
+                        .list_rows
+                        .iter()
+                        .position(|row| matches!(row, ListRow::Related(0)))
+                        .unwrap()
+                        + usize::from(view.detail_list.inline_header);
+                    let bounds = view.detail_list.state.bounds_for_item(row).unwrap();
+                    point(bounds.left() + px(24.), bounds.top() + px(110.))
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Right,
+                        position: target,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                )
+            })
+            .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+            window.update(cx, |view, _, _| {
+                assert!(matches!(&view.overlay, Some(Overlay::Collection(collection)) if collection.id == "VLPLrelated"));
+                assert_eq!(view.page.tracks().len(), 3);
+            }).unwrap();
+            super::render::key(window, cx, "escape").await;
+            if keyboard {
+                window
+                    .update(cx, |view, window, cx| {
+                        let focus = view.suggestions.as_mut().unwrap().focus.handle(14, cx);
+                        window.focus(&focus, cx);
+                    })
+                    .unwrap();
+                super::render::key(window, cx, "tab").await;
+                super::render::key(window, cx, "enter").await;
+            } else {
+                for event in [
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: target,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: target,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                ] {
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(event, cx)
+                    })
+                    .unwrap();
+                }
+                super::render::wait_for_presented_frame(window, cx).await;
+            }
+            window
+                .update(cx, |view, _, _| {
+                    assert!(
+                        matches!(&view.route, Route::Browse(link) if link.id == "VLPLrelated"),
+                        "Related card must open on {}",
+                        if keyboard { "Enter" } else { "click" }
+                    );
+                    let original = view.back.last().unwrap().page.as_ref().unwrap();
+                    assert_eq!(original.tracks().len(), 3);
+                })
+                .unwrap();
+        }
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; run in release mode for timings"]
+fn suggestions_refresh_cost_with_loaded_playlist() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        for rows in [500, 5000] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.navigate(
+                        Route::Browse(BrowseLink::new(
+                            format!("VLmeasure-{rows}"),
+                            "Suggestions fixture",
+                        )),
+                        cx,
+                    );
+                    reply(view, playlist(view, rows), cx);
+                    let read = view.catalog_requests.pending.try_recv().unwrap();
+                    deliver(view, read, Ok(batch(view, "Measured suggestion")), cx);
+                    view.detail_list.state.scroll_to(ListOffset {
+                        item_ix: rows / 2,
+                        offset_in_item: px(0.),
+                    });
+                })
+                .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+            for sample in 0..9 {
+                let started = Instant::now();
+                let (job, request_us) = window
+                    .update(cx, |view, _, cx| {
+                        let cpu = Instant::now();
+                        view.refresh_suggestions(cx);
+                        let elapsed = cpu.elapsed().as_micros();
+                        (view.catalog_requests.pending.try_recv().unwrap(), elapsed)
+                    })
+                    .unwrap();
+                super::render::wait_for_presented_frame(window, cx).await;
+                let response_us = window
+                    .update(cx, |view, _, cx| {
+                        let response = batch(view, "Measured suggestion");
+                        let cpu = Instant::now();
+                        deliver(view, job, Ok(response), cx);
+                        let elapsed = cpu.elapsed().as_micros();
+                        assert_eq!(view.rows.len(), rows);
+                        assert_eq!(
+                            view.page
+                                .shelves
+                                .iter()
+                                .map(|shelf| shelf.items.len())
+                                .sum::<usize>(),
+                            rows
+                        );
+                        elapsed
+                    })
+                    .unwrap();
+                super::render::wait_for_presented_frame(window, cx).await;
+                if sample > 0 {
+                    println!(
+                        "SUGGESTIONS_REFRESH_PERF {}",
+                        json!({"rows":rows,"sample":sample,"request_us":request_us,"response_us":response_us,"two_frames_us":started.elapsed().as_micros()})
+                    );
+                }
+            }
+        }
     })
 }
 
@@ -218,6 +463,17 @@ fn suggestions_add_keeps_clicked_metadata_after_refresh_and_navigation() -> Resu
             })
             .unwrap();
         super::render::key(window, cx, "enter").await;
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        window
+            .update(cx, |view, window, _| {
+                assert_eq!(
+                    view.suggestions.as_ref().unwrap().focus.focused(window),
+                    Some(4),
+                    "Tab skips Add controls while an edit is pending"
+                );
+            })
+            .unwrap();
         window.update(cx, |view, window, cx| {
             let account::Command::Apply { session, mutation } = pending.try_recv().unwrap() else { panic!("Expected Add") };
             assert!(matches!(&*mutation, Mutation::AddToPlaylist { id, video_ids, .. } if id == "suggestions" && video_ids == std::slice::from_ref(&selected.id)));
