@@ -1,96 +1,29 @@
-name: CI
+name: Ubuntu mirror comparison
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: 4
-
 jobs:
-  check:
+  compare:
     runs-on: ubuntu-24.04
+    timeout-minutes: 6
     steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: bin/test
-      - run: bin/test-install
-      # Ubuntu 24.04 ships the oldest libmpv the packages accept (0.37).
-      - name: Play through the distro libmpv
-        run: |
-          export XDG_RUNTIME_DIR=$(mktemp -d /dev/shm/yt-music-ci.XXXXXX)
-          bin/test -- --ignored --exact \
-            player::tests::plays_with_the_installed_libmpv \
-            player::tests::playback_checks_the_account_version_once_when_needed
-      - uses: actions/setup-python@v7
-        id: python
-        with:
-          python-version: "3.x"
-      - name: Install the reviewed yt-dlp
-        run: |
-          version=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
-          python -m pip install --quiet "yt-dlp==$version"
-      - name: Test yt-dlp contracts
-        env:
-          YT_DLP_TEST_PYTHON: ${{ steps.python.outputs.python-path }}
-        run: >-
-          bin/test -- --ignored --exact
-          player::tests::quality_selectors_respect_audio_classes_and_video_caps
-          player::tests::embedded_extractor_binds_the_selected_account
-
-  # Builds and plays audio on Apple Silicon. Sign-in and video are Linux-only so far.
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: bin/test
-      - name: Play through Homebrew's libmpv
-        run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
-
-  # Builds and plays audio on Windows. Sign-in and video are Linux-only so far.
-  windows:
-    runs-on: windows-2025
-    defaults:
-      run:
+      - name: Compare downloads on this runner
         shell: bash
-    steps:
-      # Git for Windows checks out CRLF by default, which breaks bin/test.
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: bin/test
-      - name: Play through mpv's libmpv
-        run: bin/test -- --ignored --exact player::tests::plays_with_the_installed_libmpv
-
-  performance:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          fetch-depth: 2
-      - uses: ./.github/actions/setup
-      - name: Compare release size and local playback against the PR base
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
-        run: bin/check-performance "$BASE_SHA"
-
-  release-test:
-    if: github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/release-build.yml
+        run: |
+          awk '/^URIs:/ {print}' /etc/apt/sources.list.d/ubuntu.sources
+          object=/ubuntu/dists/noble/main/binary-amd64/Packages.xz
+          for mirror in us-east-2.ec2.archive.ubuntu.com azure.archive.ubuntu.com azure.archive.ubuntu.com us-east-2.ec2.archive.ubuntu.com; do
+            metrics=$(curl --silent --show-error --fail --max-time 55 --output /dev/null \
+              --write-out '%{http_code} %{size_download} %{time_total} %{speed_download}' \
+              "http://${mirror}${object}") && result=0 || result=$?
+            printf '%s %s %s\n' "$mirror" "$result" "$metrics" | tee -a comparison.tsv
+          done
+          summary="$GITHUB_STEP_SUMMARY"
+          printf '| Mirror | Curl exit | HTTP | Bytes | Seconds | Bytes per second |\n| --- | ---: | ---: | ---: | ---: | ---: |\n' >> "$summary"
+          while read -r mirror result code bytes seconds speed; do
+            printf '| %s | %s | %s | %s | %s | %s |\n' "$mirror" "$result" "$code" "$bytes" "$seconds" "$speed" >> "$summary"
+          done < comparison.tsv
