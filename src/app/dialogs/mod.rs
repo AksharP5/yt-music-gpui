@@ -1427,6 +1427,16 @@ impl Music {
                                             }
                                             view.error = None;
                                             if view.mutate(mutation, cx) {
+                                                if let Destination::Playlist(id) = &destination
+                                                    && let Some(sources) =
+                                                        view.pending_mutations.get_mut(id)
+                                                    && let Some(Overlay::PlaylistPicker {
+                                                        tracks,
+                                                        ..
+                                                    }) = &mut view.overlay
+                                                {
+                                                    *sources = std::mem::take(tracks);
+                                                }
                                                 view.close_overlay(window, cx);
                                             } else if let Some(Overlay::PlaylistPicker {
                                                 error,

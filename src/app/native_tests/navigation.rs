@@ -2689,3 +2689,100 @@ fn playlist_song_menu_moves_the_selected_occurrence_across_shelves() -> Result<(
         }
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn saving_a_queue_keeps_its_songs_after_playback_changes() -> Result<()> {
+    use super::render::key;
+    use crate::app::sync::tests::page as playlist;
+
+    check_cache_window(async |window, cx| {
+        let (commands, submitted) = async_channel::bounded(1);
+        let songs = window
+            .update(cx, |view, window, cx| {
+                view.account_commands = commands;
+                view.navigate(Route::Browse(BrowseLink::new("VLPLtarget", "Target")), cx);
+                let mut destination = playlist(0, false);
+                destination.editable = true;
+                reply(view, destination, cx);
+                view.sidebar_playlists = vec![crate::catalog::Collection {
+                    id: "VLPLtarget".into(),
+                    title: "Target".into(),
+                    subtitle: String::new(),
+                    thumbnail: None,
+                    details: crate::catalog::CollectionDetails {
+                        editable: true,
+                        ..Default::default()
+                    },
+                }];
+                let mut tracks = playlist(2, false).tracks();
+                for (index, track) in tracks.iter_mut().enumerate() {
+                    track.id = format!("queueSong0{index}");
+                    track.title = format!("Queue song {index}");
+                }
+                view.library.queue.replace(tracks.clone(), 0);
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(view.library.queue.tracks.clone(), cx);
+                let _ = playlist_choices_job(view);
+                tracks
+            })
+            .unwrap();
+
+        key(window, cx, "tab").await;
+        key(window, cx, "tab").await;
+        key(window, cx, "enter").await;
+        let account::Command::Apply { session, mutation } = submitted.try_recv().unwrap() else {
+            panic!("Expected the Save to playlist selection");
+        };
+        let video_ids: Vec<_> = songs.iter().map(|track| track.id.clone()).collect();
+        assert!(
+            matches!(&*mutation, Mutation::AddToPlaylist { id, video_ids: selected, duplicates: false }
+            if id == "PLtarget" && selected == &video_ids)
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.overlay.is_none());
+                view.clear_queue(cx);
+                view.account_event(
+                    account::Event::Applied {
+                        session,
+                        mutation,
+                        result: Ok(Effect::PlaylistAdded {
+                            additions: video_ids
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, id)| (id, format!("saved-occurrence-{i}")))
+                                .collect(),
+                            toast: None,
+                        }),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+                let tracks = view.page.tracks();
+                assert_eq!(
+                    tracks.len(),
+                    songs.len(),
+                    "Confirmed songs must appear before readback"
+                );
+                for (index, (actual, source)) in tracks.iter().zip(&songs).enumerate() {
+                    assert_eq!(actual.id, source.id);
+                    assert_eq!(actual.title, source.title);
+                    assert_eq!(actual.artist, source.artist);
+                    assert_eq!(
+                        actual.details.set_video_id,
+                        Some(format!("saved-occurrence-{index}"))
+                    );
+                }
+                assert!(!view.catalog_requests.is_loading(CatalogTarget::Page));
+                assert!(
+                    view.catalog_requests
+                        .is_loading(CatalogTarget::PlaylistMetadata)
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+    })
+}
