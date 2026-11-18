@@ -51,6 +51,28 @@ fn control(
     tinted_control(id, name, theme.text, theme, cx, action)
 }
 
+fn transport_control(
+    name: &'static str,
+    available: bool,
+    theme: Theme,
+    cx: &mut Context<Music>,
+    action: fn(&mut Music, &mut Context<Music>),
+) -> Stateful<Div> {
+    if available {
+        return control(name, name, theme, cx, move |view, _, cx| action(view, cx));
+    }
+    div()
+        .id(name)
+        .size(px(36.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor(CursorStyle::Arrow)
+        .child(icon(name, 24., theme.muted))
+        .on_click(|_, _, cx| cx.stop_propagation())
+}
+
 /// The web draws the volume, repeat and shuffle buttons grey until they are active.
 const INACTIVE: u32 = 0x909090;
 
@@ -154,20 +176,14 @@ impl Music {
         let playing = self.active_id.is_some()
             && self.playback != Playback::Stopped
             && !self.playback.is_paused();
-        let next = if self.can_go_next() {
-            control("next", "next", theme, cx, |view, _, cx| view.skip_next(cx))
-        } else {
-            div()
-                .id("next")
-                .size(px(36.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor(CursorStyle::Arrow)
-                .child(icon("next", 24., theme.muted))
-                .on_click(|_, _, cx| cx.stop_propagation())
-        };
+        let previous = transport_control(
+            "previous",
+            self.can_go_previous(),
+            theme,
+            cx,
+            Music::previous,
+        );
+        let next = transport_control("next", self.can_go_next(), theme, cx, Music::skip_next);
         // Sized to its content and centered, so the rating buttons follow the title as on the web.
         let mut details = div().min_w_0().max_w(px(660.)).flex().items_center();
         if let Some(track) = current {
@@ -328,9 +344,7 @@ impl Music {
                             .flex()
                             .items_center()
                             .gap(px(12.))
-                            .child(control("previous", "previous", theme, cx, |view, _, cx| {
-                                view.previous(cx)
-                            }))
+                            .child(previous)
                             .child(
                                 div()
                                     .id("play-pause")
