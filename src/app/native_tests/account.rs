@@ -125,7 +125,7 @@ fn renew(
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<()> {
+fn renewed_session_preserves_loaded_rows_and_can_continue_them() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         let next = session("renewed-navigation");
         let (sender, commands) = async_channel::unbounded();
@@ -143,6 +143,20 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                     .unwrap(),
                 );
                 view.navigate(
+                    Route::Browse(BrowseLink::new("VLprevious", "Previous playlist")),
+                    cx,
+                );
+                let mut previous = crate::app::sync::tests::page(100, true);
+                previous.continuation = Some(
+                    crate::catalog::Continuation::from_response(
+                        "previous-visit-tail",
+                        &json!({}),
+                        Some(view.account.as_ref().unwrap().session.clone()),
+                    )
+                    .unwrap(),
+                );
+                super::navigation::reply(view, previous, cx);
+                view.navigate(
                     Route::Browse(BrowseLink::new("VLrenewed", "Renewed playlist")),
                     cx,
                 );
@@ -155,7 +169,7 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                     )
                     .unwrap(),
                 );
-                super::navigation::reply(view, first, cx);
+                super::navigation::reply(view, first.clone(), cx);
                 view.prefetch_page(100, 100, 0, cx);
                 let mut tail = crate::app::sync::tests::response(
                     &[("Songs", (100..150).collect())],
@@ -171,6 +185,32 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                     .unwrap(),
                 );
                 super::navigation::reply(view, tail, cx);
+                view.navigate(
+                    Route::Browse(BrowseLink::new("VLfuture", "Forward playlist")),
+                    cx,
+                );
+                let mut future = crate::app::sync::tests::page(100, true);
+                future.continuation = Some(
+                    crate::catalog::Continuation::from_response(
+                        "forward-visit-tail",
+                        &json!({}),
+                        Some(view.account.as_ref().unwrap().session.clone()),
+                    )
+                    .unwrap(),
+                );
+                super::navigation::reply(view, future, cx);
+                view.go_back(cx);
+                super::navigation::reply(view, first, cx);
+                assert_eq!(view.rows.len(), 150);
+
+                view.sync.sidebar_continuation = Some(
+                    crate::catalog::Continuation::from_response(
+                        "old-sidebar-tail",
+                        &json!({}),
+                        Some(view.account.as_ref().unwrap().session.clone()),
+                    )
+                    .unwrap(),
+                );
                 view.refresh_playlist_metadata(
                     "renewed",
                     Vec::new(),
@@ -215,38 +255,140 @@ fn renewed_session_does_not_cache_the_active_pages_old_continuation() -> Result<
                 "Synthetic renewal was not acknowledged"
             );
         }
-        window.update(cx, |view, _, cx| {
-            assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &next));
-            assert!(view.sync.playlist_refreshes.is_empty());
-            assert!(view.sync.playlist_failures.is_empty(), "Renewal releases failed readback facts and old-session row snapshots");
-            assert!(!view.catalog_requests.is_loading(CatalogTarget::PlaylistMetadata));
-            assert_ne!(stale_metadata.id,view.catalog_requests.generations[CatalogTarget::PlaylistMetadata as usize].load(Ordering::Relaxed),"Cookie renewal cancels further reads with the old session");
-            view.catalog_result(CatalogResult {
-                id:stale_metadata.id,account_revision:stale_metadata.account_revision,account_generation:stale_metadata.account_generation,history_generation:stale_metadata.history_generation,
-                append:false,revalidate:false,result:Err("Old-session metadata must not publish".into()),session_rejected:false,target:CatalogTarget::PlaylistMetadata,
-            },cx);
-            assert!(view.error.is_none());
-            let mut fresh = crate::app::sync::tests::page(100, true);
-            fresh.continuation = Some(crate::catalog::Continuation::from_response("renewed-first-tail", &json!({}), Some(next.clone())).unwrap());
-            assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), crate::app::Query::Revalidate(_)));
-            assert_eq!(view.rows.len(), 150, "Renewal must preserve the active loaded rows as on main");
-            assert_eq!(view.page.continuation.as_ref().unwrap().token(), "old-loaded-tail", "Active revalidation must retain main's continuation behavior");
-            view.navigate(Route::Explore, cx);
-            super::navigation::reply(view, crate::app::sync::tests::page(1, false), cx);
-            view.go_back(cx);
-            assert_eq!(view.rows.len(), 150, "Back must immediately restore the page invalidated by renewal");
-            assert!(matches!(super::navigation::reply(view, fresh.clone(), cx), crate::app::Query::Revalidate(_)));
-            assert_eq!(view.page.continuation.as_ref().unwrap().token(), "old-loaded-tail");
-            view.navigate(Route::Explore, cx);
-            view.navigate(Route::Browse(BrowseLink::new("VLrenewed", "Renewed playlist")), cx);
-            assert!(view.rows.is_empty(), "Forward must not serve an active page merged across renewal with an old-session tail");
-            assert!(matches!(super::navigation::reply(view, fresh, cx), crate::app::Query::Browse(_)));
-            view.prefetch_page(100, 100, 0, cx);
-            let job = view.catalog_requests.pending.try_recv().unwrap();
-            let crate::app::Query::More { mut token, .. } = job.query else { panic!("Expected load more after renewal") };
-            assert_eq!(token.token(), "renewed-first-tail");
-            token.renew_session(&next, &next).expect("Load more must be bound to the renewed session");
-        }).unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(Arc::ptr_eq(&view.account.as_ref().unwrap().session, &next));
+                assert!(view.sync.playlist_refreshes.is_empty());
+                assert!(
+                    view.sync.playlist_failures.is_empty(),
+                    "Renewal releases failed readback facts and old-session row snapshots"
+                );
+                assert!(
+                    !view
+                        .catalog_requests
+                        .is_loading(CatalogTarget::PlaylistMetadata)
+                );
+                assert_ne!(
+                    stale_metadata.id,
+                    view.catalog_requests.generations[CatalogTarget::PlaylistMetadata as usize]
+                        .load(Ordering::Relaxed),
+                    "Cookie renewal cancels further reads with the old session"
+                );
+                view.catalog_result(
+                    CatalogResult {
+                        id: stale_metadata.id,
+                        account_revision: stale_metadata.account_revision,
+                        account_generation: stale_metadata.account_generation,
+                        history_generation: stale_metadata.history_generation,
+                        append: false,
+                        revalidate: false,
+                        result: Err("Old-session metadata must not publish".into()),
+                        session_rejected: false,
+                        target: CatalogTarget::PlaylistMetadata,
+                    },
+                    cx,
+                );
+                assert!(view.error.is_none());
+                let mut fresh = crate::app::sync::tests::page(100, true);
+                fresh.continuation = Some(
+                    crate::catalog::Continuation::from_response(
+                        "renewed-first-tail",
+                        &json!({}),
+                        Some(next.clone()),
+                    )
+                    .unwrap(),
+                );
+                assert!(matches!(
+                    super::navigation::reply(view, fresh.clone(), cx),
+                    crate::app::Query::Revalidate(_)
+                ));
+                assert_eq!(
+                    view.rows.len(),
+                    150,
+                    "Renewal must preserve the active loaded rows as on main"
+                );
+                assert_eq!(
+                    view.page.continuation.as_ref().unwrap().token(),
+                    "old-loaded-tail",
+                    "Renewal must keep the cursor at the end of the loaded rows"
+                );
+                view.prefetch_page(150, 150, 0, cx);
+                let mut token =
+                    std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+                        .find_map(|job| match job.query {
+                            Query::More { token, .. } => Some(token),
+                            _ => None,
+                        })
+                        .expect("The renewed active page can request its next page");
+                token
+                    .renew_session(&next, &next)
+                    .expect("Active Load more must use the renewed session");
+                let mut sidebar = view.sync.sidebar_continuation.clone().unwrap();
+                sidebar
+                    .renew_session(&next, &next)
+                    .expect("Sidebar Load more must use the renewed session");
+                view.navigate_history(gpui::NavigationDirection::Forward, cx);
+                assert!(matches!(&view.route, Route::Browse(link) if link.id == "VLfuture"));
+                assert_eq!(view.rows.len(), 100);
+                let mut future = view.page.continuation.clone().unwrap();
+                assert_eq!(future.token(), "forward-visit-tail");
+                future
+                    .renew_session(&next, &next)
+                    .expect("Forward must restore the cursor under the renewed session");
+                view.go_back(cx);
+                assert_eq!(view.rows.len(), 150);
+
+                view.navigate(Route::Explore, cx);
+                super::navigation::reply(view, crate::app::sync::tests::page(1, false), cx);
+                view.go_back(cx);
+                assert_eq!(
+                    view.rows.len(),
+                    150,
+                    "Back must immediately restore the page invalidated by renewal"
+                );
+                assert!(matches!(
+                    super::navigation::reply(view, fresh.clone(), cx),
+                    crate::app::Query::Revalidate(_)
+                ));
+                assert_eq!(
+                    view.page.continuation.as_ref().unwrap().token(),
+                    "old-loaded-tail"
+                );
+                view.navigate(Route::Explore, cx);
+                view.navigate(
+                    Route::Browse(BrowseLink::new("VLrenewed", "Renewed playlist")),
+                    cx,
+                );
+                assert!(
+                    view.rows.is_empty(),
+                    "A new visit must fetch its own first page after renewal"
+                );
+                assert!(matches!(
+                    super::navigation::reply(view, fresh, cx),
+                    crate::app::Query::Browse(_)
+                ));
+                view.prefetch_page(100, 100, 0, cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                let crate::app::Query::More { mut token, .. } = job.query else {
+                    panic!("Expected load more after renewal")
+                };
+                assert_eq!(token.token(), "renewed-first-tail");
+                token
+                    .renew_session(&next, &next)
+                    .expect("Load more must be bound to the renewed session");
+
+                view.go_back(cx);
+                view.go_back(cx);
+                view.go_back(cx);
+                assert!(matches!(&view.route, Route::Browse(link) if link.id == "VLprevious"));
+                assert_eq!(view.rows.len(), 100);
+                let mut previous = view.page.continuation.clone().unwrap();
+                assert_eq!(previous.token(), "previous-visit-tail");
+                previous
+                    .renew_session(&next, &next)
+                    .expect("Back must restore the cursor under the renewed session");
+            })
+            .unwrap();
     })
 }
 
