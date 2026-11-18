@@ -8,37 +8,6 @@ impl Music {
             return;
         };
         let queue = &self.library.queue;
-        let skip = |track: &Track| is_disliked(&self.ratings, track);
-        let seed_available = !self.autoplay_seeded
-            && self.now_playing.as_ref().is_some_and(|watch| {
-                watch
-                    .current
-                    .as_ref()
-                    .zip(queue.current())
-                    .is_some_and(|(issued, current)| issued.id == current.id)
-                    && watch.current_index.is_some_and(|index| {
-                        index + 1 < watch.queue.len() || watch.continuation.is_some()
-                    })
-            });
-        let can_go_next = queue.next_index(self.library.repeat, false, skip).is_some()
-            || matches!(
-                &self.watch_pending,
-                Some(
-                    PlaybackQuery::Playlist(_)
-                        | PlaybackQuery::Collection(_)
-                        | PlaybackQuery::Watch {
-                            mode: WatchMode::Issued | WatchMode::Radio,
-                            ..
-                        }
-                )
-            )
-            || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
-            || (self.library.music_autoplay()
-                && (self.autoplay_tracks.iter().any(|track| !skip(track))
-                    || self.radio.is_some()
-                    || self.watch_pending.is_some()
-                    || self.radio_loading
-                    || seed_available));
         let waiting = self.queue_waiting.is_some()
             || self.autoplay_waiting.is_some()
             || self.waiting_for_watch();
@@ -64,12 +33,50 @@ impl Music {
                 .map(|collection| collection.order == queue_source::PlaybackOrder::Shuffled),
             can_play: self.player.is_some() && (!queue.tracks.is_empty() || waiting),
             can_pause: self.active_id.is_some() || waiting,
-            can_go_next: self.player.is_some() && can_go_next,
+            can_go_next: self.can_go_next(),
             can_go_previous: self.can_go_previous(),
             can_seek: self.seekable
                 && self.active_id.is_some()
                 && !matches!(self.playback, Playback::Stopped | Playback::Loading { .. }),
         });
+    }
+
+    fn can_go_next(&self) -> bool {
+        if self.player.is_none() {
+            return false;
+        }
+        let queue = &self.library.queue;
+        let skip = |track: &Track| is_disliked(&self.ratings, track);
+        let seed_available = !self.autoplay_seeded
+            && self.now_playing.as_ref().is_some_and(|watch| {
+                watch
+                    .current
+                    .as_ref()
+                    .zip(queue.current())
+                    .is_some_and(|(issued, current)| issued.id == current.id)
+                    && watch.current_index.is_some_and(|index| {
+                        index + 1 < watch.queue.len() || watch.continuation.is_some()
+                    })
+            });
+        queue.next_index(self.library.repeat, false, skip).is_some()
+            || matches!(
+                &self.watch_pending,
+                Some(
+                    PlaybackQuery::Playlist(_)
+                        | PlaybackQuery::Collection(_)
+                        | PlaybackQuery::Watch {
+                            mode: WatchMode::Issued | WatchMode::Radio,
+                            ..
+                        }
+                )
+            )
+            || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
+            || (self.library.music_autoplay()
+                && (self.autoplay_tracks.iter().any(|track| !skip(track))
+                    || self.radio.is_some()
+                    || self.watch_pending.is_some()
+                    || self.radio_loading
+                    || seed_available))
     }
 
     pub(in crate::app) fn desktop_event(
@@ -98,6 +105,9 @@ impl Music {
             {
                 let seconds = (self.playback_position() + offset).max(0.);
                 if self.duration > 0. && seconds > self.duration {
+                    if !self.can_go_next() {
+                        return;
+                    }
                     self.next(false, cx);
                 } else {
                     self.seek_current(seconds, cx);
