@@ -83,6 +83,10 @@ pub(in crate::app) enum Query {
     SidebarMore(Continuation),
     PlaylistChoices(Vec<String>),
     PlaylistMetadata(sync::PlaylistRefresh),
+    PlaylistSuggestions {
+        playlist: BrowseLink,
+        token: Option<Continuation>,
+    },
     /// The current page again in another order, replacing it.
     Reload(Continuation),
     Revalidate(Box<Query>),
@@ -93,6 +97,7 @@ impl Query {
             Self::SidebarPlaylists | Self::SidebarMore(_) => CatalogTarget::Sidebar,
             Self::PlaylistChoices(_) => CatalogTarget::PlaylistChoices,
             Self::PlaylistMetadata(_) => CatalogTarget::PlaylistMetadata,
+            Self::PlaylistSuggestions { .. } => CatalogTarget::Suggestions,
             Self::Revalidate(query) => query.target(),
             _ => CatalogTarget::Page,
         }
@@ -127,6 +132,7 @@ pub(in crate::app) struct PlaylistChoicesResult {
 enum CatalogEvent {
     Page(Box<CatalogResult>),
     PlaylistChoices(Box<PlaylistChoicesResult>),
+    Suggestions(Box<suggestions::SuggestionsResult>),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum CatalogTarget {
@@ -134,13 +140,15 @@ pub(in crate::app) enum CatalogTarget {
     Sidebar,
     PlaylistChoices,
     PlaylistMetadata,
+    Suggestions,
 }
 impl CatalogTarget {
-    pub(in crate::app) const ALL: [Self; 4] = [
+    pub(in crate::app) const ALL: [Self; 5] = [
         Self::Page,
         Self::Sidebar,
         Self::PlaylistChoices,
         Self::PlaylistMetadata,
+        Self::Suggestions,
     ];
 }
 struct RestoringRequest {
@@ -160,6 +168,7 @@ pub(in crate::app) struct CatalogRequests {
     pub(in crate::app) jobs: async_channel::Sender<Job>,
     pub(in crate::app) pending: async_channel::Receiver<Job>,
     metadata_queue: Option<(async_channel::Sender<Job>, async_channel::Receiver<Job>)>,
+    suggestions_queue: Option<(async_channel::Sender<Job>, async_channel::Receiver<Job>)>,
     pub(in crate::app) playlist_choices: Option<Choices>,
     pub(in crate::app) playlist_choices_error: Option<String>,
     restoring: Option<RestoringCatalog>,
@@ -173,6 +182,7 @@ impl CatalogRequests {
             jobs,
             pending,
             metadata_queue: None,
+            suggestions_queue: None,
             playlist_choices: None,
             playlist_choices_error: None,
             restoring: None,
@@ -292,8 +302,9 @@ impl CatalogRequests {
         let target = query.target();
         self.cancel(target);
         let id = self.generations[target as usize].load(Ordering::Relaxed);
-        let (jobs, pending) = match &self.metadata_queue {
-            Some((jobs, pending)) if target == CatalogTarget::PlaylistMetadata => (jobs, pending),
+        let (jobs, pending) = match (target, &self.metadata_queue, &self.suggestions_queue) {
+            (CatalogTarget::PlaylistMetadata, Some((jobs, pending)), _) => (jobs, pending),
+            (CatalogTarget::Suggestions, _, Some((jobs, pending))) => (jobs, pending),
             _ => (&self.jobs, &self.pending),
         };
         let mut other = Vec::with_capacity(CatalogTarget::ALL.len() - 1);
@@ -462,6 +473,11 @@ impl Music {
         {
             self.sync.playlist_refreshes.clear();
             self.error.get_or_insert(error);
+        } else if target == CatalogTarget::Suggestions
+            && let Err(error) = result
+            && let Some(suggestions) = &mut self.suggestions
+        {
+            suggestions.error = Some(error);
         }
         cx.notify();
     }
@@ -495,6 +511,7 @@ impl Music {
                 sort: active.sort.clone(),
             });
         }
+        self.clear_suggestions();
         if self.route != route {
             let cached = (!self.rows.is_empty()
                 || (!self.catalog_requests.is_loading(CatalogTarget::Page)
@@ -601,6 +618,8 @@ impl Music {
                     .map(Query::Reload)
                     .unwrap_or_else(|| self.page_query());
                 self.request(query, cx);
+            } else {
+                self.load_suggestions(true, cx);
             }
             cx.notify();
             return;
@@ -654,7 +673,9 @@ impl Music {
         }
     }
 
-    pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) {
+    pub(in crate::app) fn append_rows(&mut self, first_shelf: usize) -> usize {
+        let start = self.playlist_rows_end();
+        self.list_rows.truncate(start);
         self.shelf_heights.truncate(first_shelf);
         let sectioned = self.page.header.is_some();
         let browse_sections = self.browse_sections();
@@ -715,6 +736,8 @@ impl Music {
                 self.list_rows.extend(items.into_iter().map(ListRow::Item));
             }
         }
+        self.append_suggestion_rows();
+        start
     }
 
     pub(in crate::app) fn refresh_local(&mut self) {
@@ -795,6 +818,7 @@ impl Music {
             return;
         }
         let Some(state) = self.back.pop() else { return };
+        self.clear_suggestions();
         if let Some(page) = state.page {
             self.catalog_requests.cancel(CatalogTarget::Page);
             self.artwork.cancel_pending();
@@ -825,6 +849,9 @@ impl Music {
         self.list_scroll = state.list_scroll;
         self.detail_list = state.detail_list;
         self.shelf_scroll = state.shelf_scroll;
+        if self.grouped_rows() {
+            self.detail_list.reset_rows(self.list_rows.len());
+        }
         cx.notify();
     }
 
@@ -995,7 +1022,6 @@ impl Music {
                 } else if result.append {
                     self.sync.page_coverage.continued = true;
                     let first_shelf = self.page.shelves.len();
-                    let previous_rows = self.list_rows.len();
                     let was_grouped = self.grouped_rows();
                     self.page.continuation = page.continuation;
                     self.page.shelves.extend(page.shelves);
@@ -1003,10 +1029,10 @@ impl Music {
                     if self.history_groups() || self.grouped_rows() != was_grouped {
                         self.rebuild_rows();
                     } else {
-                        self.append_rows(first_shelf);
+                        let start = self.append_rows(first_shelf);
                         if was_grouped {
                             self.detail_list
-                                .append_rows(self.list_rows.len() - previous_rows);
+                                .replace_tail(start, self.list_rows.len() - start);
                         }
                     }
                     self.update_playlist_rows_snapshot();
@@ -1024,6 +1050,9 @@ impl Music {
                 if self.sync.page_reload.is_some() {
                     self.rebuild_rows();
                     self.continue_page_reload(cx);
+                }
+                if !result.append {
+                    self.load_suggestions(false, cx);
                 }
             }
             Err(error) => {
@@ -1064,12 +1093,16 @@ impl CatalogRequests {
         run_worker: impl Fn(async_channel::Receiver<Job>) + Clone + Send + 'static,
     ) -> Self {
         let (jobs, pending) = async_channel::bounded(1);
+        let (suggestion_jobs, suggestion_pending) = async_channel::bounded(1);
         // Startup sends Home and the sidebar before verification. A third
         // foreground worker can load a replacement even when both are blocked.
         // Metadata readback can poll for an edit, so it has its own worker.
         let workers = (0..3)
             .map(|worker| (format!("catalog-{worker}"), self.pending.clone()))
-            .chain([("catalog-metadata".to_owned(), pending.clone())]);
+            .chain([
+                ("catalog-metadata".to_owned(), pending.clone()),
+                ("catalog-suggestions".to_owned(), suggestion_pending.clone()),
+            ]);
         for (name, receiver) in workers {
             let run_worker = run_worker.clone();
             thread::Builder::new()
@@ -1078,6 +1111,7 @@ impl CatalogRequests {
                 .expect("start catalog worker");
         }
         self.metadata_queue = Some((jobs, pending));
+        self.suggestions_queue = Some((suggestion_jobs, suggestion_pending));
         self
     }
 
@@ -1093,6 +1127,44 @@ impl CatalogRequests {
                     continue;
                 }
                 let catalog = catalog.get_or_insert_with(Catalog::new);
+                if let Query::PlaylistSuggestions { playlist, token } = &job.query {
+                    let result = catalog
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))
+                        .and_then(|catalog| {
+                            let catalog = catalog.for_session(job.session.clone());
+                            let seed = match token {
+                                Some(token) => token.clone(),
+                                None => catalog
+                                    .browse(playlist)?
+                                    .header
+                                    .and_then(|header| header.suggestions)
+                                    .ok_or_else(|| anyhow::anyhow!("No suggestions available"))?,
+                            };
+                            anyhow::ensure!(
+                                generations[target as usize].load(Ordering::Relaxed) == job.id,
+                                "Suggestions read was superseded"
+                            );
+                            catalog.playlist_suggestions(&seed, &playlist.id)
+                        });
+                    if generations[target as usize].load(Ordering::Relaxed) != job.id {
+                        continue;
+                    }
+                    let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                    if results
+                        .send_blocking(CatalogEvent::Suggestions(Box::new(
+                            suggestions::SuggestionsResult {
+                                job,
+                                result: result.map_err(|error| format!("{error:#}")),
+                                session_rejected,
+                            },
+                        )))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if let Query::PlaylistChoices(video_ids) = &job.query {
                     let result = catalog
                         .as_ref()
@@ -1139,6 +1211,9 @@ impl CatalogRequests {
                             Query::Revalidate(_) => Err(anyhow::anyhow!("Nested revalidation")),
                             Query::PlaylistChoices(_) => {
                                 Err(anyhow::anyhow!("Invalid playlist destination request"))
+                            }
+                            Query::PlaylistSuggestions { .. } => {
+                                Err(anyhow::anyhow!("Invalid suggestions request"))
                             }
                             Query::PlaylistMetadata(refresh) => catalog.playlist_metadata(
                                 &refresh.id,
@@ -1190,10 +1265,13 @@ impl CatalogRequests {
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(result) = completed.recv().await {
                 if view
-                    .update_in(cx, |view, _, cx| match result {
+                    .update_in(cx, |view, window, cx| match result {
                         CatalogEvent::Page(result) => view.catalog_result(*result, cx),
                         CatalogEvent::PlaylistChoices(result) => {
                             view.playlist_choices_result(*result, cx)
+                        }
+                        CatalogEvent::Suggestions(result) => {
+                            view.suggestions_result(*result, window, cx)
                         }
                     })
                     .is_err()
@@ -1288,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn playlist_metadata_does_not_delay_a_replacement_page() {
+    fn playlist_background_reads_do_not_delay_a_replacement_page() {
         let (started, observed) = mpsc::channel();
         let (release, blocked) = async_channel::bounded::<()>(1);
         let playlist = BrowseLink::new("VLplaylist", "Playlist");
@@ -1312,6 +1390,10 @@ mod tests {
                 moved: false,
                 account_generation: 0,
             }),
+            Query::PlaylistSuggestions {
+                playlist: playlist.clone(),
+                token: None,
+            },
             Query::Browse(playlist.clone()),
             Query::SidebarPlaylists,
         ] {
@@ -1333,7 +1415,7 @@ mod tests {
             .unwrap();
         let job = observed
             .recv_timeout(Duration::from_secs(5))
-            .expect("Reload must start while metadata, the old page, and the sidebar are blocked");
+            .expect("Reload must start while Suggestions, metadata, the old page, and the sidebar are blocked");
         assert!(matches!(job.query, Query::Revalidate(_)));
         drop(release);
     }

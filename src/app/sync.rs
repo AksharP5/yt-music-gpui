@@ -239,6 +239,10 @@ fn owned_item_key(item: &Item) -> ItemKey {
 enum RowAnchor {
     Item(ItemKey),
     Shelf(String, ShelfLayout),
+    Suggestion(String),
+    SuggestionsHeading,
+    SuggestionsFooter,
+    EmptyPlaylist,
 }
 
 pub(super) struct PageAnchor {
@@ -630,6 +634,22 @@ impl Music {
                 .and_then(|index| self.list_rows.get(index))
                 .map(|row| match *row {
                     ListRow::Item(index) => RowAnchor::Item(owned_item_key(&self.rows[index])),
+                    ListRow::EmptyPlaylist => RowAnchor::EmptyPlaylist,
+                    ListRow::SuggestionsHeading => RowAnchor::SuggestionsHeading,
+                    ListRow::SuggestionsFooter => RowAnchor::SuggestionsFooter,
+                    ListRow::Suggestion(index) => RowAnchor::Suggestion(
+                        self.suggestions
+                            .as_ref()
+                            .map(|suggestions| suggestions.tracks[index].track.id.clone())
+                            .unwrap_or_default(),
+                    ),
+                    ListRow::Related(index) => self.suggestions.as_ref().map_or(
+                        RowAnchor::SuggestionsHeading,
+                        |suggestions| {
+                            let shelf = &suggestions.related[index];
+                            RowAnchor::Shelf(shelf.title.clone(), shelf.layout)
+                        },
+                    ),
                     ListRow::Featured(index)
                     | ListRow::Shelf(index)
                     | ListRow::Heading(index)
@@ -716,6 +736,19 @@ impl Music {
             self.list_rows
                 .iter()
                 .position(|row| match (anchor, row) {
+                    (RowAnchor::EmptyPlaylist, ListRow::EmptyPlaylist)
+                    | (RowAnchor::SuggestionsHeading, ListRow::SuggestionsHeading)
+                    | (RowAnchor::SuggestionsFooter, ListRow::SuggestionsFooter) => true,
+                    (RowAnchor::Suggestion(id), ListRow::Suggestion(index)) => self
+                        .suggestions
+                        .as_ref()
+                        .is_some_and(|suggestions| suggestions.tracks[*index].track.id == *id),
+                    (RowAnchor::Shelf(title, layout), ListRow::Related(index)) => {
+                        self.suggestions.as_ref().is_some_and(|suggestions| {
+                            let shelf = &suggestions.related[*index];
+                            shelf.title == *title && shelf.layout == *layout
+                        })
+                    }
                     (RowAnchor::Item(key), ListRow::Item(index)) => {
                         item_key(&self.rows[*index]) == (key.0.as_str(), key.1.as_deref(), key.2)
                     }
@@ -812,9 +845,10 @@ impl Music {
         &mut self,
         id: &str,
         additions: &[(String, String)],
+        preferred: &[Track],
         cx: &mut Context<Self>,
     ) {
-        let sources = self.playlist_added_sources(additions);
+        let sources = self.playlist_added_sources(additions, preferred);
         self.append_playlist_tracks(id, &sources);
         if sources.len() < additions.len()
             && matches!(&self.route, Route::Browse(link) if link.id.trim_start_matches("VL") == id.trim_start_matches("VL"))
@@ -824,29 +858,36 @@ impl Music {
         cx.notify();
     }
 
-    fn playlist_added_sources(&self, additions: &[(String, String)]) -> Vec<Track> {
+    fn playlist_added_sources(
+        &self,
+        additions: &[(String, String)],
+        preferred: &[Track],
+    ) -> Vec<Track> {
         additions
             .iter()
             .filter_map(|(video, occurrence)| {
-                let source = self
-                    .library
-                    .queue
-                    .tracks
+                let source = preferred
                     .iter()
-                    .chain(self.rows.iter().filter_map(|item| match item {
-                        Item::Track(track) => Some(track),
-                        _ => None,
-                    }))
                     .chain(
-                        self.back
+                        self.library
+                            .queue
+                            .tracks
                             .iter()
-                            .filter_map(|state| state.page.as_ref())
-                            .flat_map(|page| &page.shelves)
-                            .flat_map(|shelf| &shelf.items)
-                            .filter_map(|item| match item {
+                            .chain(self.rows.iter().filter_map(|item| match item {
                                 Item::Track(track) => Some(track),
                                 _ => None,
-                            }),
+                            }))
+                            .chain(
+                                self.back
+                                    .iter()
+                                    .filter_map(|state| state.page.as_ref())
+                                    .flat_map(|page| &page.shelves)
+                                    .flat_map(|shelf| &shelf.items)
+                                    .filter_map(|item| match item {
+                                        Item::Track(track) => Some(track),
+                                        _ => None,
+                                    }),
+                            ),
                     )
                     .find(|track| &track.id == video)?;
                 let mut track = source.clone();
@@ -1017,7 +1058,7 @@ impl Music {
                         Some((track.id.clone(), track.details.set_video_id.clone()?))
                     })
                     .collect();
-                let mut sources = self.playlist_added_sources(&additions);
+                let mut sources = self.playlist_added_sources(&additions, &[]);
                 for track in returned {
                     if !sources
                         .iter()

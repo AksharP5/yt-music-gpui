@@ -43,6 +43,7 @@ impl Music {
         self.finish_listening(false);
         self.next_session_refresh = None;
         self.sync = sync::SyncState::default();
+        self.clear_suggestions();
         self.page_cache.clear();
         self.forward_page = None;
         self.catalog_requests.reset_account(
@@ -451,7 +452,7 @@ impl Music {
             return false;
         };
         let key = mutation.key();
-        if self.pending_mutations.contains(&key) {
+        if self.pending_mutations.contains_key(&key) {
             return false;
         }
         let optimistic = if let Mutation::RateSong { track, rating } = &mutation {
@@ -471,7 +472,7 @@ impl Music {
             mutation: Box::new(mutation),
         }) {
             Ok(()) => {
-                self.pending_mutations.insert(key);
+                self.pending_mutations.insert(key, Vec::new());
                 self.error = self.sync.page_error.clone();
                 self.sync.playlist_metadata_error = None;
                 self.notice = Some("Saving to YouTube Music…".into());
@@ -861,8 +862,9 @@ impl Music {
                                             view.sync.page_changes.clear();
                                             view.ratings.clear();
                                             view.pending_mutations.clear();
+                                            view.clear_suggestions();
                                             for track in &mut view.library.queue.tracks { track.details.clear_account_state(); }
-                                            if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::SongText { .. })) {
+                                            if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. })) {
                                                 view.overlay = None;
                                             }
                                             view.search.update(cx, |search, cx| search.set_session(Some(session.clone()), cx));
@@ -930,7 +932,10 @@ impl Music {
                 }
                 self.account_generation = self.account_generation.wrapping_add(1);
                 let mutation = *mutation;
-                self.pending_mutations.remove(&mutation.key());
+                let sources = self
+                    .pending_mutations
+                    .remove(&mutation.key())
+                    .unwrap_or_default();
                 let rollback = if let Mutation::RateSong { track, .. } = &mutation {
                     self.sync
                         .optimistic_ratings
@@ -972,13 +977,15 @@ impl Music {
                                     self.overlay = Some(Overlay::AlreadyAdded {
                                         id,
                                         video_ids,
+                                        sources,
                                         error: None,
                                     });
                                 }
                             }
                             Effect::PlaylistAdded { additions, toast } => {
                                 if let Mutation::AddToPlaylist { id, .. } = &mutation {
-                                    self.patch_added(id, &additions, cx);
+                                    self.patch_added(id, &additions, &sources, cx);
+                                    self.acknowledge_suggestions(id, &additions, cx);
                                     self.refresh_playlist_metadata(
                                         id,
                                         additions

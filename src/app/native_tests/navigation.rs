@@ -1853,7 +1853,7 @@ fn already_added_shows_a_rejected_retry_inside_the_dialog() -> Result<()> {
                     matches!(*mutation, Mutation::AddToPlaylist { id, video_ids, duplicates: true }
                     if id == "PLduplicate" && video_ids == ["00000000000"])
                 );
-                assert!(view.pending_mutations.contains("PLduplicate"));
+                assert!(view.pending_mutations.contains_key("PLduplicate"));
             })
             .unwrap();
     })

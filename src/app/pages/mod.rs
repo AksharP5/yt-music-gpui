@@ -58,6 +58,24 @@ pub(in crate::app) enum ListRow {
     Item(usize),
     Shelf(usize),
     More(usize),
+    EmptyPlaylist,
+    SuggestionsHeading,
+    Suggestion(usize),
+    SuggestionsFooter,
+    Related(usize),
+}
+
+impl ListRow {
+    pub(in crate::app) fn is_suggestion(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyPlaylist
+                | Self::SuggestionsHeading
+                | Self::Suggestion(_)
+                | Self::SuggestionsFooter
+                | Self::Related(_)
+        )
+    }
 }
 
 /// Space above stacked album and playlist columns: the old back-button row
@@ -80,13 +98,11 @@ impl DetailList {
         self.state.reset(rows + usize::from(self.inline_header));
         self.state.scroll_to(top);
     }
-    pub(in crate::app) fn append_rows(&self, rows: usize) {
-        if rows == 0 {
-            return;
-        }
+    pub(in crate::app) fn replace_tail(&self, start: usize, rows: usize) {
         let top = self.state.logical_scroll_top();
         let end = self.state.item_count();
-        self.state.splice(end..end, rows);
+        self.state
+            .splice(start + usize::from(self.inline_header)..end, rows);
         self.state.scroll_to(top);
     }
     pub(in crate::app) fn set_inline_header(&mut self, inline: bool) {
@@ -299,7 +315,8 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.prefetch_page(index, self.list_rows.len(), 8, cx);
+        let playlist_end = self.playlist_rows_end();
+        self.prefetch_page(index.min(playlist_end), playlist_end, 8, cx);
         match self.list_rows[index] {
             ListRow::Featured(index) => {
                 self.featured_result(index, inset, self.page_layout(window).search_width(), cx)
@@ -318,6 +335,26 @@ impl Music {
                 .into_any_element(),
             ListRow::Item(index) => self.row(index, inset, window, cx),
             ListRow::Shelf(index) => self.shelf(index, inset, window, cx),
+            ListRow::EmptyPlaylist => div()
+                .px(px(inset + 16.))
+                .py(px(24.))
+                .text_color(self.theme.muted)
+                .child("No songs here yet.")
+                .into_any_element(),
+            ListRow::SuggestionsHeading => div()
+                .h(px(96.))
+                .px(px(inset))
+                .flex()
+                .items_center()
+                .text_size(px(28.))
+                .font_weight(FontWeight::BOLD)
+                .child("Suggestions")
+                .into_any_element(),
+            ListRow::Suggestion(index) => self.suggestion_row(index, inset, cx),
+            ListRow::SuggestionsFooter => self.suggestions_footer(inset, cx),
+            ListRow::Related(index) => {
+                self.shelf(self.page.shelves.len() + index, inset, window, cx)
+            }
             ListRow::More(index) => {
                 let Some(link) = self.page.shelves[index].more.clone() else {
                     return div().into_any_element();
@@ -528,7 +565,9 @@ impl Music {
                     .iter()
                     .all(|item| matches!(item, Item::Collection(_)));
             let grouped = self.grouped_rows();
-            let list = if collection && stacked && self.rows.is_empty() {
+            let empty_stacked =
+                collection && stacked && self.rows.is_empty() && self.suggestions.is_none();
+            let list = if empty_stacked {
                 div()
                     .flex_1()
                     .px(px(24.))
@@ -574,7 +613,7 @@ impl Music {
                                 .flex()
                                 .justify_center()
                                 .child(div().w_full().max_w(px(500.)).child(heading).when(
-                                    view.rows.is_empty(),
+                                    view.rows.is_empty() && view.suggestions.is_none(),
                                     |d| {
                                         d.child(
                                             div()

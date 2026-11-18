@@ -4,10 +4,11 @@ A fast, native YouTube Music client for Linux, built with Rust and GPUI. Audio a
 
 ![Home page with Quick picks and playlist shelves](docs/screenshot.webp)
 
-- Home, Explore, charts, artists, albums, playlists, podcasts and search, with YouTube Music's layout.
+- Native views for Home, Explore, charts, artists, albums, playlists, podcasts and search.
 - Audio and video playback with a drag-to-reorder queue, shuffle, repeat, radio and autoplay.
 - Player page with Up next, lyrics, credits, comments and related music.
 - Sign in to use your library, edit playlists and keep your YouTube Music history in sync.
+- Suggestions and related playlists for editable playlists when YouTube supplies them. Refresh replaces the recommendations, and Add saves a suggested song to the playlist.
 - Volume levelled between songs like the YouTube Music website (needs mpv 0.38 or newer).
 - Autoplay and Next skip songs the app knows you disliked.
 - Picks up the last song where you left off after a restart.
@@ -83,6 +84,8 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | Ctrl Q | Quit |
 
 Right-click a song, card or collection for its menu.
+
+In an editable playlist, Tab reveals each Suggestions control as it receives focus. Press Enter on **Refresh** for a new batch or on **Add to playlist** to save a song. Suggested songs stay out of the playlist's count and Play all until YouTube confirms an add.
 
 ## Contributing
 

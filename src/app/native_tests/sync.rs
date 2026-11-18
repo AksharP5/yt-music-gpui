@@ -1417,7 +1417,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
                 view.navigate(Route::Browse(BrowseLink::new("VLtarget","Target playlist")),cx);
                 view.page = page(0,false);
                 view.library.queue = Default::default();
-                view.patch_added("target",&[(track.id.clone(),"new-occurrence".into())],cx);
+                view.patch_added("target",&[(track.id.clone(),"new-occurrence".into())],&[],cx);
                 assert_eq!(view.rows.len(),1,"An addition can resolve metadata from the page left behind");
                 assert_eq!(view.page.tracks()[0].details.set_video_id.as_deref(),Some("new-occurrence"));
                 let id = view.catalog_requests.generations[CatalogTarget::Page as usize].load(Ordering::Relaxed);

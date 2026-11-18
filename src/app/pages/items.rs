@@ -295,6 +295,12 @@ impl Music {
             _ => None,
         };
         let playable = play.is_some() || matches!(&item, Item::Track(_));
+        let collection = match item {
+            Item::Collection(collection) => Some(Arc::new(collection)),
+            _ => None,
+        };
+        let menu_collection = collection.clone();
+        let context_collection = collection.clone();
         let mut art = div()
             .relative()
             .w(px(width))
@@ -376,7 +382,11 @@ impl Music {
             .child(art.when(!artist, |art| {
                 art.child(
                     self.menu_button(("card-menu", id), cx, move |view, window, cx| {
-                        view.open_item_menu(id, window, cx);
+                        if let Some(collection) = &menu_collection {
+                            view.open_collection_menu((**collection).clone(), window, cx);
+                        } else {
+                            view.open_item_menu(id, window, cx);
+                        }
                     })
                     .absolute()
                     .right(px(4.))
@@ -437,12 +447,26 @@ impl Music {
                 MouseButton::Right,
                 cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
-                    view.open_item_menu(id, window, cx);
+                    if let Some(collection) = &context_collection {
+                        view.open_collection_menu((**collection).clone(), window, cx);
+                    } else {
+                        view.open_item_menu(id, window, cx);
+                    }
                 }),
             )
             .on_click(cx.listener(move |view, _, window, cx| {
                 window.focus(&view.focus, cx);
-                view.play_item(id, cx);
+                if let Some(collection) = &collection {
+                    view.navigate(
+                        Route::Browse(BrowseLink::new(
+                            collection.id.clone(),
+                            collection.title.clone(),
+                        )),
+                        cx,
+                    );
+                } else {
+                    view.play_item(id, cx);
+                }
             }))
             .into_any_element()
     }

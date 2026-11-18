@@ -90,7 +90,7 @@ fn collection_layout_preserves_scroll_when_the_header_moves_between_columns() {
 }
 
 #[test]
-fn appended_rows_preserve_scroll_and_the_empty_list_origin() {
+fn replacing_the_list_tail_preserves_scroll_and_the_empty_list_origin() {
     let mut details = DetailList::new();
     details.reset_rows(100);
     details.set_inline_header(true);
@@ -98,11 +98,11 @@ fn appended_rows_preserve_scroll_and_the_empty_list_origin() {
         item_ix: 31,
         offset_in_item: px(8.),
     });
-    details.append_rows(100);
+    details.replace_tail(100, 100);
     assert_eq!(details.state.item_count(), 201);
     assert_eq!(details.state.logical_scroll_top().item_ix, 31);
     assert_eq!(details.state.logical_scroll_top().offset_in_item, px(8.));
-    details.append_rows(0);
+    details.replace_tail(180, 20);
     assert_eq!(details.state.item_count(), 201);
     assert_eq!(details.state.logical_scroll_top().item_ix, 31);
 
@@ -111,7 +111,7 @@ fn appended_rows_preserve_scroll_and_the_empty_list_origin() {
         item_ix: 0,
         offset_in_item: px(0.),
     });
-    empty.append_rows(5);
+    empty.replace_tail(0, 5);
     assert_eq!(empty.state.item_count(), 5);
     assert_eq!(empty.state.logical_scroll_top().item_ix, 0);
     assert_eq!(empty.state.logical_scroll_top().offset_in_item, px(0.));
