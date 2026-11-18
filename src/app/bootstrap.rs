@@ -80,8 +80,15 @@ impl Music {
             }
         })
         .detach();
+        let check_account_at_startup = auth::ACCOUNT_LOGIN_ENABLED
+            && match startup {
+                Startup::Restore => auth::Session::has_saved_account(),
+                Startup::Connect => true,
+                Startup::Guest => false,
+            };
         let (player, mut error) = match Player::new(PlayerOptions {
             credentials: None,
+            check_account_at_startup,
             volume: library.effective_volume(),
             speed: library.speed,
             ..Default::default()
