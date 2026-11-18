@@ -6,15 +6,30 @@ use crate::catalog::{PlaylistSuggestion, PlaylistSuggestions};
 pub(super) struct Suggestions {
     playlist: BrowseLink,
     visit: usize,
-    pub tracks: Vec<PlaylistSuggestion>,
+    pub tracks: Vec<SuggestionRow>,
     reload: Option<Continuation>,
     pub related: Vec<Shelf>,
     pub(super) related_scroll: HashMap<usize, ScrollHandle>,
     pub error: Option<String>,
-    pub(super) focus: VirtualListFocus,
     pub(super) refresh_focus: FocusHandle,
     auto_reload_when_empty: bool,
     added_during_read: HashSet<String>,
+}
+
+pub(super) struct SuggestionRow {
+    pub track: Track,
+    addable: bool,
+    // The controls move with the row when an acknowledged Add removes a song.
+    pub(super) controls: [FocusHandle; 2],
+}
+
+impl Suggestions {
+    pub(super) fn focused_control(&self, window: &Window) -> Option<usize> {
+        self.tracks
+            .iter()
+            .flat_map(|row| &row.controls)
+            .position(|handle| handle.is_focused(window))
+    }
 }
 
 pub(super) struct SuggestionsResult {
@@ -91,7 +106,6 @@ impl Music {
             related: Vec::new(),
             related_scroll: HashMap::new(),
             error: None,
-            focus: VirtualListFocus::default(),
             refresh_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             auto_reload_when_empty: false,
             added_during_read: HashSet::new(),
@@ -157,7 +171,17 @@ impl Music {
                     batch.tracks.retain(|suggestion| {
                         !suggestions.added_during_read.contains(&suggestion.track.id)
                     });
-                    suggestions.tracks = batch.tracks;
+                    suggestions.tracks = batch
+                        .tracks
+                        .into_iter()
+                        .map(|PlaylistSuggestion { track, addable }| SuggestionRow {
+                            track,
+                            addable,
+                            controls: std::array::from_fn(|_| {
+                                cx.focus_handle().tab_index(0).tab_stop(true)
+                            }),
+                        })
+                        .collect();
                     suggestions.reload = batch.reload;
                     suggestions.auto_reload_when_empty = batch.auto_reload_when_empty;
                     if let Some(related) = batch.related {
@@ -184,6 +208,13 @@ impl Music {
         let Some(suggestions) = &self.suggestions else {
             return;
         };
+        if !suggestions
+            .tracks
+            .iter()
+            .any(|row| row.addable && row.track.id == track.id)
+        {
+            return;
+        }
         let mutation = Mutation::AddToPlaylist {
             id: suggestions.playlist.id.trim_start_matches("VL").to_owned(),
             video_ids: vec![track.id.clone()],
@@ -232,18 +263,16 @@ impl Music {
         cx: &Context<Self>,
     ) -> AnyElement {
         let enabled = self.suggestion_control_enabled(index * 2 + 1);
-        let Some(suggestions) = &mut self.suggestions else {
-            return div().into_any_element();
-        };
-        let Some(suggestion) = suggestions.tracks.get(index) else {
+        let Some(suggestion) = self
+            .suggestions
+            .as_ref()
+            .and_then(|suggestions| suggestions.tracks.get(index))
+        else {
             return div().into_any_element();
         };
         let track = suggestion.track.clone();
-        let play_focus = suggestions.focus.handle(index * 2, cx);
-        let add_focus = suggestions
-            .focus
-            .handle(index * 2 + 1, cx)
-            .tab_stop(enabled);
+        let play_focus = suggestion.controls[0].clone();
+        let add_focus = suggestion.controls[1].clone().tab_stop(enabled);
         let subtitle = track
             .details
             .byline
@@ -396,7 +425,7 @@ impl Music {
         let refresh = suggestions.tracks.len() * 2;
         let control = if suggestions.refresh_focus.is_focused(window) {
             refresh
-        } else if let Some(control) = suggestions.focus.focused(window) {
+        } else if let Some(control) = suggestions.focused_control(window) {
             control
         } else {
             return false;
@@ -409,13 +438,12 @@ impl Music {
             (control + 1..=refresh).find(|index| self.suggestion_control_enabled(*index))
         };
         let Some(control) = next else { return false };
-        if let Some(suggestions) = &mut self.suggestions {
-            if control == refresh {
-                window.focus(&suggestions.refresh_focus, cx);
-            } else {
-                suggestions.focus.focus(control, window, cx);
-            }
-        }
+        let focus = if control == refresh {
+            &suggestions.refresh_focus
+        } else {
+            &suggestions.tracks[control / 2].controls[control % 2]
+        };
+        window.focus(focus, cx);
         self.reveal_suggestion_control((control != refresh).then_some(control / 2));
         cx.notify();
         true
