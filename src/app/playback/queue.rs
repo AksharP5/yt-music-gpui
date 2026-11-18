@@ -819,13 +819,13 @@ impl Music {
             self.play_current_resuming(playback.is_paused(), WatchMode::Details, cx);
             return;
         }
-        self.stop_playback(cx);
         self.duration = self
             .library
             .queue
             .current()
             .and_then(|track| track.duration)
             .unwrap_or(0) as f64;
+        self.stop_playback(cx);
         self.refresh_current_account(cx);
         self.prefetch_queue(cx);
         self.save();
