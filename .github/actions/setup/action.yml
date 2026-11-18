@@ -13,6 +13,12 @@ runs:
       # build.rs links EGL, GLESv2, X11, Xext, Wayland and libmpv; GPUI needs xcb, xkbcommon,
       # fontconfig and freetype.
       run: |
+        # Prefer the faster Ubuntu mirror on hosted runners that default to EC2.
+        mirrors=/etc/apt/apt-mirrors.txt
+        if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]]; then
+          sudo sed -E -i \
+            's#^(http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/)[[:blank:]]+priority:1$#http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\1\tpriority:4#' "$mirrors"
+        fi
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev \

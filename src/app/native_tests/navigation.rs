@@ -2744,6 +2744,8 @@ fn saving_a_queue_keeps_its_songs_after_playback_changes() -> Result<()> {
             .update(cx, |view, window, cx| {
                 assert!(view.overlay.is_none());
                 view.clear_queue(cx);
+                view.library.queue.replace(playlist(500, false).tracks(), 0);
+                let saved_queue = view.library.queue.tracks.clone();
                 view.account_event(
                     account::Event::Applied {
                         session,
@@ -2761,6 +2763,7 @@ fn saving_a_queue_keeps_its_songs_after_playback_changes() -> Result<()> {
                     window,
                     cx,
                 );
+                assert!(Arc::ptr_eq(&view.library.queue.tracks, &saved_queue));
                 let tracks = view.page.tracks();
                 assert_eq!(
                     tracks.len(),

@@ -93,7 +93,9 @@ The X11 player tab check compares frames before and after a failed track-details
 
 The Comments check reads public guest comments during muted playback, exercises sorting and keyboard controls, and verifies that a 500-comment list renders only the visible rows. Set `YT_MUSIC_COMMENTS_PROFILE=1` to run `bin/profile PID 30` for two paired Up next/Comments samples. Panel crops are captured at 1280×800 and 1920×1080. Deterministic comments also check that Read more follows four rendered lines after wrapping and resizing.
 
-Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. The New playlist footer must stay clear of scrolling rows. Editable-playlist drag checks move the selected occurrence across loaded shelves, keep the playing queue unchanged, and cancel with Escape or an unavailable drop target. Holding a drag near the list edge scrolls until a song outside the original viewport can be reached. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
+Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. The New playlist footer must stay clear of scrolling rows. A rejected destination read keeps the selected song through same-account renewal, refreshes the choices and waits for the user to confirm a save. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
+
+Editable-playlist drag checks move the selected occurrence across loaded shelves, keep the playing queue unchanged, and cancel with Escape or an unavailable drop target. Holding a drag near the list edge scrolls until a song outside the original viewport can be reached.
 
 While Save to playlist waits for the service, it counts the eligible destinations from the loaded guide and copies only the rows requested by the virtual list. The count and row ranges use the same eligibility filter.
 
@@ -111,7 +113,7 @@ Artist Shuffle and Mix starts retain the queue's independently issued toggle act
 
 MPRIS Shuffle uses the same album, playlist or artist source as the player bar. Repeated requests for the same pending order do not reload it, and a rapid on/off pair keeps the last request. `desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests` checks these commands in a native window. Queues without a reversible collection source still reject enabling persistent shuffle through MPRIS.
 
-`desktop_metadata_follows_stopped_queue_selection` presses J and K in a native window and checks the selected song and its duration through a private D-Bus service, including a song without a known duration. It also switches between Song and Video and checks each version’s duration while playback stays stopped.
+`desktop_metadata_follows_stopped_queue_selection` presses J and K in a native window and checks the selected song and its duration through a private D-Bus service, including a song without a known duration. A second native check removes the last loaded song in a partial queue and verifies that the desktop sees the selected song and its duration both while waiting and after more songs arrive. It also switches between Song and Video and checks each version’s duration while playback stays stopped.
 
 `account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 
@@ -176,7 +178,7 @@ At 850 × 560, the native keyboard check opens long song and podcast episode men
 
 The search suggestions panel follows the field's width and scrolls when the rows exceed the available window height. Native X11 checks at 850 × 560 verify clicks inside and outside the panel and that arrow selection and wheel scrolling reveal the last row for pointer input.
 
-When saving the library, the app and the writer share the queued songs and the source's loaded IDs. Selecting another song does not copy those lists. Queue edits detach from a pending snapshot, so a write sees the order and track details captured when it was queued. The library file keeps the same JSON format. Run `bin/test --release -- --ignored --exact library::tests::large_queue_preference_save_latency --nocapture` to measure the time spent submitting snapshots, preferences, and position checkpoints with 10,000 queued songs.
+When saving the library, the app and the writer share the queued songs and the source's loaded IDs. Selecting another song does not copy those lists. Queue edits detach from a pending snapshot, so a write sees the order and track details captured when it was queued. Playlist confirmations and unchanged song ratings keep sharing the saved queue. The library file keeps the same JSON format. Run `bin/test --release -- --ignored --exact library::tests::large_queue_preference_save_latency --nocapture` to measure the time spent submitting snapshots, preferences, and position checkpoints with 10,000 queued songs.
 
 ## Player waits
 
@@ -226,6 +228,8 @@ The Linux performance job compares the stripped release binary and the headless 
 Never commit cookies, account data or keyring contents. Use synthetic values in tests, as the existing ones do.
 
 ## Release
+
+GitHub-hosted Ubuntu builds prefer the Azure archive when the runner's mirror list puts the EC2 archive first. APT retains the other archive entries as fallbacks.
 
 Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything. Releases are immutable once published, and only repository admins can create or move `v*` tags; the release build also refuses a tag whose commit is not on `main`.
 

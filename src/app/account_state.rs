@@ -748,6 +748,9 @@ impl Music {
                                 self.queue_source.cancel();
                                 self.error = Some(error);
                             }
+                            if self.catalog_requests.playlist_choices_error.is_some() {
+                                self.refresh_playlist_choices(cx);
+                            }
                             self.refresh_remote(cx);
                             self.finish_account_playback(pending, true, cx);
                             if self.active_id.is_some()
@@ -882,8 +885,16 @@ impl Music {
                                             view.pending_mutations.clear();
                                             view.clear_suggestions();
                                             for track in view.library.queue.tracks_mut() { track.details.clear_account_state(); }
-                                            if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. })) {
-                                                view.overlay = None;
+                                            match &mut view.overlay {
+                                                Some(Overlay::PlaylistPicker { tracks, error }) => {
+                                                    for track in tracks {
+                                                        track.details.clear_account_state();
+                                                    }
+                                                    *error = None;
+                                                    view.refresh_playlist_choices(cx);
+                                                }
+                                                Some(Overlay::Track { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. }) => view.overlay = None,
+                                                _ => {}
                                             }
                                             view.search.update(cx, |search, cx| search.renew_session(previous_session.as_ref(), session.clone(), window, cx));
                                             view.error = retry_change.then(|| "Your account reconnected. Retry the failed change.".into());
@@ -966,7 +977,7 @@ impl Music {
                     Ok(effect) => {
                         let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
                         acknowledge_song_change(
-                            self.library.queue.tracks_mut().iter_mut(),
+                            &mut self.library.queue,
                             &mut self.ratings,
                             &mutation,
                         );
@@ -1202,24 +1213,33 @@ pub(in crate::app) fn apply_track_details(
     }
 }
 
-pub(in crate::app) fn acknowledge_song_change<'a>(
-    tracks: impl IntoIterator<Item = &'a mut Track>,
+pub(in crate::app) fn acknowledge_song_change(
+    queue: &mut Queue,
     ratings: &mut HashMap<String, Rating>,
     mutation: &Mutation,
 ) {
     match mutation {
         Mutation::RateSong { track, rating } => {
             ratings.insert(track.id.clone(), *rating);
-            for current in tracks.into_iter().filter(|current| current.id == track.id) {
-                current.details.rating = Some(*rating);
-            }
+            queue.update_tracks(
+                |current| current.id == track.id && current.details.rating != Some(*rating),
+                |current| current.details.rating = Some(*rating),
+            );
         }
         Mutation::SongLibrary { track, save } => {
-            for current in tracks.into_iter().filter(|current| current.id == track.id) {
-                current.details.in_library = Some(*save);
-                current.details.add_library = track.details.add_library.clone();
-                current.details.remove_library = track.details.remove_library.clone();
-            }
+            queue.update_tracks(
+                |current| {
+                    current.id == track.id
+                        && (current.details.in_library != Some(*save)
+                            || current.details.add_library != track.details.add_library
+                            || current.details.remove_library != track.details.remove_library)
+                },
+                |current| {
+                    current.details.in_library = Some(*save);
+                    current.details.add_library = track.details.add_library.clone();
+                    current.details.remove_library = track.details.remove_library.clone();
+                },
+            );
         }
         _ => {}
     }

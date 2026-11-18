@@ -15,20 +15,22 @@ impl Music {
         } else {
             self.ratings.remove(id);
         }
-        for track in self.library.queue.tracks_mut().iter_mut().chain(
-            self.page
-                .shelves
-                .iter_mut()
-                .flat_map(|shelf| &mut shelf.items)
-                .chain(&mut self.rows)
-                .filter_map(|item| match item {
-                    Item::Track(track) => Some(track),
-                    _ => None,
-                }),
-        ) {
-            if track.id == id {
-                track.details.rating = rating;
-            }
+        self.library.queue.update_tracks(
+            |track| track.id == id && track.details.rating != rating,
+            |track| track.details.rating = rating,
+        );
+        for track in self
+            .page
+            .shelves
+            .iter_mut()
+            .flat_map(|shelf| &mut shelf.items)
+            .chain(&mut self.rows)
+            .filter_map(|item| match item {
+                Item::Track(track) if track.id == id => Some(track),
+                _ => None,
+            })
+        {
+            track.details.rating = rating;
         }
     }
 
