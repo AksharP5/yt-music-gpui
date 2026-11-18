@@ -374,7 +374,7 @@ impl Music {
         cx.notify();
     }
 
-    pub(in crate::app) fn connect_account(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn connect_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !auth::ACCOUNT_LOGIN_ENABLED {
             self.error = Some("Sign-in on this system is coming soon.".into());
             cx.notify();
@@ -402,11 +402,11 @@ impl Music {
             .try_send(account::Command::Connect(operation.clone()))
         {
             Ok(()) => {
+                self.open_overlay(Overlay::SignIn, window, cx);
                 self.account_operation = Some(AccountOperation::Connecting(
                     operation,
                     BrowserConnection::Opening { left_app: false },
                 ));
-                self.overlay = Some(Overlay::SignIn);
                 self.error = None;
                 self.notice = None;
             }

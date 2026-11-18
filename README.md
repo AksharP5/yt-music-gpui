@@ -58,7 +58,7 @@ Sign-in needs a supported default browser: Zen, Firefox, Chromium, Google Chrome
 
 1. Choose **Sign in**.
 2. Sign in to YouTube Music in your browser.
-3. Return to the app. Your account is verified and saved automatically.
+3. Return to the app to verify and save your account. If the window stayed focused, choose **Check sign-in**.
 
 The app copies your browser's YouTube session, so the browser can stay closed afterwards. It has the same access to YouTube as that browser session. Private windows and browser containers aren't supported. Start with `--guest` to skip the saved account.
 
