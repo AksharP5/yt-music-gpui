@@ -88,6 +88,8 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | ? | Keyboard shortcuts |
 | Ctrl Q | Quit |
 
+Previous restarts the current song once playback has passed three seconds. The desktop media control follows the same rule.
+
 Right-click a song, card or collection for its menu. Use ↑ and ↓ to move between actions or Home and End to jump to the first or last action. The menu scrolls to the focused action.
 
 The player keeps the selected tab when you change tracks. Lyrics, Comments and Related show when their content is unavailable.

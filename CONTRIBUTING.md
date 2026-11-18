@@ -109,6 +109,8 @@ MPRIS Shuffle uses the same album, playlist or artist source as the player bar. 
 
 `account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 
+`desktop_previous_follows_the_restart_position` reads the private D-Bus capability as playback crosses three seconds and while a seek is pending or rejected.
+
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
 At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline. Search top-result captures check stacked cards at column widths of 592 and 720 pixels and two-column cards at 860 pixels. At 956, 1280 and 1920 pixels, it captures search and player chrome, including the Autoplay header and hover handles. It opens the compact player controls with a pointer and dismisses them with Escape.

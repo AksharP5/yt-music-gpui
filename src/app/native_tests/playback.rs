@@ -122,14 +122,164 @@ fn desktop_shuffle_sets_the_requested_order_without_repeating_pending_requests()
     })
 }
 
+#[cfg(target_os = "linux")]
+const DESKTOP_PLAYER_NAME: &str = "org.mpris.MediaPlayer2.yt_music_gpui";
+
+#[cfg(target_os = "linux")]
+async fn start_test_desktop_controls(
+    window: gpui::WindowHandle<Music>,
+    cx: &mut gpui::AsyncApp,
+) -> zbus::blocking::Connection {
+    use crate::{
+        media_controls::MediaControls,
+        player::{Player, PlayerOptions},
+    };
+    let connection = zbus::blocking::Connection::session().unwrap();
+    let bus = zbus::blocking::fdo::DBusProxy::new(&connection).unwrap();
+    let name = DESKTOP_PLAYER_NAME;
+    let owns_name = || bus.name_has_owner(name.try_into().unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owns_name() {
+        assert!(
+            Instant::now() < deadline,
+            "The initial desktop service must stop"
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    window
+        .update(cx, |view, _, _| {
+            view.media_controls = Some(MediaControls::new().unwrap());
+            view.player = Some(
+                Player::new(PlayerOptions {
+                    audio_output: Some("null".into()),
+                    volume: 0.,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !owns_name() {
+        assert!(
+            Instant::now() < deadline,
+            "The test desktop service must start"
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    connection
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
+fn desktop_previous_follows_the_restart_position() -> Result<()> {
+    use crate::{app::playback::SeekIntent, player::PlayerEvent};
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let connection = start_test_desktop_controls(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                view.account = None;
+                view.account_operation = None;
+                view.library
+                    .queue
+                    .replace(continuation_page(0..2, None).tracks(), 0);
+                view.active_id = Some(1);
+                view.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                view.position = 0.;
+                view.publish_desktop();
+            })
+            .unwrap();
+        let properties = zbus::blocking::Proxy::new(
+            &connection,
+            DESKTOP_PLAYER_NAME,
+            "/org/mpris/MediaPlayer2",
+            "org.freedesktop.DBus.Properties",
+        )
+        .unwrap();
+        let previous = || {
+            let value: zbus::zvariant::OwnedValue = properties
+                .call("Get", &("org.mpris.MediaPlayer2.Player", "CanGoPrevious"))
+                .unwrap();
+            bool::try_from(value).unwrap()
+        };
+
+        for (seconds, expected) in [
+            (2.75, false),
+            (3., false),
+            (3.25, true),
+            (3., false),
+            (3.25, true),
+        ] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.player_event(
+                        PlayerEvent::Position {
+                            track_id: 1,
+                            seconds,
+                        },
+                        cx,
+                    );
+                })
+                .unwrap();
+            assert_eq!(previous(), expected, "Previous at {seconds} seconds");
+        }
+
+        window
+            .update(cx, |view, _, _| {
+                view.pending_seek = Some(SeekIntent {
+                    track_id: 1,
+                    revision: 2,
+                    seconds: 0.,
+                });
+                view.publish_desktop();
+            })
+            .unwrap();
+        assert!(
+            !previous(),
+            "The first queue row must use the pending seek position"
+        );
+
+        window
+            .update(cx, |view, _, cx| {
+                view.player_event(
+                    PlayerEvent::SeekFinished {
+                        track_id: 1,
+                        revision: 2,
+                        result: Err("Synthetic seek failed".into()),
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(previous(), "A rejected seek restores the prior capability");
+
+        window
+            .update(cx, |view, _, _| {
+                view.library.queue.select(1);
+                view.position = 0.;
+                view.publish_desktop();
+            })
+            .unwrap();
+        assert!(previous(), "A later queue row always has a previous row");
+    })
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account and playlist commands only"]
 fn account_changes_cancel_pending_shuffle_in_desktop_controls() -> Result<()> {
     use crate::{
         app::{AccountOperation, BrowserConnection, PlaybackResult, QueueUpdate},
-        media_controls::{Event, MediaControls},
-        player::{Player, PlayerOptions},
+        media_controls::Event,
     };
     #[derive(Clone, Copy, Debug)]
     enum Transition {
@@ -142,45 +292,10 @@ fn account_changes_cancel_pending_shuffle_in_desktop_controls() -> Result<()> {
     use Transition::*;
 
     super::navigation::check_cache_window(async |window, cx| {
-        let connection = zbus::blocking::Connection::session().unwrap();
-        let bus = zbus::blocking::fdo::DBusProxy::new(&connection).unwrap();
-        let name = "org.mpris.MediaPlayer2.yt_music_gpui";
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while bus.name_has_owner(name.try_into().unwrap()).unwrap() {
-            assert!(
-                Instant::now() < deadline,
-                "The initial desktop service must stop"
-            );
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-        }
-        window
-            .update(cx, |view, _, _| {
-                view.media_controls = Some(MediaControls::new().unwrap());
-                view.player = Some(
-                    Player::new(PlayerOptions {
-                        audio_output: Some("null".into()),
-                        volume: 0.,
-                        ..Default::default()
-                    })
-                    .unwrap(),
-                );
-            })
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !bus.name_has_owner(name.try_into().unwrap()).unwrap() {
-            assert!(
-                Instant::now() < deadline,
-                "The test desktop service must start"
-            );
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-        }
+        let connection = start_test_desktop_controls(window, cx).await;
         let properties = zbus::blocking::Proxy::new(
             &connection,
-            name,
+            DESKTOP_PLAYER_NAME,
             "/org/mpris/MediaPlayer2",
             "org.freedesktop.DBus.Properties",
         )
