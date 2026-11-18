@@ -1490,7 +1490,7 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
                     requests.len() == 1 && matches!(requests[0].query, Query::PlaylistChoices(_)),
                     "Loaded rows must appear immediately while the selection's destinations are read"
                 );
-                assert_eq!(view.playlist_picker_choices().destinations[1].title, "Road trip");
+                assert_eq!(view.playlist_picker_choices().rows(1..2)[0].title, "Road trip");
             })
             .unwrap();
         for attempt in 0..250 {
@@ -1602,26 +1602,30 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                 window.focus(&view.overlay_focus, cx);
                 view.playlist_picker(vec![track], cx);
                 let choices = view.playlist_picker_choices();
-                assert_eq!(choices.destinations.len(), 2);
-                assert_eq!(choices.destinations[0].title, "Liked Music");
-                assert!(choices.destinations[0].byline.is_empty());
+                assert_eq!(choices.len(), 2);
+                let rows = choices.rows(0..2);
+                assert_eq!(rows[0].title, "Liked Music");
+                assert!(rows[0].byline.is_empty());
                 let job = playlist_choices_job(view);
-                let mut returned = view.playlist_picker_choices().into_owned();
-                returned.destinations[0].byline = "4 songs".into();
-                returned.destinations[0].pinned = true;
-                returned.destinations[1].title = "Road trip".into();
-                returned.destinations[1].byline = "8 songs".into();
-                returned.destinations[1].privacy = Some(crate::account::Privacy::Private);
+                let mut destinations = rows;
+                destinations[0].byline = "4 songs".into();
+                destinations[0].pinned = true;
+                destinations[1].title = "Road trip".into();
+                destinations[1].byline = "8 songs".into();
+                destinations[1].privacy = Some(crate::account::Privacy::Private);
                 view.playlist_choices_result(
                     crate::app::PlaylistChoicesResult {
                         job,
-                        result: Ok(returned),
+                        result: Ok(crate::playlist_choices::Choices {
+                            destinations,
+                            empty: None,
+                        }),
                         session_rejected: false,
                     },
                     cx,
                 );
                 assert_eq!(
-                    view.playlist_picker_choices().destinations[1].title,
+                    view.playlist_picker_choices().rows(1..2)[0].title,
                     "Road trip"
                 );
             })
@@ -1649,7 +1653,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                 );
                 assert!(view.catalog_requests.playlist_choices_error.is_some());
                 assert_eq!(
-                    view.playlist_picker_choices().destinations[1].title,
+                    view.playlist_picker_choices().rows(1..2)[0].title,
                     "Loaded playlist"
                 );
             })
@@ -1748,10 +1752,10 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         view.playlist_picker(tracks, cx);
         let new_account = playlist_choices_job(view);
         view.playlist_choices_result(response(refreshed, "Before account refresh"), cx);
-        assert!(view.playlist_picker_choices().destinations.is_empty());
+        assert_eq!(view.playlist_picker_choices().len(), 0);
         view.playlist_choices_result(response(new_account, "Current destinations"), cx);
         assert_eq!(
-            view.playlist_picker_choices().destinations[0].title,
+            view.playlist_picker_choices().rows(0..1)[0].title,
             "Current destinations"
         );
         assert!(
