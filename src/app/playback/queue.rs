@@ -653,6 +653,63 @@ impl Music {
             && matches!(self.playback, Playback::Loading { .. })
     }
 
+    pub(in crate::app) fn can_go_next(&self) -> bool {
+        if self.player.is_none() {
+            return false;
+        }
+        let queue = &self.library.queue;
+        let skip = |track: &Track| is_disliked(&self.ratings, track);
+        let seed_available = !self.autoplay_seeded
+            && self.now_playing.as_ref().is_some_and(|watch| {
+                watch
+                    .current
+                    .as_ref()
+                    .zip(queue.current())
+                    .is_some_and(|(issued, current)| issued.id == current.id)
+                    && watch.current_index.is_some_and(|index| {
+                        index + 1 < watch.queue.len() || watch.continuation.is_some()
+                    })
+            });
+        queue.next_index(self.library.repeat, false, skip).is_some()
+            || matches!(
+                &self.watch_pending,
+                Some(
+                    PlaybackQuery::Playlist(_)
+                        | PlaybackQuery::Collection(_)
+                        | PlaybackQuery::Watch {
+                            mode: WatchMode::Issued | WatchMode::Radio,
+                            ..
+                        }
+                )
+            )
+            || matches!(
+                &self.account_operation,
+                Some(
+                    AccountOperation::Refreshing { resume, .. }
+                    | AccountOperation::Activating { resume, .. }
+                    | AccountOperation::RefreshFailed { resume }
+                ) if matches!(
+                    resume,
+                    Some(PlaybackIntent::Queue { .. } | PlaybackIntent::Track(PlaybackResume {
+                        mode: WatchMode::Issued, ..
+                    }))
+                )
+            )
+            || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
+            || (self.library.music_autoplay()
+                && (self.autoplay_tracks.iter().any(|track| !skip(track))
+                    || self.radio.is_some()
+                    || self.watch_pending.is_some()
+                    || self.radio_loading
+                    || seed_available))
+    }
+
+    pub(in crate::app) fn skip_next(&mut self, cx: &mut Context<Self>) {
+        if self.can_go_next() {
+            self.next(false, cx);
+        }
+    }
+
     pub(in crate::app) fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
         self.finish_listening(natural);
         let playback = self.playback;

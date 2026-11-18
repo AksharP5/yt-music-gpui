@@ -378,6 +378,55 @@ fn desktop_seek_past_end_uses_next_availability() -> Result<()> {
         .unwrap();
         let _: () = player.call("Next", &()).unwrap();
         assert!(events.is_empty());
+
+        window
+            .update(cx, |view, window, cx| window.focus(&view.focus, cx))
+            .unwrap();
+        super::render::key(window, cx, "j").await;
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.active_id,
+                    Some(1),
+                    "J must leave the last song playing"
+                );
+                assert_eq!(view.position, 20.);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let next = point(px(138.), window.viewport_size().height - px(36.));
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    button: gpui::MouseButton::Left,
+                    position: next,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    button: gpui::MouseButton::Left,
+                    position: next,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.active_id,
+                    Some(1),
+                    "Unavailable Next must leave playback alone"
+                );
+                assert!(!view.player_open);
+            })
+            .unwrap();
+
         let _: () = player.call("Seek", &(20_000_000_i64,)).unwrap();
         let event = events.try_recv().unwrap();
         assert!(matches!(event, Event::Seek { track_id: 1, offset } if offset == 20.));
@@ -399,6 +448,8 @@ fn desktop_seek_past_end_uses_next_availability() -> Result<()> {
                     }
                 );
                 assert_eq!(view.position, 20.);
+                view.player_event(crate::player::PlayerEvent::Ended { track_id: 1 }, cx);
+                assert_eq!(view.playback, Playback::Stopped);
             })
             .unwrap();
     })

@@ -41,51 +41,13 @@ impl Music {
         });
     }
 
-    fn can_go_next(&self) -> bool {
-        if self.player.is_none() {
-            return false;
-        }
-        let queue = &self.library.queue;
-        let skip = |track: &Track| is_disliked(&self.ratings, track);
-        let seed_available = !self.autoplay_seeded
-            && self.now_playing.as_ref().is_some_and(|watch| {
-                watch
-                    .current
-                    .as_ref()
-                    .zip(queue.current())
-                    .is_some_and(|(issued, current)| issued.id == current.id)
-                    && watch.current_index.is_some_and(|index| {
-                        index + 1 < watch.queue.len() || watch.continuation.is_some()
-                    })
-            });
-        queue.next_index(self.library.repeat, false, skip).is_some()
-            || matches!(
-                &self.watch_pending,
-                Some(
-                    PlaybackQuery::Playlist(_)
-                        | PlaybackQuery::Collection(_)
-                        | PlaybackQuery::Watch {
-                            mode: WatchMode::Issued | WatchMode::Radio,
-                            ..
-                        }
-                )
-            )
-            || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
-            || (self.library.music_autoplay()
-                && (self.autoplay_tracks.iter().any(|track| !skip(track))
-                    || self.radio.is_some()
-                    || self.watch_pending.is_some()
-                    || self.radio_loading
-                    || seed_available))
-    }
-
     pub(in crate::app) fn desktop_event(
         &mut self,
         event: media_controls::Event,
         cx: &mut Context<Self>,
     ) {
         match event {
-            media_controls::Event::Next => self.next(false, cx),
+            media_controls::Event::Next => return self.skip_next(cx),
             media_controls::Event::Previous => self.previous(cx),
             media_controls::Event::Play
                 if self.playback == Playback::Stopped || self.playback.is_paused() =>
@@ -105,10 +67,7 @@ impl Music {
             {
                 let seconds = (self.playback_position() + offset).max(0.);
                 if self.duration > 0. && seconds > self.duration {
-                    if !self.can_go_next() {
-                        return;
-                    }
-                    self.next(false, cx);
+                    return self.skip_next(cx);
                 } else {
                     self.seek_current(seconds, cx);
                 }
