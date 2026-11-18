@@ -12,6 +12,8 @@ use std::{
 
 const ORIGIN: &str = "https://music.youtube.com";
 const CLIENT_VERSION: &str = "1.20261014.01.00";
+const SECONDARY_SECTIONS: &str =
+    "/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer";
 
 // Share only transport; account and continuation authority belongs to each request.
 static CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
@@ -600,6 +602,7 @@ pub struct PageHeader {
     pub stats: String,
     pub shuffle: Option<Arc<PlaylistTarget>>,
     pub mix: Option<Arc<PlaylistTarget>>,
+    pub suggestions: Option<Continuation>,
     pub subscribed: Option<bool>,
     pub subscription_label: String,
     pub subscriber_count: String,
@@ -632,11 +635,7 @@ impl Continuation {
         response: &Value,
         session: Option<Arc<Session>>,
     ) -> Result<Continuation> {
-        ensure!(
-            !token.is_empty() && token.len() <= 32768 && !token.chars().any(char::is_whitespace),
-            "YouTube Music returned an invalid read continuation"
-        );
-        let mut continuation = Continuation::new(token);
+        let mut continuation = Self::read_token(token)?;
         continuation.session = session;
         continuation.visitor = response
             .pointer("/responseContext/visitorData")
@@ -648,6 +647,26 @@ impl Continuation {
             visitor.set_sensitive(true);
         }
         Ok(continuation)
+    }
+
+    fn from_page(
+        token: &str,
+        response: &Value,
+        session: Option<Arc<Session>>,
+        previous: Option<&Continuation>,
+    ) -> Result<Self> {
+        let mut continuation = Self::read_token(token)?;
+        continuation.session = session;
+        continuation.visitor = page_visitor(response, previous)?;
+        Ok(continuation)
+    }
+
+    fn read_token(token: &str) -> Result<Self> {
+        ensure!(
+            !token.is_empty() && token.len() <= 32768 && !token.chars().any(char::is_whitespace),
+            "YouTube Music returned an invalid read continuation"
+        );
+        Ok(Self::new(token))
     }
 
     fn new(token: &str) -> Self {
@@ -693,6 +712,21 @@ impl fmt::Debug for Continuation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Continuation { .. }")
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlaylistSuggestion {
+    pub track: Track,
+    pub addable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlaylistSuggestions {
+    pub tracks: Vec<PlaylistSuggestion>,
+    pub reload: Option<Continuation>,
+    /// Only the enclosing section response includes the related shelves.
+    pub related: Option<Vec<Shelf>>,
+    pub auto_reload_when_empty: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -856,6 +890,19 @@ impl Catalog {
         self.bind_page(parse_page(&data, "More music")?, &data, Some(continuation))
     }
 
+    pub(crate) fn playlist_suggestions(
+        &self,
+        continuation: &Continuation,
+        playlist_id: &str,
+    ) -> Result<PlaylistSuggestions> {
+        let data = self.request_with_continuation(
+            "browse",
+            json!({"continuation": continuation.token()}),
+            Some(continuation),
+        )?;
+        parse_playlist_suggestions(&data, playlist_id, continuation)
+    }
+
     pub(crate) fn bind_page(
         &self,
         mut page: Page,
@@ -872,25 +919,24 @@ impl Catalog {
             .chain(sorts.map(|sort| &mut sort.reload))
             .peekable();
         if tokens.peek().is_some() {
-            let visitor = match previous.and_then(|previous| previous.visitor.clone()) {
-                Some(visitor) => Some(visitor),
-                None => response
-                    .pointer("/responseContext/visitorData")
-                    .map(|value| -> Result<HeaderValue> {
-                        let visitor = value
-                            .as_str()
-                            .context("YouTube Music returned an invalid page visitor")?;
-                        let mut visitor = HeaderValue::from_str(visitor)
-                            .context("YouTube Music returned an invalid page visitor")?;
-                        visitor.set_sensitive(true);
-                        Ok(visitor)
-                    })
-                    .transpose()?,
-            };
+            let visitor = page_visitor(response, previous)?;
             for continuation in tokens {
                 continuation.session = self.session.clone();
                 continuation.visitor = visitor.clone();
             }
+        }
+        if page.editable
+            && let Some(header) = page.header.as_mut()
+        {
+            header.suggestions = response
+                .pointer(SECONDARY_SECTIONS)
+                .and_then(|sections| {
+                    sections.pointer("/continuations/0/nextContinuationData/continuation")
+                })
+                .and_then(Value::as_str)
+                .and_then(|token| {
+                    Continuation::from_page(token, response, self.session.clone(), previous).ok()
+                });
         }
         if let Some(album) = previous.and_then(|continuation| continuation.album.as_ref()) {
             album.apply(&mut page);
@@ -988,6 +1034,24 @@ impl Catalog {
         };
         Ok(request)
     }
+}
+
+fn page_visitor(response: &Value, previous: Option<&Continuation>) -> Result<Option<HeaderValue>> {
+    if let Some(visitor) = previous.and_then(|previous| previous.visitor.clone()) {
+        return Ok(Some(visitor));
+    }
+    response
+        .pointer("/responseContext/visitorData")
+        .map(|value| {
+            let visitor = value
+                .as_str()
+                .context("YouTube Music returned an invalid page visitor")?;
+            let mut visitor = HeaderValue::from_str(visitor)
+                .context("YouTube Music returned an invalid page visitor")?;
+            visitor.set_sensitive(true);
+            Ok(visitor)
+        })
+        .transpose()
 }
 
 pub fn text(value: &Value) -> String {
@@ -1856,6 +1920,85 @@ fn owned_continuation(owner: &Value) -> Option<Continuation> {
         .map(Continuation::new)
 }
 
+fn parse_playlist_suggestions(
+    response: &Value,
+    playlist_id: &str,
+    previous: &Continuation,
+) -> Result<PlaylistSuggestions> {
+    let payload = &response["continuationContents"];
+    let (shelf, related) = if let Some(sections) = payload
+        .pointer("/sectionListContinuation/contents")
+        .and_then(Value::as_array)
+    {
+        let mut related = Vec::new();
+        for section in sections {
+            if section.get("musicCarouselShelfRenderer").is_some() {
+                parse_shelves(section, &mut related);
+            }
+        }
+        let shelf = sections
+            .iter()
+            .find_map(|section| section.get("musicShelfRenderer"))
+            .unwrap_or(&Value::Null);
+        (shelf, Some(related))
+    } else if let Some(shelf) = payload
+        .get("musicShelfContinuation")
+        .filter(|shelf| shelf.is_object())
+    {
+        (shelf, None)
+    } else {
+        bail!("YouTube Music returned an unrecognized playlist Suggestions response");
+    };
+    let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    let tracks = shelf["contents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let row = entry.get("musicResponsiveListItemRenderer")?;
+            let Item::Track(track) = parse_item(entry)? else {
+                return None;
+            };
+            let addable = suggestion_addable(row, playlist_id, &track.id);
+            Some(PlaylistSuggestion { track, addable })
+        })
+        .collect();
+    let reload = shelf["continuations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|entry| {
+            let token = entry
+                .pointer("/reloadContinuationData/continuation")?
+                .as_str()?;
+            Continuation::from_page(token, response, previous.session.clone(), Some(previous)).ok()
+        });
+    Ok(PlaylistSuggestions {
+        tracks,
+        reload,
+        related,
+        auto_reload_when_empty: shelf["autoReloadWhenEmpty"].as_bool().unwrap_or(false),
+    })
+}
+
+fn suggestion_addable(row: &Value, playlist_id: &str, video_id: &str) -> bool {
+    let Some(endpoint) = row.pointer(
+        "/fixedColumns/1/musicResponsiveListItemFixedColumnRenderer/button/buttonRenderer/command/playlistEditEndpoint",
+    ) else {
+        return false;
+    };
+    let Some(target) = endpoint["playlistId"].as_str() else {
+        return false;
+    };
+    let Some([action]) = endpoint["actions"].as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    !playlist_id.is_empty()
+        && target.strip_prefix("VL").unwrap_or(target) == playlist_id
+        && action["action"] == "ACTION_ADD_VIDEO"
+        && action["addedVideoId"] == video_id
+}
+
 pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
     let mut shelves = Vec::new();
     parse_shelves(data, &mut shelves);
@@ -1896,6 +2039,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         .or_else(|| data.get("sectionListContinuation"))
     {
         Some(owner) => owned_continuation(owner),
+        None if editable_header.is_some() => None,
         None => find(data, "nextContinuationData")
             .and_then(|v| v["continuation"].as_str())
             .or_else(|| find(data, "continuationCommand").and_then(|v| v["token"].as_str()))
@@ -1991,6 +2135,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
                 })
                 .and_then(|button| PlaylistTarget::from_navigation(&button["navigationEndpoint"]))
                 .map(Arc::new),
+            suggestions: None,
             subscribed,
             subscription_label: subscription_button
                 .map(|button| {
@@ -3795,6 +3940,253 @@ mod tests {
         );
     }
 
+    fn playlist_suggestions_seed() -> Value {
+        json!({
+            "responseContext":{"visitorData":"synthetic-visitor"},
+            "contents":{"twoColumnBrowseResultsRenderer":{
+                "tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{"contents":[{
+                    "musicEditablePlaylistDetailHeaderRenderer":{
+                        "playlistId":"PLsynthetic",
+                        "header":{"musicResponsiveHeaderRenderer":{
+                            "title":{"simpleText":"Synthetic playlist"},
+                            "secondSubtitle":{"simpleText":"1 song"}
+                        }}
+                    }
+                }]}}}}],
+                "secondaryContents":{"sectionListRenderer":{
+                    "contents":[{"musicPlaylistShelfRenderer":{
+                        "contents":[
+                            {"musicResponsiveListItemRenderer":{
+                                "playlistItemData":{"videoId":"aaaaaaaaaaa"},
+                                "title":{"simpleText":"Playlist song"}
+                            }},
+                            {"continuationItemRenderer":{"continuationEndpoint":{
+                                "continuationCommand":{"token":"playlist-tail"}
+                            }}}
+                        ]
+                    }}],
+                    "continuations":[{"nextContinuationData":{"continuation":"suggestions-seed"}}]
+                }}
+            }}
+        })
+    }
+
+    fn suggestion_row(video_id: &str, target: &str, actions: Value) -> Value {
+        json!({"musicResponsiveListItemRenderer":{
+            "flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{
+                "text":{"runs":[{"text":"Synthetic suggestion","navigationEndpoint":{
+                    "watchEndpoint":{"videoId":video_id}
+                }}]}
+            }}],
+            "fixedColumns":[
+                {"musicResponsiveListItemFixedColumnRenderer":{"text":{"simpleText":"3:21"}}},
+                {"musicResponsiveListItemFixedColumnRenderer":{"button":{"buttonRenderer":{
+                    "command":{"playlistEditEndpoint":{"playlistId":target,"actions":actions}}
+                }}}}
+            ]
+        }})
+    }
+
+    fn suggestion_shelf() -> Value {
+        let mut contents = (0..7)
+            .map(|index| {
+                let id = format!("song{index:07}");
+                suggestion_row(
+                    &id,
+                    "PLsynthetic",
+                    json!([{"action":"ACTION_ADD_VIDEO","addedVideoId":id}]),
+                )
+            })
+            .collect::<Vec<_>>();
+        // A row nested in an Add response command is not another recommendation.
+        contents[0]["musicResponsiveListItemRenderer"]["fixedColumns"][1]["musicResponsiveListItemFixedColumnRenderer"]
+            ["button"]["buttonRenderer"]["command"]["onAddCommands"] = json!([{"appendContinuationItemsAction":{
+            "continuationItems":[suggestion_row("bbbbbbbbbbb", "PLsynthetic", json!([]))]
+        }}]);
+        json!({
+            "title":{"simpleText":"Suggestions"},
+            "contents":contents,
+            "autoReloadWhenEmpty":true,
+            "continuations":[{"reloadContinuationData":{"continuation":"suggestions-reload"}}]
+        })
+    }
+
+    #[test]
+    fn playlist_suggestions_keep_tracks_count_and_play_all_separate() {
+        let catalog = Catalog::new().unwrap();
+        let response = playlist_suggestions_seed();
+        let page = catalog
+            .bind_page(parse_page(&response, "Playlist").unwrap(), &response, None)
+            .unwrap();
+        let header = page.header.as_ref().unwrap();
+        let seed = header.suggestions.as_ref().unwrap();
+        assert_eq!(seed.token(), "suggestions-seed");
+        assert_eq!(page.continuation.as_ref().unwrap().token(), "playlist-tail");
+
+        let response = json!({"continuationContents":{"sectionListContinuation":{
+            "contents":[
+                {"musicShelfRenderer":suggestion_shelf()},
+                {"musicCarouselShelfRenderer":{
+                    "header":{"musicCarouselShelfBasicHeaderRenderer":{
+                        "title":{"simpleText":"Related playlists"}
+                    }},
+                    "contents":[{"musicTwoRowItemRenderer":{
+                        "title":{"simpleText":"Synthetic related playlist"},
+                        "navigationEndpoint":{"browseEndpoint":{"browseId":"VLPLrelated"}}
+                    }}]
+                }}
+            ]
+        }}});
+        let suggestions = parse_playlist_suggestions(&response, "VLPLsynthetic", seed).unwrap();
+        assert_eq!(suggestions.tracks.len(), 7);
+        assert_eq!(suggestions.tracks[0].track.id, "song0000000");
+        assert!(suggestions.tracks.iter().all(|row| row.addable));
+        assert!(suggestions.auto_reload_when_empty);
+        assert_eq!(suggestions.related.unwrap()[0].items[0].id(), "VLPLrelated");
+        let reload = suggestions.reload.unwrap();
+        assert_eq!(reload.token(), "suggestions-reload");
+
+        let mut refresh = suggestion_shelf();
+        refresh["continuations"][0]["reloadContinuationData"]["continuation"] =
+            json!("suggestions-next");
+        let response = json!({"continuationContents":{"musicShelfContinuation":refresh}});
+        let refreshed = parse_playlist_suggestions(&response, "PLsynthetic", &reload).unwrap();
+        assert_eq!(refreshed.tracks.len(), 7);
+        assert!(refreshed.related.is_none());
+        assert_eq!(refreshed.reload.unwrap().token(), "suggestions-next");
+
+        assert_eq!(header.track_count(), Some("1 song"));
+        assert_eq!(page.shelves.len(), 1);
+        assert_eq!(page.tracks()[0].id, "aaaaaaaaaaa");
+        let mut queue = crate::library::Queue::default();
+        let (mut worker, _events) = crate::queue_source::Worker::start();
+        worker.replace_queue(
+            &mut queue,
+            &page,
+            0,
+            crate::queue_source::PageRequest::Collection("VLPLsynthetic".into()),
+            None,
+        );
+        assert_eq!(queue.tracks.len(), 1);
+        assert_eq!(queue.tracks[0].id, "aaaaaaaaaaa");
+    }
+
+    #[test]
+    fn an_empty_playlist_can_offer_suggestions_without_a_track_continuation() {
+        let catalog = Catalog::new().unwrap();
+        let mut response = playlist_suggestions_seed();
+        response.pointer_mut(SECONDARY_SECTIONS).unwrap()["contents"] = json!([]);
+        let page = catalog
+            .bind_page(parse_page(&response, "Playlist").unwrap(), &response, None)
+            .unwrap();
+        assert!(page.tracks().is_empty());
+        assert!(page.continuation.is_none());
+        assert!(page.header.unwrap().suggestions.is_some());
+
+        response.pointer_mut(SECONDARY_SECTIONS).unwrap()["continuations"][0]["nextContinuationData"]
+            ["continuation"] = json!("invalid seed");
+        let page = catalog
+            .bind_page(parse_page(&response, "Playlist").unwrap(), &response, None)
+            .unwrap();
+        assert!(page.header.unwrap().suggestions.is_none());
+    }
+
+    #[test]
+    fn a_noneditable_playlist_does_not_offer_suggestions() {
+        let catalog = Catalog::new().unwrap();
+        let mut response = playlist_suggestions_seed();
+        response["contents"]["twoColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]
+            ["sectionListRenderer"]["contents"][0] = json!({"musicResponsiveHeaderRenderer":{
+            "title":{"simpleText":"Someone else's playlist"}
+        }});
+        let page = catalog
+            .bind_page(parse_page(&response, "Playlist").unwrap(), &response, None)
+            .unwrap();
+        assert!(!page.editable);
+        assert!(page.header.unwrap().suggestions.is_none());
+    }
+
+    #[test]
+    fn invalid_suggestion_add_actions_keep_the_rows_playable() {
+        let id = "song0000000";
+        let add = json!({"action":"ACTION_ADD_VIDEO","addedVideoId":id});
+        let remove = json!({"action":"ACTION_REMOVE_VIDEO","removedVideoId":id});
+        let mut shelf = suggestion_shelf();
+        shelf["contents"] = json!([
+            suggestion_row(id, "VLPLsynthetic", json!([add])),
+            suggestion_row(id, "PLwrong", json!([add])),
+            suggestion_row(
+                id,
+                "PLsynthetic",
+                json!([{"action":"ACTION_ADD_VIDEO","addedVideoId":"bbbbbbbbbbb"}])
+            ),
+            suggestion_row(id, "PLsynthetic", json!([remove])),
+            suggestion_row(id, "PLsynthetic", json!([add, remove])),
+            suggestion_row(id, "PLsynthetic", json!([]))
+        ]);
+        let response = json!({"continuationContents":{"musicShelfContinuation":shelf}});
+        let parsed =
+            parse_playlist_suggestions(&response, "PLsynthetic", &Continuation::new("seed"))
+                .unwrap();
+        assert!(parsed.tracks.iter().all(|row| row.track.id == id));
+        assert_eq!(
+            parsed
+                .tracks
+                .iter()
+                .map(|row| row.addable)
+                .collect::<Vec<_>>(),
+            [true, false, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn suggestion_continuations_keep_the_originating_session_and_visitor() {
+        let session = Arc::new(
+            serde_json::from_value::<Session>(json!({
+                "cookie":"SAPISID=synthetic", "playback_cookie":"# Netscape HTTP Cookie File\n",
+                "authuser":"2", "delegated_session_id":null, "data_sync_id":"synthetic-account||",
+                "client_version":"test"
+            }))
+            .unwrap(),
+        );
+        let catalog = Catalog::with_session(Some(session.clone())).unwrap();
+        let response = playlist_suggestions_seed();
+        let seed = catalog
+            .bind_page(parse_page(&response, "Playlist").unwrap(), &response, None)
+            .unwrap()
+            .header
+            .unwrap()
+            .suggestions
+            .unwrap();
+        let response = json!({
+            "responseContext":{"visitorData":"new-visitor"},
+            "continuationContents":{"musicShelfContinuation":suggestion_shelf()}
+        });
+        let reload = parse_playlist_suggestions(&response, "PLsynthetic", &seed)
+            .unwrap()
+            .reload
+            .unwrap();
+        let replacement = catalog.for_session(Some(Arc::new((*session).clone())));
+        let signed_out = catalog.for_session(None);
+        for continuation in [&seed, &reload] {
+            let request = catalog
+                .page_request("browse", json!({}), Some(continuation))
+                .unwrap()
+                .build()
+                .unwrap();
+            let visitor = &request.headers()["X-Goog-Visitor-Id"];
+            assert_eq!(visitor, "synthetic-visitor");
+            assert!(visitor.is_sensitive());
+            for other in [&replacement, &signed_out] {
+                let error = other
+                    .page_request("browse", json!({}), Some(continuation))
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("account changed"));
+            }
+        }
+    }
+
     #[test]
     fn a_finished_section_list_does_not_use_a_nested_shelf_continuation() {
         let mut response = continued_page(json!("visitor"), "page-token");
@@ -4890,6 +5282,71 @@ mod tests {
             page.title,
             page.tracks().len()
         );
+    }
+
+    #[test]
+    #[ignore = "reads an explicitly selected owned playlist and refreshes Suggestions using the saved account; no account writes"]
+    fn live_owned_playlist_suggestions() -> Result<()> {
+        let id = std::env::var("YT_MUSIC_LIVE_PLAYLIST")
+            .context("Set YT_MUSIC_LIVE_PLAYLIST to an owned playlist")?;
+        ensure!(id.starts_with("VLPL"), "Select a playlist browse ID");
+        let operation = auth::Operation::default();
+        let session = auth::Session::load(&operation)?
+            .context("Sign in before running the Suggestions read check")?;
+        let session = Arc::new(session);
+        let mut catalog = Catalog::with_session(Some(session.clone()))?;
+        let playlist = BrowseLink::new(&id, "Playlist");
+        let page = match catalog.browse(&playlist) {
+            Err(error) if auth::session_was_rejected(&error) => {
+                let profile = session.source_profile.as_ref().context(
+                    "The saved session expired and has no browser profile. Reconnect in the app.",
+                )?;
+                let refreshed = profile.read_session(&operation)?;
+                session.require_same_account(&refreshed)?;
+                catalog = catalog.for_session(Some(Arc::new(refreshed)));
+                catalog.browse(&playlist)?
+            }
+            result => result?,
+        };
+        ensure!(page.editable, "Select an owned editable playlist");
+        let count = page.tracks().len();
+        let seed = page
+            .header
+            .as_ref()
+            .and_then(|header| header.suggestions.as_ref())
+            .context("Playlist has no Suggestions seed")?;
+        let batch = catalog.playlist_suggestions(seed, &id)?;
+        ensure!(!batch.tracks.is_empty(), "Suggestions returned no rows");
+        ensure!(
+            batch.tracks.iter().all(|row| row.addable),
+            "Suggestions returned an unusable Add action"
+        );
+        let reload = batch
+            .reload
+            .as_ref()
+            .context("Suggestions returned no Refresh token")?;
+        let next = catalog.playlist_suggestions(reload, &id)?;
+        ensure!(!next.tracks.is_empty(), "Refresh returned no rows");
+        ensure!(
+            next.tracks.iter().all(|row| row.addable),
+            "Refresh returned an unusable Add action"
+        );
+        ensure!(next.reload.is_some(), "Refresh returned no next token");
+        ensure!(
+            page.tracks().len() == count,
+            "Suggestions changed playlist rows"
+        );
+        println!(
+            "Suggestions rows={}, refreshed rows={}, playlist rows={count}, batch changed={}; read only",
+            batch.tracks.len(),
+            next.tracks.len(),
+            !batch
+                .tracks
+                .iter()
+                .map(|row| &row.track.id)
+                .eq(next.tracks.iter().map(|row| &row.track.id)),
+        );
+        Ok(())
     }
 
     #[test]

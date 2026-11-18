@@ -290,7 +290,7 @@ impl Music {
             account_worker: Some(account_worker),
             account_operation,
             next_session_refresh: None,
-            pending_mutations: HashSet::new(),
+            pending_mutations: HashMap::new(),
             ratings: HashMap::new(),
             account_revision: 0,
             account_generation: 0,
@@ -319,6 +319,7 @@ impl Music {
             },
             rows: Vec::new(),
             list_rows: Vec::new(),
+            suggestions: None,
             shelf_scroll: HashMap::new(),
             shelf_heights: Vec::new(),
             #[cfg(test)]

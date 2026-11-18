@@ -36,6 +36,7 @@ pub(in crate::app) enum Overlay {
     AlreadyAdded {
         id: String,
         video_ids: Vec<String>,
+        sources: Vec<Track>,
         error: Option<String>,
     },
     PlaylistForm {
@@ -1036,6 +1037,7 @@ impl Music {
         } else if let Overlay::AlreadyAdded {
             id,
             video_ids,
+            sources,
             error,
         } = kind
         {
@@ -1046,6 +1048,7 @@ impl Music {
             );
             let id = id.clone();
             let video_ids = video_ids.clone();
+            let sources = sources.clone();
             body = body.child(self.menu_action(
                 "add-anyway",
                 "Add anyway",
@@ -1063,6 +1066,9 @@ impl Music {
                         },
                         cx,
                     ) {
+                        if let Some(pending) = view.pending_mutations.get_mut(&id) {
+                            *pending = sources.clone();
+                        }
                         view.close_overlay(window, cx);
                     } else if let Some(Overlay::AlreadyAdded { error, .. }) = &mut view.overlay {
                         *error = view.error.take();
