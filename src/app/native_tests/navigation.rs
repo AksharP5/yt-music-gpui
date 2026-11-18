@@ -1765,7 +1765,60 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playlist_picker_shows_a_rejected_save_inside_the_dialog() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+
     check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, _, cx| {
+                view.request(
+                    Query::More {
+                        token: view.page.continuation.clone().unwrap(),
+                        search: None,
+                    },
+                    cx,
+                );
+                let job = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+                    .filter(|job| matches!(job.query, Query::More { .. }))
+                    .last()
+                    .unwrap();
+                view.catalog_result(
+                    CatalogResult {
+                        id: job.id,
+                        account_revision: job.account_revision,
+                        account_generation: job.account_generation,
+                        history_generation: job.history_generation,
+                        append: true,
+                        revalidate: false,
+                        result: Err("Could not load more songs".into()),
+                        session_rejected: false,
+                        target: CatalogTarget::Page,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let page_error_pixels = |cx: &mut gpui::AsyncApp, name| {
+            window
+                .update(cx, |_, window, _| {
+                    super::render::capture(window, name)
+                        .enumerate_pixels()
+                        .filter(|(x, y, pixel)| {
+                            (260..640).contains(x)
+                                && (65..450).contains(y)
+                                && pixel.0[0] > 140
+                                && pixel.0[0].saturating_sub(pixel.0[1]) > 40
+                        })
+                        .count()
+                })
+                .unwrap()
+        };
+        let page_error_before = page_error_pixels(cx, "page-error-before-picker");
+        assert!(
+            page_error_before > 100,
+            "Show the continuation failure before saving"
+        );
+
         window
             .update(cx, |view, window, cx| {
                 let (commands, submitted) = async_channel::bounded(1);
@@ -1825,6 +1878,56 @@ fn playlist_picker_shows_a_rejected_save_inside_the_dialog() -> Result<()> {
                 .all(|y| (0..440).all(|x| before.get_pixel(x, y) == after.get_pixel(x, y))),
             "Submission feedback must leave the page behind the picker unchanged"
         );
+        super::render::key(window, cx, "escape").await;
+        assert!(
+            page_error_pixels(cx, "page-error-after-picker") >= page_error_before,
+            "Closing Save to playlist must keep the continuation error visible"
+        );
+
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.overlay.is_none());
+                view.error = Some("Could not start playback".into());
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let dismiss = |cx: &mut gpui::AsyncApp| {
+            cx.update_window(window.into(), |_, window, cx| {
+                let position = point(px(1154.), px(84.));
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        };
+        dismiss(cx);
+        wait_for_presented_frame(window, cx).await;
+        assert!(
+            page_error_pixels(cx, "page-error-after-dismiss") >= page_error_before,
+            "Dismissing another warning must reveal the continuation failure"
+        );
+        dismiss(cx);
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| assert!(view.sync.page_error.is_none()))
+            .unwrap();
     })
 }
 
