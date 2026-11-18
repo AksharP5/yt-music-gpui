@@ -98,7 +98,7 @@ When playback is stopped, Next and Previous select songs without starting playba
 
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 
-In **Save to playlist**, use Tab and Shift+Tab to move through the destinations. The list scrolls to the focused playlist. Press Enter to choose it.
+In **Save to playlist**, use Tab and Shift+Tab to move through the destinations. The list scrolls to the focused playlist. Press Enter to choose it. Confirmed songs appear in a fully loaded destination even if you changed the queue while the save was pending.
 
 While dragging a song in **Up next**, press Escape to cancel the move. Press Escape again to close the player page. Leaving Up next, shuffling, or replacing the queue also cancels the move.
 
