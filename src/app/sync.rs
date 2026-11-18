@@ -539,6 +539,32 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) -> 
     {
         return false;
     }
+    let mut existing = page
+        .shelves
+        .iter()
+        .flat_map(|shelf| &shelf.items)
+        .filter_map(|item| match item {
+            Item::Track(track) => Some(&track.details.set_video_id),
+            _ => None,
+        });
+    let mut pending = if let [track] = sources {
+        if existing.any(|id| id == &track.details.set_video_id) {
+            return false;
+        }
+        None
+    } else {
+        let mut pending: HashSet<&Option<String>> = sources
+            .iter()
+            .map(|track| &track.details.set_video_id)
+            .collect();
+        for id in existing {
+            pending.remove(id);
+        }
+        if pending.is_empty() {
+            return false;
+        }
+        Some(pending)
+    };
     if page.shelves.is_empty() {
         page.shelves.push(Shelf {
             title: String::new(),
@@ -547,16 +573,21 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) -> 
             items: Vec::new(),
         });
     }
-    let mut added = false;
-    for track in sources {
-        if !page.shelves.iter().flat_map(|shelf| &shelf.items).any(|item| matches!(item, Item::Track(current) if current.details.set_video_id == track.details.set_video_id))
-            && let Some(shelf) = page.shelves.last_mut()
-        {
-            shelf.items.push(Item::Track(track.clone()));
-            added = true;
-        }
-    }
-    added
+    let Some(shelf) = page.shelves.last_mut() else {
+        return false;
+    };
+    shelf.items.extend(
+        sources
+            .iter()
+            .filter(|track| {
+                pending
+                    .as_mut()
+                    .is_none_or(|ids| ids.remove(&track.details.set_video_id))
+            })
+            .cloned()
+            .map(Item::Track),
+    );
+    true
 }
 
 impl Music {
@@ -1346,6 +1377,37 @@ pub(super) mod tests {
             track.details.set_video_id = Some(format!("occurrence-{index}")); Item::Track(track)
         }).collect() });
         page
+    }
+
+    #[test]
+    fn batch_append_keeps_distinct_occurrences_and_ignores_replayed_ids() {
+        let mut destination = page(1, false);
+        let route = Route::Browse(BrowseLink::new("VLPLtest", "Playlist"));
+        let source = destination.tracks().remove(0);
+        let mut second = source.clone();
+        second.details.set_video_id = Some("second".into());
+        let mut third = source.clone();
+        third.details.set_video_id = Some("third".into());
+        let batch = [source, second.clone(), second, third];
+
+        assert!(super::append_added(
+            &mut destination,
+            &route,
+            "PLtest",
+            &batch
+        ));
+        assert!(!super::append_added(
+            &mut destination,
+            &route,
+            "PLtest",
+            &batch
+        ));
+        let occurrences: Vec<_> = destination
+            .tracks()
+            .into_iter()
+            .map(|track| track.details.set_video_id.unwrap())
+            .collect();
+        assert_eq!(occurrences, ["occurrence-0", "second", "third"]);
     }
 
     #[test]
