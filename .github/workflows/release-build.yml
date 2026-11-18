@@ -100,18 +100,12 @@ jobs:
           cp dist/stage/LICENSE* dist/stage/NOTICE dist/stage/OFL.txt packaging/LICENSE-DENO packaging/LICENSE-V8 packaging/NOTICE-DENO packaging/LICENSE-YT-DLP dist/licenses/
           for packager in deb rpm; do tools/nfpm package --config packaging/nfpm.yaml --packager "$packager" --target dist/; done
           (cd dist && for package in *.deb *.rpm; do sha256sum "$package" > "$package.sha256"; done)
-          rm -r dist/stage dist/helpers dist/licenses tools
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: linux-x86_64
-          path: dist/*
-          if-no-files-found: error
-          compression-level: 0
 
       - name: Measure local guest playback
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
+          test -x dist/helpers/yt-dlp
           runtime=$(mktemp -d /dev/shm/yt-music-playback.XXXXXX)
           XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$RUNNER_TEMP/yt-music-playback-data" PATH="$PWD/dist/helpers:$PATH" \
             player-test/yt-music-gpui-tests --ignored --exact \
@@ -136,6 +130,15 @@ jobs:
                   print(f"| {label} | {len(values)} | {statistics.median(values):.1f} ms |", file=summary)
               print("", file=summary)
           PY
+
+      - name: Remove package staging files
+        run: rm -r dist/stage dist/helpers dist/licenses tools
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
 
       - name: Compare stripped binary size with the branch base
         if: github.event_name == 'workflow_dispatch'
