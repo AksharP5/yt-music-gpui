@@ -113,7 +113,7 @@ MPRIS Shuffle uses the same album, playlist or artist source as the player bar. 
 
 `account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 
-`desktop_previous_follows_the_restart_position` reads the private D-Bus capability as playback crosses three seconds and while a seek is pending or rejected.
+`desktop_previous_follows_the_restart_position` reads the private D-Bus capability as playback crosses three seconds and while a seek is pending or rejected. `desktop_seek_past_end_uses_next_availability` sends Next and Seek on the private D-Bus service and checks that both leave the last song playing when Next is unavailable.
 
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
