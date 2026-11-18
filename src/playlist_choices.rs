@@ -11,7 +11,7 @@ use std::ops::Range;
 pub(crate) const LIKED_MUSIC_ART: &str =
     "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-songs-delhi-192.png";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Destination {
     Playlist(String),
     LikedMusic,
@@ -59,6 +59,24 @@ impl ChoiceList<'_> {
         match self {
             Self::Server(choices) => choices.empty.as_ref(),
             Self::Library { .. } => None,
+        }
+    }
+
+    pub fn index_of(&self, target: &Destination) -> Option<usize> {
+        match self {
+            Self::Server(choices) => choices
+                .destinations
+                .iter()
+                .position(|choice| &choice.target == target),
+            Self::Library { playlists, tracks } => {
+                provisional(playlists, tracks).position(|choice| match (choice, target) {
+                    (ProvisionalChoice::LikedMusic, Destination::LikedMusic) => true,
+                    (ProvisionalChoice::Playlist(_, id), Destination::Playlist(target)) => {
+                        id == target
+                    }
+                    _ => false,
+                })
+            }
         }
     }
 

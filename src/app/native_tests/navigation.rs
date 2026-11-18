@@ -1310,6 +1310,94 @@ const COVERS: [(&str, &str, &str); 5] = [
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn keyboard_reaches_offscreen_save_destinations() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let submitted = window
+            .update(cx, |view, window, cx| {
+                let (commands, submitted) = async_channel::bounded(1);
+                view.account_commands = commands;
+                view.sidebar_playlists = (0..40)
+                    .map(|index| crate::catalog::Collection {
+                        id: format!("VLPLkeyboard-{index}"),
+                        title: format!("Playlist {index:02}"),
+                        subtitle: String::new(),
+                        thumbnail: None,
+                        details: crate::catalog::CollectionDetails {
+                            editable: true,
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let tracks = view.page.tracks()[..2].to_vec();
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(tracks, cx);
+                submitted
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        // Close is the first stop, then the playlist destinations in order.
+        for _ in 0..18 {
+            super::render::key(window, cx, "tab").await;
+        }
+        super::render::key(window, cx, "shift-tab").await;
+        super::render::key(window, cx, "enter").await;
+        let account::Command::Apply { mutation, .. } = submitted
+            .try_recv()
+            .expect("Enter must select the destination reached with Tab")
+        else {
+            panic!("Expected the add-to-playlist command");
+        };
+        assert!(
+            matches!(&*mutation, Mutation::AddToPlaylist { id, .. } if id == "PLkeyboard-15"),
+            "Tab and Shift+Tab must reach the expected offscreen destination. Got {:?}",
+            mutation.key(),
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                let tracks = view.page.tracks()[..2].to_vec();
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(tracks, cx);
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        window
+            .update(cx, |view, _, cx| {
+                let job = playlist_choices_job(view);
+                let mut destinations = view.playlist_picker_choices().rows(0..3);
+                destinations.swap(0, 1);
+                view.playlist_choices_result(
+                    crate::app::PlaylistChoicesResult {
+                        job,
+                        result: Ok(crate::playlist_choices::Choices {
+                            destinations,
+                            empty: None,
+                        }),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        super::render::key(window, cx, "enter").await;
+        let account::Command::Apply { mutation, .. } = submitted
+            .try_recv()
+            .expect("Enter must retain its destination after a reorder")
+        else {
+            panic!("Expected the add-to-playlist command");
+        };
+        assert!(
+            matches!(&*mutation, Mutation::AddToPlaylist { id, .. } if id == "PLkeyboard-0"),
+            "A refreshed list must not move focus to a different playlist"
+        );
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Result<()> {
     use gpui::{
         MouseButton, MouseDownEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
