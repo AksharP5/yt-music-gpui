@@ -407,7 +407,6 @@ impl Music {
             drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             volume_bounds: Rc::new(Cell::new(Bounds::default())),
-            drag_position: None,
             _subscriptions: vec![subscription, activation, focus_lost, rescale],
         };
         view.listening.restored = restored;
