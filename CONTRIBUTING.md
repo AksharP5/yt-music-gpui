@@ -109,6 +109,8 @@ Render-count measurements wait for idle artwork and playback/catalog requests, t
 
 The carousel check measures release-mode shelf construction across 40 presented redraws with 20, 100 and 500 album cards, reporting cold time and warm mean/p50/p95 in microseconds. It also checks horizontal wheel input, offscreen title changes and responsive heights. In the fresh private environment described below, run `bin/test --release -- --ignored --exact app::native_tests::performance::carousel_render_work_and_height_stay_bounded_while_scrolling --nocapture`. These timings cover shelf construction, not total frame time or song startup. Shelf heights reuse their text measurements until content or layout changes.
 
+To measure local guest playback on Linux, run `bin/test --release -- --ignored --exact player::tests::measure_local_guest_playback --nocapture` with the usual libmpv and yt-dlp and a private, RAM-backed `XDG_RUNTIME_DIR`. The test reports five first plays and 200 warm switches as JSON, measured from the play request to the first advancing position. It uses silent local WAV files and null audio. Compare runs on the same machine with the same libmpv and yt-dlp versions.
+
 The Suggestions check compares Refresh work with 500 and 5,000 loaded songs. It reports eight samples per size after one warm-up. Use the same private environment and run `bin/test --release -- --ignored --exact app::native_tests::suggestions::suggestions_refresh_cost_with_loaded_playlist --nocapture`. Request and response times measure local processing with the network intercepted. The window timing includes two frame waits and is useful for comparing runs on the same display.
 
 These tests use Cargo's unoptimized test profile with debug assertions, the same assertions enabled by `cargo run`. The render check includes a Home response with selected and unselected chips and a network error at 956px, then clicks its dismiss button. Run each test in a separate process and fresh environment. GPUI's native application loop cannot be restarted within one test process. This recipe also gives the playback check a synthetic yt-dlp version mismatch, to exercise the guest fallback notice without an account:
@@ -203,7 +205,7 @@ Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only r
 
 Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the same read-only release build workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
 
-The manual preflight summary reports stripped Linux binary size against the branch's common ancestor with `main`. Both builds use `cargo build --release --locked` on the same runner. The summary also lists the sizes of the candidate tarball, Debian package and RPM.
+The manual preflight summary reports stripped Linux binary size against the branch's common ancestor with `main`. Both builds use `cargo build --release --locked` on the same runner. The summary also lists the sizes of the candidate tarball, Debian package and RPM. It records local guest first-play and warm-switch timings using the same null-audio test described above. Those timings measure local player work and exclude YouTube network latency.
 
 Download the artifact and test the installer without touching an existing installation:
 
