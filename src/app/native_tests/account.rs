@@ -1618,3 +1618,131 @@ fn browser_sign_in_can_be_checked_without_refocusing_the_app() -> Result<()> {
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_picker_keeps_its_selection_when_the_account_reconnects() -> Result<()> {
+    use super::render::{key, wait_for_presented_frame};
+    use crate::app::PlaylistChoicesResult;
+    use crate::playlist_choices::{Choice, Choices, Destination};
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let renewed = session("renewed-playlist-picker");
+        let (sender, commands) = async_channel::unbounded();
+        let rejected = window
+            .update(cx, |view, window, cx| {
+                view.account_commands = sender;
+                *view.session.write().unwrap() =
+                    Some(view.account.as_ref().unwrap().session.clone());
+                view.player = Some(
+                    Player::new(PlayerOptions {
+                        audio_output: Some("null".into()),
+                        volume: 0.,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+                let mut song = track("00000000000");
+                song.details.set_video_id = Some("old-occurrence".into());
+                while view.catalog_requests.pending.try_recv().is_ok() {}
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(vec![song], cx);
+                let job = view.catalog_requests.pending.try_recv().unwrap();
+                assert!(matches!(job.query, Query::PlaylistChoices(_)));
+                job
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                let response = PlaylistChoicesResult {
+                    job: rejected.clone(),
+                    result: Err("Synthetic expired session".into()),
+                    session_rejected: true,
+                };
+                view.playlist_choices_result(response, window, cx);
+                let account::Command::Refresh {
+                    operation,
+                    expected,
+                } = commands.try_recv().unwrap()
+                else {
+                    panic!("Expected the picker read to trigger a refresh");
+                };
+                assert!(Arc::ptr_eq(&expected, rejected.session.as_ref().unwrap()));
+                view.account_event(
+                    account::Event::Connected {
+                        operation,
+                        result: Ok(Some(connection(renewed.clone()))),
+                        save_session: false,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_startup_activation(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                assert!(Arc::ptr_eq(
+                    &view.account.as_ref().unwrap().session,
+                    &renewed
+                ));
+                let Some(Overlay::PlaylistPicker { tracks, .. }) = &view.overlay else {
+                    panic!("Reconnecting the same account closed the destination picker");
+                };
+                assert_eq!(tracks[0].title, "00000000000");
+                assert_eq!(tracks[0].details.set_video_id, None);
+                let fresh = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
+                    .find(|job| matches!(job.query, Query::PlaylistChoices(_)))
+                    .expect("Reconnect must retry the open picker's destination read");
+                assert!(Arc::ptr_eq(fresh.session.as_ref().unwrap(), &renewed));
+                assert!(
+                    matches!(&fresh.query, Query::PlaylistChoices(ids) if ids == &["00000000000"])
+                );
+                view.playlist_choices_result(
+                    PlaylistChoicesResult {
+                        job: rejected,
+                        result: Err("Late result from the old session".into()),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(view.catalog_requests.playlist_choices_error.is_none());
+                view.playlist_choices_result(
+                    PlaylistChoicesResult {
+                        job: fresh,
+                        result: Ok(Choices {
+                            destinations: vec![Choice {
+                                target: Destination::Playlist("PLrenewed".into()),
+                                title: "Fresh destination".into(),
+                                byline: String::new(),
+                                thumbnail: None,
+                                privacy: None,
+                                pinned: false,
+                            }],
+                            empty: None,
+                        }),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(commands.is_empty(), "Reconnect must not submit an edit");
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        key(window, cx, "tab").await;
+        key(window, cx, "tab").await;
+        key(window, cx, "enter").await;
+        let account::Command::Apply { session, mutation } = commands.try_recv().unwrap() else {
+            panic!("Expected Enter on the refreshed destination to save the original song");
+        };
+        assert!(Arc::ptr_eq(&session, &renewed));
+        assert!(matches!(
+            &*mutation,
+            Mutation::AddToPlaylist { id, video_ids, duplicates: false }
+                if id == "PLrenewed" && video_ids == &["00000000000"]
+        ));
+    })
+}

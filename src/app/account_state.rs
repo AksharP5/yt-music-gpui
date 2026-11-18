@@ -748,6 +748,9 @@ impl Music {
                                 self.queue_source.cancel();
                                 self.error = Some(error);
                             }
+                            if self.catalog_requests.playlist_choices_error.is_some() {
+                                self.refresh_playlist_choices(cx);
+                            }
                             self.refresh_remote(cx);
                             self.finish_account_playback(pending, true, cx);
                             if self.active_id.is_some()
@@ -882,8 +885,16 @@ impl Music {
                                             view.pending_mutations.clear();
                                             view.clear_suggestions();
                                             for track in view.library.queue.tracks_mut() { track.details.clear_account_state(); }
-                                            if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. })) {
-                                                view.overlay = None;
+                                            match &mut view.overlay {
+                                                Some(Overlay::PlaylistPicker { tracks, error }) => {
+                                                    for track in tracks {
+                                                        track.details.clear_account_state();
+                                                    }
+                                                    *error = None;
+                                                    view.refresh_playlist_choices(cx);
+                                                }
+                                                Some(Overlay::Track { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. }) => view.overlay = None,
+                                                _ => {}
                                             }
                                             view.search.update(cx, |search, cx| search.renew_session(previous_session.as_ref(), session.clone(), window, cx));
                                             view.error = retry_change.then(|| "Your account reconnected. Retry the failed change.".into());
