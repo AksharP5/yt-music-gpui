@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Compare two locked Linux release builds with local, silent playback."""
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+BUDGETS = (
+    ("Stripped binary", "binary_bytes", "bytes"),
+    ("First play", "first_position_ms", "ms"),
+    ("Warm switch", "warm_switch_ms", "ms"),
+)
+
+
+def build(root, target, executable):
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+    subprocess.run(["cargo", "build", "--release", "--locked"], cwd=root, env=env, check=True)
+    size = (target / "release/yt-music-gpui").stat().st_size
+    output = subprocess.check_output(
+        ["cargo", "test", "--release", "--locked", "--no-run", "--message-format=json"],
+        cwd=root, env=env, text=True,
+    )
+    artifacts = [json.loads(line) for line in output.splitlines()]
+    test, = (
+        artifact["executable"] for artifact in artifacts
+        if artifact.get("reason") == "compiler-artifact"
+        and artifact["profile"]["test"] and artifact["target"]["name"] == "yt-music-gpui"
+        and artifact["executable"]
+    )
+    shutil.copy2(test, executable)
+    return size
+
+
+def stage_extractor(destination, source):
+    pins = ast.parse((ROOT / "src/ytdlp_account.py").read_text())
+    values = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in pins.body
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+    }
+    if source:
+        shutil.copyfile(source, destination)
+    else:
+        version = values["REVIEWED_VERSION"]
+        subprocess.run([
+            "curl", "-q", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-fsSL",
+            f"https://github.com/yt-dlp/yt-dlp/releases/download/{version}/yt-dlp",
+            "-o", destination,
+        ], check=True)
+    with destination.open("rb") as file:
+        if hashlib.file_digest(file, "sha256").hexdigest() != values["REVIEWED_SHA256"]:
+            sys.exit("yt-dlp does not match the reviewed release hash.")
+    destination.chmod(0o700)
+
+
+def measure(executable, scratch):
+    with tempfile.TemporaryDirectory(prefix="yt-music-ci.", dir="/dev/shm") as runtime:
+        env = dict(
+            os.environ, HOME=str(scratch), XDG_DATA_HOME=str(scratch / "data"),
+            XDG_RUNTIME_DIR=runtime,
+        )
+        output = subprocess.check_output([
+            executable, "--ignored", "--exact", "player::tests::measure_local_guest_playback",
+            "--nocapture",
+        ], env=env, text=True)
+    prefix = "playback_samples "
+    samples, = (json.loads(line.split(prefix, 1)[1]) for line in output.splitlines() if prefix in line)
+    return {key: statistics.median(values) for key, values in samples.items()}
+
+
+def report(base, candidate, before, after):
+    budgets = json.loads((ROOT / "bin/performance-budget.json").read_text())
+    rows = [
+        "### Linux release performance",
+        "",
+        f"Comparing `{base[:12]}` with `{candidate[:12]}` on the same runner.",
+        "",
+        "| Measurement | Base | Candidate | Change | Allowed increase | Result |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    size_limit = budgets["max_binary_bytes"]
+    size_cap_exceeded = after["binary_bytes"] > size_limit
+    for label, key, unit in BUDGETS:
+        change = after[key] - before[key]
+        allowed = budgets[key]
+        exceeds_delta = change > allowed
+        exceeds_size = key == "binary_bytes" and size_cap_exceeded
+        exceeded = exceeds_delta or exceeds_size
+        decimals = 0 if unit == "bytes" else 1
+        rows.append(
+            f"| {label} ({unit}) | {before[key]:,.{decimals}f} | {after[key]:,.{decimals}f} | "
+            f"{change:+,.{decimals}f} | {allowed:,} | {'Regression' if exceeded else 'Within budget'} |"
+        )
+        if exceeds_delta:
+            level = "error" if key == "binary_bytes" else "warning"
+            print(f"::{level}::{label} grew by {change:,.{decimals}f} {unit} (budget {allowed:,}).")
+    if size_cap_exceeded:
+        print(f"::error::Stripped binary is {after['binary_bytes']:,} bytes (cap {size_limit:,}).")
+    size_growth_exceeded = after["binary_bytes"] - before["binary_bytes"] > budgets["binary_bytes"]
+    rows += [
+        "",
+        f"The stripped binary is capped at {size_limit:,} bytes.",
+        "Playback uses silent local WAV files and excludes streaming and network latency.",
+    ]
+    summary = "\n".join(rows) + "\n"
+    print(summary)
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a") as file:
+            file.write(summary)
+    return int(size_cap_exceeded or size_growth_exceeded)
+
+
+def main():
+    if not 2 <= len(sys.argv) <= 3:
+        sys.exit("Usage: bin/check-performance BASE_COMMIT [REVIEWED_YT_DLP]")
+    base = subprocess.check_output(["git", "rev-parse", "--verify", "--end-of-options", sys.argv[1] + "^{commit}"],
+                                   cwd=ROOT, text=True).strip()
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
+    with tempfile.TemporaryDirectory(prefix="yt-music-performance.") as directory:
+        scratch = Path(directory)
+        home = scratch / "home"
+        local = home / ".local"
+        share = local / "share"
+        helpers = share / "yt-music-gpui"
+        for folder in [home, local, share, helpers]:
+            folder.mkdir(mode=0o700)
+        stage_extractor(helpers / "yt-dlp", sys.argv[2] if len(sys.argv) == 3 else None)
+        candidate_test = scratch / "candidate-test"
+        candidate_size = build(ROOT, target, candidate_test)
+        if base == candidate:
+            current = dict(measure(candidate_test, home), binary_bytes=candidate_size)
+            return report(base, candidate, current, current)
+        base_tree = scratch / "base"
+        subprocess.run(["git", "worktree", "add", "--detach", base_tree, base], cwd=ROOT, check=True)
+        try:
+            base_test = scratch / "base-test"
+            base_size = build(base_tree, target, base_test)
+            before = dict(measure(base_test, home), binary_bytes=base_size)
+            after = dict(measure(candidate_test, home), binary_bytes=candidate_size)
+        finally:
+            subprocess.run(["git", "worktree", "remove", base_tree], cwd=ROOT, check=True)
+        return report(base, candidate, before, after)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
