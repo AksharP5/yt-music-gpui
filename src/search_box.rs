@@ -465,7 +465,7 @@ impl Render for SearchBox {
                 .absolute()
                 .top(px(HEIGHT - 2.))
                 .left(px(-1.))
-                .w(px(WIDTH))
+                .right(px(-1.))
                 .py(px(8.))
                 .rounded_b(px(8.))
                 .bg(rgb(0x030303))

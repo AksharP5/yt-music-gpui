@@ -1,9 +1,12 @@
 //! Search box input with the real window event path.
 use super::navigation::check_cache_window;
-use super::render::wait_for_presented_frame;
+use super::render::{capture, wait_for_presented_frame};
 use crate::app::{Music, Route};
 use crate::library::Repeat;
-use gpui::{AppContext, AsyncApp, Focusable, PlatformInput, WindowHandle, point, px};
+use gpui::{
+    AppContext, AsyncApp, Focusable, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
+    WindowHandle, point, px, size,
+};
 
 async fn press(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
     cx.update_window(window.into(), |_, window, cx| {
@@ -93,5 +96,65 @@ fn enter_searches_the_typed_text_unless_a_suggestion_was_chosen_with_the_keyboar
         press(window, cx, "down").await;
         press(window, cx, "enter").await;
         assert_eq!(searched(window, cx), "second suggestion");
+    })
+}
+
+#[test]
+#[ignore = "requires X11, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |music, window, cx| {
+                music.sidebar_collapsed = Some(false);
+                window.resize(size(px(850.), px(560.)));
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        type_with_suggestions(window, cx).await;
+
+        let click = |cx: &mut AsyncApp, x: f32| {
+            cx.update_window(window.into(), |_, window, cx| {
+                let position = point(px(x), px(83.));
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        };
+        window
+            .update(cx, |_, window, _| {
+                capture(window, "narrow-search-suggestions")
+            })
+            .unwrap();
+
+        // This point is under the account controls, past the signed-in search field.
+        click(cx, 740.);
+        wait_for_presented_frame(window, cx).await;
+        assert!(
+            searched(window, cx).is_empty(),
+            "Clicking outside must not select a suggestion"
+        );
+
+        type_with_suggestions(window, cx).await;
+        click(cx, 400.);
+        wait_for_presented_frame(window, cx).await;
+        assert_eq!(searched(window, cx), "first suggestion");
     })
 }
