@@ -152,7 +152,7 @@ The wrapper handles `--version` after other flags because the player queries `yt
 
 No test signs in to a real Google account. Do not add one that does.
 
-Search suggestions allow two active reads and keep only the latest queued query. A slow earlier read can finish in the background while the current query shows its suggestions. Results still require the exact query and session. The worker test holds the older read until the new response arrives and checks that the older response is discarded.
+Search suggestions allow two active reads and keep only the latest queued query. A slow earlier read can finish in the background while the current query shows its suggestions. Results still require the exact query and session. The worker test holds the older read until the new response arrives and checks that the older response is discarded. An explicit session rejection uses the normal reconnect path. After verified renewal, the focused query retries with the updated session. The native search check exercises this with a synthetic account.
 
 ## Player waits
 
