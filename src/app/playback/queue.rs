@@ -290,7 +290,7 @@ impl Music {
                         }
                         if let Some(track) = &watch.current {
                             apply_track_details(
-                                &mut self.library.queue.tracks,
+                                self.library.queue.tracks_mut(),
                                 &mut self.ratings,
                                 track,
                                 fresh,
@@ -564,7 +564,7 @@ impl Music {
         };
         self.autoplay_tracks.drain(..index);
         let selected = self.library.queue.tracks.len();
-        self.library.queue.tracks.push(track);
+        self.library.queue.tracks_mut().push(track);
         self.library.queue.select(selected);
         self.play_current(cx);
     }
@@ -890,7 +890,7 @@ impl Music {
 
     pub(in crate::app) fn enqueue(&mut self, track: Track, cx: &mut Context<Self>) {
         self.notice = Some(format!("Added {} to the queue", track.title));
-        self.library.queue.tracks.push(track);
+        self.library.queue.tracks_mut().push(track);
         self.queue_changed(cx);
     }
 
