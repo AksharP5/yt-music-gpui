@@ -150,6 +150,8 @@ The wrapper handles `--version` after other flags because the player queries `yt
 
 No test signs in to a real Google account. Do not add one that does.
 
+Search suggestions allow two active reads and keep only the latest queued query. A slow earlier read can finish in the background while the current query shows its suggestions. Results still require the exact query and session. The worker test holds the older read until the new response arrives and checks that the older response is discarded.
+
 ## Player waits
 
 The fast lookup runs in Rust with a cookie-free HTTP client and the VISIONOS player context reviewed against yt-dlp 2026.08.19. It skips the watch page and manifests, reuses connections, and caches visitor data from the first Music homepage bootstrap in memory. Short-lived lookup threads deliver completions through the player's eventfd, independently of the sequential Python resolver. A click never waits behind or restarts the Python resolver; preparation the click made obsolete is cancelled. Visitor data and pauses reset when the account changes. Late native results cannot satisfy a full lookup or load an obsolete track.
