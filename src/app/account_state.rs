@@ -966,7 +966,7 @@ impl Music {
                     Ok(effect) => {
                         let deleting = matches!(mutation, Mutation::DeletePlaylist { .. });
                         acknowledge_song_change(
-                            self.library.queue.tracks_mut().iter_mut(),
+                            &mut self.library.queue,
                             &mut self.ratings,
                             &mutation,
                         );
@@ -1202,24 +1202,33 @@ pub(in crate::app) fn apply_track_details(
     }
 }
 
-pub(in crate::app) fn acknowledge_song_change<'a>(
-    tracks: impl IntoIterator<Item = &'a mut Track>,
+pub(in crate::app) fn acknowledge_song_change(
+    queue: &mut Queue,
     ratings: &mut HashMap<String, Rating>,
     mutation: &Mutation,
 ) {
     match mutation {
         Mutation::RateSong { track, rating } => {
             ratings.insert(track.id.clone(), *rating);
-            for current in tracks.into_iter().filter(|current| current.id == track.id) {
-                current.details.rating = Some(*rating);
-            }
+            queue.update_tracks(
+                |current| current.id == track.id && current.details.rating != Some(*rating),
+                |current| current.details.rating = Some(*rating),
+            );
         }
         Mutation::SongLibrary { track, save } => {
-            for current in tracks.into_iter().filter(|current| current.id == track.id) {
-                current.details.in_library = Some(*save);
-                current.details.add_library = track.details.add_library.clone();
-                current.details.remove_library = track.details.remove_library.clone();
-            }
+            queue.update_tracks(
+                |current| {
+                    current.id == track.id
+                        && (current.details.in_library != Some(*save)
+                            || current.details.add_library != track.details.add_library
+                            || current.details.remove_library != track.details.remove_library)
+                },
+                |current| {
+                    current.details.in_library = Some(*save);
+                    current.details.add_library = track.details.add_library.clone();
+                    current.details.remove_library = track.details.remove_library.clone();
+                },
+            );
         }
         _ => {}
     }
