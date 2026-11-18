@@ -115,7 +115,7 @@ MPRIS Shuffle uses the same album, playlist or artist source as the player bar. 
 
 `account_changes_cancel_pending_shuffle_in_desktop_controls` reads the actual private D-Bus property when sign-out, sign-in, startup restore, refresh cancellation and account switching cancel a synthetic pending request. It checks the immediate state and the state after activation and late replies.
 
-`desktop_previous_follows_the_restart_position` reads the private D-Bus capability as playback crosses three seconds and while a seek is pending or rejected. It also verifies that the Previous shortcut and button preserve a short saved position when there is no earlier song. `desktop_seek_past_end_uses_next_availability` checks Next and Seek on the private D-Bus service, the Next shortcut and the player-bar button. All leave the last song playing when Next is unavailable. Natural completion still stops playback.
+`desktop_previous_follows_the_restart_position` reads the private D-Bus capability as playback crosses three seconds and while a seek is pending or rejected. It checks that the button redraws when availability changes within a displayed second. The Previous shortcut and button also preserve a short saved position when there is no earlier song. `desktop_seek_past_end_uses_next_availability` checks Next and Seek on the private D-Bus service, the Next shortcut and the player-bar button. All leave the last song playing when Next is unavailable. Natural completion still stops playback.
 
 The native seek check clicks the progress bar and holds a second seek through a song change. Releasing the old drag must keep the replacement song at its own position.
 
