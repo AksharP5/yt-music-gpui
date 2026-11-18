@@ -126,46 +126,49 @@ impl RenderOnce for ChipRow {
 
 /// Keep handles for rendered controls and the next keyboard target. Tab creates its handle before
 /// scrolling it into the virtualized tree, without constructing offscreen rows.
-#[derive(Default)]
-pub(in crate::app) struct VirtualListFocus {
-    handles: HashMap<usize, FocusHandle>,
-    revealing: Option<(usize, Rc<Cell<bool>>)>,
+pub(in crate::app) struct VirtualListFocus<K = usize> {
+    handles: HashMap<K, FocusHandle>,
+    revealing: Option<(K, Rc<Cell<bool>>)>,
 }
 
-impl VirtualListFocus {
-    pub(in crate::app) fn handle(&mut self, index: usize, cx: &App) -> FocusHandle {
+impl<K> Default for VirtualListFocus<K> {
+    fn default() -> Self {
+        Self {
+            handles: HashMap::new(),
+            revealing: None,
+        }
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash> VirtualListFocus<K> {
+    pub(in crate::app) fn handle(&mut self, key: K, cx: &App) -> FocusHandle {
         self.handles
-            .entry(index)
+            .entry(key)
             .or_insert_with(|| cx.focus_handle().tab_index(0).tab_stop(true))
             .clone()
     }
 
-    pub(in crate::app) fn retain(
+    pub(in crate::app) fn retain_visible(
         &mut self,
-        rows: std::ops::Range<usize>,
         window: &Window,
-        row_for: impl Fn(usize) -> usize,
+        is_visible: impl Fn(&K) -> bool,
     ) {
-        // UniformList also requests row zero in its measurement pass. Only prune
-        // against a viewport range, keeping a newly focused offscreen target.
-        if rows == (0..1) {
-            return;
-        }
         if self
             .revealing
             .as_ref()
-            .is_some_and(|(index, _)| rows.contains(&row_for(*index)))
+            .is_some_and(|(key, _)| is_visible(key))
         {
             self.revealing = None;
         }
         self.handles
-            .retain(|index, handle| rows.contains(&row_for(*index)) || handle.is_focused(window));
+            .retain(|key, handle| is_visible(key) || handle.is_focused(window));
     }
 
-    pub(in crate::app) fn focused(&self, window: &Window) -> Option<usize> {
+    pub(in crate::app) fn focused(&self, window: &Window) -> Option<K> {
         self.handles
             .iter()
-            .find_map(|(index, handle)| handle.is_focused(window).then_some(*index))
+            .find(|(_, handle)| handle.is_focused(window))
+            .map(|(key, _)| key.clone())
     }
 
     pub(in crate::app) fn reveal_pending(&self, window: &Window) -> bool {
@@ -178,15 +181,29 @@ impl VirtualListFocus {
         })
     }
 
-    pub(in crate::app) fn focus(&mut self, index: usize, window: &mut Window, cx: &mut App) {
+    pub(in crate::app) fn focus(&mut self, key: K, window: &mut Window, cx: &mut App) {
         let pending = Rc::new(Cell::new(true));
-        self.revealing = Some((index, pending.clone()));
-        window.focus(&self.handle(index, cx), cx);
+        self.revealing = Some((key.clone(), pending.clone()));
+        window.focus(&self.handle(key, cx), cx);
         // The measurement pass can be the only 0..1 range in a one-row list.
         // Expire protection after presentation even when retain cannot clear it.
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |_, _| pending.set(false));
         });
+    }
+}
+
+impl VirtualListFocus {
+    pub(in crate::app) fn retain(
+        &mut self,
+        rows: std::ops::Range<usize>,
+        window: &Window,
+        row_for: impl Fn(usize) -> usize,
+    ) {
+        // UniformList can request row zero for measurement before the viewport.
+        if rows != (0..1) {
+            self.retain_visible(window, |index| rows.contains(&row_for(*index)));
+        }
     }
 
     fn advance(&mut self, reverse: bool, count: usize, window: &mut Window, cx: &mut App) -> bool {

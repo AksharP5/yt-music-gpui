@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::catalog::{BrowseChoice, LibraryFilters};
-use crate::playlist_choices::{Choices, LIKED_MUSIC_ART};
+use crate::playlist_choices::{ChoiceList, Choices, LIKED_MUSIC_ART};
 
 #[derive(Clone, PartialEq)]
 pub(in crate::app) struct Search {
@@ -881,6 +881,7 @@ impl Music {
     pub(in crate::app) fn playlist_choices_result(
         &mut self,
         response: PlaylistChoicesResult,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Query::PlaylistChoices(video_ids) = &response.job.query else {
@@ -913,6 +914,17 @@ impl Music {
         }
         match response.result {
             Ok(choices) => {
+                if let Some(target) = self.picker_focus.focused(window) {
+                    let previous = self.playlist_picker_choices().index_of(&target);
+                    match ChoiceList::Server(&choices).index_of(&target) {
+                        Some(index) if Some(index) != previous => {
+                            self.picker_scroll
+                                .scroll_to_item(index, ScrollStrategy::Nearest);
+                        }
+                        None => window.focus(&self.overlay_focus, cx),
+                        _ => {}
+                    }
+                }
                 self.catalog_requests.playlist_choices = Some(choices);
                 self.catalog_requests.playlist_choices_error = None;
             }
@@ -1291,7 +1303,7 @@ impl CatalogRequests {
                     .update_in(cx, |view, window, cx| match result {
                         CatalogEvent::Page(result) => view.catalog_result(*result, cx),
                         CatalogEvent::PlaylistChoices(result) => {
-                            view.playlist_choices_result(*result, cx)
+                            view.playlist_choices_result(*result, window, cx)
                         }
                         CatalogEvent::Suggestions(result) => {
                             view.suggestions_result(*result, window, cx)
