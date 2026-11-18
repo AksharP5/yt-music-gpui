@@ -778,6 +778,7 @@ impl Music {
             let song = track.clone();
             actions.push(
                 self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
+                    view.cancel_queue_drag();
                     let index = view.library.queue.index.map_or(0, |i| i + 1);
                     view.library.queue.tracks.insert(index, song.clone());
                     view.queue_changed(cx);

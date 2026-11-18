@@ -260,6 +260,7 @@ impl Music {
                                 }
                             };
                         if replaced {
+                            self.cancel_queue_drag();
                             if !fresh && let Some(collection) = &mut collection {
                                 collection.clear_actions();
                             }
@@ -417,6 +418,7 @@ impl Music {
     }
 
     pub(in crate::app) fn replace_page_queue(&mut self, selected: usize, cx: &mut Context<Self>) {
+        self.cancel_queue_drag();
         self.player_open = true;
         self.queue_waiting = None;
         self.reset_radio();
@@ -480,10 +482,15 @@ impl Music {
     ) {
         let session = self.account.as_ref().map(|account| &account.session);
         let session_rejected = event.rejected_for(session);
-        match self
+        let previous_len = self.library.queue.tracks.len();
+        let result = self
             .queue_source
-            .apply(event, &mut self.library.queue, session)
-        {
+            .apply(event, &mut self.library.queue, session);
+        // Shuffled continuations can insert songs ahead of existing drag indices.
+        if self.library.queue.shuffled && self.library.queue.tracks.len() > previous_len {
+            self.cancel_queue_drag();
+        }
+        match result {
             Ok(false) => return,
             Ok(true) => {
                 if self.library.queue.tracks.is_empty() && !self.library.queue.incomplete {
@@ -562,6 +569,7 @@ impl Music {
     }
 
     pub(in crate::app) fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.cancel_queue_drag();
         self.stop_playback(cx);
         self.queue_source.cancel();
         self.track_state.cancel();
@@ -632,6 +640,7 @@ impl Music {
         self.queue_source.cancel();
         self.queue_waiting = None;
         self.now_playing = None;
+        self.cancel_queue_drag();
         self.library.queue.replace(vec![track], 0);
         self.player_open = true;
         self.play_current_resuming(false, mode, cx);
@@ -839,6 +848,7 @@ impl Music {
     }
 
     pub(in crate::app) fn remove_queue_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.cancel_queue_drag();
         let playback = self
             .queue_waiting
             .or(self.autoplay_waiting)

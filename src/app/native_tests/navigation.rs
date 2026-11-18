@@ -2474,6 +2474,174 @@ fn clicking_a_queued_row_plays_it_and_dragging_reorders() -> Result<()> {
                 );
             })
             .unwrap();
+
+        let start_drag = async |cx: &mut gpui::AsyncApp| {
+            for event in [hover(start, None), down(start), hover(end, held)] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(event, cx)
+                })
+                .unwrap();
+                wait_for_presented_frame(window, cx).await;
+            }
+            window
+                .update(cx, |view, _, _| {
+                    let preview = view.player_page.reorder.unwrap();
+                    assert_eq!((preview.from, preview.to), (1, 3));
+                })
+                .unwrap();
+        };
+        let release_drag = async |cx: &mut gpui::AsyncApp| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(up(end), cx)
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        };
+        let original = window.update(cx, |view, _, _| order(view)).unwrap();
+        for shortcut in ["escape", "q", "alt-left"] {
+            start_drag(cx).await;
+
+            super::render::key(window, cx, shortcut).await;
+            release_drag(cx).await;
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(
+                        order(view),
+                        original,
+                        "{shortcut} must cancel the queue move before release"
+                    );
+                    assert_eq!(view.player_open, shortcut == "escape");
+                    assert!(view.player_page.reorder.is_none());
+                    assert_eq!(view.library.queue.index, Some(4));
+                })
+                .unwrap();
+            if shortcut == "escape" {
+                super::render::key(window, cx, "escape").await;
+                window
+                    .update(cx, |view, _, _| {
+                        assert!(!view.player_open, "Second Escape closes the player");
+                    })
+                    .unwrap();
+            }
+            super::render::key(window, cx, "q").await;
+        }
+
+        let reply = window
+            .update(cx, |view, _, cx| {
+                use crate::{
+                    app::{PlaybackQuery, PlaybackResult, QueueUpdate},
+                    catalog::PlaylistTarget,
+                    watch::Watch,
+                };
+                let (jobs, pending) = async_channel::bounded(1);
+                view.playback_jobs = jobs;
+                view.pending_playback_jobs = pending;
+                let source = PlaylistTarget::from_navigation(&serde_json::json!({
+                    "watchPlaylistEndpoint":{"playlistId":"PLreplacement"}
+                }))
+                .unwrap();
+                view.start_queue(PlaybackQuery::Playlist(source.into()), cx);
+                let job = view.pending_playback_jobs.try_recv().unwrap();
+                let replacement = crate::app::sync::tests::response(
+                    &[("Replacement", (20..26).collect())],
+                    None,
+                    true,
+                )
+                .tracks();
+                PlaybackResult::Watch {
+                    id: job.id,
+                    account_revision: job.account_revision,
+                    update: QueueUpdate::Replace,
+                    collection: None,
+                    result: Ok(Box::new(Watch {
+                        current: Some(replacement[0].clone()),
+                        current_index: Some(0),
+                        queue: replacement,
+                        source: Some("Replacement playlist".into()),
+                        lyrics: None,
+                        related: None,
+                        comments: None,
+                        alternatives: None,
+                        continuation: None,
+                        source_target: None,
+                        shuffle: None,
+                    })),
+                    session_rejected: false,
+                }
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        start_drag(cx).await;
+        let replacement = window
+            .update(cx, |view, _, cx| {
+                view.playback_result(reply, cx);
+                order(view)
+            })
+            .unwrap();
+        assert_eq!(
+            replacement,
+            (20..26).map(|i| format!("{i:011}")).collect::<Vec<_>>()
+        );
+        wait_for_presented_frame(window, cx).await;
+        release_drag(cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    order(view),
+                    replacement,
+                    "A drag from the old queue must not reorder the replacement"
+                );
+                assert_eq!(view.library.queue.index, Some(0));
+                assert!(view.player_page.reorder.is_none());
+            })
+            .unwrap();
+
+        start_drag(cx).await;
+        super::render::key(window, cx, "s").await;
+        let shuffled = window
+            .update(cx, |view, _, _| {
+                assert!(
+                    view.library.queue.shuffled,
+                    "S must shuffle the local queue"
+                );
+                order(view)
+            })
+            .unwrap();
+        release_drag(cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    order(view),
+                    shuffled,
+                    "Release must preserve the shuffled queue"
+                );
+                assert_eq!(view.library.queue.index, Some(0));
+                assert!(view.player_page.reorder.is_none());
+            })
+            .unwrap();
+
+        start_drag(cx).await;
+        window
+            .update(cx, |view, _, cx| {
+                let song = view.page.tracks()[26].clone();
+                view.enqueue(song, cx);
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        release_drag(cx).await;
+        window
+            .update(cx, |view, _, _| {
+                let expected = [0, 2, 3, 1, 4, 5].map(|index| shuffled[index].as_str());
+                let mut expected = expected.to_vec();
+                expected.push("00000000026");
+                assert_eq!(
+                    order(view),
+                    expected,
+                    "Appending a song must preserve the drag"
+                );
+                assert_eq!(view.library.queue.index, Some(0));
+            })
+            .unwrap();
     })
 }
 

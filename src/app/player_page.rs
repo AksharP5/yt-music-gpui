@@ -184,6 +184,7 @@ const TOGGLE_HEIGHT: f32 = 56.;
 impl Music {
     pub(in crate::app) fn select_player_tab(&mut self, tab: PlayerTab, cx: &mut Context<Self>) {
         if self.player_page.tab != tab {
+            self.cancel_queue_drag();
             if self.player_page.tab == PlayerTab::Comments && self.player_page.comments.cancel() {
                 self.player_page.worker.cancel();
             }
@@ -193,9 +194,14 @@ impl Music {
         }
     }
 
+    pub(in crate::app) fn close_player_page(&mut self) {
+        self.cancel_queue_drag();
+        self.player_open = false;
+    }
+
     pub(in crate::app) fn toggle_player_page(&mut self, cx: &mut Context<Self>) {
         if self.player_open {
-            self.player_open = false;
+            self.close_player_page();
         } else if self.library.queue.current().is_some() {
             self.player_open = true;
             if let Some(index) = self.library.queue.index {

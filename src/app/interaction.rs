@@ -39,6 +39,16 @@ pub(in crate::app) enum Drag {
 }
 
 impl Music {
+    pub(in crate::app) fn cancel_queue_drag(&mut self) -> bool {
+        if self.drag != Some(Drag::Queue) {
+            return false;
+        }
+        self.drag = None;
+        self.player_page.reorder = None;
+        self.player_page.press = None;
+        true
+    }
+
     pub(in crate::app) fn drag_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         match self.drag {
             Some(Drag::Seek) if self.duration > 0. => {
@@ -235,12 +245,16 @@ impl Music {
                     self.close_overlay(window, cx);
                     return;
                 }
+                if self.cancel_queue_drag() {
+                    cx.notify();
+                    return;
+                }
                 if self.player_open && window.is_fullscreen() {
                     self.toggle_video_fullscreen(window, cx);
                     return;
                 }
                 if self.player_open {
-                    self.player_open = false;
+                    self.close_player_page();
                     cx.notify();
                 }
             }
