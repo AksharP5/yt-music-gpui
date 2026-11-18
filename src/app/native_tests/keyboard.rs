@@ -438,3 +438,61 @@ fn compact_playlist_menu_focus_reveals_the_last_action() -> anyhow::Result<()> {
         }
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account only"]
+fn queue_menu_actions_restore_the_opening_focus() -> anyhow::Result<()> {
+    use gpui::Focusable;
+
+    use crate::library::Repeat;
+
+    check_cache_window(async |window, cx| {
+        for downs in [1, 2] {
+            let opening_focus = window
+                .update(cx, |view, window, cx| {
+                    view.route = Route::Browse(BrowseLink::new("VLfocus", "Songs"));
+                    view.page = crate::app::sync::tests::page(2, false);
+                    view.library
+                        .queue
+                        .replace(vec![view.page.tracks()[0].clone()], 0);
+                    view.library.autoplay = false;
+                    view.library.repeat = Repeat::Off;
+                    view.rebuild_rows();
+                    let opening_focus = if downs == 1 {
+                        view.focus.clone()
+                    } else {
+                        view.search.focus_handle(cx)
+                    };
+                    window.focus(&opening_focus, cx);
+                    view.open_item_menu(1, window, cx);
+                    opening_focus
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            key(window, cx, "home").await;
+            for _ in 0..downs {
+                key(window, cx, "down").await;
+            }
+            key(window, cx, "enter").await;
+            window
+                .update(cx, |view, window, _| {
+                    assert!(view.overlay.is_none());
+                    assert_eq!(view.library.queue.tracks.len(), 2);
+                    assert_eq!(view.library.queue.tracks[1].id, view.page.tracks()[1].id);
+                    assert!(
+                        opening_focus.is_focused(window),
+                        "The opener must regain focus after confirming queue action {downs}"
+                    );
+                })
+                .unwrap();
+            if downs == 1 {
+                key(window, cx, "r").await;
+                window
+                    .update(cx, |view, _, _| {
+                        assert_eq!(view.library.repeat, Repeat::All)
+                    })
+                    .unwrap();
+            }
+        }
+    })
+}

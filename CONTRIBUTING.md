@@ -172,11 +172,11 @@ No test signs in to a real Google account. Do not add one that does.
 
 Search suggestions allow two active reads and keep only the latest queued query. A slow earlier read can finish in the background while the current query shows its suggestions. Results still require the exact query and session. The worker test holds the older read until the new response arrives and checks that the older response is discarded. An explicit session rejection uses the normal reconnect path. After verified renewal, the focused query retries with the updated session. The native search check exercises this with a synthetic account.
 
-At 850 × 560, the native keyboard check opens long song and podcast episode menus, including the episode subtitle. It verifies that End, Home and backward Tab reveal the focused action, and that reopening starts at the top.
+At 850 × 560, the native keyboard check opens long song and podcast episode menus, including the episode subtitle. It verifies that End, Home and backward Tab reveal the focused action, and that reopening starts at the top. The queue action check confirms that Play next and Add to queue restore the opening focus when the menu closes.
 
 The search suggestions panel follows the field's width and scrolls when the rows exceed the available window height. Native X11 checks at 850 × 560 verify clicks inside and outside the panel and that arrow selection and wheel scrolling reveal the last row for pointer input.
 
-When saving the library, the app and the writer share the queued songs and the source's loaded IDs. Selecting another song does not copy those lists. Queue edits detach from a pending snapshot, so a write sees the order and track details captured when it was queued. The library file keeps the same JSON format. Run `bin/test --release -- --ignored --exact library::tests::large_queue_preference_save_latency --nocapture` to measure the time spent submitting snapshots, preferences, and position checkpoints with 10,000 queued songs.
+When saving the library, the app and the writer share the queued songs and the source's loaded IDs. Selecting another song does not copy those lists. Queue edits detach from a pending snapshot, so a write sees the order and track details captured when it was queued. Playlist confirmations and unchanged song ratings keep sharing the saved queue. The library file keeps the same JSON format. Run `bin/test --release -- --ignored --exact library::tests::large_queue_preference_save_latency --nocapture` to measure the time spent submitting snapshots, preferences, and position checkpoints with 10,000 queued songs.
 
 ## Player waits
 
@@ -226,6 +226,8 @@ The Linux performance job compares the stripped release binary and the headless 
 Never commit cookies, account data or keyring contents. Use synthetic values in tests, as the existing ones do.
 
 ## Release
+
+GitHub-hosted Ubuntu builds prefer the Azure archive when the runner's mirror list puts the EC2 archive first. APT retains the other archive entries as fallbacks.
 
 Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything. Releases are immutable once published, and only repository admins can create or move `v*` tags; the release build also refuses a tag whose commit is not on `main`.
 
