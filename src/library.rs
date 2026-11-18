@@ -147,6 +147,22 @@ impl Queue {
     pub(crate) fn tracks_mut(&mut self) -> &mut Vec<Track> {
         Arc::make_mut(&mut self.tracks)
     }
+    /// Keep saved snapshots shared until a track actually needs editing.
+    pub(crate) fn update_tracks(
+        &mut self,
+        needs_update: impl Fn(&Track) -> bool,
+        mut update: impl FnMut(&mut Track),
+    ) {
+        let Some(first) = self.tracks.iter().position(&needs_update) else {
+            return;
+        };
+        for track in self.tracks_mut().iter_mut().skip(first) {
+            if needs_update(track) {
+                update(track);
+            }
+        }
+    }
+
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tracks.len() {
             return false;
