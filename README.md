@@ -90,6 +90,8 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 
 Right-click a song, card or collection for its menu.
 
+While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
+
 In an editable playlist, Tab reveals each Suggestions control as it receives focus. Press Enter on **Refresh** for a new batch or on **Add to playlist** to save a song. Suggested songs stay out of the playlist's count and Play all until YouTube confirms an add.
 
 ## Contributing

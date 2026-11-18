@@ -5,7 +5,7 @@ use crate::app::{Music, Route};
 use crate::library::Repeat;
 use gpui::{
     AppContext, AsyncApp, Focusable, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
-    WindowHandle, point, px, size,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, WindowHandle, point, px, size,
 };
 
 async fn press(window: WindowHandle<Music>, cx: &mut AsyncApp, key: &str) {
@@ -156,6 +156,79 @@ fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
         click(cx, 400.);
         wait_for_presented_frame(window, cx).await;
         assert_eq!(searched(window, cx), "first suggestion");
+    })
+}
+
+#[test]
+#[ignore = "requires X11, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn last_search_suggestion_is_clickable_in_a_short_window() -> anyhow::Result<()> {
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |music, window, cx| {
+                music.sidebar_collapsed = Some(false);
+                window.resize(size(px(850.), px(560.)));
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let suggestions = (1..=12)
+            .map(|i| format!("suggestion {i}"))
+            .collect::<Vec<_>>();
+        let suggestions = suggestions.iter().map(String::as_str).collect::<Vec<_>>();
+        for by_keyboard in [true, false] {
+            window
+                .update(cx, |music, window, cx| {
+                    window.focus(&music.search.focus_handle(cx), cx);
+                    music.search.update(cx, |search, cx| {
+                        search.set_query("typed query".into(), cx);
+                        search.show_suggestions(&suggestions, cx);
+                    });
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+
+            if by_keyboard {
+                press(window, cx, "up").await;
+            } else {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: point(px(400.), px(200.)),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+                            modifiers: Default::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                wait_for_presented_frame(window, cx).await;
+            }
+
+            cx.update_window(window.into(), |_, window, cx| {
+                if by_keyboard {
+                    capture(window, "compact-suggestion-tail");
+                }
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: point(px(400.), window.viewport_size().height - px(28.)),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            assert_eq!(searched(window, cx), "suggestion 12");
+            // Use a distinct route so the next click cannot pass by keeping this result.
+            window
+                .update(cx, |music, _, cx| music.navigate(Route::Home, cx))
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+        }
     })
 }
 
