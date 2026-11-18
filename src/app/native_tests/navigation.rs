@@ -1426,7 +1426,14 @@ fn refreshing_save_destinations_does_not_retarget_a_mouse_click() -> Result<()> 
             })
             .unwrap();
         wait_for_presented_frame(window, cx).await;
-        let position = point(px(640.), px(389.));
+        let position = window
+            .update(cx, |view, _, _| {
+                let scroll = view.picker_scroll.0.borrow();
+                let bounds = scroll.base_handle.bounds();
+                let row_height = scroll.last_item_size.unwrap().item.height;
+                point(bounds.center().x, bounds.top() + row_height / 2.)
+            })
+            .unwrap();
         let dispatch = |event, cx: &mut gpui::AsyncApp| {
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(event, cx)
