@@ -275,6 +275,82 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
+fn desktop_seek_past_end_uses_next_availability() -> Result<()> {
+    use crate::media_controls::Event;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let connection = start_test_desktop_controls(window, cx).await;
+        let events = window
+            .update(cx, |view, _, _| {
+                view.account = None;
+                view.account_operation = None;
+                view.library.autoplay = false;
+                view.library.repeat = crate::library::Repeat::Off;
+                view.library
+                    .queue
+                    .replace(continuation_page(0..1, None).tracks(), 0);
+                view.watch_pending = None;
+                view.active_id = Some(1);
+                view.playback = Playback::Loaded {
+                    paused: false,
+                    buffering: false,
+                };
+                view.seekable = true;
+                view.duration = 30.;
+                view.position = 20.;
+                view.publish_desktop();
+                view.media_controls.as_ref().unwrap().events()
+            })
+            .unwrap();
+        let properties = zbus::blocking::Proxy::new(
+            &connection,
+            DESKTOP_PLAYER_NAME,
+            "/org/mpris/MediaPlayer2",
+            "org.freedesktop.DBus.Properties",
+        )
+        .unwrap();
+        let interface = "org.mpris.MediaPlayer2.Player";
+        let can_go_next: zbus::zvariant::OwnedValue =
+            properties.call("Get", &(interface, "CanGoNext")).unwrap();
+        assert!(!bool::try_from(can_go_next).unwrap());
+        let player = zbus::blocking::Proxy::new(
+            &connection,
+            DESKTOP_PLAYER_NAME,
+            "/org/mpris/MediaPlayer2",
+            interface,
+        )
+        .unwrap();
+        let _: () = player.call("Next", &()).unwrap();
+        assert!(events.is_empty());
+        let _: () = player.call("Seek", &(20_000_000_i64,)).unwrap();
+        let event = events.try_recv().unwrap();
+        assert!(matches!(event, Event::Seek { track_id: 1, offset } if offset == 20.));
+
+        window
+            .update(cx, |view, _, cx| {
+                view.desktop_event(event, cx);
+                assert_eq!(view.library.queue.index, Some(0));
+                assert_eq!(
+                    view.active_id,
+                    Some(1),
+                    "Next is unavailable at the end of the queue"
+                );
+                assert_eq!(
+                    view.playback,
+                    Playback::Loaded {
+                        paused: false,
+                        buffering: false
+                    }
+                );
+                assert_eq!(view.position, 20.);
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account and playlist commands only"]
 fn account_changes_cancel_pending_shuffle_in_desktop_controls() -> Result<()> {
     use crate::{
