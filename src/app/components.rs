@@ -189,7 +189,13 @@ impl VirtualListFocus {
         });
     }
 
-    fn advance(&mut self, reverse: bool, count: usize, window: &mut Window, cx: &mut App) -> bool {
+    pub(in crate::app) fn advance(
+        &mut self,
+        reverse: bool,
+        count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
         let Some(current) = self.focused(window) else {
             return false;
         };
@@ -217,6 +223,9 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         if self.move_comments_focus(reverse, window, cx) {
+            return;
+        }
+        if self.move_suggestions_focus(reverse, window, cx) {
             return;
         }
         let sidebar_count = if self.account.is_some() {
@@ -364,6 +373,7 @@ pub(in crate::app) fn tinted_button(
         "volume" => "Mute",
         "mute" => "Unmute",
         "plus" => "Add",
+        "menu-save-playlist" => "Add to playlist",
         "bookmark" => "Save to library",
         "bookmark-filled" => "Remove from library",
         "back" => "Go back",

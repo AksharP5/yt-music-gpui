@@ -1004,6 +1004,7 @@ async fn scrolled_artist_survives_tab(
                 stats: String::new(),
                 shuffle: None,
                 mix: None,
+                suggestions: None,
                 subscribed: None,
                 subscription_label: String::new(),
                 subscriber_count: String::new(),

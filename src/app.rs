@@ -51,6 +51,7 @@ mod player_bar;
 mod player_page;
 mod queue_panel;
 mod sidebar;
+mod suggestions;
 mod sync;
 mod video;
 mod window;
@@ -97,7 +98,7 @@ pub struct Music {
     account_worker: Option<account::Worker>,
     account_operation: Option<AccountOperation>,
     next_session_refresh: Option<Instant>,
-    pending_mutations: HashSet<String>,
+    pending_mutations: HashMap<String, Vec<Track>>,
     ratings: HashMap<String, Rating>,
     account_revision: u64,
     account_generation: u64,
@@ -113,6 +114,7 @@ pub struct Music {
     page: Page,
     rows: Vec<Item>,
     list_rows: Vec<ListRow>,
+    suggestions: Option<suggestions::Suggestions>,
     shelf_scroll: HashMap<usize, ScrollHandle>,
     shelf_heights: Vec<Option<pages::shelves::ShelfHeight>>,
     list_scroll: UniformListScrollHandle,

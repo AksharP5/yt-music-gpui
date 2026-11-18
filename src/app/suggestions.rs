@@ -1,0 +1,384 @@
+//! Playlist recommendations have their own read and display state, never queue rows.
+
+use super::*;
+use crate::catalog::{PlaylistSuggestion, PlaylistSuggestions};
+
+pub(super) struct Suggestions {
+    playlist: BrowseLink,
+    visit: usize,
+    pub tracks: Vec<PlaylistSuggestion>,
+    reload: Option<Continuation>,
+    pub related: Vec<Shelf>,
+    pub error: Option<String>,
+    pub(super) focus: VirtualListFocus,
+    auto_reload_when_empty: bool,
+    added_during_read: HashSet<String>,
+}
+
+pub(super) struct SuggestionsResult {
+    pub job: Job,
+    pub result: Result<PlaylistSuggestions, String>,
+    pub session_rejected: bool,
+}
+
+impl Music {
+    pub(super) fn clear_suggestions(&mut self) {
+        self.catalog_requests.cancel(CatalogTarget::Suggestions);
+        if self.suggestions.take().is_some() {
+            self.rebuild_rows();
+        }
+    }
+
+    pub(super) fn load_suggestions(&mut self, fresh_seed: bool, cx: &mut Context<Self>) {
+        if self.account.is_none() || !self.page.editable {
+            self.clear_suggestions();
+            return;
+        }
+        if self.suggestions.is_some() {
+            return;
+        }
+        let Route::Browse(playlist) = &self.route else {
+            return;
+        };
+        if !playlist.id.starts_with("VL") {
+            return;
+        }
+        let token = self
+            .page
+            .header
+            .as_ref()
+            .and_then(|header| header.suggestions.clone());
+        if !fresh_seed && token.is_none() {
+            return;
+        }
+        self.suggestions = Some(Suggestions {
+            playlist: playlist.clone(),
+            visit: self.list_id,
+            tracks: Vec::new(),
+            reload: None,
+            related: Vec::new(),
+            error: None,
+            focus: VirtualListFocus::default(),
+            auto_reload_when_empty: false,
+            added_during_read: HashSet::new(),
+        });
+        self.request_suggestions(if fresh_seed { None } else { token }, cx);
+    }
+
+    fn request_suggestions(&mut self, token: Option<Continuation>, cx: &mut Context<Self>) {
+        let Some(suggestions) = &mut self.suggestions else {
+            return;
+        };
+        suggestions.error = None;
+        suggestions.added_during_read.clear();
+        let playlist = suggestions.playlist.clone();
+        self.request(Query::PlaylistSuggestions { playlist, token }, cx);
+        self.rebuild_rows();
+    }
+
+    pub(super) fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
+        if self.catalog_requests.is_loading(CatalogTarget::Suggestions) {
+            return;
+        }
+        let Some(suggestions) = &self.suggestions else {
+            return;
+        };
+        let token = suggestions.reload.clone();
+        self.request_suggestions(token, cx);
+    }
+
+    pub(super) fn suggestions_result(
+        &mut self,
+        response: SuggestionsResult,
+        cx: &mut Context<Self>,
+    ) {
+        let Query::PlaylistSuggestions { playlist, .. } = &response.job.query else {
+            return;
+        };
+        if response.job.account_revision != self.account_revision
+            || !self.account.as_ref().is_some_and(|account| {
+                response
+                    .job
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| Arc::ptr_eq(session, &account.session))
+            })
+            || !self.suggestions.as_ref().is_some_and(|suggestions| {
+                suggestions.visit == self.list_id && suggestions.playlist.id == playlist.id
+            })
+            || !self
+                .catalog_requests
+                .finish(CatalogTarget::Suggestions, response.job.id)
+        {
+            return;
+        }
+        if response.session_rejected {
+            self.refresh_session(false, cx);
+            return;
+        }
+        let anchor = self.page_anchor();
+        if let Some(suggestions) = &mut self.suggestions {
+            match response.result {
+                Ok(mut batch) => {
+                    batch.tracks.retain(|suggestion| {
+                        !suggestions.added_during_read.contains(&suggestion.track.id)
+                    });
+                    suggestions.tracks = batch.tracks;
+                    suggestions.reload = batch.reload;
+                    suggestions.auto_reload_when_empty = batch.auto_reload_when_empty;
+                    if let Some(related) = batch.related {
+                        suggestions.related = related;
+                    }
+                    suggestions.error = None;
+                }
+                Err(error) => suggestions.error = Some(error),
+            }
+            suggestions.added_during_read.clear();
+        }
+        self.rebuild_rows();
+        self.restore_page_anchor(&anchor);
+        cx.notify();
+    }
+
+    pub(super) fn add_suggestion(&mut self, track: Track, cx: &mut Context<Self>) {
+        let Some(suggestions) = &self.suggestions else {
+            return;
+        };
+        let mutation = Mutation::AddToPlaylist {
+            id: suggestions.playlist.id.trim_start_matches("VL").to_owned(),
+            video_ids: vec![track.id.clone()],
+            duplicates: false,
+        };
+        let key = mutation.key();
+        if self.mutate(mutation, cx)
+            && let Some(sources) = self.pending_mutations.get_mut(&key)
+        {
+            sources.push(track);
+        }
+    }
+
+    pub(super) fn acknowledge_suggestions(
+        &mut self,
+        id: &str,
+        additions: &[(String, String)],
+        cx: &mut Context<Self>,
+    ) {
+        let loading = self.catalog_requests.is_loading(CatalogTarget::Suggestions);
+        let Some(suggestions) = &mut self.suggestions else {
+            return;
+        };
+        if suggestions.playlist.id.trim_start_matches("VL") != id.trim_start_matches("VL") {
+            return;
+        }
+        for (video, _) in additions {
+            suggestions
+                .tracks
+                .retain(|suggestion| suggestion.track.id != *video);
+            if loading {
+                suggestions.added_during_read.insert(video.clone());
+            }
+        }
+        let reload = suggestions.tracks.is_empty() && suggestions.auto_reload_when_empty;
+        self.rebuild_rows();
+        if reload && !loading {
+            self.refresh_suggestions(cx);
+        }
+    }
+
+    pub(super) fn suggestion_row(
+        &mut self,
+        index: usize,
+        inset: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some(suggestions) = &mut self.suggestions else {
+            return div().into_any_element();
+        };
+        let Some(suggestion) = suggestions.tracks.get(index) else {
+            return div().into_any_element();
+        };
+        let track = suggestion.track.clone();
+        let play_focus = suggestions.focus.handle(index * 2, cx);
+        let add_focus = suggestions.focus.handle(index * 2 + 1, cx);
+        let enabled = suggestion.addable
+            && self.account_operation.is_none()
+            && !self
+                .pending_mutations
+                .contains_key(suggestions.playlist.id.trim_start_matches("VL"));
+        let subtitle = track
+            .details
+            .byline
+            .clone()
+            .unwrap_or_else(|| match &track.album {
+                Some(album) => format!("{} • {album}", track.artist),
+                None => track.artist.clone(),
+            });
+        let play = track.clone();
+        let play_row = track.clone();
+        let add = track.clone();
+        let visit = self.list_id;
+        let thumbnail = self.row_thumbnail(
+            track.thumbnail.as_deref(),
+            48.,
+            ArtworkShape::Square,
+            track.details.wide_thumbnail,
+            "suggestion-row",
+        );
+        div()
+            .id(("suggestion-row", index))
+            .group("suggestion-row")
+            .w_full()
+            .min_w_0()
+            .h(px(68.))
+            .px(px(inset + 16.))
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .child(
+                div()
+                    .id(("suggestion-play", index))
+                    .keyboard_control(self.theme)
+                    .track_focus(&play_focus)
+                    .cursor_pointer()
+                    .flex_shrink_0()
+                    .child(thumbnail)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        cx.stop_propagation();
+                        if view.list_id == visit {
+                            view.play_track(play.clone(), cx);
+                        }
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(track.title),
+                    )
+                    .child(self.byline(
+                        track.details.explicit,
+                        self.linked_text(subtitle, &track.details.links, cx),
+                        14.,
+                    )),
+            )
+            .child(
+                div()
+                    .w(px(44.))
+                    .flex_shrink_0()
+                    .text_size(px(14.))
+                    .text_color(self.theme.muted)
+                    .child(
+                        track
+                            .duration
+                            .map(|seconds| clock(seconds as f64))
+                            .unwrap_or_default(),
+                    ),
+            )
+            .child(
+                button(("suggestion-add", index), "menu-save-playlist", self.theme)
+                    .track_focus(&add_focus)
+                    .tab_stop(enabled)
+                    .opacity(if enabled { 1. } else { 0.35 })
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        cx.stop_propagation();
+                        if enabled && view.list_id == visit {
+                            view.add_suggestion(add.clone(), cx);
+                        }
+                    })),
+            )
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _, _, cx| {
+                if view.list_id == visit {
+                    view.play_track(play_row.clone(), cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    pub(super) fn suggestions_footer(&mut self, inset: f32, cx: &Context<Self>) -> AnyElement {
+        let loading = self.catalog_requests.is_loading(CatalogTarget::Suggestions);
+        let Some(suggestions) = &mut self.suggestions else {
+            return div().into_any_element();
+        };
+        let focus = suggestions.focus.handle(suggestions.tracks.len() * 2, cx);
+        let error = suggestions.error.clone();
+        div()
+            .w_full()
+            .px(px(inset + 16.))
+            .pt(px(16.))
+            .pb(px(32.))
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .children(error.map(|error| {
+                div()
+                    .text_size(px(14.))
+                    .text_color(self.theme.muted)
+                    .child(error)
+            }))
+            .child(
+                div().w_full().flex().justify_center().child(
+                    div()
+                        .id("suggestions-refresh")
+                        .keyboard_control(self.theme)
+                        .track_focus(&focus)
+                        .tab_stop(!loading)
+                        .px(px(20.))
+                        .h(px(36.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(self.theme.border)
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(14.))
+                        .child(if loading { "Loading…" } else { "Refresh" })
+                        .on_click(cx.listener(|view, _, _, cx| view.refresh_suggestions(cx))),
+                ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn move_suggestions_focus(
+        &mut self,
+        reverse: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(suggestions) = &mut self.suggestions else {
+            return false;
+        };
+        let count = suggestions.tracks.len() * 2 + 1;
+        if !suggestions.focus.advance(reverse, count, window, cx) {
+            return false;
+        }
+        let Some(control) = suggestions.focus.focused(window) else {
+            return false;
+        };
+        let row = self.list_rows.iter().position(|row| match row {
+            ListRow::Suggestion(index) => control / 2 == *index && control + 1 < count,
+            ListRow::SuggestionsFooter => control + 1 == count,
+            _ => false,
+        });
+        if let Some(row) = row {
+            if self.detail_list.state.bounds_for_item(row).is_some() {
+                self.detail_list.state.scroll_to_reveal_item(row);
+            } else {
+                self.detail_list.state.scroll_to(ListOffset {
+                    item_ix: row,
+                    offset_in_item: px(0.),
+                });
+            }
+        }
+        cx.notify();
+        true
+    }
+}

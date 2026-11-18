@@ -72,6 +72,14 @@ fn measure_shelf_height(shelf: &Shelf, size: ShelfSize, window: &Window) -> f32 
 }
 
 impl Music {
+    pub(in crate::app) fn display_shelf(&self, index: usize) -> Option<&Shelf> {
+        self.page.shelves.get(index).or_else(|| {
+            self.suggestions
+                .as_ref()?
+                .related
+                .get(index.checked_sub(self.page.shelves.len())?)
+        })
+    }
     pub(in crate::app) fn navigation(
         &self,
         link: BrowseLink,
@@ -104,11 +112,13 @@ impl Music {
     ) -> AnyElement {
         #[cfg(test)]
         let started = Instant::now();
-        let shelf = &self.page.shelves[index];
+        let Some(shelf) = self.display_shelf(index) else {
+            return div().into_any_element();
+        };
         let title = shelf.title.clone();
         let more = shelf.more.clone();
         let layout = shelf.layout;
-        let start = self.page.shelves[..index]
+        let start = self.page.shelves[..index.min(self.page.shelves.len())]
             .iter()
             .map(|shelf| shelf.items.len())
             .sum::<usize>();
@@ -139,6 +149,7 @@ impl Music {
         };
         // Include offscreen text when sizing the carousel so its height stays
         // steady when a longer title scrolls out of the rendered columns.
+        let count = shelf.items.len().div_ceil(rows);
         let card_height = if rows == 1 {
             let size = ShelfSize {
                 width,
@@ -165,7 +176,6 @@ impl Music {
         } else {
             0.
         };
-        let count = shelf.items.len().div_ceil(rows);
         let scroll = self.shelf_scroll.entry(index).or_default().clone();
         let range = visible_cards(count, (-scroll.offset().x).into(), available, width + gap);
         let stride = width + gap;
@@ -188,9 +198,10 @@ impl Music {
         let columns = range
             .clone()
             .map(|column| {
-                let items = self.page.shelves[index]
-                    .items
-                    .iter()
+                let items = self
+                    .display_shelf(index)
+                    .into_iter()
+                    .flat_map(|shelf| &shelf.items)
                     .skip(column * rows)
                     .take(rows)
                     .cloned()

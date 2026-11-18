@@ -9,6 +9,7 @@ pub(in crate::app) mod render;
 mod restart;
 mod resume;
 mod search;
+mod suggestions;
 mod sync;
 
 use anyhow::{Context as _, Result, ensure};

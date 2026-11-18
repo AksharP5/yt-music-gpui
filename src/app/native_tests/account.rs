@@ -384,7 +384,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
             let original = window.update(cx, |view, window, cx| {
                 let current = view.account.as_ref().unwrap().session.clone();
                 let mutation = Mutation::RateSong { track: track("invalid-first"), rating: Rating::Like };
-                view.pending_mutations.insert(mutation.key());
+                view.pending_mutations.insert(mutation.key(), Vec::new());
                 view.account_event(account::Event::Applied { session: current.clone(), mutation: Box::new(mutation), result: Err("Synthetic rejected edit".into()), session_rejected: true }, window, cx);
                 let account::Command::Refresh { operation, expected } = commands.try_recv().unwrap() else { panic!("Rejected edits must refresh without replay"); };
                 assert!(Arc::ptr_eq(&expected, &current));
