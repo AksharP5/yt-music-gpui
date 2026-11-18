@@ -99,7 +99,7 @@ impl Music {
                                 }
                                 view.overlay_return_focus = window.focused(cx);
                                 window.focus(&view.overlay_focus, cx);
-                                let tracks = view.library.queue.tracks.clone();
+                                let tracks = view.library.queue.tracks.to_vec();
                                 view.playlist_picker(tracks, cx);
                             })),
                     ),
@@ -692,7 +692,8 @@ mod tests {
                             thumbnail: None,
                             details: Default::default(),
                         })
-                        .collect(),
+                        .collect::<Vec<_>>()
+                        .into(),
                     ..Default::default()
                 };
                 queue.move_track(from, to);

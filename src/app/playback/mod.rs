@@ -542,7 +542,7 @@ impl Music {
                 .library
                 .queue
                 .index
-                .and_then(|index| self.library.queue.tracks.get_mut(index))
+                .and_then(|index| self.library.queue.tracks_mut().get_mut(index))
         {
             let duration = track.duration.unwrap_or(0) as f64;
             *current = track;

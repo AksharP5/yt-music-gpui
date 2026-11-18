@@ -993,7 +993,7 @@ fn collection_shuffle_toggles_pending_requests_and_ignores_stale_results() -> Re
                     },
                     cx,
                 );
-                assert_eq!(view.library.queue.tracks, watch(true).queue);
+                assert_eq!(view.library.queue.tracks.as_slice(), watch(true).queue);
                 assert_eq!(view.library.queue.index, Some(0));
                 assert!(
                     !view.library.queue.shuffled,
@@ -1041,7 +1041,7 @@ fn collection_shuffle_toggles_pending_requests_and_ignores_stale_results() -> Re
                     },
                     cx,
                 );
-                assert_eq!(view.library.queue.tracks, tracks);
+                assert_eq!(view.library.queue.tracks.as_slice(), tracks);
                 assert_eq!(view.library.queue.index, Some(0));
                 view.library.queue =
                     serde_json::from_value(serde_json::to_value(&view.library.queue).unwrap())

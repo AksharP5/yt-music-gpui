@@ -15,7 +15,7 @@ impl Music {
         } else {
             self.ratings.remove(id);
         }
-        for track in self.library.queue.tracks.iter_mut().chain(
+        for track in self.library.queue.tracks_mut().iter_mut().chain(
             self.page
                 .shelves
                 .iter_mut()

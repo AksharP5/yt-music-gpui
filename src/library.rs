@@ -112,7 +112,7 @@ pub struct LastPosition {
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Queue {
-    pub tracks: Vec<Track>,
+    pub tracks: Arc<Vec<Track>>,
     pub index: Option<usize>,
     /// More explicit tracks exist. Restored partial queues must not enter autoplay.
     pub incomplete: bool,
@@ -135,13 +135,17 @@ impl Queue {
     }
     pub fn replace(&mut self, tracks: Vec<Track>, selected: usize) {
         self.index = (selected < tracks.len()).then_some(selected);
-        self.tracks = tracks;
+        self.tracks = Arc::new(tracks);
         self.incomplete = false;
         self.playing_from = None;
         self.shuffled = false;
         self.collection = None;
         self.source_id = None;
         self.source = None;
+    }
+    /// Editing detaches from any immutable library snapshot held by the writer.
+    pub(crate) fn tracks_mut(&mut self) -> &mut Vec<Track> {
+        Arc::make_mut(&mut self.tracks)
     }
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tracks.len() {
@@ -194,7 +198,7 @@ impl Queue {
             return false;
         };
         self.index = Some(self.tracks.len());
-        self.tracks.push(track);
+        self.tracks_mut().push(track);
         true
     }
     pub fn previous(&mut self) -> bool {
@@ -205,7 +209,7 @@ impl Queue {
             return false;
         }
         let was_current = self.index == Some(index);
-        self.tracks.remove(index);
+        self.tracks_mut().remove(index);
         self.index = match self.index {
             Some(i) if i > index => Some(i - 1),
             Some(_) if self.tracks.is_empty() => None,
@@ -218,8 +222,9 @@ impl Queue {
         if from == to || from >= self.tracks.len() || to >= self.tracks.len() {
             return false;
         }
-        let track = self.tracks.remove(from);
-        self.tracks.insert(to, track);
+        let tracks = self.tracks_mut();
+        let track = tracks.remove(from);
+        tracks.insert(to, track);
         self.index = self.index.map(|current| match current {
             i if i == from => to,
             i if from < i && i <= to => i - 1,
@@ -234,8 +239,11 @@ impl Queue {
     }
 
     pub(crate) fn append_source(&mut self, tracks: Vec<Track>) {
+        if tracks.is_empty() {
+            return;
+        }
         let first_new = self.tracks.len();
-        self.tracks.extend(tracks);
+        self.tracks_mut().extend(tracks);
         if self.shuffled {
             self.shuffle_from(first_new);
         }
@@ -247,18 +255,23 @@ impl Queue {
 
     fn shuffle_from(&mut self, first: usize) {
         let start = self.index.map_or(0, |i| i + 1);
+        let first = first.max(start + 1);
+        if first >= self.tracks.len() {
+            return;
+        }
+        let tracks = self.tracks_mut();
         let mut seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         // Forward Fisher-Yates also inserts new pages into an already shuffled
         // suffix in O(page size), without revisiting the entire loaded queue.
-        for i in first.max(start + 1)..self.tracks.len() {
+        for i in first..tracks.len() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
             let j = start + seed as usize % (i - start + 1);
-            self.tracks.swap(i, j);
+            tracks.swap(i, j);
         }
     }
 }
@@ -611,7 +624,7 @@ mod tests {
         assert_eq!(saved.effective_volume(), 0.);
         assert_eq!(saved.queue.tracks, library.queue.tracks);
         let (writer, errors) = LibraryWriter::new(Store { path: path.clone() });
-        library.queue.tracks.push(track("new-tail"));
+        library.queue.tracks_mut().push(track("new-tail"));
         writer.save(&library);
         for n in 0..100 {
             library.volume = n as f64;
@@ -640,7 +653,7 @@ mod tests {
         for snapshot in [false, true] {
             let (writer, errors) = LibraryWriter::new(Store { path: path.clone() });
             if snapshot {
-                library.queue.tracks.push(track("queued"));
+                library.queue.tracks_mut().push(track("queued"));
                 writer.save(&library);
             }
             for seconds in 100..200 {
@@ -764,6 +777,36 @@ mod tests {
     }
 
     #[test]
+    fn writing_a_snapshot_preserves_the_queue_as_it_was_submitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.json");
+        let (release, wait) = std::sync::mpsc::channel();
+        let (writer, errors) =
+            LibraryWriter::with_save(Store { path: path.clone() }, move |store, library| {
+                wait.recv()?;
+                store.save(library)
+            });
+        let mut library = Library::new();
+        library
+            .queue
+            .replace(vec![track("first"), track("second")], 1);
+        writer.save(&library);
+        library.queue.tracks_mut()[1].title = "Edited in the app".into();
+        library.queue.move_track(1, 0);
+        release.send(()).unwrap();
+        drop(writer);
+
+        assert!(errors.is_empty());
+        let saved = fs::read(path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert!(json["queue"]["tracks"].is_array());
+        let restored: Library = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.queue.tracks[0].id, "first");
+        assert_eq!(restored.queue.index, Some(1));
+        assert_eq!(restored.queue.current().unwrap().title, "second");
+    }
+
+    #[test]
     fn playback_preferences_migrate_and_round_trip() {
         assert!(Library::default().autoplay);
         assert!(Library::new().autoplay);
@@ -836,7 +879,7 @@ mod tests {
         let mut queue = Queue::default();
         queue.replace(vec![track("playing")], 0);
         let mut recommendations = VecDeque::from([track("recommended")]);
-        queue.tracks.push(track("enqueued"));
+        queue.tracks_mut().push(track("enqueued"));
         assert!(
             queue.advance_with_autoplay(Repeat::Off, true, true, &mut recommendations, |_| false)
         );
@@ -908,7 +951,7 @@ mod tests {
             for to in 0..tracks.len() {
                 for selected in [None, Some(0), Some(1), Some(2), Some(3)] {
                     let mut queue = Queue {
-                        tracks: tracks.clone(),
+                        tracks: Arc::new(tracks.clone()),
                         index: selected,
                         ..Default::default()
                     };

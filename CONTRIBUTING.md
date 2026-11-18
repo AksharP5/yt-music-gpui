@@ -176,6 +176,8 @@ At 850 × 560, the native keyboard check opens long song and podcast episode men
 
 The search suggestions panel follows the field's width and scrolls when the rows exceed the available window height. Native X11 checks at 850 × 560 verify clicks inside and outside the panel and that arrow selection and wheel scrolling reveal the last row for pointer input.
 
+When saving the library, the app and the writer share the queued songs and the source's loaded IDs. Selecting another song does not copy those lists. Queue edits detach from a pending snapshot, so a write sees the order and track details captured when it was queued. The library file keeps the same JSON format. Run `bin/test --release -- --ignored --exact library::tests::large_queue_preference_save_latency --nocapture` to measure the time spent submitting snapshots, preferences, and position checkpoints with 10,000 queued songs.
+
 ## Player waits
 
 The fast lookup runs in Rust with a cookie-free HTTP client and the VISIONOS player context reviewed against yt-dlp 2026.08.19. It skips the watch page and manifests, reuses connections, and caches visitor data from the first Music homepage bootstrap in memory. Short-lived lookup threads deliver completions through the player's eventfd, independently of the sequential Python resolver. A click never waits behind or restarts the Python resolver; preparation the click made obsolete is cancelled. Visitor data and pauses reset when the account changes. Late native results cannot satisfy a full lookup or load an obsolete track.
