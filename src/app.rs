@@ -73,6 +73,7 @@ use player_bar::PlayerBar;
 use player_page::PlayerPage;
 use window::MusicContent;
 
+pub(crate) const HEADER_HEIGHT: f32 = 64.;
 const CARD_GAP: f32 = 24.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
