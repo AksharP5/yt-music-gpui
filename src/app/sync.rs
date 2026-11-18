@@ -859,20 +859,27 @@ impl Music {
         if self.sync.rating_overrides.is_empty() {
             return;
         }
-        for track in self.library.queue.tracks_mut().iter_mut().chain(
-            self.page
-                .shelves
-                .iter_mut()
-                .flat_map(|shelf| &mut shelf.items)
-                .chain(&mut self.rows)
-                .filter_map(|item| match item {
-                    Item::Track(track) => Some(track),
-                    _ => None,
-                }),
-        ) {
-            if self.sync.rating_overrides.contains(&track.id) {
-                track.details.rating = self.ratings.get(&track.id).copied();
-            }
+        let overrides = &self.sync.rating_overrides;
+        let ratings = &self.ratings;
+        self.library.queue.update_tracks(
+            |track| {
+                overrides.contains(&track.id)
+                    && track.details.rating != ratings.get(&track.id).copied()
+            },
+            |track| track.details.rating = ratings.get(&track.id).copied(),
+        );
+        for track in self
+            .page
+            .shelves
+            .iter_mut()
+            .flat_map(|shelf| &mut shelf.items)
+            .chain(&mut self.rows)
+            .filter_map(|item| match item {
+                Item::Track(track) if overrides.contains(&track.id) => Some(track),
+                _ => None,
+            })
+        {
+            track.details.rating = ratings.get(&track.id).copied();
         }
     }
 

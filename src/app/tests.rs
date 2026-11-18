@@ -263,55 +263,66 @@ fn acknowledged_song_state_survives_old_reads_and_fresh_reads_can_remove_it() {
     let mut tracks = vec![song.clone(), song.clone()];
     tracks[0].details.set_video_id = Some("first".into());
     tracks[1].details.set_video_id = Some("second".into());
+    let mut queue = Queue::default();
+    queue.replace(tracks, 0);
     let mut ratings = HashMap::new();
+    let like = Mutation::RateSong {
+        track: song.clone(),
+        rating: Rating::Like,
+    };
+    acknowledge_song_change(&mut queue, &mut ratings, &like);
+    let snapshot = queue.tracks.clone();
+    acknowledge_song_change(&mut queue, &mut ratings, &like);
+    assert!(std::sync::Arc::ptr_eq(&queue.tracks, &snapshot));
     acknowledge_song_change(
-        &mut tracks,
-        &mut ratings,
-        &Mutation::RateSong {
-            track: song.clone(),
-            rating: Rating::Like,
-        },
-    );
-    acknowledge_song_change(
-        &mut tracks,
+        &mut queue,
         &mut ratings,
         &Mutation::SongLibrary {
             track: song.clone(),
             save: true,
         },
     );
-    apply_track_details(&mut tracks, &mut ratings, &song, false);
+    apply_track_details(queue.tracks_mut(), &mut ratings, &song, false);
     assert_eq!(ratings[&song.id], Rating::Like);
     assert!(
-        tracks
+        queue
+            .tracks
             .iter()
             .all(|track| track.details.rating == Some(Rating::Like)
                 && track.details.in_library == Some(true))
     );
 
-    apply_track_details(&mut tracks, &mut ratings, &song, true);
+    apply_track_details(queue.tracks_mut(), &mut ratings, &song, true);
     assert_eq!(ratings[&song.id], Rating::Indifferent);
     assert!(
-        tracks
+        queue
+            .tracks
             .iter()
             .all(|track| track.details.in_library == Some(false))
     );
-    assert_eq!(tracks[0].details.set_video_id.as_deref(), Some("first"));
-    assert_eq!(tracks[1].details.set_video_id.as_deref(), Some("second"));
+    assert_eq!(
+        queue.tracks[0].details.set_video_id.as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        queue.tracks[1].details.set_video_id.as_deref(),
+        Some("second")
+    );
 
     song.details.rating = None;
     song.details.in_library = None;
-    apply_track_details(&mut tracks, &mut ratings, &song, true);
+    apply_track_details(queue.tracks_mut(), &mut ratings, &song, true);
     assert!(!ratings.contains_key(&song.id));
     assert!(
-        tracks
+        queue
+            .tracks
             .iter()
             .all(|track| track.details.rating.is_none() && track.details.in_library.is_none())
     );
 }
 
 #[test]
-fn acknowledged_library_changes_update_both_visible_copies_without_a_queue_match() {
+fn acknowledged_library_changes_update_visible_songs_without_copying_the_queue() {
     let mut song: Track = serde_json::from_value(serde_json::json!({
         "id":"abcdefghijk", "title":"Visible song", "artist":"Artist"
     }))
@@ -319,25 +330,24 @@ fn acknowledged_library_changes_update_both_visible_copies_without_a_queue_match
     song.details.in_library = Some(false);
     song.details.add_library = Some("synthetic-add".into());
     song.details.remove_library = Some("synthetic-remove".into());
-    let mut page = vec![crate::catalog::Item::Track(song.clone())];
-    let mut rows = page.clone();
+
+    let mut page = super::sync::tests::page(1, false);
+    let mut queue = Queue::default();
+    queue.replace(page.tracks(), 0);
+    page.shelves[0].items[0] = Item::Track(song.clone());
+    let mut back = page.clone();
+    let snapshot = queue.tracks.clone();
     let mut ratings = HashMap::new();
     for save in [true, false] {
-        acknowledge_song_change(
-            page.iter_mut()
-                .chain(&mut rows)
-                .filter_map(|item| match item {
-                    crate::catalog::Item::Track(track) => Some(track),
-                    _ => None,
-                }),
-            &mut ratings,
-            &Mutation::SongLibrary {
-                track: song.clone(),
-                save,
-            },
-        );
-        for item in page.iter().chain(&rows) {
-            let crate::catalog::Item::Track(track) = item else {
+        let mutation = Mutation::SongLibrary {
+            track: song.clone(),
+            save,
+        };
+        acknowledge_song_change(&mut queue, &mut ratings, &mutation);
+        assert!(std::sync::Arc::ptr_eq(&queue.tracks, &snapshot));
+        for visible in [&mut page, &mut back] {
+            super::sync::patch_page(visible, &super::Route::Home, &mutation);
+            let Item::Track(track) = &visible.shelves[0].items[0] else {
                 panic!("expected song")
             };
             assert_eq!(track.details.in_library, Some(save));
