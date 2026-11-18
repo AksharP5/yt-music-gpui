@@ -155,6 +155,20 @@ impl Music {
         let playing = self.active_id.is_some()
             && self.playback != Playback::Stopped
             && !self.playback.is_paused();
+        let next = if self.can_go_next() {
+            control("next", "next", theme, cx, |view, _, cx| view.skip_next(cx))
+        } else {
+            div()
+                .id("next")
+                .size(px(36.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::Arrow)
+                .child(icon("next", 24., theme.muted))
+                .on_click(|_, _, cx| cx.stop_propagation())
+        };
         // Sized to its content and centered, so the rating buttons follow the title as on the web.
         let mut details = div().min_w_0().max_w(px(660.)).flex().items_center();
         if let Some(track) = current {
@@ -334,9 +348,7 @@ impl Music {
                                         view.toggle_play(cx);
                                     })),
                             )
-                            .child(control("next", "next", theme, cx, |view, _, cx| {
-                                view.next(false, cx)
-                            }))
+                            .child(next)
                             .when(width >= 936., |d| {
                                 d.child(div().text_size(px(12.)).text_color(theme.muted).child(
                                     format!(
