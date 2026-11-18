@@ -69,37 +69,11 @@ impl SearchBox {
         let input = cx.new(SearchInput::new);
         let focus = input.focus_handle(cx);
         let generation = Arc::new(AtomicU64::new(0));
-        let (jobs, requests) = async_channel::bounded::<SuggestionRequest>(1);
-        let (results, completed) = async_channel::unbounded();
-        let worker_generation = generation.clone();
-        let error = thread::Builder::new()
-            .name("search-suggestions".into())
-            .spawn(move || {
-                let catalog = Catalog::new();
-                while let Ok(request) = requests.recv_blocking() {
-                    if request.id != worker_generation.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    let result = catalog
-                        .as_ref()
-                        .map_err(|error| format!("{error:#}"))
-                        .and_then(|catalog| {
-                            catalog
-                                .for_session(request.session.clone())
-                                .suggestions(&request.query)
-                                .map_err(|error| format!("{error:#}"))
-                        });
-                    if request.id == worker_generation.load(Ordering::Acquire)
-                        && results
-                            .send_blocking(SuggestionResult { request, result })
-                            .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .err()
-            .map(|error| format!("Could not start search suggestions: {error}"));
+        let (jobs, completed, error) = suggestion_workers(&generation, |request| {
+            Catalog::with_session(request.session.clone())
+                .and_then(|catalog| catalog.suggestions(&request.query))
+                .map_err(|error| format!("{error:#}"))
+        });
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(result) = completed.recv().await {
                 if view
@@ -515,6 +489,46 @@ impl Render for SearchBox {
     }
 }
 
+fn suggestion_workers(
+    generation: &Arc<AtomicU64>,
+    lookup: impl Fn(&SuggestionRequest) -> Result<Vec<Suggestion>, String> + Clone + Send + 'static,
+) -> (
+    async_channel::Sender<SuggestionRequest>,
+    async_channel::Receiver<SuggestionResult>,
+    Option<String>,
+) {
+    // Keep one pending query and allow a new query to bypass a slow obsolete read.
+    let (jobs, requests) = async_channel::bounded::<SuggestionRequest>(1);
+    let (results, completed) = async_channel::unbounded();
+    let mut running = false;
+    let mut error = None;
+    for name in ["search-suggestions", "search-suggestions-spare"] {
+        let requests = requests.clone();
+        let results = results.clone();
+        let generation = generation.clone();
+        let lookup = lookup.clone();
+        match thread::Builder::new().name(name.into()).spawn(move || {
+            while let Ok(request) = requests.recv_blocking() {
+                if request.id != generation.load(Ordering::Acquire) {
+                    continue;
+                }
+                let result = lookup(&request);
+                if request.id == generation.load(Ordering::Acquire)
+                    && results
+                        .send_blocking(SuggestionResult { request, result })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        }) {
+            Ok(_) => running = true,
+            Err(failure) => error = Some(format!("Could not start search suggestions: {failure}")),
+        }
+    }
+    (jobs, completed, error.filter(|_| !running))
+}
+
 fn same_session(left: Option<&Arc<Session>>, right: Option<&Arc<Session>>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -525,9 +539,65 @@ fn same_session(left: Option<&Arc<Session>>, right: Option<&Arc<Session>>) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, SuggestionRequest};
+    use super::{Session, SuggestionRequest, suggestion_workers};
     use serde_json::json;
-    use std::sync::Arc;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    #[test]
+    fn suggestions_for_the_latest_query_bypass_a_slow_old_request() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let (started, old_started) = mpsc::channel();
+        let (release, old_release) = async_channel::bounded::<()>(1);
+        let (jobs, completed, error) = suggestion_workers(&generation, move |request| {
+            if request.id == 1 {
+                started.send(()).unwrap();
+                let _ = old_release.recv_blocking();
+            }
+            Ok(Vec::new())
+        });
+        assert!(error.is_none(), "{error:?}");
+        let (observed, results) = mpsc::channel();
+        let forward = std::thread::spawn(move || {
+            while let Ok(result) = completed.recv_blocking() {
+                if observed.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let timeout = Duration::from_secs(3);
+        jobs.send_blocking(SuggestionRequest {
+            id: 1,
+            query: "older query".into(),
+            session: None,
+        })
+        .unwrap();
+        old_started.recv_timeout(timeout).unwrap();
+        generation.store(2, Ordering::Release);
+        jobs.send_blocking(SuggestionRequest {
+            id: 2,
+            query: "new query".into(),
+            session: None,
+        })
+        .unwrap();
+        let latest = results.recv_timeout(timeout);
+        drop(release);
+        drop(jobs);
+        let latest = latest.unwrap();
+        assert_eq!(latest.request.query, "new query");
+        assert!(latest.result.is_ok());
+        assert!(matches!(
+            results.recv_timeout(timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        forward.join().unwrap();
+    }
 
     #[test]
     fn suggestions_require_the_exact_query_generation_and_account() {
