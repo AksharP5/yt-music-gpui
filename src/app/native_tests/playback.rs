@@ -204,13 +204,7 @@ fn desktop_metadata_follows_stopped_queue_selection() -> Result<()> {
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .unwrap();
-        for (key, title, duration) in [
-            ("j", "Song 2", Some(83_000_000)),
-            ("j", "Song 3", None),
-            ("k", "Song 2", Some(83_000_000)),
-            ("k", "Song 1", Some(232_000_000)),
-        ] {
-            super::render::key(window, cx, key).await;
+        let expect_track = |title, duration| {
             let metadata: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
                 player.get_property("Metadata").unwrap();
             assert_eq!(<&str>::try_from(&metadata["xesam:title"]).unwrap(), title);
@@ -225,6 +219,35 @@ fn desktop_metadata_follows_stopped_queue_selection() -> Result<()> {
                 "Stopped"
             );
             assert_eq!(player.get_property::<i64>("Position").unwrap(), 0);
+        };
+        for (key, title, duration) in [
+            ("j", "Song 2", Some(83_000_000)),
+            ("j", "Song 3", None),
+            ("k", "Song 2", Some(83_000_000)),
+            ("k", "Song 1", Some(232_000_000)),
+        ] {
+            super::render::key(window, cx, key).await;
+            expect_track(title, duration);
+        }
+
+        window
+            .update(cx, |view, _, _| {
+                let song = view.library.queue.current().unwrap().clone();
+                let mut video = continuation_page(1..2, None).tracks().remove(0);
+                video.title = "Matching video".into();
+                video.duration = Some(191);
+                view.library.video = false;
+                view.media_pair = Some(Box::new(crate::watch::MediaPair { song, video }));
+            })
+            .unwrap();
+        for (video, title, duration) in [
+            (true, "Matching video", 191_000_000),
+            (false, "Song 1", 232_000_000),
+        ] {
+            window
+                .update(cx, |view, _, cx| view.set_video_mode(video, cx))
+                .unwrap();
+            expect_track(title, Some(duration));
         }
     })
 }

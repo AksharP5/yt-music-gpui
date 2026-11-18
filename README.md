@@ -94,7 +94,7 @@ Right-click a song, card or collection for its menu. Use ↑ and ↓ to move bet
 
 The player keeps the selected tab when you change tracks. Lyrics, Comments and Related show when their content is unavailable.
 
-When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected song’s duration when available.
+When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected duration when available, including when switching between Song and Video.
 
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 
