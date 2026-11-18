@@ -1528,3 +1528,90 @@ fn missing_keyring_offers_to_save_the_session_in_a_file() -> Result<()> {
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn browser_sign_in_can_be_checked_without_refocusing_the_app() -> Result<()> {
+    use super::render::key;
+    use super::render::wait_for_presented_frame;
+    use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+
+    startup_window(Startup::Guest, async |window, commands, cx| {
+        cx.update_window(window.into(), |_, window, cx| {
+            let sign_in = point(window.viewport_size().width - px(140.), px(32.));
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: sign_in,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: sign_in,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        let account::Command::Connect(operation) = commands.try_recv().unwrap() else {
+            panic!("Expected the Sign in button to open the browser");
+        };
+        window
+            .update(cx, |view, window, cx| {
+                assert!(matches!(view.overlay, Some(Overlay::SignIn)));
+                let profile: BrowserProfile = serde_json::from_value(json!({
+                    "browser":"Synthetic browser", "name":"Synthetic profile", "path":"/synthetic/profile"
+                })).unwrap();
+                view.account_event(
+                    account::Event::BrowserReady {
+                        operation: operation.clone(),
+                        result: Ok(profile),
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        assert!(
+            commands.is_empty(),
+            "Opening a browser in the background must not use its account before an explicit check"
+        );
+
+        key(window, cx, "enter").await;
+        assert!(
+            commands.is_empty(),
+            "Enter must not activate Sign in behind its dialog"
+        );
+
+        // Close is first in the dialog, followed by Check sign-in when the browser is ready.
+        for press in ["tab", "tab", "enter"] {
+            key(window, cx, press).await;
+        }
+        let account::Command::ReadBrowser {
+            operation: checked, ..
+        } = commands
+            .try_recv()
+            .expect("Check sign-in must be reachable while the app stays focused")
+        else {
+            panic!("Expected Check sign-in to read the browser selected by this operation");
+        };
+        assert!(checked.matches(&operation));
+        key(window, cx, "escape").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.overlay.is_none());
+                assert!(view.account_operation.is_none());
+                assert!(operation.is_cancelled());
+                assert!(commands.is_empty());
+            })
+            .unwrap();
+    })
+}
