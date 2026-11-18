@@ -1310,6 +1310,203 @@ const COVERS: [(&str, &str, &str); 5] = [
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn keyboard_reaches_offscreen_save_destinations() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let submitted = window
+            .update(cx, |view, window, cx| {
+                let (commands, submitted) = async_channel::bounded(1);
+                view.account_commands = commands;
+                view.sidebar_playlists = (0..40)
+                    .map(|index| crate::catalog::Collection {
+                        id: format!("VLPLkeyboard-{index}"),
+                        title: format!("Playlist {index:02}"),
+                        subtitle: String::new(),
+                        thumbnail: None,
+                        details: crate::catalog::CollectionDetails {
+                            editable: true,
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let tracks = view.page.tracks()[..2].to_vec();
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(tracks, cx);
+                submitted
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        // Close is the first stop, then the playlist destinations in order.
+        for _ in 0..18 {
+            super::render::key(window, cx, "tab").await;
+        }
+        super::render::key(window, cx, "shift-tab").await;
+        super::render::key(window, cx, "enter").await;
+        let account::Command::Apply { mutation, .. } = submitted
+            .try_recv()
+            .expect("Enter must select the destination reached with Tab")
+        else {
+            panic!("Expected the add-to-playlist command");
+        };
+        assert!(
+            matches!(&*mutation, Mutation::AddToPlaylist { id, .. } if id == "PLkeyboard-15"),
+            "Tab and Shift+Tab must reach the expected offscreen destination. Got {:?}",
+            mutation.key(),
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                let tracks = view.page.tracks()[..2].to_vec();
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(tracks, cx);
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        window
+            .update(cx, |view, window, cx| {
+                let job = playlist_choices_job(view);
+                let mut destinations = view.playlist_picker_choices().rows(0..40);
+                destinations.rotate_left(1);
+                view.playlist_choices_result(
+                    crate::app::PlaylistChoicesResult {
+                        job,
+                        result: Ok(crate::playlist_choices::Choices {
+                            destinations,
+                            empty: None,
+                        }),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        super::render::key(window, cx, "enter").await;
+        let account::Command::Apply { mutation, .. } = submitted
+            .try_recv()
+            .expect("Enter must retain its destination after a reorder")
+        else {
+            panic!("Expected the add-to-playlist command");
+        };
+        assert!(
+            matches!(&*mutation, Mutation::AddToPlaylist { id, .. } if id == "PLkeyboard-0"),
+            "A refreshed list must not move focus to a different playlist"
+        );
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn refreshing_save_destinations_does_not_retarget_a_mouse_click() -> Result<()> {
+    use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+
+    check_cache_window(async |window, cx| {
+        let submitted = window
+            .update(cx, |view, window, cx| {
+                let (commands, submitted) = async_channel::bounded(1);
+                view.account_commands = commands;
+                view.sidebar_playlists = ["First", "Second"]
+                    .into_iter()
+                    .map(|name| crate::catalog::Collection {
+                        id: format!("VLPL{name}"),
+                        title: name.into(),
+                        subtitle: String::new(),
+                        thumbnail: None,
+                        details: crate::catalog::CollectionDetails {
+                            editable: true,
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                window.focus(&view.overlay_focus, cx);
+                view.playlist_picker(view.page.tracks()[..2].to_vec(), cx);
+                submitted
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let position = window
+            .update(cx, |view, _, _| {
+                let scroll = view.picker_scroll.0.borrow();
+                let bounds = scroll.base_handle.bounds();
+                let row_height = scroll.last_item_size.unwrap().item.height;
+                point(bounds.center().x, bounds.top() + row_height / 2.)
+            })
+            .unwrap();
+        let dispatch = |event, cx: &mut gpui::AsyncApp| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+        };
+        let down = || {
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            })
+        };
+        let up = || {
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            })
+        };
+        dispatch(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }),
+            cx,
+        );
+        dispatch(down(), cx);
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                let job = playlist_choices_job(view);
+                let mut destinations = view.playlist_picker_choices().rows(0..2);
+                destinations.swap(0, 1);
+                view.playlist_choices_result(
+                    crate::app::PlaylistChoicesResult {
+                        job,
+                        result: Ok(crate::playlist_choices::Choices {
+                            destinations,
+                            empty: None,
+                        }),
+                        session_rejected: false,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        dispatch(up(), cx);
+        assert!(
+            submitted.is_empty(),
+            "Releasing on a different destination must not save"
+        );
+        wait_for_presented_frame(window, cx).await;
+        dispatch(down(), cx);
+        dispatch(up(), cx);
+        let account::Command::Apply { mutation, .. } = submitted
+            .try_recv()
+            .expect("A new click must select the refreshed destination")
+        else {
+            panic!("Expected the add-to-playlist command");
+        };
+        assert!(matches!(&*mutation, Mutation::AddToPlaylist { id, .. } if id == "PLSecond"));
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Result<()> {
     use gpui::{
         MouseButton, MouseDownEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
@@ -1622,6 +1819,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                         }),
                         session_rejected: false,
                     },
+                    window,
                     cx,
                 );
                 assert_eq!(
@@ -1637,7 +1835,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
             })
             .unwrap();
         window
-            .update(cx, |view, _, cx| {
+            .update(cx, |view, window, cx| {
                 view.refresh_playlist_choices(cx);
                 let job = playlist_choices_job(view);
                 view.playlist_choices_result(
@@ -1649,6 +1847,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                         ),
                         session_rejected: false,
                     },
+                    window,
                     cx,
                 );
                 assert!(view.catalog_requests.playlist_choices_error.is_some());
@@ -1719,12 +1918,12 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         view.playlist_picker(tracks.clone(), cx);
         let old = playlist_choices_job(view);
         view.close_overlay(window, cx);
-        view.playlist_choices_result(response(old.clone(), "Closed"), cx);
+        view.playlist_choices_result(response(old.clone(), "Closed"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
         view.playlist_picker(tracks.clone(), cx);
         let current = playlist_choices_job(view);
-        view.playlist_choices_result(response(old, "Reopened"), cx);
+        view.playlist_choices_result(response(old, "Reopened"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
         assert!(
             view.catalog_requests
@@ -1734,16 +1933,16 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         let mut reversed = current.clone();
         reversed.query =
             Query::PlaylistChoices(tracks.iter().rev().map(|track| track.id.clone()).collect());
-        view.playlist_choices_result(response(reversed, "Wrong song order"), cx);
+        view.playlist_choices_result(response(reversed, "Wrong song order"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
         let mut wrong_session = current.clone();
         wrong_session.session = Some(Arc::new((**current.session.as_ref().unwrap()).clone()));
-        view.playlist_choices_result(response(wrong_session, "Different session"), cx);
+        view.playlist_choices_result(response(wrong_session, "Different session"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
         view.account_generation = view.account_generation.wrapping_add(1);
-        view.playlist_choices_result(response(current, "Before another edit"), cx);
+        view.playlist_choices_result(response(current, "Before another edit"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
         let refreshed = playlist_choices_job(view);
         view.account.as_mut().unwrap().session =
@@ -1751,9 +1950,9 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         view.clear_account_state(cx);
         view.playlist_picker(tracks, cx);
         let new_account = playlist_choices_job(view);
-        view.playlist_choices_result(response(refreshed, "Before account refresh"), cx);
+        view.playlist_choices_result(response(refreshed, "Before account refresh"), window, cx);
         assert_eq!(view.playlist_picker_choices().len(), 0);
-        view.playlist_choices_result(response(new_account, "Current destinations"), cx);
+        view.playlist_choices_result(response(new_account, "Current destinations"), window, cx);
         assert_eq!(
             view.playlist_picker_choices().rows(0..1)[0].title,
             "Current destinations"

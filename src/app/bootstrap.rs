@@ -398,6 +398,8 @@ impl Music {
             overlay_anchor: None,
             overlay_button: None,
             overlay_focus: cx.focus_handle(),
+            picker_focus: VirtualListFocus::default(),
+            picker_scroll: UniformListScrollHandle::new(),
             settings_focus: cx.focus_handle(),
             overlay_return_focus: None,
             overlay_subscription: None,

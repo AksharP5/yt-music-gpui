@@ -134,6 +134,8 @@ impl Music {
     /// Show loaded destinations at once while YouTube Music returns this selection's choices.
     pub(in crate::app) fn playlist_picker(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
         self.error = None;
+        self.picker_scroll = UniformListScrollHandle::new();
+        self.picker_focus = VirtualListFocus::default();
         self.overlay = Some(Overlay::PlaylistPicker {
             tracks,
             error: None,
@@ -291,11 +293,24 @@ impl Music {
     }
 
     pub(in crate::app) fn move_overlay_focus(
-        &self,
+        &mut self,
         backward: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let picker = matches!(self.overlay, Some(Overlay::PlaylistPicker { .. }));
+        if picker
+            && let Some(current) = self.picker_focus.focused(window)
+            && let Some(index) = self.playlist_picker_choices().index_of(&current)
+            && let Some(next) = if backward {
+                index.checked_sub(1)
+            } else {
+                index.checked_add(1)
+            }
+            && self.focus_picker_choice(next, window, cx)
+        {
+            return;
+        }
         let root = if self.settings_menu.is_some() {
             &self.settings_focus
         } else {
@@ -330,6 +345,30 @@ impl Music {
             index.map_or(0, |index| (index + 1) % controls.len())
         };
         window.focus(&controls[next], cx);
+        if picker && self.picker_focus.focused(window).is_some() {
+            let index = if backward {
+                self.playlist_picker_choices().len().saturating_sub(1)
+            } else {
+                0
+            };
+            self.focus_picker_choice(index, window, cx);
+        }
+    }
+
+    fn focus_picker_choice(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(choice) = self.playlist_picker_choices().rows(index..index + 1).pop() else {
+            return false;
+        };
+        self.picker_focus.focus(choice.target, window, cx);
+        self.picker_scroll
+            .scroll_to_item(index, ScrollStrategy::Nearest);
+        cx.notify();
+        true
     }
 
     pub(in crate::app) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1258,19 +1297,23 @@ impl Music {
                     uniform_list(
                         "playlist-choices",
                         count,
-                        cx.processor(|view, range: std::ops::Range<usize>, _, cx| {
-                            let start = range.start;
+                        cx.processor(|view, range: std::ops::Range<usize>, window, cx| {
+                            let measuring = range == (0..1);
                             let choices = view.playlist_picker_choices().rows(range);
+                            // Row zero also serves the uniform list's sizing pass.
+                            if !measuring {
+                                view.picker_focus.retain_visible(window, |target| {
+                                    choices.iter().any(|choice| &choice.target == target)
+                                });
+                            }
                             choices
                                 .into_iter()
-                                .enumerate()
-                                .map(|(offset, choice)| {
-                                    let index = start + offset;
+                                .map(|choice| {
                                     let cover = choice.thumbnail.as_deref().and_then(|url| {
                                         view.artwork
                                             .get(url, size(px(PICKER_COVER), px(PICKER_COVER)))
                                     });
-                                    let destination = choice.target.clone();
+                                    let destination = choice.target;
                                     let privacy = choice.privacy.map(|privacy| match privacy {
                                         Privacy::Private => "Private",
                                         Privacy::Unlisted => "Unlisted",
@@ -1284,8 +1327,19 @@ impl Music {
                                         (None, _) => choice.byline.clone(),
                                     };
                                     div()
-                                        .id(("playlist-choice", index))
+                                        // A service reply can reorder rows between mouse-down and mouse-up.
+                                        .id(match &destination {
+                                            Destination::Playlist(id) => {
+                                                ElementId::from(format!("save-destination-{id}"))
+                                            }
+                                            Destination::LikedMusic => {
+                                                ElementId::from("save-liked-music")
+                                            }
+                                        })
                                         .keyboard_control(view.theme)
+                                        .track_focus(
+                                            &view.picker_focus.handle(destination.clone(), cx),
+                                        )
                                         .w_full()
                                         .h(px(PICKER_ROW))
                                         .px(px(24.))
@@ -1386,6 +1440,7 @@ impl Music {
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .track_scroll(&self.picker_scroll)
                     .w_full()
                     .h(px(list_height))
                     .min_h_0()

@@ -92,6 +92,8 @@ Right-click a song, card or collection for its menu.
 
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 
+In **Save to playlist**, use Tab and Shift+Tab to move through the destinations. The list scrolls to the focused playlist. Press Enter to choose it.
+
 In an editable playlist, Tab reveals each Suggestions control as it receives focus. Press Enter on **Refresh** for a new batch or on **Add to playlist** to save a song. Suggested songs stay out of the playlist's count and Play all until YouTube confirms an add.
 
 ## Contributing
