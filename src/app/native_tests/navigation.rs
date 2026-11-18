@@ -1364,10 +1364,10 @@ fn keyboard_reaches_offscreen_save_destinations() -> Result<()> {
         super::render::key(window, cx, "tab").await;
         super::render::key(window, cx, "tab").await;
         window
-            .update(cx, |view, _, cx| {
+            .update(cx, |view, window, cx| {
                 let job = playlist_choices_job(view);
-                let mut destinations = view.playlist_picker_choices().rows(0..3);
-                destinations.swap(0, 1);
+                let mut destinations = view.playlist_picker_choices().rows(0..40);
+                destinations.rotate_left(1);
                 view.playlist_choices_result(
                     crate::app::PlaylistChoicesResult {
                         job,
@@ -1377,6 +1377,7 @@ fn keyboard_reaches_offscreen_save_destinations() -> Result<()> {
                         }),
                         session_rejected: false,
                     },
+                    window,
                     cx,
                 );
             })
@@ -1710,6 +1711,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                         }),
                         session_rejected: false,
                     },
+                    window,
                     cx,
                 );
                 assert_eq!(
@@ -1725,7 +1727,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
             })
             .unwrap();
         window
-            .update(cx, |view, _, cx| {
+            .update(cx, |view, window, cx| {
                 view.refresh_playlist_choices(cx);
                 let job = playlist_choices_job(view);
                 view.playlist_choices_result(
@@ -1737,6 +1739,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                         ),
                         session_rejected: false,
                     },
+                    window,
                     cx,
                 );
                 assert!(view.catalog_requests.playlist_choices_error.is_some());
@@ -1807,12 +1810,12 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         view.playlist_picker(tracks.clone(), cx);
         let old = playlist_choices_job(view);
         view.close_overlay(window, cx);
-        view.playlist_choices_result(response(old.clone(), "Closed"), cx);
+        view.playlist_choices_result(response(old.clone(), "Closed"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
         view.playlist_picker(tracks.clone(), cx);
         let current = playlist_choices_job(view);
-        view.playlist_choices_result(response(old, "Reopened"), cx);
+        view.playlist_choices_result(response(old, "Reopened"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
         assert!(
             view.catalog_requests
@@ -1822,16 +1825,16 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         let mut reversed = current.clone();
         reversed.query =
             Query::PlaylistChoices(tracks.iter().rev().map(|track| track.id.clone()).collect());
-        view.playlist_choices_result(response(reversed, "Wrong song order"), cx);
+        view.playlist_choices_result(response(reversed, "Wrong song order"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
         let mut wrong_session = current.clone();
         wrong_session.session = Some(Arc::new((**current.session.as_ref().unwrap()).clone()));
-        view.playlist_choices_result(response(wrong_session, "Different session"), cx);
+        view.playlist_choices_result(response(wrong_session, "Different session"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
         view.account_generation = view.account_generation.wrapping_add(1);
-        view.playlist_choices_result(response(current, "Before another edit"), cx);
+        view.playlist_choices_result(response(current, "Before another edit"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
         let refreshed = playlist_choices_job(view);
         view.account.as_mut().unwrap().session =
@@ -1839,9 +1842,9 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         view.clear_account_state(cx);
         view.playlist_picker(tracks, cx);
         let new_account = playlist_choices_job(view);
-        view.playlist_choices_result(response(refreshed, "Before account refresh"), cx);
+        view.playlist_choices_result(response(refreshed, "Before account refresh"), window, cx);
         assert_eq!(view.playlist_picker_choices().len(), 0);
-        view.playlist_choices_result(response(new_account, "Current destinations"), cx);
+        view.playlist_choices_result(response(new_account, "Current destinations"), window, cx);
         assert_eq!(
             view.playlist_picker_choices().rows(0..1)[0].title,
             "Current destinations"
