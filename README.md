@@ -92,6 +92,8 @@ Previous restarts the current song once playback has passed three seconds. The d
 
 Right-click a song, card or collection for its menu. Use ↑ and ↓ to move between actions or Home and End to jump to the first or last action. The menu scrolls to the focused action.
 
+If the track changes while you drag the progress bar, the drag ends without seeking the new track.
+
 The player keeps the selected tab when you change tracks. Lyrics, Comments and Related show when their content is unavailable.
 
 When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected song’s duration when available.

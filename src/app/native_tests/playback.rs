@@ -232,6 +232,117 @@ fn desktop_metadata_follows_stopped_queue_selection() -> Result<()> {
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
+fn seek_drag_does_not_seek_a_replacement_song() -> Result<()> {
+    use crate::{media_controls::Event, player::PlayerEvent};
+    use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let _connection = start_test_desktop_controls(window, cx).await;
+        window
+            .update(cx, |view, _, cx| {
+                view.account = None;
+                view.account_operation = None;
+                view.library.autoplay = false;
+                view.library
+                    .queue
+                    .replace(continuation_page(0..2, None).tracks(), 0);
+                view.active_id = Some(1);
+                view.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                view.duration = 100.;
+                view.position = 10.;
+                cx.notify();
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+
+        let position = window
+            .update(cx, |view, _, _| {
+                let bounds = view.seek_bounds.get();
+                point(bounds.center().x, bounds.center().y)
+            })
+            .unwrap();
+        let press = || {
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            })
+        };
+        let release = || {
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            })
+        };
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(press(), cx);
+            window.dispatch_event(release(), cx);
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                assert_eq!(view.playback_position(), 50., "The displayed bar must seek");
+                let seek = view.pending_seek.unwrap();
+                view.player_event(
+                    PlayerEvent::SeekFinished {
+                        track_id: seek.track_id,
+                        revision: seek.revision,
+                        result: Ok(50.),
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(press(), cx);
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                // A stopped transport keeps selection local. Next changes the
+                // selected song and duration without resolving a remote track.
+                view.desktop_event(Event::Stop, cx);
+                view.desktop_event(Event::Next, cx);
+                assert_eq!(view.library.queue.index, Some(1));
+                view.active_id = Some(2);
+                view.playback = Playback::Loaded {
+                    paused: true,
+                    buffering: false,
+                };
+                view.duration = 80.;
+                view.position = 2.;
+                view.notify_playback(cx);
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(release(), cx);
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.playback_position(),
+                    2.,
+                    "Releasing an old seek drag must leave the replacement song alone"
+                );
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
 fn desktop_previous_follows_the_restart_position() -> Result<()> {
     use crate::{app::playback::SeekIntent, player::PlayerEvent};
 
