@@ -2476,3 +2476,48 @@ fn clicking_a_queued_row_plays_it_and_dragging_reorders() -> Result<()> {
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_song_menu_moves_the_selected_occurrence_across_shelves() -> Result<()> {
+    use super::render::key;
+    use crate::catalog::Item;
+
+    check_cache_window(async |window, cx| {
+        let (commands, submitted) = async_channel::bounded(2);
+        for (offset, destination) in [(5, "occurrence-0"), (6, "occurrence-3")] {
+            window
+                .update(cx, |view, window, cx| {
+                    view.account_commands = commands.clone();
+                    let id = format!("VLmenu-{offset}");
+                    view.route = Route::Browse(BrowseLink::new(id, "Editable playlist"));
+                    view.page = crate::app::sync::tests::response(
+                        &[("Songs", vec![0, 1]), ("More songs", vec![2, 3])],
+                        None,
+                        true,
+                    );
+                    view.page.editable = true;
+                    // Two occurrences of the same video, each with its own playlist ID.
+                    let Item::Track(duplicate) = &mut view.page.shelves[0].items[1] else {
+                        panic!("The fixture must contain song rows");
+                    };
+                    duplicate.id = "00000000000".into();
+                    view.rebuild_rows();
+                    view.open_item_menu(1, window, cx);
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            key(window, cx, "home").await;
+            for _ in 0..offset {
+                key(window, cx, "down").await;
+            }
+            key(window, cx, "enter").await;
+            let account::Command::Apply { mutation, .. } = submitted.try_recv().unwrap() else {
+                panic!("Expected a playlist move");
+            };
+            assert!(matches!(*mutation, Mutation::MoveInPlaylist {
+                id, set_video_id, before: Some(before)
+            } if id == format!("VLmenu-{offset}") && set_video_id == "occurrence-1" && before == destination));
+        }
+    })
+}
