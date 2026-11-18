@@ -401,6 +401,9 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
             bool::try_from(value).unwrap()
         };
 
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        let mut available = previous();
         for (seconds, expected) in [
             (2.75, false),
             (3., false),
@@ -408,6 +411,9 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
             (3., false),
             (3.25, true),
         ] {
+            let renders = window
+                .update(cx, |view, _, cx| view.player_bar.read(cx).renders)
+                .unwrap();
             window
                 .update(cx, |view, _, cx| {
                     view.player_event(
@@ -420,6 +426,18 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
                 })
                 .unwrap();
             assert_eq!(previous(), expected, "Previous at {seconds} seconds");
+            super::render::wait_for_presented_frame(window, cx).await;
+            if available != expected {
+                window
+                    .update(cx, |view, _, cx| {
+                        assert!(
+                            view.player_bar.read(cx).renders > renders,
+                            "Previous must redraw when its availability changes at {seconds} seconds"
+                        );
+                    })
+                    .unwrap();
+            }
+            available = expected;
         }
 
         window

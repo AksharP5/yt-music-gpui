@@ -867,8 +867,6 @@ impl Music {
                 }
                 if changed || can_go_previous != self.can_go_previous() {
                     self.publish_desktop();
-                }
-                if changed {
                     self.player_bar.update(cx, |_, cx| cx.notify());
                 }
                 return;
