@@ -223,7 +223,7 @@ impl Music {
         }
         if secondary {
             match key {
-                "right" => self.next(false, cx),
+                "right" => self.skip_next(cx),
                 "left" => self.previous(cx),
                 _ => {}
             }
@@ -245,7 +245,7 @@ impl Music {
         // platforms may keep the base key and the modifier.
         match (key, shift) {
             ("space" | ";", false) => self.toggle_play(cx),
-            ("j", false) | ("n", true) => self.next(false, cx),
+            ("j", false) | ("n", true) => self.skip_next(cx),
             ("k", false) | ("p", true) => self.previous(cx),
             ("right", false) => self.seek_by(5., cx),
             ("left", false) => self.seek_by(-5., cx),

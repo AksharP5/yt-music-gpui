@@ -677,10 +677,13 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                             view.play_current_at(7., true, WatchMode::Issued, cx);
                         }
                         "radio" => {
+                            view.library.queue.select(1);
+                            view.library.repeat = Repeat::Off;
+                            view.library.autoplay = false;
                             view.start_queue(PlaybackQuery::Watch { track: Box::new(track("invalid-radio")), mode: WatchMode::Radio }, cx);
                             assert!(view.pending_playback_jobs.is_empty(), "Queue requests must wait for credential acknowledgment");
                             view.toggle_play(cx);
-                            view.next(false, cx);
+                            view.skip_next(cx);
                         }
                         "video" => {
                             view.media_pair = Some(Box::new(MediaPair { song: view.library.queue.current().unwrap().clone(), video: track("invalid-video") }));
