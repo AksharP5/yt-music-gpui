@@ -437,8 +437,11 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 let (writer, errors) = LibraryWriter::new(store);
                 view.store = Some(writer);
                 view.desktop_event(media_controls::Event::Volume(view.library.volume), cx);
-                view.drag = Some(Drag::Seek);
-                view.drag_position = Some(42.);
+                view.drag = Some(Drag::Seek {
+                    track_id: view.active_id,
+                    generation: view.playback_generation.load(Ordering::Relaxed),
+                    seconds: 42.,
+                });
                 view.end_drag(cx);
                 drop(view.store.take());
                 assert!(errors.is_empty());

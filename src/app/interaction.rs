@@ -32,7 +32,11 @@ pub(in crate::app) const SHORTCUTS: &[(&str, &str)] = &[
 
 #[derive(Clone, Copy, PartialEq)]
 pub(in crate::app) enum Drag {
-    Seek,
+    Seek {
+        track_id: Option<u64>,
+        generation: u64,
+        seconds: f64,
+    },
     Volume,
     /// Reordering Up next; the rows track the pointer in `PlayerPage`.
     Queue,
@@ -49,14 +53,56 @@ impl Music {
         true
     }
 
+    pub(in crate::app) fn start_seek_drag(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.duration <= 0. {
+            return;
+        }
+        self.drag = Some(Drag::Seek {
+            track_id: self.active_id,
+            generation: self.playback_generation.load(Ordering::Relaxed),
+            seconds: self.playback_position(),
+        });
+        self.drag_to(position, cx);
+    }
+
+    pub(in crate::app) fn seek_drag_position(&self) -> Option<f64> {
+        let Some(Drag::Seek {
+            track_id,
+            generation,
+            seconds,
+        }) = self.drag
+        else {
+            return None;
+        };
+        // Stream reloads change the playback ID. Stopped queue selections
+        // change the generation even though they do not have a playback ID.
+        (track_id == self.active_id
+            && generation == self.playback_generation.load(Ordering::Relaxed))
+        .then_some(seconds)
+    }
+
     pub(in crate::app) fn drag_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         match self.drag {
-            Some(Drag::Seek) if self.duration > 0. => {
+            Some(Drag::Seek {
+                track_id,
+                generation,
+                ..
+            }) => {
+                if self.seek_drag_position().is_none() {
+                    self.drag = None;
+                    return;
+                }
                 let bounds = self.seek_bounds.get();
-                self.drag_position = Some(
-                    ((position.x - bounds.left()) / bounds.size.width).clamp(0., 1.) as f64
-                        * self.duration,
-                );
+                let fraction = ((position.x - bounds.left()) / bounds.size.width).clamp(0., 1.);
+                self.drag = Some(Drag::Seek {
+                    track_id,
+                    generation,
+                    seconds: f64::from(fraction) * self.duration,
+                });
                 self.player_bar.update(cx, |_, cx| cx.notify());
             }
             Some(Drag::Volume) => {
@@ -72,9 +118,10 @@ impl Music {
     }
 
     pub(in crate::app) fn end_drag(&mut self, cx: &mut Context<Self>) {
+        let seek_position = self.seek_drag_position();
         match self.drag.take() {
-            Some(Drag::Seek) => {
-                if let Some(seconds) = self.drag_position.take() {
+            Some(Drag::Seek { .. }) => {
+                if let Some(seconds) = seek_position {
                     self.seek_current(seconds, cx);
                 }
             }
