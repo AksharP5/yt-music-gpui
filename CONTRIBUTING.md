@@ -154,6 +154,8 @@ No test signs in to a real Google account. Do not add one that does.
 
 Search suggestions allow two active reads and keep only the latest queued query. A slow earlier read can finish in the background while the current query shows its suggestions. Results still require the exact query and session. The worker test holds the older read until the new response arrives and checks that the older response is discarded. An explicit session rejection uses the normal reconnect path. After verified renewal, the focused query retries with the updated session. The native search check exercises this with a synthetic account.
 
+The search suggestions panel follows the field's width when the guide and account controls leave less room in the header. The native X11 check opens suggestions at 850 px with the guide expanded and verifies clicks inside and outside the panel.
+
 ## Player waits
 
 The fast lookup runs in Rust with a cookie-free HTTP client and the VISIONOS player context reviewed against yt-dlp 2026.08.19. It skips the watch page and manifests, reuses connections, and caches visitor data from the first Music homepage bootstrap in memory. Short-lived lookup threads deliver completions through the player's eventfd, independently of the sequential Python resolver. A click never waits behind or restarts the Python resolver; preparation the click made obsolete is cancelled. Visitor data and pauses reset when the account changes. Late native results cannot satisfy a full lookup or load an obsolete track.
