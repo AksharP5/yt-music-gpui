@@ -175,7 +175,7 @@ fn suggestions_refresh_keeps_playlist_rows_and_discards_late_visits() -> Result<
             .unwrap();
         window
             .update(cx, |view, window, cx| {
-                let focus = view.suggestions.as_mut().unwrap().focus.handle(1, cx);
+                let focus = view.suggestions.as_ref().unwrap().tracks[0].controls[1].clone();
                 window.focus(&focus, cx);
             })
             .unwrap();
@@ -532,7 +532,7 @@ fn suggestions_add_keeps_clicked_metadata_after_refresh_and_navigation() -> Resu
         super::render::wait_for_presented_frame(window, cx).await;
         window
             .update(cx, |view, window, cx| {
-                let focus = view.suggestions.as_mut().unwrap().focus.handle(1, cx);
+                let focus = view.suggestions.as_ref().unwrap().tracks[0].controls[1].clone();
                 window.focus(&focus, cx);
             })
             .unwrap();
@@ -542,7 +542,7 @@ fn suggestions_add_keeps_clicked_metadata_after_refresh_and_navigation() -> Resu
         window
             .update(cx, |view, window, _| {
                 assert_eq!(
-                    view.suggestions.as_ref().unwrap().focus.focused(window),
+                    view.suggestions.as_ref().unwrap().focused_control(window),
                     Some(4),
                     "Tab skips Add controls while an edit is pending"
                 );
@@ -574,5 +574,67 @@ fn suggestions_add_keeps_clicked_metadata_after_refresh_and_navigation() -> Resu
             assert_eq!(view.rows.len(), 1);
             view.detail_list.state.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
         }).unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn confirming_suggestion_add_does_not_focus_a_different_song() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let (pending, selected) = window
+            .update(cx, |view, window, cx| {
+                let (commands, pending) = async_channel::bounded(8);
+                view.account_commands = commands;
+                view.navigate(
+                    Route::Browse(BrowseLink::new("VLsuggestions", "Suggestions fixture")),
+                    cx,
+                );
+                reply(view, playlist(view, 0), cx);
+                let read = view.catalog_requests.pending.try_recv().unwrap();
+                deliver(view, read, Ok(batch(view, "Suggestion")), window, cx);
+                let selected = view.suggestions.as_ref().unwrap().tracks[0]
+                    .track
+                    .id
+                    .clone();
+                (pending, selected)
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                let focus = view.suggestions.as_ref().unwrap().tracks[0].controls[1].clone();
+                window.focus(&focus, cx);
+            })
+            .unwrap();
+        super::render::key(window, cx, "enter").await;
+        window.update(cx, |view, window, cx| {
+            let account::Command::Apply { session, mutation } = pending.try_recv().expect("Enter should add the focused suggestion") else {
+                panic!("Expected Add to playlist");
+            };
+            assert!(matches!(&*mutation, Mutation::AddToPlaylist { video_ids, .. } if video_ids == std::slice::from_ref(&selected)));
+            view.account_event(account::Event::Applied {
+                session,
+                mutation,
+                result: Ok(Effect::PlaylistAdded { additions: vec![(selected.clone(), "added-occurrence".into())], toast: None }),
+                session_rejected: false,
+            }, window, cx);
+            assert_ne!(view.suggestions.as_ref().unwrap().tracks[0].track.id, selected);
+        }).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let keystroke = gpui::Keystroke::parse("enter").unwrap();
+            window.dispatch_keystroke(keystroke.clone(), cx);
+            window.dispatch_event(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
+        })
+        .unwrap();
+        assert!(
+            pending.is_empty(),
+            "Enter on the previous frame must not add again"
+        );
+        super::render::wait_for_presented_frame(window, cx).await;
+        super::render::key(window, cx, "enter").await;
+        assert!(
+            pending.is_empty(),
+            "Enter must not add the next song without moving focus"
+        );
     })
 }
