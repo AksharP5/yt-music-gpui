@@ -992,12 +992,17 @@ impl Music {
                             }
                             Effect::AlreadyAdded => {
                                 if let Mutation::AddToPlaylist { id, video_ids, .. } = mutation {
+                                    if self.overlay.is_some() {
+                                        self.close_overlay(window, cx);
+                                    }
+                                    self.overlay_return_focus = window.focused(cx);
                                     self.overlay = Some(Overlay::AlreadyAdded {
                                         id,
                                         video_ids,
                                         sources,
                                         error: None,
                                     });
+                                    window.focus(&self.overlay_focus, cx);
                                 }
                             }
                             Effect::PlaylistAdded { additions, toast } => {
