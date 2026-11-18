@@ -366,6 +366,7 @@ impl Music {
         let collection = !home && self.page.header.is_some();
         let artist = collection && self.route.is_artist();
         let stacked = collection && !artist && layout.tier >= Tier::Wide;
+        let floating_back = stacked && self.error.is_none() && self.notice.is_none();
         // Library pages open on their chips, without a back button or heading.
         let library = !collection && matches!(self.route, Route::Saved | Route::Library(_));
         let mut content = div()
@@ -377,7 +378,7 @@ impl Music {
             .flex_col();
         // Stacked album and playlist rows scroll up to the header, so their
         // back button floats over the top of the art column instead.
-        if stacked && !self.back.is_empty() {
+        if floating_back && !self.back.is_empty() {
             content = content.child(
                 div()
                     .absolute()
@@ -392,7 +393,7 @@ impl Music {
                     ),
             );
         }
-        if !home && !artist && !search && !stacked && !library {
+        if !home && !artist && !search && !floating_back && !library {
             content = content.child(
                 div()
                     .h(px(if collection { 24. } else { 48. }))
