@@ -391,6 +391,20 @@ impl Music {
         true
     }
 
+    pub(in crate::app) fn open_overlay(
+        &mut self,
+        overlay: Overlay,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.is_some() {
+            self.close_overlay(window, cx);
+        }
+        self.overlay_return_focus = window.focused(cx);
+        self.overlay = Some(overlay);
+        window.focus(&self.overlay_focus, cx);
+    }
+
     pub(in crate::app) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.overlay, Some(Overlay::SignIn)) {
             self.cancel_connection(cx);
