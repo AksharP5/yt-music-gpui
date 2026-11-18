@@ -3093,10 +3093,14 @@ fn playlist_drag_scrolls_to_songs_outside_the_original_viewport() -> Result<()> 
             if let Some(target) = target {
                 break target;
             }
-            assert!(
-                Instant::now() < deadline,
-                "Holding the dragged song near the bottom must scroll the list"
-            );
+            if Instant::now() >= deadline {
+                let distance = window
+                    .update(cx, |view, _, _| {
+                        initial_offset - view.detail_list.state.scroll_px_offset_for_scrollbar().y
+                    })
+                    .unwrap();
+                panic!("Holding the dragged song near the bottom scrolled only {distance:?}");
+            }
             cx.background_executor()
                 .timer(Duration::from_millis(20))
                 .await;

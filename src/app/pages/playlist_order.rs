@@ -71,7 +71,7 @@ impl Render for DraggedSong {
                     let elapsed = now
                         .duration_since(std::mem::replace(&mut drag.scrolled_at, now))
                         .as_secs_f32()
-                        .min(0.03);
+                        .min(0.10);
                     let speed = drag.edge_speed(window);
                     let old = drag.list.scroll_px_offset_for_scrollbar();
                     let end = -drag.list.max_offset_for_scrollbar().y.max(px(0.));
