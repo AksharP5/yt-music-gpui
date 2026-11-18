@@ -848,6 +848,9 @@ impl Music {
     }
 
     pub(in crate::app) fn previous(&mut self, cx: &mut Context<Self>) {
+        if !self.can_go_previous() {
+            return;
+        }
         let playback = self
             .queue_waiting
             .take()
