@@ -223,7 +223,7 @@ impl Music {
             .map_or(self.position, |seek| seek.seconds)
     }
 
-    fn can_go_previous(&self) -> bool {
+    pub(in crate::app) fn can_go_previous(&self) -> bool {
         self.player.is_some()
             && (self.library.queue.index.is_some_and(|index| index > 0)
                 || self.playback_position() > PREVIOUS_RESTART_SECONDS)
@@ -867,8 +867,6 @@ impl Music {
                 }
                 if changed || can_go_previous != self.can_go_previous() {
                     self.publish_desktop();
-                }
-                if changed {
                     self.player_bar.update(cx, |_, cx| cx.notify());
                 }
                 return;
