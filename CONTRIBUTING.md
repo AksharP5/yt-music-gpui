@@ -193,6 +193,8 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with
 
 Keep each pull request to one change. Say what was broken or missing from a user's point of view, how you fixed it, and how you checked it in the running app. Include a screenshot or recording for UI changes.
 
+The Linux performance job compares the stripped release binary and the headless local-playback medians with the pull request's base commit. It uses the reviewed yt-dlp from the candidate for both builds and posts the comparison in the Actions summary. The job fails when the binary exceeds the size cap or grows beyond its per-PR budget and flags playback regressions with warnings because shared runners vary. The permitted increases are in `bin/performance-budget.json`. Run `bin/check-performance BASE_COMMIT` on Linux to reproduce the comparison. You can pass the reviewed yt-dlp zipapp as a second argument to avoid downloading it again.
+
 Never commit cookies, account data or keyring contents. Use synthetic values in tests, as the existing ones do.
 
 ## Release
