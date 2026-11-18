@@ -89,6 +89,8 @@ The Comments check reads public guest comments during muted playback, exercises 
 
 Dialog checks scroll both sides of a long Save to playlist list and its backdrop, and right-click the dimmed page. The list must move without scrolling or opening a menu in the page underneath. The New playlist footer must stay clear of scrolling rows. Keyboard checks ensure Help captures Enter and Space and restores focus on Escape, and that country-picker arrows make Enter choose the highlighted country.
 
+While Save to playlist waits for the service, it counts the eligible destinations from the loaded guide and copies only the rows requested by the virtual list. The count and row ranges use the same eligibility filter.
+
 Album and playlist queues retain their independently issued Play and Shuffle actions. Toggling reloads the chosen source order and starts playback, as on the web, including restoring entries removed from Up next. Service-shuffled pages keep the service order and do not enable local eager continuation loading. Saved queues retain only the collection ID and order; restart or account changes require fresh actions. The native `collection_shuffle_toggles_pending_requests_and_ignores_stale_results` check covers rapid toggles, failures, late replies, background details reads and account recovery. `collection_shuffle_refreshes_actions_only_when_the_account_changes` completes synthetic player activation for account switches, guest sign-in and same-account refresh. A separate public guest integration check reloads actions after serialization and verifies both orders without accessing an account or playing media:
 
 ```sh
