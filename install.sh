@@ -212,6 +212,15 @@ try:
                        if len(line.split()) == 2 and line.split()[1] == name]
             if matches != [[checksum, name]]:
                 raise ValueError('Upstream checksum differs from the reviewed pin')
+    elif action == 'reuse-ytdlp':
+        checksum, output = args
+        try:
+            installed = read_file(targets['yt-dlp'])
+        except (OSError, ValueError):
+            sys.exit(1)
+        if digest(installed) != checksum:
+            sys.exit(1)
+        Path(output).write_bytes(installed)
     elif action == 'deno':
         archive, output = map(Path, args)
         with zipfile.ZipFile(archive) as z:
@@ -354,9 +363,11 @@ PY
         fi
         helper unpack "$archive" "$work/archive.sha256" "$work/stage" > "$work/pins"
         { read -r ytdlp_version; read -r ytdlp_hash; read -r deno_version; read -r deno_hash; read -r deno_size; } < "$work/pins"
-        download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/yt-dlp" "$work/yt-dlp"
-        download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/SHA2-256SUMS" "$work/ytdlp-sums"
-        helper verify "$work/yt-dlp" "$ytdlp_hash" "$work/ytdlp-sums" yt-dlp
+        if ! helper reuse-ytdlp "$ytdlp_hash" "$work/yt-dlp"; then
+            download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/yt-dlp" "$work/yt-dlp"
+            download "https://github.com/yt-dlp/yt-dlp/releases/download/$ytdlp_version/SHA2-256SUMS" "$work/ytdlp-sums"
+            helper verify "$work/yt-dlp" "$ytdlp_hash" "$work/ytdlp-sums" yt-dlp
+        fi
         runtime_zip="$work/yt-dlp"
     else
         runtime_zip="$private_dir/yt-dlp"

@@ -88,6 +88,28 @@ class InstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Upstream checksum differs', result.stderr)
 
+    def test_reuses_only_a_trusted_ytdlp_matching_the_release_pin(self):
+        private = self.home / '.local/share/yt-music-gpui'
+        private.mkdir(parents=True)
+        installed = private / 'yt-dlp'
+        original = b'reviewed fixture'
+        installed.write_bytes(original)
+        checksum = hashlib.sha256(original).hexdigest()
+        staged = self.root / 'staged-ytdlp'
+        args = ['reuse-ytdlp', checksum, staged]
+
+        result = self.helper_run(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staged.read_bytes(), original)
+        staged.unlink()
+
+        for content, mode in [(b'changed fixture', 0o644), (original, 0o664)]:
+            with self.subTest(content=content, mode=mode):
+                installed.write_bytes(content)
+                installed.chmod(mode)
+                self.assertNotEqual(self.helper_run(*args).returncode, 0)
+                self.assertFalse(staged.exists())
+
     def test_truncated_pipe_does_no_work(self):
         invocation = SCRIPT.rindex('\n(install_main')
         for end in [len(SCRIPT) // 2, *range(invocation, len(SCRIPT.rstrip()))]:

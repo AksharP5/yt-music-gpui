@@ -217,6 +217,6 @@ HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --uninstall
 rm -r -- "$home"
 ```
 
-Keep the matching `.tar.gz.sha256` beside the local tarball. The app and helpers still need their normal runtime libraries; the installer still downloads its pinned yt-dlp and optional Deno over HTTPS. Use the isolated desktop recipe above to test playback, with the installed binary and a muted library. Container `--version` checks do not establish working graphics, audio or sign-in on those desktops.
+Keep the matching `.tar.gz.sha256` beside the local tarball. The app and helpers still need their normal runtime libraries. The installer reuses an existing private yt-dlp when its hash matches the pin and downloads it over HTTPS otherwise. It downloads private Deno if needed. Use the isolated desktop recipe above to test playback, with the installed binary and a muted library. Container `--version` checks do not establish working graphics, audio or sign-in on those desktops.
 
 `src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256 plus the fallback Deno version, archive SHA-256 and download size. Packaging copies them into `runtime-pins.json`, and the release build uses them to download and verify the yt-dlp and Deno bundled in the `.deb` and `.rpm`; neither the installer nor the packages have independent version pins. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.
