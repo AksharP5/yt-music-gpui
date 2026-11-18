@@ -633,6 +633,9 @@ impl Music {
                 window.focus(&view.focus, cx);
                 view.play_item(index, cx);
             }))
+            .when_some(track, |row, track| {
+                self.playlist_order_controls(row, index, track, cx)
+            })
             .child(art);
         row = if style == RowStyle::ArtistTable {
             // The web gives the title two fifths of the columns and each other

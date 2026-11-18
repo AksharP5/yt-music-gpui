@@ -292,7 +292,7 @@ impl Music {
                     self.close_overlay(window, cx);
                     return;
                 }
-                if self.cancel_queue_drag() {
+                if cx.stop_active_drag(window) || self.cancel_queue_drag() {
                     cx.notify();
                     return;
                 }

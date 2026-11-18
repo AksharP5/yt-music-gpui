@@ -5,6 +5,7 @@ pub(in crate::app) mod collection;
 pub(in crate::app) mod home;
 pub(in crate::app) mod items;
 pub(in crate::app) mod library;
+mod playlist_order;
 pub(in crate::app) mod search;
 pub(in crate::app) mod shelves;
 
