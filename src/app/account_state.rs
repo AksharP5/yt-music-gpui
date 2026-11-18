@@ -885,7 +885,7 @@ impl Music {
                                             if matches!(view.overlay, Some(Overlay::Track { .. } | Overlay::PlaylistPicker { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. })) {
                                                 view.overlay = None;
                                             }
-                                            view.search.update(cx, |search, cx| search.set_session(Some(session.clone()), cx));
+                                            view.search.update(cx, |search, cx| search.renew_session(previous_session.as_ref(), session.clone(), window, cx));
                                             view.error = retry_change.then(|| "Your account reconnected. Retry the failed change.".into());
                                             view.refresh_remote(cx);
                                         } else {

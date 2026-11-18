@@ -1,5 +1,5 @@
 use crate::{
-    auth::Session,
+    auth::{self, Session},
     catalog::{Catalog, Item},
     input::{InputEvent, SearchInput},
     search::Suggestion,
@@ -19,6 +19,7 @@ pub enum SearchBoxEvent {
     Submit(String),
     /// A suggested artist, album or song chosen straight from the dropdown.
     Open(Box<Item>),
+    SessionRejected(Arc<Session>),
     Blur,
 }
 
@@ -43,7 +44,7 @@ impl SuggestionRequest {
 
 struct SuggestionResult {
     request: SuggestionRequest,
-    result: Result<Vec<Suggestion>, String>,
+    result: anyhow::Result<Vec<Suggestion>>,
 }
 
 pub struct SearchBox {
@@ -58,6 +59,7 @@ pub struct SearchBox {
     theme: Theme,
     generation: Arc<AtomicU64>,
     jobs: async_channel::Sender<SuggestionRequest>,
+    // Retain it until the query is invalidated so session renewal can resume it.
     debounce: Option<Task<()>>,
     _subscriptions: [Subscription; 3],
 }
@@ -72,7 +74,6 @@ impl SearchBox {
         let (jobs, completed, error) = suggestion_workers(&generation, |request| {
             Catalog::with_session(request.session.clone())
                 .and_then(|catalog| catalog.suggestions(&request.query))
-                .map_err(|error| format!("{error:#}"))
         });
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(result) = completed.recv().await {
@@ -154,6 +155,61 @@ impl SearchBox {
         self.invalidate(cx);
     }
 
+    /// Retry only the focused query owned by the verified previous session.
+    pub(crate) fn renew_session(
+        &mut self,
+        previous: Option<&Arc<Session>>,
+        next: Arc<Session>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retry = self.debounce.is_some()
+            && previous.is_some_and(|previous| {
+                same_session(self.session.as_ref(), Some(previous)) && !Arc::ptr_eq(previous, &next)
+            })
+            && self.focus_handle(cx).is_focused(window);
+        self.set_session(Some(next), cx);
+        if retry {
+            self.request_suggestions(window, cx);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn intercept_requests(
+        &mut self,
+    ) -> impl Fn() -> Option<(String, Option<Arc<Session>>)> + 'static + use<> {
+        let (jobs, requests) = async_channel::bounded::<SuggestionRequest>(1);
+        self.jobs.close();
+        self.jobs = jobs;
+        move || {
+            requests
+                .try_recv()
+                .ok()
+                .map(|request| (request.query, request.session))
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn reject_test_suggestion(
+        &mut self,
+        session: Arc<Session>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.received(
+            SuggestionResult {
+                request: SuggestionRequest {
+                    id: self.generation.load(Ordering::Acquire),
+                    query: self.input.read(cx).value().trim().to_owned(),
+                    session: Some(session),
+                },
+                result: Err(auth::RejectedSession.into()),
+            },
+            window,
+            cx,
+        );
+    }
+
     fn invalidate(&mut self, cx: &mut Context<Self>) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.debounce = None;
@@ -165,6 +221,10 @@ impl SearchBox {
 
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.invalidate(cx);
+        self.request_suggestions(window, cx);
+    }
+
+    fn request_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.input.read(cx).value().trim().to_owned();
         if query.is_empty() {
             return;
@@ -209,7 +269,14 @@ impl SearchBox {
                 self.suggestions = suggestions;
                 self.error = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                if auth::session_was_rejected(&error)
+                    && let Some(session) = result.request.session
+                {
+                    cx.emit(SearchBoxEvent::SessionRejected(session));
+                }
+                self.error = Some(format!("{error:#}"));
+            }
         }
         self.selected = None;
         cx.notify();
@@ -491,7 +558,7 @@ impl Render for SearchBox {
 
 fn suggestion_workers(
     generation: &Arc<AtomicU64>,
-    lookup: impl Fn(&SuggestionRequest) -> Result<Vec<Suggestion>, String> + Clone + Send + 'static,
+    lookup: impl Fn(&SuggestionRequest) -> anyhow::Result<Vec<Suggestion>> + Clone + Send + 'static,
 ) -> (
     async_channel::Sender<SuggestionRequest>,
     async_channel::Receiver<SuggestionResult>,
