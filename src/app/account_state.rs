@@ -992,17 +992,16 @@ impl Music {
                             }
                             Effect::AlreadyAdded => {
                                 if let Mutation::AddToPlaylist { id, video_ids, .. } = mutation {
-                                    if self.overlay.is_some() {
-                                        self.close_overlay(window, cx);
-                                    }
-                                    self.overlay_return_focus = window.focused(cx);
-                                    self.overlay = Some(Overlay::AlreadyAdded {
-                                        id,
-                                        video_ids,
-                                        sources,
-                                        error: None,
-                                    });
-                                    window.focus(&self.overlay_focus, cx);
+                                    self.open_overlay(
+                                        Overlay::AlreadyAdded {
+                                            id,
+                                            video_ids,
+                                            sources,
+                                            error: None,
+                                        },
+                                        window,
+                                        cx,
+                                    );
                                 }
                             }
                             Effect::PlaylistAdded { additions, toast } => {
@@ -1093,7 +1092,7 @@ impl Music {
                     return;
                 }
                 if keyring_unavailable {
-                    self.overlay = Some(Overlay::NoKeyring(session));
+                    self.open_overlay(Overlay::NoKeyring(session), window, cx);
                 } else if let Err(error) = result {
                     self.error = Some(format!(
                         "Connected for this session, but the account was not saved: {error}"

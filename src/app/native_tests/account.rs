@@ -1449,27 +1449,66 @@ fn rejected_early_read_discards_both_results_before_verification() -> Result<()>
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn missing_keyring_offers_to_save_the_session_in_a_file() -> Result<()> {
+    use gpui::Focusable;
+
     startup_window(Startup::Guest, async |window, commands, cx| {
         let current = session("no-keyring");
-        window
+        let search = window
             .update(cx, |view, window, cx| {
                 *view.session.write().unwrap() = Some(current.clone());
                 view.account = Some(connection(current.clone()));
-                view.account_event(
-                    account::Event::Persisted {
-                        session: current.clone(),
-                        result: Err("No desktop keyring is running".into()),
-                        keyring_unavailable: true,
-                    },
-                    window,
-                    cx,
-                );
-                assert!(
-                    matches!(&view.overlay, Some(Overlay::NoKeyring(offered)) if Arc::ptr_eq(offered, &current))
-                );
-                assert!(view.error.is_none());
+                view.search.update(cx, |search, cx| {
+                    search.set_query("An unfinished search".into(), cx);
+                });
+                let search = view.search.focus_handle(cx);
+                window.focus(&search, cx);
+                search
             })
             .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+
+        let offer_storage = |cx: &mut gpui::AsyncApp| {
+            window
+                .update(cx, |view, window, cx| {
+                    view.account_event(
+                        account::Event::Persisted {
+                            session: current.clone(),
+                            result: Err("No desktop keyring is running".into()),
+                            keyring_unavailable: true,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        matches!(&view.overlay, Some(Overlay::NoKeyring(offered)) if Arc::ptr_eq(offered, &current))
+                    );
+                    assert!(view.error.is_none());
+                })
+                .unwrap();
+        };
+        offer_storage(cx);
+        super::render::wait_for_presented_frame(window, cx).await;
+        super::render::key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    !matches!(view.route, Route::Search(_)),
+                    "Enter must not submit a search behind the account-storage prompt"
+                );
+                assert!(matches!(view.overlay, Some(Overlay::NoKeyring(_))));
+                assert!(commands.is_empty());
+            })
+            .unwrap();
+        super::render::key(window, cx, "escape").await;
+        window
+            .update(cx, |view, window, _| {
+                assert!(view.overlay.is_none());
+                assert!(search.is_focused(window));
+                assert!(commands.is_empty());
+            })
+            .unwrap();
+
+        offer_storage(cx);
         super::render::wait_for_presented_frame(window, cx).await;
         for key in ["tab", "tab", "enter"] {
             super::render::key(window, cx, key).await;
