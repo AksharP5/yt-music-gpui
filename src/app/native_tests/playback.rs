@@ -401,6 +401,9 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
             bool::try_from(value).unwrap()
         };
 
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        let mut available = previous();
         for (seconds, expected) in [
             (2.75, false),
             (3., false),
@@ -408,6 +411,9 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
             (3., false),
             (3.25, true),
         ] {
+            let renders = window
+                .update(cx, |view, _, cx| view.player_bar.read(cx).renders)
+                .unwrap();
             window
                 .update(cx, |view, _, cx| {
                     view.player_event(
@@ -420,6 +426,18 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
                 })
                 .unwrap();
             assert_eq!(previous(), expected, "Previous at {seconds} seconds");
+            super::render::wait_for_presented_frame(window, cx).await;
+            if available != expected {
+                window
+                    .update(cx, |view, _, cx| {
+                        assert!(
+                            view.player_bar.read(cx).renders > renders,
+                            "Previous must redraw when its availability changes at {seconds} seconds"
+                        );
+                    })
+                    .unwrap();
+            }
+            available = expected;
         }
 
         window
@@ -459,6 +477,58 @@ fn desktop_previous_follows_the_restart_position() -> Result<()> {
             })
             .unwrap();
         assert!(previous(), "A later queue row always has a previous row");
+
+        window
+            .update(cx, |view, window, cx| {
+                view.active_id = None;
+                view.playback = Playback::Stopped;
+                view.library.queue.select(0);
+                let restored = crate::library::LastPosition {
+                    track_id: view.library.queue.current().unwrap().id.clone(),
+                    seconds: 2.,
+                };
+                view.position = restored.seconds;
+                view.listening.restored = Some(restored.clone());
+                view.library.last_position = Some(restored);
+                view.publish_desktop();
+                window.focus(&view.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        assert!(!previous());
+        super::render::key(window, cx, "k").await;
+        cx.update_window(window.into(), |_, window, cx| {
+            let position = point(px(26.), window.viewport_size().height - px(36.));
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    button: gpui::MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    button: gpui::MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.playback_position(), 2.);
+                assert_eq!(view.library.last_position.as_ref().unwrap().seconds, 2.);
+                assert_eq!(view.library.queue.index, Some(0));
+                assert!(!view.player_open);
+            })
+            .unwrap();
     })
 }
 
