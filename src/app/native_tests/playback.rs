@@ -177,6 +177,61 @@ async fn start_test_desktop_controls(
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
+fn desktop_metadata_follows_stopped_queue_selection() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        let connection = start_test_desktop_controls(window, cx).await;
+        window
+            .update(cx, |view, window, cx| {
+                let mut tracks = continuation_page(0..3, None).tracks();
+                tracks[0].duration = Some(232);
+                tracks[1].duration = Some(83);
+                tracks[2].duration = None;
+                view.library.queue.replace(tracks, 0);
+                view.duration = 232.;
+                view.publish_desktop();
+                window.focus(&view.focus, cx);
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+
+        let player = zbus::blocking::proxy::Builder::<zbus::blocking::Proxy<'_>>::new(&connection)
+            .destination(DESKTOP_PLAYER_NAME)
+            .unwrap()
+            .path("/org/mpris/MediaPlayer2")
+            .unwrap()
+            .interface("org.mpris.MediaPlayer2.Player")
+            .unwrap()
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .unwrap();
+        for (key, title, duration) in [
+            ("j", "Song 2", Some(83_000_000)),
+            ("j", "Song 3", None),
+            ("k", "Song 2", Some(83_000_000)),
+            ("k", "Song 1", Some(232_000_000)),
+        ] {
+            super::render::key(window, cx, key).await;
+            let metadata: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+                player.get_property("Metadata").unwrap();
+            assert_eq!(<&str>::try_from(&metadata["xesam:title"]).unwrap(), title);
+            assert_eq!(
+                metadata
+                    .get("mpris:length")
+                    .map(|length| i64::try_from(length).unwrap()),
+                duration
+            );
+            assert_eq!(
+                player.get_property::<String>("PlaybackStatus").unwrap(),
+                "Stopped"
+            );
+            assert_eq!(player.get_property::<i64>("Position").unwrap(), 0);
+        }
+    })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic playback only"]
 fn desktop_previous_follows_the_restart_position() -> Result<()> {
     use crate::{app::playback::SeekIntent, player::PlayerEvent};
 
