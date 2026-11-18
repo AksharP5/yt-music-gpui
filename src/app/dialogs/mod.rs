@@ -1298,7 +1298,6 @@ impl Music {
                         "playlist-choices",
                         count,
                         cx.processor(|view, range: std::ops::Range<usize>, window, cx| {
-                            let start = range.start;
                             let measuring = range == (0..1);
                             let choices = view.playlist_picker_choices().rows(range);
                             // Row zero also serves the uniform list's sizing pass.
@@ -1309,14 +1308,12 @@ impl Music {
                             }
                             choices
                                 .into_iter()
-                                .enumerate()
-                                .map(|(offset, choice)| {
-                                    let index = start + offset;
+                                .map(|choice| {
                                     let cover = choice.thumbnail.as_deref().and_then(|url| {
                                         view.artwork
                                             .get(url, size(px(PICKER_COVER), px(PICKER_COVER)))
                                     });
-                                    let destination = choice.target.clone();
+                                    let destination = choice.target;
                                     let privacy = choice.privacy.map(|privacy| match privacy {
                                         Privacy::Private => "Private",
                                         Privacy::Unlisted => "Unlisted",
@@ -1330,7 +1327,15 @@ impl Music {
                                         (None, _) => choice.byline.clone(),
                                     };
                                     div()
-                                        .id(("playlist-choice", index))
+                                        // A service reply can reorder rows between mouse-down and mouse-up.
+                                        .id(match &destination {
+                                            Destination::Playlist(id) => {
+                                                ElementId::from(format!("save-destination-{id}"))
+                                            }
+                                            Destination::LikedMusic => {
+                                                ElementId::from("save-liked-music")
+                                            }
+                                        })
                                         .keyboard_control(view.theme)
                                         .track_focus(
                                             &view.picker_focus.handle(destination.clone(), cx),
