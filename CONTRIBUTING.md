@@ -27,6 +27,8 @@ bin/install
 
 `bin/install` copies the app to `~/.local/bin` and the launcher, icon and licenses under `${XDG_DATA_HOME:-~/.local/share}`. It does not install dependencies or the reviewed yt-dlp; with any other yt-dlp version, signed-in lookups fall back to guest extraction. Signed-in playback also needs Deno; Node, Bun and QuickJS are never used (see [SECURITY.md](SECURITY.md)).
 
+`yt-music-gpui --version` prints the app version on the first line, followed by the detected yt-dlp and Deno paths. Use `yt-music-gpui --version | head -n 1` for just the version line.
+
 ## How playback works
 
 A clicked song first uses a native, cookie-free player request that skips the watch page and doesn't wait on yt-dlp. The next song is prepared in the background; when signed in with High audio quality, that uses your account through yt-dlp to keep Premium audio. Video above 1080p also uses yt-dlp. If the native request fails or needs JavaScript to decode a stream URL, the same play falls back to yt-dlp, and a stream that fails to open retries through yt-dlp.
