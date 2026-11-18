@@ -638,3 +638,96 @@ fn confirming_suggestion_add_does_not_focus_a_different_song() -> Result<()> {
         );
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn duplicate_dialog_keeps_enter_off_the_background_suggestion() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        let (pending, focus) = window
+            .update(cx, |view, window, cx| {
+                let (commands, pending) = async_channel::bounded(4);
+                view.account_commands = commands;
+                view.navigate(
+                    Route::Browse(BrowseLink::new("VLsuggestions", "Suggestions fixture")),
+                    cx,
+                );
+                reply(view, playlist(view, 0), cx);
+                let read = view.catalog_requests.pending.try_recv().unwrap();
+                deliver(view, read, Ok(batch(view, "Suggestion")), window, cx);
+                let focus = view.suggestions.as_ref().unwrap().tracks[0].controls[1].clone();
+                (pending, focus)
+            })
+            .unwrap();
+
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, cx| window.focus(&focus, cx))
+            .unwrap();
+        for close_with_escape in [true, false] {
+            super::render::key(window, cx, "enter").await;
+            window
+                .update(cx, |view, window, cx| {
+                    let account::Command::Apply { session, mutation } = pending.try_recv().unwrap()
+                    else {
+                        panic!("Expected Add to playlist");
+                    };
+                    assert!(matches!(
+                        *mutation,
+                        Mutation::AddToPlaylist {
+                            duplicates: false,
+                            ..
+                        }
+                    ));
+                    view.account_event(
+                        account::Event::Applied {
+                            session,
+                            mutation,
+                            result: Ok(Effect::AlreadyAdded),
+                            session_rejected: false,
+                        },
+                        window,
+                        cx,
+                    );
+                })
+                .unwrap();
+            super::render::wait_for_presented_frame(window, cx).await;
+            super::render::key(window, cx, "enter").await;
+
+            assert!(
+                pending.is_empty(),
+                "Enter must not resubmit Add on the song behind the confirmation"
+            );
+            window
+                .update(cx, |view, _, _| {
+                    assert!(matches!(view.overlay, Some(Overlay::AlreadyAdded { .. })));
+                })
+                .unwrap();
+            if close_with_escape {
+                super::render::key(window, cx, "escape").await;
+                window
+                    .update(cx, |view, window, _| {
+                        assert!(view.overlay.is_none());
+                        assert!(focus.is_focused(window));
+                    })
+                    .unwrap();
+            }
+        }
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "tab").await;
+        super::render::key(window, cx, "enter").await;
+        let account::Command::Apply { mutation, .. } = pending.try_recv().unwrap() else {
+            panic!("Expected Add anyway");
+        };
+        assert!(matches!(
+            *mutation,
+            Mutation::AddToPlaylist {
+                duplicates: true,
+                ..
+            }
+        ));
+        assert!(pending.is_empty());
+        window
+            .update(cx, |view, _, _| assert!(view.overlay.is_none()))
+            .unwrap();
+    })
+}
