@@ -702,8 +702,10 @@ impl Music {
         match loaded.and_then(|loaded| loaded.result.as_ref()) {
             Some(Ok(SongText::Related(_))) => {}
             Some(Err(error)) => return related_message(error.clone(), self.theme),
-            Some(Ok(_)) => return related_message("Nothing related yet".into(), self.theme),
-            None => return related_message("Loading…".into(), self.theme),
+            None if loaded.is_some() || self.current_watch().is_none() => {
+                return related_message("Loading…".into(), self.theme);
+            }
+            Some(Ok(_)) | None => return related_message("Nothing related yet".into(), self.theme),
         }
         list(
             self.player_page.related_list.clone(),

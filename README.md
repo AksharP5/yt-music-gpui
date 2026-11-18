@@ -90,6 +90,8 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 
 Right-click a song, card or collection for its menu. Use ↑ and ↓ to move between actions or Home and End to jump to the first or last action. The menu scrolls to the focused action.
 
+The player keeps the selected tab when you change tracks. Related shows a message when YouTube Music doesn't supply recommendations for the new track.
+
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 
 In **Save to playlist**, use Tab and Shift+Tab to move through the destinations. The list scrolls to the focused playlist. Press Enter to choose it.
