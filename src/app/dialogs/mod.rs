@@ -513,8 +513,12 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         if self.overlay.is_none() {
-            self.close_overlay(window, cx);
-            window.focus(&self.focus, cx);
+            // Some actions already dismissed the menu and restored focus.
+            if self.overlay_return_focus.is_some()
+                || self.overlay_focus.contains_focused(window, cx)
+            {
+                self.close_overlay(window, cx);
+            }
             return;
         }
         if previous != self.overlay.as_ref().map(std::mem::discriminant)
