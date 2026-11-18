@@ -565,6 +565,18 @@ impl Music {
         cx.notify();
     }
 
+    fn renew_read_continuations(&mut self, expected: &Arc<Session>, next: &Arc<Session>) {
+        for page in std::iter::once(&mut self.page).chain(
+            self.back
+                .iter_mut()
+                .chain(&mut self.forward)
+                .filter_map(|state| state.page.as_mut()),
+        ) {
+            page.renew_read_continuations(expected, next);
+        }
+        Continuation::renew_optional(&mut self.sync.sidebar_continuation, expected, next);
+    }
+
     pub(in crate::app) fn refresh_remote(&mut self, cx: &mut Context<Self>) {
         self.sync
             .rating_overrides
@@ -846,12 +858,17 @@ impl Music {
                                             // Read continuations belong to the exact session snapshot.
                                             view.page_cache.clear();
                                             view.forward_page = None;
-                                            // Rebind only this verified account's queue; discard other in-flight reads.
+                                            // Discard in-flight reads from the old session. Keep loaded
+                                            // continuations only for this verified account.
                                             for target in CatalogTarget::ALL { view.catalog_requests.cancel(target); }
                                             view.sync.cancel_playlist_refreshes();
-                                            if let Some(expected) = &previous_session
-                                                && let Err(error) = view.queue_source.renew_session(expected, session.clone())
-                                            { view.queue_source.cancel(); view.error = Some(error); }
+                                            if let Some(expected) = &previous_session {
+                                                view.renew_read_continuations(expected, &session);
+                                                if let Err(error) = view.queue_source.renew_session(expected, session.clone()) {
+                                                    view.queue_source.cancel();
+                                                    view.error = Some(error);
+                                                }
+                                            }
                                             view.track_state.cancel();
                                             view.track_state_id = None;
                                             view.song_text.cancel();

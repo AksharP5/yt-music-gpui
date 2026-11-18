@@ -694,6 +694,20 @@ impl Continuation {
         Ok(())
     }
 
+    /// Keep the cursor only if it belonged to the account snapshot just renewed.
+    pub(crate) fn renew_optional(
+        continuation: &mut Option<Self>,
+        expected: &Arc<Session>,
+        next: &Arc<Session>,
+    ) {
+        if continuation
+            .as_mut()
+            .is_some_and(|token| token.renew_session(expected, next).is_err())
+        {
+            *continuation = None;
+        }
+    }
+
     fn require_session(&self, session: Option<&Arc<Session>>) -> Result<()> {
         let matches = match (self.session.as_ref(), session) {
             (None, None) => true,
@@ -766,6 +780,22 @@ pub struct SortChoice {
 }
 
 impl Page {
+    pub(crate) fn renew_read_continuations(
+        &mut self,
+        expected: &Arc<Session>,
+        next: &Arc<Session>,
+    ) {
+        Continuation::renew_optional(&mut self.continuation, expected, next);
+        if let Some(header) = &mut self.header {
+            Continuation::renew_optional(&mut header.suggestions, expected, next);
+        }
+        if let Some(library) = &mut self.library {
+            library
+                .sort
+                .retain_mut(|choice| choice.reload.renew_session(expected, next).is_ok());
+        }
+    }
+
     pub fn track_index(&self, item_index: usize) -> Option<usize> {
         let mut items = self.shelves.iter().flat_map(|shelf| &shelf.items);
         let preceding = items
