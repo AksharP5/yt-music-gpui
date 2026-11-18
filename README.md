@@ -88,7 +88,7 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 | ? | Keyboard shortcuts |
 | Ctrl Q | Quit |
 
-Right-click a song, card or collection for its menu.
+Right-click a song, card or collection for its menu. Use ↑ and ↓ to move between actions or Home and End to jump to the first or last action. The menu scrolls to the focused action.
 
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 

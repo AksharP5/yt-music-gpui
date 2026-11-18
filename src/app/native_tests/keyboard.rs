@@ -325,3 +325,116 @@ fn country_arrows_choose_the_highlighted_country_after_tabbing_into_rows() -> an
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn compact_playlist_menu_focus_reveals_the_last_action() -> anyhow::Result<()> {
+    use crate::{
+        app::Music,
+        catalog::{Chapter, EpisodeContext, Item},
+    };
+    use gpui::{px, size};
+
+    check_cache_window(async |window, cx| {
+        let visible = |view: &Music, child| {
+            let scroll = &view.menu_scroll;
+            let row = scroll.bounds_for_item(child).unwrap();
+            let offset = scroll.offset().y;
+            row.top() + offset >= scroll.bounds().top()
+                && row.bottom() + offset <= scroll.bounds().bottom()
+        };
+
+        // The podcast menu has a subtitle above its actions.
+        for (episode, first, last) in [(false, 1, 12), (true, 2, 14)] {
+            window
+                .update(cx, |view, window, cx| {
+                    window.resize(size(px(850.), px(560.)));
+                    view.route = Route::Browse(BrowseLink::new("VLcompact", "Editable playlist"));
+                    view.page = crate::app::sync::tests::response(
+                        &[("Songs", vec![0, 1, 2, 3])],
+                        None,
+                        true,
+                    );
+                    view.page.editable = true;
+                    let Item::Track(song) = &mut view.page.shelves[0].items[1] else {
+                        panic!("Expected a song");
+                    };
+                    song.details.add_library = Some("test-save".into());
+                    song.details.album_id = Some("MPREcompact".into());
+                    song.details.artist_id = Some("UCcompact".into());
+                    if episode {
+                        song.details.episode = Some(Box::new(EpisodeContext {
+                            show_id: Some("MPSPcompact".into()),
+                            subtitle: "Synthetic podcast episode".into(),
+                            chapters: vec![Chapter {
+                                title: "Opening chapter".into(),
+                                start_seconds: 0,
+                            }],
+                            ..Default::default()
+                        }));
+                    }
+
+                    view.rebuild_rows();
+                    cx.notify();
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(365.), px(250.)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            window
+                .update(cx, |view, window, cx| view.open_item_menu(1, window, cx))
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+
+            window
+                .update(cx, |view, window, _| {
+                    assert_eq!(window.viewport_size(), size(px(850.), px(560.)));
+                    assert!(visible(view, first));
+                    assert!(!visible(view, last));
+                    assert!(view.menu_scroll.bounds_for_item(last + 1).is_none());
+                })
+                .unwrap();
+            key(window, cx, "end").await;
+            window
+                .update(cx, |view, _, _| {
+                    assert!(visible(view, last), "End must reveal Share");
+                })
+                .unwrap();
+            key(window, cx, "home").await;
+            window
+                .update(cx, |view, _, _| {
+                    assert!(visible(view, first), "Home must reveal the first action");
+                })
+                .unwrap();
+            key(window, cx, "shift-tab").await;
+            window
+                .update(cx, |view, _, _| {
+                    assert!(
+                        visible(view, last),
+                        "Shift+Tab must reveal the wrapped focus"
+                    );
+                })
+                .unwrap();
+            key(window, cx, "escape").await;
+            window
+                .update(cx, |view, window, cx| view.open_item_menu(1, window, cx))
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(view.menu_scroll.offset().y, px(0.));
+                    assert!(visible(view, first));
+                })
+                .unwrap();
+            key(window, cx, "escape").await;
+        }
+    })
+}

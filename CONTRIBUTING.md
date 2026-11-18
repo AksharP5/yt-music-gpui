@@ -160,6 +160,8 @@ No test signs in to a real Google account. Do not add one that does.
 
 Search suggestions allow two active reads and keep only the latest queued query. A slow earlier read can finish in the background while the current query shows its suggestions. Results still require the exact query and session. The worker test holds the older read until the new response arrives and checks that the older response is discarded. An explicit session rejection uses the normal reconnect path. After verified renewal, the focused query retries with the updated session. The native search check exercises this with a synthetic account.
 
+At 850 × 560, the native keyboard check opens long song and podcast episode menus, including the episode subtitle. It verifies that End, Home and backward Tab reveal the focused action, and that reopening starts at the top.
+
 The search suggestions panel follows the field's width and scrolls when the rows exceed the available window height. Native X11 checks at 850 × 560 verify clicks inside and outside the panel and that arrow selection and wheel scrolling reveal the last row for pointer input.
 
 ## Player waits

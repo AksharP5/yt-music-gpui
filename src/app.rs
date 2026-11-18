@@ -180,6 +180,7 @@ pub struct Music {
     /// The "More options" button whose menu is open, so the menu can align to it.
     overlay_button: Option<Bounds<Pixels>>,
     overlay_focus: FocusHandle,
+    menu_scroll: ScrollHandle,
     picker_focus: VirtualListFocus<crate::playlist_choices::Destination>,
     picker_scroll: UniformListScrollHandle,
     settings_focus: FocusHandle,
