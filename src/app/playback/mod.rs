@@ -544,11 +544,14 @@ impl Music {
                 .index
                 .and_then(|index| self.library.queue.tracks.get_mut(index))
         {
+            let duration = track.duration.unwrap_or(0) as f64;
             *current = track;
             self.reset_radio();
             self.now_playing = None;
             if self.active_id.is_some() || pending_track {
                 self.play_current_at(position, paused, WatchMode::Details, cx);
+            } else {
+                self.duration = duration;
             }
         } else if changed
             && self.active_id.is_some()
