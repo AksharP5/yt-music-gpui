@@ -535,6 +535,25 @@ fn history_buttons_restore_visited_pages() -> Result<()> {
                 );
             })
             .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.overlay = Some(crate::app::Overlay::Help);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        navigate(gpui::NavigationDirection::Forward, window, cx);
+        window
+            .update(cx, |view, _, cx| {
+                assert!(
+                    matches!(view.route, Route::Explore),
+                    "The dialog blocks mouse Forward"
+                );
+                view.overlay = None;
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
         navigate(gpui::NavigationDirection::Forward, window, cx);
         wait_for_presented_frame(window, cx).await;
         window

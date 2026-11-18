@@ -821,9 +821,6 @@ impl Music {
         direction: NavigationDirection,
         cx: &mut Context<Self>,
     ) {
-        if self.overlay.is_some() || self.sort_menu {
-            return;
-        }
         if direction == NavigationDirection::Back && self.player_open {
             self.focus_after_navigation(cx);
             self.player_open = false;
