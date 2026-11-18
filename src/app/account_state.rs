@@ -1018,13 +1018,14 @@ impl Music {
                                             cx,
                                         );
                                     }
-                                    Mutation::MoveInPlaylist { id, .. } => {
-                                        let order = self.playlist_order_snapshot(id);
+                                    Mutation::MoveInPlaylist {
+                                        id, set_video_id, ..
+                                    } => {
                                         self.refresh_playlist_metadata(
                                             id,
                                             Vec::new(),
                                             None,
-                                            order,
+                                            Some(set_video_id),
                                             cx,
                                         );
                                     }

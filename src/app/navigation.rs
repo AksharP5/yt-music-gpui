@@ -159,6 +159,7 @@ pub(in crate::app) struct CatalogRequests {
     pub(in crate::app) loading: [bool; CatalogTarget::ALL.len()],
     pub(in crate::app) jobs: async_channel::Sender<Job>,
     pub(in crate::app) pending: async_channel::Receiver<Job>,
+    metadata_queue: Option<(async_channel::Sender<Job>, async_channel::Receiver<Job>)>,
     pub(in crate::app) playlist_choices: Option<Choices>,
     pub(in crate::app) playlist_choices_error: Option<String>,
     restoring: Option<RestoringCatalog>,
@@ -171,6 +172,7 @@ impl CatalogRequests {
             loading: [false; CatalogTarget::ALL.len()],
             jobs,
             pending,
+            metadata_queue: None,
             playlist_choices: None,
             playlist_choices_error: None,
             restoring: None,
@@ -290,8 +292,12 @@ impl CatalogRequests {
         let target = query.target();
         self.cancel(target);
         let id = self.generations[target as usize].load(Ordering::Relaxed);
+        let (jobs, pending) = match &self.metadata_queue {
+            Some((jobs, pending)) if target == CatalogTarget::PlaylistMetadata => (jobs, pending),
+            _ => (&self.jobs, &self.pending),
+        };
         let mut other = Vec::with_capacity(CatalogTarget::ALL.len() - 1);
-        while let Ok(job) = self.pending.try_recv() {
+        while let Ok(job) = pending.try_recv() {
             if job.query.target() != target {
                 other.push(job);
             }
@@ -305,7 +311,7 @@ impl CatalogRequests {
             query,
             session,
         })) {
-            self.jobs.try_send(job).map_err(|_| {
+            jobs.try_send(job).map_err(|_| {
                 "The music connection stopped. Restart the app to reconnect.".to_owned()
             })?;
         }
@@ -1003,7 +1009,7 @@ impl Music {
                                 .append_rows(self.list_rows.len() - previous_rows);
                         }
                     }
-                    self.update_playlist_order_snapshot();
+                    self.update_playlist_rows_snapshot();
                 } else {
                     self.sync.page_coverage = retained_coverage.unwrap_or(sync::PageCoverage {
                         first_page_len: page.shelves.len(),
@@ -1053,133 +1059,134 @@ impl CatalogRequests {
         clippy::expect_used,
         reason = "the app cannot run without this worker, and spawning one fails only when the OS is out of threads"
     )]
+    fn start_workers(
+        mut self,
+        run_worker: impl Fn(async_channel::Receiver<Job>) + Clone + Send + 'static,
+    ) -> Self {
+        let (jobs, pending) = async_channel::bounded(1);
+        // Startup sends Home and the sidebar before verification. A third
+        // foreground worker can load a replacement even when both are blocked.
+        // Metadata readback can poll for an edit, so it has its own worker.
+        let workers = (0..3)
+            .map(|worker| (format!("catalog-{worker}"), self.pending.clone()))
+            .chain([("catalog-metadata".to_owned(), pending.clone())]);
+        for (name, receiver) in workers {
+            let run_worker = run_worker.clone();
+            thread::Builder::new()
+                .name(name)
+                .spawn(move || run_worker(receiver))
+                .expect("start catalog worker");
+        }
+        self.metadata_queue = Some((jobs, pending));
+        self
+    }
+
     pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
         let catalog_requests = CatalogRequests::new();
         let (results, completed) = async_channel::unbounded::<CatalogEvent>();
-        // Blocking reads can't be interrupted once discarded. Startup sends Home
-        // and the sidebar before verification, so keep a worker beyond those two
-        // free for whatever replaces them (the guest fallback or the next page).
-        for worker in 0..3 {
-            let receiver = catalog_requests.pending.clone();
-            let results = results.clone();
-            let generations = catalog_requests.generations.clone();
-            thread::Builder::new()
-                .name(format!("catalog-{worker}"))
-                .spawn(move || {
-                    let catalog = Catalog::new();
-                    while let Ok(job) = receiver.recv_blocking() {
-                        let target = job.query.target();
-                        if generations[target as usize].load(Ordering::Relaxed) != job.id {
-                            continue;
-                        }
-                        if let Query::PlaylistChoices(video_ids) = &job.query {
-                            let result = catalog
-                                .as_ref()
-                                .map_err(|error| anyhow::anyhow!("{error:#}"))
-                                .and_then(|catalog| {
-                                    catalog
-                                        .for_session(job.session.clone())
-                                        .playlist_choices(video_ids)
-                                });
-                            if generations[target as usize].load(Ordering::Relaxed) != job.id {
-                                continue;
-                            }
-                            let session_rejected =
-                                result.as_ref().is_err_and(auth::session_was_rejected);
-                            if results
-                                .send_blocking(CatalogEvent::PlaylistChoices(Box::new(
-                                    PlaylistChoicesResult {
-                                        job,
-                                        result: result.map_err(|error| format!("{error:#}")),
-                                        session_rejected,
-                                    },
-                                )))
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                        let append =
-                            matches!(job.query, Query::More { .. } | Query::SidebarMore(_));
-                        let revalidate = matches!(job.query, Query::Revalidate(_));
-                        let query = match &job.query {
-                            Query::Revalidate(query) => query.as_ref(),
-                            query => query,
-                        };
-                        let result = match &catalog {
-                            Err(e) => Err(anyhow::anyhow!("{e:#}")),
-                            Ok(catalog) => {
-                                let catalog = catalog.for_session(job.session);
-                                match query {
-                                    Query::Home => catalog.home(),
-                                    Query::Explore => catalog.explore(),
-                                    Query::Library(section) => catalog.library(*section),
-                                    Query::SidebarPlaylists => catalog.library(Section::Playlists),
-                                    Query::SidebarMore(token) | Query::Reload(token) => {
-                                        catalog.more(token)
-                                    }
-                                    Query::Revalidate(_) => {
-                                        Err(anyhow::anyhow!("Nested revalidation"))
-                                    }
-                                    Query::PlaylistChoices(_) => {
-                                        Err(anyhow::anyhow!("Invalid playlist destination request"))
-                                    }
-                                    Query::PlaylistMetadata(refresh) => catalog.playlist_metadata(
-                                        &refresh.id,
-                                        &refresh.additions,
-                                        &refresh.removals,
-                                        refresh.order.as_ref().map(|order| &order.page),
-                                        || {
-                                            generations[target as usize].load(Ordering::Relaxed)
-                                                == job.id
-                                        },
-                                    ),
-                                    Query::Search(search) => catalog.search_filtered(
-                                        &search.query,
-                                        search.filter,
-                                        search.scope,
-                                    ),
-                                    Query::Browse(link) => catalog.browse(link),
-                                    Query::More {
-                                        token,
-                                        search: Some(search),
-                                    } => catalog.search_more(
-                                        &search.query,
-                                        search.filter,
-                                        search.scope,
-                                        token,
-                                    ),
-                                    Query::More {
-                                        token,
-                                        search: None,
-                                    } => catalog.more(token),
-                                }
-                            }
-                        };
-                        let session_rejected =
-                            result.as_ref().is_err_and(auth::session_was_rejected);
-                        let result = result.map_err(|error| format!("{error:#}"));
-                        if results
-                            .send_blocking(CatalogEvent::Page(Box::new(CatalogResult {
-                                id: job.id,
-                                account_revision: job.account_revision,
-                                account_generation: job.account_generation,
-                                history_generation: job.history_generation,
-                                append,
-                                revalidate,
-                                result,
+        let generations = catalog_requests.generations.clone();
+        let catalog_requests = catalog_requests.start_workers(move |receiver| {
+            let mut catalog = None;
+            while let Ok(job) = receiver.recv_blocking() {
+                let target = job.query.target();
+                if generations[target as usize].load(Ordering::Relaxed) != job.id {
+                    continue;
+                }
+                let catalog = catalog.get_or_insert_with(Catalog::new);
+                if let Query::PlaylistChoices(video_ids) = &job.query {
+                    let result = catalog
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))
+                        .and_then(|catalog| {
+                            catalog
+                                .for_session(job.session.clone())
+                                .playlist_choices(video_ids)
+                        });
+                    if generations[target as usize].load(Ordering::Relaxed) != job.id {
+                        continue;
+                    }
+                    let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                    if results
+                        .send_blocking(CatalogEvent::PlaylistChoices(Box::new(
+                            PlaylistChoicesResult {
+                                job,
+                                result: result.map_err(|error| format!("{error:#}")),
                                 session_rejected,
-                                target,
-                            })))
-                            .is_err()
-                        {
-                            break;
+                            },
+                        )))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                let append = matches!(job.query, Query::More { .. } | Query::SidebarMore(_));
+                let revalidate = matches!(job.query, Query::Revalidate(_));
+                let query = match &job.query {
+                    Query::Revalidate(query) => query.as_ref(),
+                    query => query,
+                };
+                let result = match catalog {
+                    Err(e) => Err(anyhow::anyhow!("{e:#}")),
+                    Ok(catalog) => {
+                        let catalog = catalog.for_session(job.session);
+                        match query {
+                            Query::Home => catalog.home(),
+                            Query::Explore => catalog.explore(),
+                            Query::Library(section) => catalog.library(*section),
+                            Query::SidebarPlaylists => catalog.library(Section::Playlists),
+                            Query::SidebarMore(token) | Query::Reload(token) => catalog.more(token),
+                            Query::Revalidate(_) => Err(anyhow::anyhow!("Nested revalidation")),
+                            Query::PlaylistChoices(_) => {
+                                Err(anyhow::anyhow!("Invalid playlist destination request"))
+                            }
+                            Query::PlaylistMetadata(refresh) => catalog.playlist_metadata(
+                                &refresh.id,
+                                &refresh.additions,
+                                &refresh.removals,
+                                refresh.order_page(),
+                                || generations[target as usize].load(Ordering::Relaxed) == job.id,
+                            ),
+                            Query::Search(search) => {
+                                catalog.search_filtered(&search.query, search.filter, search.scope)
+                            }
+                            Query::Browse(link) => catalog.browse(link),
+                            Query::More {
+                                token,
+                                search: Some(search),
+                            } => catalog.search_more(
+                                &search.query,
+                                search.filter,
+                                search.scope,
+                                token,
+                            ),
+                            Query::More {
+                                token,
+                                search: None,
+                            } => catalog.more(token),
                         }
                     }
-                })
-                .expect("start catalog worker");
-        }
+                };
+                let session_rejected = result.as_ref().is_err_and(auth::session_was_rejected);
+                let result = result.map_err(|error| format!("{error:#}"));
+                if results
+                    .send_blocking(CatalogEvent::Page(Box::new(CatalogResult {
+                        id: job.id,
+                        account_revision: job.account_revision,
+                        account_generation: job.account_generation,
+                        history_generation: job.history_generation,
+                        append,
+                        revalidate,
+                        result,
+                        session_rejected,
+                        target,
+                    })))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(result) = completed.recv().await {
                 if view
@@ -1252,7 +1259,11 @@ fn local_library_filters(selected: Option<Section>) -> LibraryFilters {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOCAL_SECTIONS, Route, Section, local_library_filters, local_section};
+    use super::{
+        BrowseLink, CatalogRequests, Duration, LOCAL_SECTIONS, Query, Route, Section,
+        local_library_filters, local_section, sync,
+    };
+    use std::sync::mpsc;
 
     #[test]
     fn guest_library_chips_stay_on_local_routes() {
@@ -1274,5 +1285,56 @@ mod tests {
         ] {
             assert_eq!(local_section(id), section);
         }
+    }
+
+    #[test]
+    fn playlist_metadata_does_not_delay_a_replacement_page() {
+        let (started, observed) = mpsc::channel();
+        let (release, blocked) = async_channel::bounded::<()>(1);
+        let playlist = BrowseLink::new("VLplaylist", "Playlist");
+        let mut requests = CatalogRequests::new().start_workers(move |receiver| {
+            while let Ok(job) = receiver.recv_blocking() {
+                let replacement = matches!(job.query, Query::Revalidate(_));
+                if started.send(job).is_err() {
+                    break;
+                }
+                if !replacement {
+                    let _ = blocked.recv_blocking();
+                }
+            }
+        });
+        for query in [
+            Query::PlaylistMetadata(sync::PlaylistRefresh {
+                id: "playlist".into(),
+                additions: Vec::new(),
+                removals: Vec::new(),
+                rows: None,
+                moved: false,
+                account_generation: 0,
+            }),
+            Query::Browse(playlist.clone()),
+            Query::SidebarPlaylists,
+        ] {
+            let target = query.target();
+            requests.request(query, 0, 0, 0, None).unwrap();
+            let job = observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("each read must enter its worker");
+            assert!(job.query.target() == target);
+        }
+        requests
+            .request(
+                Query::Revalidate(Box::new(Query::Browse(playlist))),
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        let job = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Reload must start while metadata, the old page, and the sidebar are blocked");
+        assert!(matches!(job.query, Query::Revalidate(_)));
+        drop(release);
     }
 }

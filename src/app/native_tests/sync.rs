@@ -574,8 +574,12 @@ fn playlist_reload_keeps_a_known_added_row_when_readback_fails() -> Result<()> {
     super::navigation::check_cache_window(async |window, cx| {
         window
             .update(cx, |view, window, cx| {
-                for partial in [false, true] {
-                    let id = if partial { "beta" } else { "alpha" };
+                for (id, partial, order) in [
+                    ("complete", false, "page-first"),
+                    ("partial", true, "page-first"),
+                    ("metadata-first", true, "metadata-first"),
+                    ("already-failed", true, "already-failed"),
+                ] {
                     view.navigate(Route::Browse(BrowseLink::new(format!("VL{id}"), id)), cx);
                     let original = if partial { 100 } else { 1 };
                     if partial {
@@ -609,11 +613,17 @@ fn playlist_reload_keeps_a_known_added_row_when_readback_fails() -> Result<()> {
                         window,
                         cx,
                     );
-                    let metadata = view.catalog_requests.pending.try_recv().unwrap();
+                    let mut metadata = Some(view.catalog_requests.pending.try_recv().unwrap());
                     assert_eq!(view.rows.len(), original + 1);
+                    if order == "already-failed" {
+                        deliver(view, metadata.take().unwrap(), Err("Readback failed; refresh the playlist".into()), cx);
+                    }
                     let (page_read, guide_read) = reload_jobs(view, cx);
+                    if order == "metadata-first" {
+                        deliver(view, metadata.take().unwrap(), Ok(playlist(50, true, "101 tracks")), cx);
+                    }
                     let stale = if partial {
-                        playlist(50, true, "100 tracks")
+                        playlist(50, true, if order == "already-failed" { "101 tracks" } else { "100 tracks" })
                     } else {
                         playlist(1, false, "1 track")
                     };
@@ -621,14 +631,11 @@ fn playlist_reload_keeps_a_known_added_row_when_readback_fails() -> Result<()> {
                     assert_eq!(
                         view.rows.len(),
                         original + 1,
-                        "A stale Reload must retain the acknowledged added row, partial={partial}"
+                        "A stale Reload must retain the acknowledged added row, partial={partial}, order={order}"
                     );
-                    deliver(
-                        view,
-                        metadata,
-                        Err("Readback failed; refresh the playlist".into()),
-                        cx,
-                    );
+                    if let Some(metadata) = metadata {
+                        deliver(view, metadata, Err("Readback failed; refresh the playlist".into()), cx);
+                    }
                     deliver(view, guide_read, Ok(guide(id, "1 track")), cx);
                     assert_eq!(view.rows.len(), original + 1);
                     assert_eq!(
@@ -642,7 +649,59 @@ fn playlist_reload_keeps_a_known_added_row_when_readback_fails() -> Result<()> {
                         Some("acknowledged-append")
                     );
                     assert!(view.forward_page.as_ref().unwrap().fetched_at.is_none());
+                    if order != "page-first" {
+                        assert_eq!(view.page.header.as_ref().unwrap().stats, "101 tracks");
+                        assert_eq!(view.sidebar_playlists[0].subtitle, "101 tracks");
+                        assert!(view.error.is_none());
+                    }
                 }
+            })
+            .unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-added-retained-after-reload")
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn playlist_reopening_during_a_move_does_not_capture_loading_rows() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        window.update(cx, |view, window, cx| {
+            let route = Route::Browse(BrowseLink::new("VLreopening", "Reopening"));
+            view.navigate(route.clone(), cx);
+            super::navigation::reply(view, playlist(3, false, "3 tracks"), cx);
+            let (commands, pending) = async_channel::bounded(1);
+            view.account_commands = commands;
+            let mutation = Mutation::MoveInPlaylist {
+                id: "reopening".into(),
+                set_video_id: "occurrence-2".into(),
+                before: Some("occurrence-0".into()),
+            };
+            assert!(view.mutate(mutation.clone(), cx));
+            assert!(matches!(pending.try_recv().unwrap(), account::Command::Apply { .. }));
+            view.navigate(route, cx);
+            let browse = view.catalog_requests.pending.try_recv().unwrap();
+            assert!(view.rows.is_empty());
+            assert!(view.page.header.is_none());
+            super::navigation::confirm(view, window, mutation, cx);
+            let metadata = view.catalog_requests.pending.try_recv().unwrap();
+            deliver(view, browse, Ok(playlist(3, false, "3 tracks")), cx);
+            assert_eq!(view.rows.len(), 3, "An acknowledgment during reopening must not replace valid rows with the loading placeholder");
+            assert_eq!(view.rows[0].id(), "00000000002");
+            let mut fresh = playlist(3, false, "3 tracks");
+            fresh.shelves[0].items.rotate_right(1);
+            deliver(view, metadata, Ok(fresh), cx);
+            assert_eq!(view.rows.len(), 3);
+            assert_eq!(view.rows[0].id(), "00000000002");
+        }).unwrap();
+        super::render::wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |_, window, _| {
+                super::render::capture(window, "playlist-reopened-after-move")
             })
             .unwrap();
     })
@@ -1052,7 +1111,7 @@ fn playlist_refreshes_keep_independent_edits_and_scope_failures() -> Result<()> 
             assert!(view.catalog_requests.pending.is_empty());
             deliver(view, older_alpha, Err("Superseded metadata failure".into()), cx);
             let alpha = view.catalog_requests.pending.try_recv().unwrap();
-            assert!(matches!(&alpha.query, Query::PlaylistMetadata(refresh) if refresh.additions.is_empty() && refresh.removals.contains(&"occurrence-0".into()) && refresh.removals.contains(&"new-occurrence".into()) && refresh.order.is_some()), "The single successor retains the removal, move and undone addition");
+            assert!(matches!(&alpha.query, Query::PlaylistMetadata(refresh) if refresh.additions.is_empty() && refresh.removals.contains(&"occurrence-0".into()) && refresh.removals.contains(&"new-occurrence".into()) && refresh.moved && refresh.rows.is_some()), "The single successor retains the removal, move and undone addition");
             assert!(view.error.is_none(), "An obsolete readback cannot publish an error or consume the current refresh");
 
             super::navigation::confirm(view, window, Mutation::EditPlaylist {
