@@ -404,7 +404,10 @@ impl Music {
         let collection = !home && self.page.header.is_some();
         let artist = collection && self.route.is_artist();
         let stacked = collection && !artist && layout.tier >= Tier::Wide;
-        let floating_back = stacked && self.error.is_none() && self.notice.is_none();
+        let floating_back = stacked
+            && self.error.is_none()
+            && self.sync.page_error.is_none()
+            && self.notice.is_none();
         // Library pages open on their chips, without a back button or heading.
         let library = !collection && matches!(self.route, Route::Saved | Route::Library(_));
         let mut content = div()
