@@ -125,6 +125,8 @@ The native account recovery check closes the playback details channel during a d
 
 The native seek check clicks the progress bar and holds a second seek through a song change. Releasing the old drag must keep the replacement song at its own position.
 
+The stacked playlist render check compares the Back button and error banner before and after the general error clears. Both remain visible in their own rows while the page error is retained.
+
 Pixel captures must match the window geometry reported by X11. The capture helper keeps the test window inside the X11 desktop because ImageMagick clips offscreen pixels, including when a popup extends past the last monitor. It preserves the window size and all pixel assertions.
 
 At 956 and 1920 pixels, the render check also verifies search song row spacing, separators and that duration appears only in the byline. Search top-result captures check stacked cards at column widths of 592 and 720 pixels and two-column cards at 860 pixels. At 956, 1280 and 1920 pixels, it captures search and player chrome, including the Autoplay header and hover handles. It opens the compact player controls with a pointer and dismisses them with Escape.
