@@ -98,7 +98,7 @@ If the track changes while you drag the progress bar, the drag ends without seek
 
 The player keeps the selected tab when you change tracks. Lyrics, Comments and Related show when their content is unavailable.
 
-When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected duration when available, including when switching between Song and Video.
+**Add to queue** and **Play next** show the first song in an empty queue. Press Play to start listening. When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected duration when available, including when switching between Song and Video.
 
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 

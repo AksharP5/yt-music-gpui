@@ -109,6 +109,8 @@ While Save to playlist waits for the service, it counts the eligible destination
 
 Save to playlist focuses the dialog from search results, a song menu, or Up next. Escape returns focus to the opener. Tab and Shift+Tab scroll Save to playlist as focus moves through the destinations. If a service reply moves the focused playlist, the picker scrolls to its new position. A click completes only on the same destination where it started. The native checks cover offscreen selection, a reorder that moves the focused row out of view, and a refresh between mouse-down and mouse-up.
 
+The native queue-menu check uses Add to queue and Play next with an empty queue. It checks that the first song is selected without starting playback, that Up next opens, and that older saves with no selected song can be recovered.
+
 The native Back check removes the only song through the Up next menu. The playlist is visible again, and the first Alt+Left must return to the preceding page.
 
 Cancelling New playlist returns focus to the button that opened it. The native sidebar check closes the form with Escape, then presses Enter to open it again.
