@@ -2723,3 +2723,84 @@ fn player_tabs_stop_loading_when_track_details_fail() -> Result<()> {
         );
     })
 }
+
+#[test]
+#[ignore = "requires X11, ImageMagick, private D-Bus and isolated runtime/data"]
+fn stacked_playlist_back_stays_above_a_retained_page_error() -> anyhow::Result<()> {
+    use crate::app::Route;
+    use crate::catalog::BrowseLink;
+    use image::GenericImageView;
+
+    super::navigation::check_cache_window(async |window, cx| {
+        let error = "Could not load more playlist songs";
+        let crop = window
+            .update(cx, |view, window, cx| {
+                window.resize(size(px(1280.), px(800.)));
+                view.sidebar_collapsed = Some(false);
+                view.navigate(Route::Browse(BrowseLink::new("VLPLlayout", "Playlist")), cx);
+                view.catalog_requests.cancel(CatalogTarget::Page);
+                let mut page = crate::app::sync::tests::page(4, false);
+                page.header = crate::catalog::parse_page(
+                    &serde_json::json!({
+                        "header": {"musicResponsiveHeaderRenderer": {"title": {"simpleText": "Playlist"}}},
+                        "contents": []
+                    }),
+                    "Playlist",
+                )
+                .unwrap()
+                .header;
+                view.page = page;
+                view.rebuild_rows();
+                assert!(!view.back.is_empty());
+                view.error = Some(error.into());
+                view.notice = None;
+                cx.notify();
+                let scale = window.scale_factor();
+                let pixels = |logical: f32| (logical * scale).round() as u32;
+                (
+                    pixels(240. + view.page_layout(window).inset - 4.),
+                    pixels(64.),
+                    pixels(320.),
+                    pixels(94.),
+                )
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let reference = window
+            .update(cx, |_, window, _| {
+                capture(window, "playlist-banner-general")
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.error = None;
+                view.sync.page_error = Some(error.into());
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let retained = window
+            .update(cx, |_, window, _| {
+                capture(window, "playlist-banner-retained")
+            })
+            .unwrap();
+        let (x, y, w, h) = crop;
+        let reference = image::imageops::crop_imm(&reference, x, y, w, h);
+        let retained = image::imageops::crop_imm(&retained, x, y, w, h);
+        assert!(
+            reference.pixels().any(|(_, _, pixel)| {
+                pixel[0] >= 200 && pixel[1] >= 130 && pixel[0].saturating_sub(pixel[1]) > 40
+            }),
+            "The reference must contain the visible error text"
+        );
+        let changed = reference
+            .pixels()
+            .zip(retained.pixels())
+            .filter(|((_, _, a), (_, _, b))| a != b)
+            .count();
+        assert_eq!(
+            changed, 0,
+            "Back must stay above the visible banner after the general error clears"
+        );
+    })
+}
