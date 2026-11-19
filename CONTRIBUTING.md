@@ -223,7 +223,7 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with
 
 Keep each pull request to one change. Say what was broken or missing from a user's point of view, how you fixed it, and how you checked it in the running app. Include a screenshot or recording for UI changes.
 
-The Linux performance job compares the stripped release binary and the headless local-playback medians with the pull request's base commit. It uses the reviewed yt-dlp from the candidate for both builds and posts the comparison in the Actions summary. The job fails when the binary exceeds the size cap or grows beyond its per-PR budget and flags playback regressions with warnings because shared runners vary. The permitted increases are in `bin/performance-budget.json`. Run `bin/check-performance BASE_COMMIT` on Linux to reproduce the comparison. You can pass the reviewed yt-dlp zipapp as a second argument to avoid downloading it again.
+The Linux performance job compares the stripped release binary and the headless local-playback medians with the pull request's base commit. It uses the reviewed yt-dlp from the candidate for both builds and posts the comparison in the Actions summary. The job fails when the binary exceeds the size cap or grows beyond its per-PR budget and flags playback regressions with warnings because shared runners vary. The permitted increases are in `bin/performance-budget.json`. The comparison gives each revision its own Cargo fingerprint for the app and shares compiled dependencies. Run `bin/check-performance BASE_COMMIT` on Linux to reproduce it. You can pass the reviewed yt-dlp zipapp as a second argument to avoid downloading it again.
 
 Never commit cookies, account data or keyring contents. Use synthetic values in tests, as the existing ones do.
 
@@ -239,7 +239,7 @@ Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only r
 
 Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` workflow artifact and never creates a release. Before the new workflow reaches `main`, dispatch CI on the branch instead; its dispatch-only `release-test` job calls the same read-only release build workflow. Inspect `dependencies.txt` for direct dynamic dependencies, `ldd` and the highest required glibc symbol version.
 
-The manual preflight summary reports stripped Linux binary size against the branch's common ancestor with `main`. Both builds use `cargo build --release --locked` on the same runner. The summary also lists the sizes of the candidate tarball, Debian package and RPM. It records local guest first-play and warm-switch timings using the same null-audio test described above. Those timings measure local player work and exclude YouTube network latency.
+The manual preflight summary reports stripped Linux binary size against the branch's common ancestor with `main`. Both builds use the locked release profile on the same runner. The base uses a separate app fingerprint. The summary also lists the sizes of the candidate tarball, Debian package and RPM. It records local guest first-play and warm-switch timings using the same null-audio test described above. Those timings measure local player work and exclude YouTube network latency.
 
 Download the artifact and test the installer without touching an existing installation:
 
