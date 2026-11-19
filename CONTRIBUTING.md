@@ -43,6 +43,14 @@ The app hands the account to yt-dlp over the extractor's stdin: one JSON line wi
 
 Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR` (`$TMPDIR` on macOS, `%LOCALAPPDATA%\yt-music-gpui\runtime` on Windows, where mpv listens on a randomly named pipe instead), removed on normal shutdown, SIGTERM and SIGINT (Ctrl+C or Ctrl+Break on Windows). The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json` (`%LOCALAPPDATA%\yt-music-gpui\library.json` on Windows). To sample CPU and memory of a running release build, use `bin/profile APP_PID 30`.
 
+### Profiling a packaged build
+
+Use a fresh guest profile with the same display size, public track and volume. Check the executable checksum and turn off autoplay so each run plays the same selection. Let the window and artwork settle. Sample idle memory, then start playback and sample once the position advances. Run `bin/profile APP_PID 10` for each sample. It sums proportional set size (PSS) and CPU time across the app and its existing child processes.
+
+The v0.2.22 and v0.2.23 comparison used the packaged binaries in a private Wayland session on Omarchy. Each played the same muted track with the Home view visible. Each version ran three times, with build order alternating. The playback PSS ranges were 303.3 to 304.5 MiB on v0.2.22 and 234.1 to 245.0 MiB on v0.2.23. Playback CPU ranged from 1.2% to 1.6% and from 1.1% to 1.3% of one core, respectively.
+
+A separate timing check used the same packaged builds and a two-song guest queue on Omarchy. In each of three fresh sessions per version, it sent desktop Play and timed the first report of at least 50 ms of playback. After two seconds of playback it sent desktop Next and timed the same threshold for the expected track. The app prepares the next queued song while the first plays. Median first Play was 497 ms in v0.2.22 and 483 ms in v0.2.23. Median Next was 54 ms and 55 ms, respectively.
+
 ## Validate
 
 ```sh

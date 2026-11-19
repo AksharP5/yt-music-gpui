@@ -14,7 +14,9 @@ A fast, native YouTube Music client for Linux, built with Rust and GPUI. Audio a
 - Picks up the last song where you left off after a restart.
 - Keyboard shortcuts, media keys and MPRIS desktop controls, including reversible album, playlist and artist shuffle.
 
-A warm guest session measured 191 ms median from clicking a song to playback, across eight clicks on songs that were not prepared ahead. Cold starts and fallback lookups can take longer. See the [measurement method and results](https://github.com/AksharP5/yt-music-gpui/pull/34). A separate 30-second playback sample on Arch used about 1% of one CPU core across the app and its resolver; CPU use varies with hardware and workload.
+A warm guest session measured 191 ms median from clicking a song to playback, across eight clicks on songs that were not prepared ahead. Cold starts and fallback lookups can take longer. See the [measurement method and results](https://github.com/AksharP5/yt-music-gpui/pull/34).
+
+In three runs per packaged build on Omarchy, median guest playback memory fell from 304.1 MiB PSS in v0.2.22 to 238.9 MiB in v0.2.23. The new build used a median of 1.1% of one CPU core during playback. CPU ranges overlapped. [Measurement method](CONTRIBUTING.md#profiling-a-packaged-build).
 
 This is an independent client using YouTube Music's unofficial API. YouTube changes can break playback or account features.
 
