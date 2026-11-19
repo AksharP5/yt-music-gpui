@@ -578,6 +578,32 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 view.playback_result(PlaybackResult::Watch { collection: None, id: superseded.id, account_revision: superseded.account_revision, update: QueueUpdate::Replace, result: Err("Superseded read".into()), session_rejected: true }, cx);
                 assert!(view.active_id.is_none() && view.error.is_none() && commands.is_empty());
 
+                for advance in [false, true] {
+                    view.stop_playback(cx);
+                    prepare(view, original.clone());
+                    let operation = refreshing(view, &commands, cx);
+                    view.start_queue(PlaybackQuery::Watch { track: Box::new(track("invalid-radio")), mode: WatchMode::Radio }, cx);
+                    view.toggle_play(cx);
+                    assert!(view.playback.is_paused());
+                    if advance {
+                        view.skip_next(cx);
+                    }
+
+                    let (jobs, receiver) = async_channel::bounded(1);
+                    receiver.close();
+                    let previous_jobs = std::mem::replace(&mut view.playback_jobs, jobs);
+                    let previous_receiver = std::mem::replace(&mut view.pending_playback_jobs, receiver);
+                    view.account_event(account::Event::Connected { operation, result: Ok(Some(connection(original.clone()))), save_session: false }, window, cx);
+                    view.playback_jobs = previous_jobs;
+                    view.pending_playback_jobs = previous_receiver;
+
+                    assert_eq!(view.library.queue.index, Some(0), "A deferred Next belongs to the new queue");
+                    assert_eq!(view.playback, Playback::Stopped, "A failed queue start must stay stopped");
+                    assert!(view.active_id.is_none() && view.watch_pending.is_none() && view.queue_waiting.is_none());
+                    assert!(view.error.as_deref().is_some_and(|error| error.contains("playback details connection stopped")));
+                    assert!(commands.is_empty());
+                }
+
                 view.stop_playback(cx);
                 prepare(view, original.clone());
                 let operation = refreshing(view, &commands, cx);
