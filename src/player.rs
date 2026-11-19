@@ -177,6 +177,10 @@ impl VideoQuality {
         branches.push(format!("best[height<={height}]"));
         branches.join("/")
     }
+
+    fn uses_full_resolver(self) -> bool {
+        self.height() > 1080
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -193,6 +197,7 @@ pub struct PlayOptions {
 pub struct PlayerOptions {
     pub credentials: Option<PlaybackCredentials>,
     pub check_account_at_startup: bool,
+    pub initial_video: Option<VideoQuality>,
     pub volume: f64,
     pub speed: PlaybackSpeed,
     pub audio_output: Option<String>,
@@ -203,6 +208,7 @@ impl Default for PlayerOptions {
         Self {
             credentials: None,
             check_account_at_startup: false,
+            initial_video: None,
             volume: 60.,
             speed: PlaybackSpeed::default(),
             audio_output: None,
@@ -1195,7 +1201,7 @@ fn stream_refresh_time(path: &str) -> Option<SystemTime> {
 
 impl StreamKey {
     fn lane(&self, preparing: bool, signed_in: bool) -> ResolverLane {
-        if self.video.is_some_and(|video| video.height() > 1080)
+        if self.video.is_some_and(VideoQuality::uses_full_resolver)
             || (preparing && signed_in && self.quality == AudioQuality::High)
         {
             ResolverLane::Full
@@ -1524,16 +1530,31 @@ struct StreamResolver {
 }
 
 impl StreamResolver {
-    fn new(ytdlp: &Path, credentials: Option<&ExtractorCredentials>) -> Self {
-        let warm = WarmResolver::start(ytdlp, credentials).ok();
-        Self {
+    fn new(
+        ytdlp: &Path,
+        credentials: Option<&ExtractorCredentials>,
+        native: Option<NativeResolver>,
+    ) -> Self {
+        let eager = credentials.is_some() || native.is_none();
+        let mut resolver = Self {
             ytdlp: ytdlp.to_owned(),
-            warm_enabled: warm.is_some(),
-            warm,
+            warm_enabled: true,
+            warm: None,
             one_shot: None,
             target: None,
             started: Instant::now(),
-            native: None,
+            native,
+        };
+        if eager {
+            resolver.warm_up(credentials);
+        }
+        resolver
+    }
+
+    fn warm_up(&mut self, credentials: Option<&ExtractorCredentials>) {
+        if self.warm.is_none() && self.warm_enabled {
+            self.warm = WarmResolver::start(&self.ytdlp, credentials).ok();
+            self.warm_enabled = self.warm.is_some();
         }
     }
 
@@ -1616,10 +1637,7 @@ impl StreamResolver {
             self.one_shot.take();
             self.target = None;
         }
-        if self.warm.is_none() && self.warm_enabled {
-            self.warm = WarmResolver::start(&self.ytdlp, credentials).ok();
-            self.warm_enabled = self.warm.is_some();
-        }
+        self.warm_up(credentials);
         self.started = Instant::now();
         let target = self.target.insert(target);
         if let Some(warm) = &mut self.warm {
@@ -1974,8 +1992,14 @@ fn run(
     // Destroy the core before removing the private runtime.
     let core = MpvCore::new(&options, &socket_path)?;
     // Cancel/reap the resolver before credentials or the core can drop.
-    let mut resolver = StreamResolver::new(ytdlp, credentials.as_ref());
-    resolver.native = lookup.map(|lookup| NativeResolver::new(lookup, wake.clone()));
+    let native = lookup.map(|lookup| NativeResolver::new(lookup, wake.clone()));
+    let mut resolver = StreamResolver::new(ytdlp, credentials.as_ref(), native);
+    if options
+        .initial_video
+        .is_some_and(VideoQuality::uses_full_resolver)
+    {
+        resolver.warm_up(credentials.as_ref());
+    }
     let mut pending_play: Option<PendingPlay> = None;
     let mut next_target: Option<PreparedTarget> = None;
     let mut prepared: Option<(PreparedTarget, ResolvedStream)> = None;
@@ -2167,8 +2191,7 @@ fn run(
                         if let Some(native) = &native {
                             native.lookup.reset();
                         }
-                        resolver = StreamResolver::new(ytdlp, credentials.as_ref());
-                        resolver.native = native;
+                        resolver = StreamResolver::new(ytdlp, credentials.as_ref(), native);
                     }
                     let _ = reply.send_blocking(
                         result
@@ -3176,7 +3199,7 @@ YtMusicAccountIE._real_extract = extract
         let plugin = synthetic_resolver_plugin(directory.path());
         let credentials = signed_in(synthetic_credentials("INVENTED_FIRST"), &plugin);
         let ytdlp = find_ytdlp().unwrap();
-        let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials));
+        let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials), None);
         let pid = resolver.warm.as_ref().unwrap().child.id();
         let blocked = resolver_target("blocked0000", 1);
         resolver.start(blocked.clone(), Some(&credentials)).unwrap();
@@ -3276,7 +3299,7 @@ YtMusicAccountIE._real_extract = extract
         let plugin = synthetic_resolver_plugin(directory.path());
         let credentials = signed_in(synthetic_credentials("INVENTED_FIRST"), &plugin);
         let ytdlp = find_ytdlp().unwrap();
-        let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials));
+        let mut resolver = StreamResolver::new(&ytdlp, Some(&credentials), None);
         resolver
             .start(resolver_target("abcdefghijk", 1), Some(&credentials))
             .unwrap();
@@ -3292,7 +3315,7 @@ YtMusicAccountIE._real_extract = extract
             synthetic_account("INVENTED_SECOND", "3", "other", "second"),
             &plugin,
         );
-        resolver = StreamResolver::new(&ytdlp, Some(&credentials));
+        resolver = StreamResolver::new(&ytdlp, Some(&credentials), None);
         resolver
             .start(resolver_target("abcdefghijk", 2), Some(&credentials))
             .unwrap();
@@ -3331,7 +3354,7 @@ YtMusicAccountIE._real_extract = extract
         )
         .unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut resolver = StreamResolver::new(&extractor, None);
+        let mut resolver = StreamResolver::new(&extractor, None, None);
         resolver
             .start(resolver_target("abcdefghijk", 1), None)
             .unwrap();
@@ -3356,7 +3379,7 @@ YtMusicAccountIE._real_extract = extract
     }
 
     #[cfg(unix)]
-    fn synthetic_full_resolver(directory: &Path, blocked: bool) -> StreamResolver {
+    fn synthetic_full_extractor(directory: &Path, blocked: bool) -> PathBuf {
         let interpreter = directory.join("python3");
         let response = if blocked {
             format!(
@@ -3371,14 +3394,45 @@ YtMusicAccountIE._real_extract = extract
         fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
         let extractor = directory.join("extractor");
         fs::write(&extractor, format!("#!{}\n", interpreter.display())).unwrap();
-        StreamResolver::new(&extractor, None)
+        extractor
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_native_lookup_starts_the_full_resolver_only_on_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let extractor = synthetic_full_extractor(directory.path(), false);
+        let (commands, _received) = command_channel().unwrap();
+        let (lookup, server) = native::tests::server(vec![
+            native::tests::homepage(),
+            native::tests::fixture().to_string(),
+            "invalid json".into(),
+        ]);
+        let native = NativeResolver::new(lookup, commands.wake);
+        let mut resolver = StreamResolver::new(&extractor, None, Some(native));
+        assert!(resolver.fd().is_none());
+
+        let mut track = resolver_target("abcdefghijk", 1);
+        track.lane = ResolverLane::Fast;
+        resolver.start(track.clone(), None).unwrap();
+        let native_stream = resolved(&mut resolver, None);
+        assert!(!native_stream.url.ends_with("/full"));
+        assert!(resolver.fd().is_none());
+
+        track.track_id = 2;
+        resolver.start(track, None).unwrap();
+        let full_stream = resolved(&mut resolver, None);
+        assert!(full_stream.url.ends_with("/full"));
+        assert!(resolver.fd().is_some());
+        server.join().unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn native_click_during_full_preparation_does_not_wait_or_restart_python() {
         let directory = tempfile::tempdir().unwrap();
-        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let extractor = synthetic_full_extractor(directory.path(), true);
+        let mut resolver = StreamResolver::new(&extractor, None, None);
         let (commands, _received) = command_channel().unwrap();
         let (lookup, server) = native::tests::server(vec![
             native::tests::homepage(),
@@ -3424,7 +3478,8 @@ YtMusicAccountIE._real_extract = extract
     #[test]
     fn a_failed_native_preparation_leaves_the_full_reload_running() {
         let directory = tempfile::tempdir().unwrap();
-        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let extractor = synthetic_full_extractor(directory.path(), true);
+        let mut resolver = StreamResolver::new(&extractor, None, None);
         let (commands, _received) = command_channel().unwrap();
         let (lookup, server) =
             native::tests::server(vec![native::tests::homepage(), "invalid json".into()]);
@@ -3472,7 +3527,8 @@ YtMusicAccountIE._real_extract = extract
         }
         for response in ["invalid json".into(),json!({"videoDetails":{"videoId":"abcdefghijk"},"playabilityStatus":{"status":"UNPLAYABLE"}}).to_string(),cipher.to_string()] {
             let directory = tempfile::tempdir().unwrap();
-            let mut resolver = synthetic_full_resolver(directory.path(),false);
+            let extractor = synthetic_full_extractor(directory.path(), false);
+            let mut resolver = StreamResolver::new(&extractor, None, None);
             let pid = resolver.warm.as_ref().unwrap().child.id();
             let (commands,_received) = command_channel().unwrap();
             let (lookup,server) = native::tests::server(vec![native::tests::homepage(),response]);
@@ -3492,7 +3548,8 @@ YtMusicAccountIE._real_extract = extract
     #[test]
     fn a_fast_lookup_in_flight_never_answers_a_full_request() {
         let directory = tempfile::tempdir().unwrap();
-        let mut resolver = synthetic_full_resolver(directory.path(), true);
+        let extractor = synthetic_full_extractor(directory.path(), true);
+        let mut resolver = StreamResolver::new(&extractor, None, None);
         let (commands, _received) = command_channel().unwrap();
         let mut native = NativeResolver::new(native::Lookup::new().unwrap(), commands.wake);
         let mut target = resolver_target("abcdefghijk", 1);
@@ -3526,7 +3583,7 @@ YtMusicAccountIE._real_extract = extract
         let (socket, _mpv) = IpcStream::pair().unwrap();
         let (commands, _received) = command_channel().unwrap();
         for ready in [false, true] {
-            let mut resolver = StreamResolver::new(&extractor, None);
+            let mut resolver = StreamResolver::new(&extractor, None, None);
             assert!(resolver.warm.is_some());
             let started = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
             let warm = resolver.warm.as_mut().unwrap();
@@ -3588,7 +3645,7 @@ YtMusicAccountIE._real_extract = extract
             )
             .unwrap();
             fs::set_permissions(&ytdlp, fs::Permissions::from_mode(0o700)).unwrap();
-            let mut resolver = StreamResolver::new(&ytdlp, None);
+            let mut resolver = StreamResolver::new(&ytdlp, None, None);
             resolver
                 .start(resolver_target("abcdefghijk", 1), None)
                 .unwrap();
@@ -3662,7 +3719,7 @@ YtMusicAccountIE._real_extract = extract
         let extractor = directory.path().join("extractor");
         fs::write(&extractor, script).unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut resolver = StreamResolver::new(&extractor, credentials);
+        let mut resolver = StreamResolver::new(&extractor, credentials, None);
         assert_eq!(resolver.warm.is_some(), warm);
         resolver
             .start(resolver_target("abcdefghijk", 1), credentials)
@@ -3720,7 +3777,7 @@ YtMusicAccountIE._real_extract = extract
             }
             fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
             let start = Instant::now();
-            let mut resolver = StreamResolver::new(&extractor, Some(&credentials));
+            let mut resolver = StreamResolver::new(&extractor, Some(&credentials), None);
             assert_eq!(resolver.warm.is_some(), warm);
             resolver
                 .start(resolver_target("abcdefghijk", 1), Some(&credentials))

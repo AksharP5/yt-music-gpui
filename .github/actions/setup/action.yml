@@ -13,16 +13,28 @@ runs:
       # build.rs links EGL, GLESv2, X11, Xext, Wayland and libmpv; GPUI needs xcb, xkbcommon,
       # fontconfig and freetype.
       run: |
-        # Prefer the faster Ubuntu mirror on hosted runners that default to EC2.
-        mirrors=/etc/apt/apt-mirrors.txt
-        if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]]; then
-          sudo sed -E -i \
-            's#^(http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/)[[:blank:]]+priority:1$#http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\1\tpriority:4#' "$mirrors"
-        fi
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev \
+        packages=(
+          pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev
           libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
+        )
+        apt_network=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=1)
+        fetch_packages() {
+          sudo timeout --kill-after=15s 3m apt-get "${apt_network[@]}" update --error-on=any &&
+            sudo timeout --kill-after=15s 6m apt-get "${apt_network[@]}" install -y \
+              --no-install-recommends --download-only "${packages[@]}"
+        }
+
+        mirrors=/etc/apt/apt-mirrors.txt
+        if ! fetch_packages; then
+          [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]] || exit 1
+          printf '%s\n' 'APT fetch failed. Retrying at archive.ubuntu.com.'
+          original=$(mktemp "$RUNNER_TEMP/apt-mirrors.XXXXXX")
+          cp -- "$mirrors" "$original"
+          trap 'sudo tee "$mirrors" < "$original" > /dev/null; rm -- "$original"' EXIT
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee "$mirrors" > /dev/null
+          fetch_packages
+        fi
+        sudo apt-get install -y --no-install-recommends --no-download "${packages[@]}"
     - name: Install libmpv
       if: runner.os == 'macOS'
       shell: bash
