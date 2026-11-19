@@ -2344,6 +2344,96 @@ fn a_queue_can_create_its_first_playlist_without_losing_songs() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic tracks only"]
+fn removing_the_last_queued_song_leaves_back_available() -> Result<()> {
+    use super::render::key;
+    use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                view.navigate(
+                    Route::Browse(BrowseLink::new("VLemptyQueue", "Playlist")),
+                    cx,
+                );
+                reply(view, page("Playlist", "playlist-tail"), cx);
+                view.library
+                    .queue
+                    .replace(view.page.tracks()[..1].to_vec(), 0);
+                window.focus(&view.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        key(window, cx, "q").await;
+
+        let position = window
+            .update(cx, |view, _, _| {
+                assert!(view.player_open);
+                let queue = view.player_page.queue_bounds.get();
+                point(queue.left() + px(80.), queue.top() + px(28.))
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(matches!(
+                    view.overlay,
+                    Some(crate::app::Overlay::Track {
+                        queue_index: Some(0),
+                        ..
+                    })
+                ));
+            })
+            .unwrap();
+
+        // The synthetic song has no library actions before Remove from queue.
+        key(window, cx, "home").await;
+        for _ in 0..5 {
+            key(window, cx, "down").await;
+        }
+        key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.library.queue.tracks.is_empty());
+                assert!(matches!(&view.route, Route::Browse(link) if link.id == "VLemptyQueue"));
+            })
+            .unwrap();
+
+        key(window, cx, "alt-left").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    matches!(view.route, Route::Explore),
+                    "The first Back must leave the playlist after removing the last queued song"
+                );
+            })
+            .unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn clicking_a_queued_row_plays_it_and_dragging_reorders() -> Result<()> {
     use gpui::{MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
