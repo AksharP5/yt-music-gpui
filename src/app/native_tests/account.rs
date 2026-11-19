@@ -1645,8 +1645,7 @@ fn playlist_picker_keeps_its_selection_when_the_account_reconnects() -> Result<(
                 let mut song = track("00000000000");
                 song.details.set_video_id = Some("old-occurrence".into());
                 while view.catalog_requests.pending.try_recv().is_ok() {}
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(vec![song], cx);
+                view.playlist_picker(vec![song], window, cx);
                 let job = view.catalog_requests.pending.try_recv().unwrap();
                 assert!(matches!(job.query, Query::PlaylistChoices(_)));
                 job
