@@ -13,8 +13,14 @@ runs:
       # build.rs links EGL, GLESv2, X11, Xext, Wayland and libmpv; GPUI needs xcb, xkbcommon,
       # fontconfig and freetype.
       run: |
-        update_indexes() {
-          sudo timeout --kill-after=15s 3m apt-get update --error-on=any
+        packages=(
+          pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev
+          libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
+        )
+        fetch_packages() {
+          sudo timeout --kill-after=15s 3m apt-get update --error-on=any &&
+            sudo timeout --kill-after=15s 4m apt-get install -y --no-install-recommends \
+              --download-only "${packages[@]}"
         }
 
         # Prefer Azure when the hosted runner ranks the EC2 archive first.
@@ -24,19 +30,17 @@ runs:
           grep -qE "$ec2_first" "$mirrors"; then
           sudo sed -E -i.before-azure \
             's#^(http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/)[[:blank:]]+priority:1$#http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\1\tpriority:4#' "$mirrors"
-          if update_indexes; then
+          if fetch_packages; then
             sudo rm -- "$mirrors.before-azure"
           else
-            printf '%s\n' 'APT update failed with Azure preferred. Retrying with the runner mirror list.'
+            printf '%s\n' 'APT fetch failed with Azure preferred. Retrying with the runner mirror list.'
             sudo mv -- "$mirrors.before-azure" "$mirrors"
-            update_indexes
+            fetch_packages
           fi
         else
-          update_indexes
+          fetch_packages
         fi
-        sudo apt-get install -y --no-install-recommends \
-          pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev \
-          libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
+        sudo apt-get install -y --no-install-recommends --no-download "${packages[@]}"
     - name: Install libmpv
       if: runner.os == 'macOS'
       shell: bash
