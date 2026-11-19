@@ -17,27 +17,21 @@ runs:
           pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev
           libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
         )
+        apt_network=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=1)
         fetch_packages() {
-          sudo timeout --kill-after=15s 3m apt-get update --error-on=any &&
-            sudo timeout --kill-after=15s 4m apt-get install -y --no-install-recommends \
-              --download-only "${packages[@]}"
+          sudo timeout --kill-after=15s 3m apt-get "${apt_network[@]}" update --error-on=any &&
+            sudo timeout --kill-after=15s 6m apt-get "${apt_network[@]}" install -y \
+              --no-install-recommends --download-only "${packages[@]}"
         }
 
-        # Prefer Azure when the hosted runner ranks the EC2 archive first.
         mirrors=/etc/apt/apt-mirrors.txt
-        ec2_first='^http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/[[:blank:]]+priority:1$'
-        if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]] &&
-          grep -qE "$ec2_first" "$mirrors"; then
-          sudo sed -E -i.before-azure \
-            's#^(http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/)[[:blank:]]+priority:1$#http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\1\tpriority:4#' "$mirrors"
-          if fetch_packages; then
-            sudo rm -- "$mirrors.before-azure"
-          else
-            printf '%s\n' 'APT fetch failed with Azure preferred. Retrying with the runner mirror list.'
-            sudo mv -- "$mirrors.before-azure" "$mirrors"
-            fetch_packages
-          fi
-        else
+        if ! fetch_packages; then
+          [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]] || exit 1
+          printf '%s\n' 'APT fetch failed. Retrying at archive.ubuntu.com.'
+          original=$(mktemp "$RUNNER_TEMP/apt-mirrors.XXXXXX")
+          cp -- "$mirrors" "$original"
+          trap 'sudo tee "$mirrors" < "$original" > /dev/null; rm -- "$original"' EXIT
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee "$mirrors" > /dev/null
           fetch_packages
         fi
         sudo apt-get install -y --no-install-recommends --no-download "${packages[@]}"
