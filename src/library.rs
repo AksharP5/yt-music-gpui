@@ -317,7 +317,7 @@ impl Store {
         }
         library.volume = library.volume.clamp(0., 100.);
         if library.queue.current().is_none() {
-            library.queue.index = None;
+            library.queue.index = (!library.queue.tracks.is_empty()).then_some(0);
         }
         library.recent.truncate(100);
         library.video &= crate::video::SUPPORTED;

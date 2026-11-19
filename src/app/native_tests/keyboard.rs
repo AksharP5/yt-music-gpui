@@ -668,3 +668,74 @@ fn cancelling_playlist_creation_restores_the_sidebar_button() -> anyhow::Result<
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic tracks only"]
+fn queue_menu_actions_show_the_first_song_without_starting_playback() -> anyhow::Result<()> {
+    use crate::app::Playback;
+
+    check_cache_window(async |window, cx| {
+        let tracks = window
+            .update(cx, |view, _, _| {
+                let mut tracks = view.page.tracks()[..2].to_vec();
+                tracks[0].duration = Some(120);
+                tracks
+            })
+            .unwrap();
+        let mut failed = Vec::new();
+        for (first_action, second_action) in [(2, 1), (1, 2)] {
+            window
+                .update(cx, |view, window, cx| {
+                    view.clear_queue(cx);
+                    view.close_player_page();
+                    window.focus(&view.focus, cx);
+                })
+                .unwrap();
+            for (track, steps) in tracks.iter().zip([first_action, second_action]) {
+                window
+                    .update(cx, |view, window, cx| {
+                        view.open_track_menu(track.clone(), None, window, cx);
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                key(window, cx, "home").await;
+                for _ in 0..steps {
+                    key(window, cx, "down").await;
+                }
+                key(window, cx, "enter").await;
+            }
+            key(window, cx, "q").await;
+            window
+                .update(cx, |view, _, _| {
+                    let queue = &view.library.queue;
+                    assert_eq!(queue.tracks.len(), 2);
+                    if queue.current().map(|track| track.id.as_str()) != Some(&tracks[0].id)
+                        || queue.tracks[1].id != tracks[1].id
+                        || view.duration != 120.
+                        || !view.player_open
+                    {
+                        failed.push(first_action);
+                    }
+                    assert_eq!(view.playback, Playback::Stopped);
+                    assert_eq!(view.position, 0.);
+                })
+                .unwrap();
+        }
+        assert!(
+            failed.is_empty(),
+            "Both queue actions must select the first song and make Up next reachable. Failed: {failed:?}"
+        );
+
+        let mut library = crate::library::Library::new();
+        library.queue.tracks_mut().extend(tracks);
+        let path = crate::dirs::data().unwrap().join("library.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&library).unwrap()).unwrap();
+        let (_, restored) = crate::library::Store::load().unwrap();
+        assert_eq!(
+            restored.queue.current().map(|track| track.id.as_str()),
+            library.queue.tracks.first().map(|track| track.id.as_str()),
+            "Older queues saved without a selection must open on their first song"
+        );
+    })
+}

@@ -912,6 +912,13 @@ impl Music {
         } else {
             self.resume_autoplay(cx);
         }
+        if self.playback == Playback::Stopped
+            && self.library.queue.current().is_none()
+            && self.library.queue.select(0)
+        {
+            self.duration = self.selected_track_duration();
+            self.position = 0.;
+        }
         self.prefetch_queue(cx);
         self.save();
         self.notify_playback(cx);
