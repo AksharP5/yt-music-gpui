@@ -43,6 +43,12 @@ The app hands the account to yt-dlp over the extractor's stdin: one JSON line wi
 
 Playback sockets and the account extractor live in a private directory under `$XDG_RUNTIME_DIR` (`$TMPDIR` on macOS, `%LOCALAPPDATA%\yt-music-gpui\runtime` on Windows, where mpv listens on a randomly named pipe instead), removed on normal shutdown, SIGTERM and SIGINT (Ctrl+C or Ctrl+Break on Windows). The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json` (`%LOCALAPPDATA%\yt-music-gpui\library.json` on Windows). To sample CPU and memory of a running release build, use `bin/profile APP_PID 30`.
 
+### Profiling a packaged build
+
+Use a fresh guest profile with the same display size, public track and volume. Check the executable checksum and turn off autoplay so each run plays the same selection. Let the window and artwork settle. Sample idle memory, then start playback and sample once the position advances. Run `bin/profile APP_PID 10` for each sample. It sums proportional set size (PSS) and CPU time across the app and its existing child processes.
+
+The v0.2.22 and v0.2.23 comparison used the packaged binaries in a private Wayland session on Omarchy. Each played the same muted track with the Home view visible. Each version ran three times, with build order alternating. The playback PSS ranges were 303.3 to 304.5 MiB on v0.2.22 and 234.1 to 245.0 MiB on v0.2.23. Playback CPU ranged from 1.2% to 1.6% and from 1.1% to 1.3% of one core, respectively.
+
 ## Validate
 
 ```sh
