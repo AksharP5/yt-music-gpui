@@ -947,7 +947,9 @@ pub(super) mod tests {
         }).collect();
         let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
         let mut child = Command::new(python).args(["-I", "-B", "-c", r#"
-import copy, json, sys
+import copy, json, os, sys
+if zipapp := os.environ.get('YT_DLP_TEST_ZIPAPP'):
+    sys.path.insert(0, zipapp)
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.youtube import YoutubeIE
 data = json.load(sys.stdin)
