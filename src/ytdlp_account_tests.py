@@ -202,7 +202,12 @@ class AccountContract(unittest.TestCase):
 
     def test_disabled_plugin_cannot_fall_back_to_stock_extraction(self):
         code = """
+import os
 import sys
+
+if zipapp := os.environ.get('YT_DLP_TEST_ZIPAPP'):
+    sys.path.insert(0, zipapp)
+
 from yt_dlp import YoutubeDL
 from yt_dlp.globals import plugin_dirs
 from yt_dlp.plugins import load_all_plugins
