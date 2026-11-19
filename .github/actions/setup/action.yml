@@ -13,13 +13,27 @@ runs:
       # build.rs links EGL, GLESv2, X11, Xext, Wayland and libmpv; GPUI needs xcb, xkbcommon,
       # fontconfig and freetype.
       run: |
-        # Prefer the faster Ubuntu mirror on hosted runners that default to EC2.
+        update_indexes() {
+          sudo timeout --kill-after=15s 3m apt-get update --error-on=any
+        }
+
+        # Prefer Azure when the hosted runner ranks the EC2 archive first.
         mirrors=/etc/apt/apt-mirrors.txt
-        if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]]; then
-          sudo sed -E -i \
+        ec2_first='^http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/[[:blank:]]+priority:1$'
+        if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted && -f "$mirrors" ]] &&
+          grep -qE "$ec2_first" "$mirrors"; then
+          sudo sed -E -i.before-azure \
             's#^(http://us-east-2\.ec2\.archive\.ubuntu\.com/ubuntu/)[[:blank:]]+priority:1$#http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\1\tpriority:4#' "$mirrors"
+          if update_indexes; then
+            sudo rm -- "$mirrors.before-azure"
+          else
+            printf '%s\n' 'APT update failed with Azure preferred. Retrying with the runner mirror list.'
+            sudo mv -- "$mirrors.before-azure" "$mirrors"
+            update_indexes
+          fi
+        else
+          update_indexes
         fi
-        sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           pkg-config libegl-dev libgles-dev libwayland-dev libx11-dev libxext-dev libxcb1-dev \
           libxkbcommon-dev libxkbcommon-x11-dev libfontconfig-dev libfreetype-dev libmpv-dev
