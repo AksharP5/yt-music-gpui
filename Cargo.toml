@@ -1,6 +1,6 @@
 [package]
 name = "yt-music-gpui"
-version = "0.2.21"
+version = "0.2.22"
 edition = "2024"
 description = "A native YouTube Music player for Linux, built with GPUI."
 license = "MIT"
