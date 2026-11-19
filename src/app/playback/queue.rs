@@ -576,7 +576,7 @@ impl Music {
     }
 
     pub(in crate::app) fn clear_queue(&mut self, cx: &mut Context<Self>) {
-        self.cancel_queue_drag();
+        self.close_player_page();
         self.stop_playback(cx);
         self.queue_source.cancel();
         self.track_state.cancel();
@@ -951,6 +951,7 @@ impl Music {
         }
         if self.library.queue.tracks.is_empty() && !self.library.queue.incomplete {
             self.clear_queue(cx);
+            return;
         }
         self.queue_changed(cx);
     }

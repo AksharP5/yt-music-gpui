@@ -111,6 +111,8 @@ Save to playlist focuses the dialog from search results, a song menu, or Up next
 
 The native queue-menu check uses Add to queue and Play next with an empty queue. It checks that the first song is selected without starting playback, that Up next opens, and that older saves with no selected song can be recovered.
 
+The native Back check removes the only song through the Up next menu. The playlist is visible again, and the first Alt+Left must return to the preceding page.
+
 Cancelling New playlist returns focus to the button that opened it. The native sidebar check closes the form with Escape, then presses Enter to open it again.
 
 Save to playlist retains the submitted song details until YouTube replies. A batch checks existing playlist occurrences in one pass and preserves the service’s order, including distinct occurrences of the same song. A native check clears the source queue while a save is pending, then verifies that confirmed songs appear in the open playlist without waiting for another page read.
