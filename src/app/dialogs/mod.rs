@@ -62,7 +62,6 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.catalog_requests.cancel(CatalogTarget::PlaylistChoices);
         let (id, title, description, privacy) = if edit {
             let Route::Browse(link) = &self.route else {
                 return;
@@ -92,6 +91,7 @@ impl Music {
             (None, String::new(), String::new(), Privacy::Private)
         };
         let form = cx.new(|cx| PlaylistForm::new(title, description, privacy, cx));
+        self.open_overlay(Overlay::PlaylistForm { form: form.clone() }, window, cx);
         let edit_id = id.clone();
         self.overlay_subscription = Some(cx.subscribe_in(
             &form,
@@ -127,7 +127,6 @@ impl Music {
         ));
         window.focus(&form.focus_handle(cx), cx);
         self.error = None;
-        self.overlay = Some(Overlay::PlaylistForm { form });
         cx.notify();
     }
 

@@ -591,3 +591,80 @@ fn featured_save_picker_restores_focus_to_the_opening_control() -> anyhow::Resul
             .unwrap();
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account only"]
+fn cancelling_playlist_creation_restores_the_sidebar_button() -> anyhow::Result<()> {
+    use gpui::{px, size};
+
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                window.resize(size(px(1280.), px(800.)));
+                view.sidebar_collapsed = Some(false);
+                window.focus(&view.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+
+        // The wide guide's New playlist button follows its three navigation rows.
+        let position = point(px(120.), px(283.));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        let opening = window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    !view.focus.is_focused(window),
+                    "New playlist must take focus"
+                );
+                window.focused(cx).unwrap()
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(matches!(view.overlay, Some(Overlay::PlaylistForm { .. })));
+            })
+            .unwrap();
+        key(window, cx, "escape").await;
+        window
+            .update(cx, |view, window, _| {
+                assert!(view.overlay.is_none());
+                assert!(
+                    opening.is_focused(window),
+                    "New playlist must regain focus after Escape"
+                );
+            })
+            .unwrap();
+        key(window, cx, "enter").await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(matches!(view.overlay, Some(Overlay::PlaylistForm { .. })));
+            })
+            .unwrap();
+    })
+}

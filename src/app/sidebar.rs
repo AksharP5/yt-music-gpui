@@ -128,7 +128,6 @@ impl Music {
                     .child(icon("plus", 20., self.theme.text))
                     .child("New playlist")
                     .on_click(cx.listener(|view, _, window, cx| {
-                        window.focus(&view.focus, cx);
                         if view.account.is_some() {
                             view.playlist_form(false, Vec::new(), window, cx);
                         } else {
