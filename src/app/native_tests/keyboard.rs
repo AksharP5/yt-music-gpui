@@ -496,3 +496,98 @@ fn queue_menu_actions_restore_the_opening_focus() -> anyhow::Result<()> {
         }
     })
 }
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account only"]
+fn featured_save_picker_restores_focus_to_the_opening_control() -> anyhow::Result<()> {
+    use crate::app::Search;
+    use crate::catalog::ShelfLayout;
+    use crate::search::{SearchFilter, SearchScope};
+    use gpui::{px, size};
+
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, window, cx| {
+                window.resize(size(px(1280.), px(800.)));
+                view.sidebar_collapsed = Some(false);
+                view.route = Route::Search(Search {
+                    query: "Song".into(),
+                    filter: SearchFilter::All,
+                    scope: SearchScope::Catalog,
+                });
+                view.page = crate::app::sync::tests::page(2, false);
+                view.page.shelves[0].layout = ShelfLayout::Featured;
+                view.rebuild_rows();
+                window.focus(&view.focus, cx);
+                cx.notify();
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let position = window
+            .update(cx, |view, window, _| {
+                let bounds = view.detail_list.state.bounds_for_item(1).unwrap();
+                let width = view.page_layout(window).search_width();
+                let inset = (bounds.size.width - px(width)) / 2.;
+                let save_center = if width < 800. { 115. } else { 149. };
+                point(
+                    bounds.left() + inset + px(326.),
+                    bounds.top() + px(save_center),
+                )
+            })
+            .unwrap();
+        let click = |event, cx: &mut gpui::AsyncApp| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(event, cx)
+            })
+            .unwrap();
+        };
+        click(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        let opening = window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    !view.focus.is_focused(window),
+                    "Save must take focus on mouse down"
+                );
+                window.focused(cx).unwrap()
+            })
+            .unwrap();
+        click(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+        wait_for_presented_frame(window, cx).await;
+        let dialog_has_focus = window
+            .update(cx, |view, window, cx| {
+                assert!(
+                    matches!(&view.overlay, Some(Overlay::PlaylistPicker { tracks, .. })
+                    if tracks.len() == 1 && tracks[0].id == view.page.tracks()[0].id)
+                );
+                view.overlay_focus.contains_focused(window, cx)
+            })
+            .unwrap();
+        key(window, cx, "escape").await;
+        window
+            .update(cx, |view, window, _| {
+                assert!(view.overlay.is_none());
+                assert!(
+                    dialog_has_focus && opening.is_focused(window),
+                    "Save must move focus into the picker and restore it after Escape"
+                );
+            })
+            .unwrap();
+    })
+}

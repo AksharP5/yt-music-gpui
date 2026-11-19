@@ -99,7 +99,7 @@ Editable-playlist drag checks move the selected occurrence across loaded shelves
 
 While Save to playlist waits for the service, it counts the eligible destinations from the loaded guide and copies only the rows requested by the virtual list. The count and row ranges use the same eligibility filter.
 
-Tab and Shift+Tab scroll Save to playlist as focus moves through the destinations. If a service reply moves the focused playlist, the picker scrolls to its new position. A click completes only on the same destination where it started. The native checks cover offscreen selection, a reorder that moves the focused row out of view, and a refresh between mouse-down and mouse-up.
+Save to playlist focuses the dialog from search results, a song menu, or Up next. Escape returns focus to the opener. Tab and Shift+Tab scroll Save to playlist as focus moves through the destinations. If a service reply moves the focused playlist, the picker scrolls to its new position. A click completes only on the same destination where it started. The native checks cover offscreen selection, a reorder that moves the focused row out of view, and a refresh between mouse-down and mouse-up.
 
 Save to playlist retains the submitted song details until YouTube replies. A batch checks existing playlist occurrences in one pass and preserves the service’s order, including distinct occurrences of the same song. A native check clears the source queue while a save is pending, then verifies that confirmed songs appear in the open playlist without waiting for another page read.
 
