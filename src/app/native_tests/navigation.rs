@@ -1329,8 +1329,7 @@ fn keyboard_reaches_offscreen_save_destinations() -> Result<()> {
                     })
                     .collect();
                 let tracks = view.page.tracks()[..2].to_vec();
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(tracks, cx);
+                view.playlist_picker(tracks, window, cx);
                 submitted
             })
             .unwrap();
@@ -1356,8 +1355,7 @@ fn keyboard_reaches_offscreen_save_destinations() -> Result<()> {
         window
             .update(cx, |view, window, cx| {
                 let tracks = view.page.tracks()[..2].to_vec();
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(tracks, cx);
+                view.playlist_picker(tracks, window, cx);
             })
             .unwrap();
         wait_for_presented_frame(window, cx).await;
@@ -1420,8 +1418,7 @@ fn refreshing_save_destinations_does_not_retarget_a_mouse_click() -> Result<()> 
                         },
                     })
                     .collect();
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(view.page.tracks()[..2].to_vec(), cx);
+                view.playlist_picker(view.page.tracks()[..2].to_vec(), window, cx);
                 submitted
             })
             .unwrap();
@@ -1514,7 +1511,7 @@ fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Res
 
     check_cache_window(async |window, cx| {
         window
-            .update(cx, |view, _, cx| {
+            .update(cx, |view, window, cx| {
                 view.navigate(Route::Library(Section::Songs), cx);
                 reply(view, page("Songs", "songs-tail"), cx);
                 view.sidebar_playlists = (0..40)
@@ -1530,7 +1527,7 @@ fn playlist_picker_scrolls_its_full_width_without_moving_the_background() -> Res
                     })
                     .collect();
                 let track = view.page.tracks()[0].clone();
-                view.playlist_picker(vec![track], cx);
+                view.playlist_picker(vec![track], window, cx);
             })
             .unwrap();
         wait_for_presented_frame(window, cx).await;
@@ -1661,7 +1658,7 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
     check_cache_window(async |window, cx| {
         let urls: Vec<&str> = COVERS.iter().map(|(_, _, url)| *url).collect();
         window
-            .update(cx, |view, _, cx| {
+            .update(cx, |view, window, cx| {
                 view.sidebar_playlists = COVERS
                     .iter()
                     .enumerate()
@@ -1680,7 +1677,7 @@ fn save_to_playlist_opens_from_loaded_playlists_and_confirms_with_a_toast() -> R
                     .collect();
                 let track = view.page.tracks()[0].clone();
                 while view.catalog_requests.pending.try_recv().is_ok() {}
-                view.playlist_picker(vec![track], cx);
+                view.playlist_picker(vec![track], window, cx);
                 let requests = std::iter::from_fn(|| view.catalog_requests.pending.try_recv().ok())
                     .collect::<Vec<_>>();
                 assert!(
@@ -1796,8 +1793,7 @@ fn playlist_choices_keep_fallback_rows_and_never_toggle_an_existing_like() -> Re
                 }];
                 let track = view.page.tracks()[0].clone();
                 view.ratings.insert(track.id.clone(), Rating::Like);
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(vec![track], cx);
+                view.playlist_picker(vec![track], window, cx);
                 let choices = view.playlist_picker_choices();
                 assert_eq!(choices.len(), 2);
                 let rows = choices.rows(0..2);
@@ -1915,13 +1911,13 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
             session_rejected: false,
         };
         let tracks = view.page.tracks()[..2].to_vec();
-        view.playlist_picker(tracks.clone(), cx);
+        view.playlist_picker(tracks.clone(), window, cx);
         let old = playlist_choices_job(view);
         view.close_overlay(window, cx);
         view.playlist_choices_result(response(old.clone(), "Closed"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
 
-        view.playlist_picker(tracks.clone(), cx);
+        view.playlist_picker(tracks.clone(), window, cx);
         let current = playlist_choices_job(view);
         view.playlist_choices_result(response(old, "Reopened"), window, cx);
         assert!(view.catalog_requests.playlist_choices.is_none());
@@ -1948,7 +1944,7 @@ fn playlist_choices_ignore_closed_reopened_and_changed_account_responses() -> Re
         view.account.as_mut().unwrap().session =
             Arc::new((**refreshed.session.as_ref().unwrap()).clone());
         view.clear_account_state(cx);
-        view.playlist_picker(tracks, cx);
+        view.playlist_picker(tracks, window, cx);
         let new_account = playlist_choices_job(view);
         view.playlist_choices_result(response(refreshed, "Before account refresh"), window, cx);
         assert_eq!(view.playlist_picker_choices().len(), 0);
@@ -2029,8 +2025,7 @@ fn playlist_picker_shows_a_rejected_save_inside_the_dialog() -> Result<()> {
                 view.account_commands = commands;
                 view.sidebar_playlists.clear();
                 let track = view.page.tracks()[0].clone();
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(vec![track], cx);
+                view.playlist_picker(vec![track], window, cx);
             })
             .unwrap();
         super::render::key(window, cx, "tab").await;
@@ -2721,8 +2716,7 @@ fn saving_a_queue_keeps_its_songs_after_playback_changes() -> Result<()> {
                     track.title = format!("Queue song {index}");
                 }
                 view.library.queue.replace(tracks.clone(), 0);
-                window.focus(&view.overlay_focus, cx);
-                view.playlist_picker(view.library.queue.tracks.to_vec(), cx);
+                view.playlist_picker(view.library.queue.tracks.to_vec(), window, cx);
                 let _ = playlist_choices_job(view);
                 tracks
             })

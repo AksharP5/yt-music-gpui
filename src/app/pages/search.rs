@@ -234,7 +234,7 @@ impl Music {
                                     view.connect_account(window, cx);
                                     return;
                                 }
-                                view.playlist_picker(vec![track.clone()], cx);
+                                view.playlist_picker(vec![track.clone()], window, cx);
                             },
                         )),
                     );

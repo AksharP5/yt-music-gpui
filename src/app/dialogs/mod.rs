@@ -132,14 +132,23 @@ impl Music {
     }
 
     /// Show loaded destinations at once while YouTube Music returns this selection's choices.
-    pub(in crate::app) fn playlist_picker(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
+    pub(in crate::app) fn playlist_picker(
+        &mut self,
+        tracks: Vec<Track>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.error = None;
         self.picker_scroll = UniformListScrollHandle::new();
         self.picker_focus = VirtualListFocus::default();
-        self.overlay = Some(Overlay::PlaylistPicker {
-            tracks,
-            error: None,
-        });
+        self.open_overlay(
+            Overlay::PlaylistPicker {
+                tracks,
+                error: None,
+            },
+            window,
+            cx,
+        );
         self.refresh_playlist_choices(cx);
     }
 
@@ -869,7 +878,7 @@ impl Music {
                         view.connect_account(window, cx);
                         return;
                     }
-                    view.playlist_picker(vec![song.clone()], cx);
+                    view.playlist_picker(vec![song.clone()], window, cx);
                 },
             ));
             if let Some(queued) = queue_index.filter(|&queued| {
