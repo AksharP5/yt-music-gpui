@@ -49,6 +49,8 @@ Use a fresh guest profile with the same display size, public track and volume. C
 
 The v0.2.22 and v0.2.23 comparison used the packaged binaries in a private Wayland session on Omarchy. Each played the same muted track with the Home view visible. Each version ran three times, with build order alternating. The playback PSS ranges were 303.3 to 304.5 MiB on v0.2.22 and 234.1 to 245.0 MiB on v0.2.23. Playback CPU ranged from 1.2% to 1.6% and from 1.1% to 1.3% of one core, respectively.
 
+A separate timing check used the same packaged builds and a two-song guest queue on Omarchy. In each of three fresh sessions per version, it sent desktop Play and timed the first report of at least 50 ms of playback. After two seconds of playback it sent desktop Next and timed the same threshold for the expected track. The app prepares the next queued song while the first plays. Median first Play was 497 ms in v0.2.22 and 483 ms in v0.2.23. Median Next was 54 ms and 55 ms, respectively.
+
 ## Validate
 
 ```sh
