@@ -5,7 +5,21 @@ use super::PREVIOUS_RESTART_SECONDS;
 
 impl Music {
     pub(in crate::app) fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
+        self.start_queue_with_pause(query, false, cx);
+    }
+
+    pub(in crate::app) fn start_queue_with_pause(
+        &mut self,
+        query: PlaybackQuery,
+        paused: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.player_open = true;
+        let loading = Playback::Loading {
+            paused,
+            retried: false,
+            full_lookup: false,
+        };
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -13,14 +27,10 @@ impl Music {
         {
             *resume = Some(PlaybackIntent::Queue {
                 query,
-                paused: false,
+                paused,
                 advance: None,
             });
-            self.playback = Playback::Loading {
-                paused: false,
-                retried: false,
-                full_lookup: false,
-            };
+            self.playback = loading;
             self.notice = Some("Loading music…".into());
             self.player_command(Player::stop);
             self.active_id = None;
@@ -47,11 +57,7 @@ impl Music {
         self.seekable = false;
         self.pending_seek = None;
         self.position = 0.;
-        self.playback = Playback::Loading {
-            paused: false,
-            retried: false,
-            full_lookup: false,
-        };
+        self.playback = loading;
         self.now_playing = None;
         self.media_pair = None;
         self.queue_source.cancel();
