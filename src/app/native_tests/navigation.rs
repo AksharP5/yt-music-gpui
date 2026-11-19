@@ -5,7 +5,7 @@ use crate::{
     account::{self, Effect, Mutation, Section},
     app::{CatalogRequests, CatalogResult, CatalogTarget, Music, Query, Route, Search, Startup},
     assets::Assets,
-    catalog::{BrowseLink, Page, Rating},
+    catalog::{BrowseLink, Continuation, LibraryFilters, Page, Rating, SortChoice},
     search::{SearchFilter, SearchScope},
     track_state,
 };
@@ -1196,7 +1196,6 @@ fn back_owns_each_visits_loaded_page_and_ignores_forward_cache() -> Result<()> {
             page: page("Must not restore from forward cache", "wrong-tail"),
             fetched_at: Instant::now(),
             coverage: Default::default(),
-            sort: None,
         });
         let cache_len = view.page_cache.len();
         view.go_back(cx);
@@ -1255,27 +1254,127 @@ fn refresh_after_back_supersedes_the_forward_cache_entry() -> Result<()> {
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn route_revalidation_forgets_the_previous_sort() -> Result<()> {
+fn library_refresh_keeps_the_selected_order_and_its_continuation() -> Result<()> {
     check_cache(|view, _, cx| {
-        view.navigate(Route::Library(Section::Songs), cx);
-        reply(view, page("Songs", "sort-request"), cx);
-        let sort = view.page.continuation.clone().unwrap();
+        let songs = Route::Library(Section::Songs);
+        let session = view.account.as_ref().unwrap().session.clone();
+        let library = |selected, range: std::ops::Range<_>, tail| {
+            let mut page =
+                crate::app::sync::tests::response(&[("Songs", range.collect())], Some(tail), false);
+            page.library = Some(LibraryFilters {
+                sort: [("Recently saved", "saved"), ("A to Z", "alphabetical")]
+                    .into_iter()
+                    .map(|(label, token)| SortChoice {
+                        label: label.into(),
+                        selected: selected == label,
+                        reload: Continuation::from_response(
+                            token,
+                            &serde_json::Value::Null,
+                            Some(session.clone()),
+                        )
+                        .unwrap(),
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+            page
+        };
+        let default = library("Recently saved", 20..23, "saved-next");
+        let sorted = library("A to Z", 0..3, "alphabetical-next");
+        let tail = crate::app::sync::tests::response(
+            &[("Songs", (3..6).collect())],
+            Some("alphabetical-deeper"),
+            false,
+        );
+        view.navigate(songs.clone(), cx);
+        reply(view, default.clone(), cx);
+        let sort = view.page.library.as_ref().unwrap().sort[1].reload.clone();
         view.request(Query::Reload(sort), cx);
-        reply(view, page("Sorted songs", "sorted-tail"), cx);
-        // Returning to the window after three minutes revalidates the route in its default order.
+        reply(view, sorted.clone(), cx);
+        view.request(
+            Query::More {
+                token: view.page.continuation.clone().unwrap(),
+                search: None,
+            },
+            cx,
+        );
+        reply(view, tail.clone(), cx);
+
         view.revalidate_page(cx);
-        reply(view, page("Default order", "default-tail"), cx);
-        view.navigate(Route::Explore, cx);
-        for entry in &mut view.page_cache {
-            entry.fetched_at = Instant::now()
-                .checked_sub(Duration::from_secs(181))
-                .unwrap();
-        }
-        view.navigate(Route::Library(Section::Songs), cx);
         let job = view.catalog_requests.pending.try_recv().unwrap();
+        let alphabetic = matches!(&job.query, Query::Revalidate(query) if matches!(query.as_ref(), Query::Reload(token) if token.token() == "alphabetical"));
+        view.catalog_result(
+            CatalogResult {
+                id: job.id,
+                account_revision: job.account_revision,
+                account_generation: job.account_generation,
+                history_generation: job.history_generation,
+                append: false,
+                revalidate: true,
+                result: Ok(if alphabetic {
+                    sorted.clone()
+                } else {
+                    default.clone()
+                }),
+                session_rejected: false,
+                target: CatalogTarget::Page,
+            },
+            cx,
+        );
+        let titles = view
+            .page
+            .tracks()
+            .into_iter()
+            .map(|track| track.title)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            ["Song 1", "Song 2", "Song 3", "Song 4", "Song 5", "Song 6"]
+        );
+        assert_eq!(
+            view.page.continuation.as_ref().unwrap().token(),
+            "alphabetical-deeper"
+        );
+
+        view.navigate(Route::Explore, cx);
+        let entry = view
+            .page_cache
+            .iter_mut()
+            .find(|entry| entry.route == songs)
+            .unwrap();
+        entry.fetched_at = Instant::now()
+            .checked_sub(Duration::from_secs(181))
+            .unwrap();
+        view.navigate(songs, cx);
         assert!(
-            matches!(job.query, Query::Library(Section::Songs)),
-            "A stale revisit must refresh in the order last shown"
+            matches!(reply(view, sorted.clone(), cx), Query::Reload(token) if token.token() == "alphabetical")
+        );
+
+        view.navigate(Route::Explore, cx);
+        view.go_back(cx);
+        assert!(
+            matches!(reply(view, sorted.clone(), cx), Query::Revalidate(query) if matches!(query.as_ref(), Query::Reload(token) if token.token() == "alphabetical"))
+        );
+        view.reload_current_page(cx);
+        assert!(
+            matches!(reply(view, sorted.clone(), cx), Query::Revalidate(query) if matches!(query.as_ref(), Query::Reload(token) if token.token() == "alphabetical"))
+        );
+        view.request(
+            Query::More {
+                token: view.page.continuation.clone().unwrap(),
+                search: None,
+            },
+            cx,
+        );
+        reply(view, tail, cx);
+
+        // A response in a different order must take its own continuation.
+        view.revalidate_page(cx);
+        reply(view, default, cx);
+        assert_eq!(view.rows.len(), 3);
+        assert_eq!(
+            view.page.continuation.as_ref().unwrap().token(),
+            "saved-next"
         );
     })
 }

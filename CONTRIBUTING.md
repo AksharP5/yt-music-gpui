@@ -196,6 +196,8 @@ At 850 × 560, the native keyboard check opens long song and podcast episode men
 
 The search suggestions panel follows the field's width and scrolls when the rows exceed the available window height. Native X11 checks at 850 × 560 verify clicks inside and outside the panel and that arrow selection and wheel scrolling reveal the last row for pointer input.
 
+Library refreshes use the selected sort action from the displayed response. A first page in a different order replaces the old rows and uses its own continuation. The native navigation check covers background revalidation, Back, an expired cache revisit and explicit Reload.
+
 When saving the library, the app and the writer share the queued songs and the source's loaded IDs. Selecting another song does not copy those lists. Queue edits detach from a pending snapshot, so a write sees the order and track details captured when it was queued. Playlist confirmations and unchanged song ratings keep sharing the saved queue. The library file keeps the same JSON format. Run `bin/test --release -- --ignored --exact library::tests::large_queue_preference_save_latency --nocapture` to measure the time spent submitting snapshots, preferences, and position checkpoints with 10,000 queued songs.
 
 ## Player waits

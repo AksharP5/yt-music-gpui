@@ -780,6 +780,14 @@ pub struct SortChoice {
 }
 
 impl Page {
+    pub(crate) fn selected_sort(&self) -> Option<&SortChoice> {
+        self.library
+            .as_ref()?
+            .sort
+            .iter()
+            .find(|choice| choice.selected)
+    }
+
     pub(crate) fn renew_read_continuations(
         &mut self,
         expected: &Arc<Session>,

@@ -43,10 +43,9 @@ impl Music {
                         }))
                     }),
             );
-        let sort = filters
-            .sort
-            .iter()
-            .find(|choice| choice.selected)
+        let sort = self
+            .page
+            .selected_sort()
             .map(|current| self.sort_button(current.label.clone(), &filters.sort, cx));
         // Measured on the web: chips sit 32px under the header and the grid
         // starts 42px below them.
