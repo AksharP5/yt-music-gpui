@@ -229,7 +229,7 @@ Never commit cookies, account data or keyring contents. Use synthetic values in 
 
 ## Release
 
-GitHub-hosted Ubuntu builds prefer the Azure archive when the runner's mirror list puts the EC2 archive first. APT retains the other archive entries as fallbacks.
+Linux CI gives APT three minutes to refresh its indexes and six minutes to download dependencies, with a 20-second connection and data timeout. On GitHub-hosted runners with a mirror list, setup retries a failed fetch once against the public Ubuntu archive and restores the runner's list when the step exits. Installation uses the downloaded packages.
 
 Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging changes only runs CI, without publishing a release or deploying anything. Releases are immutable once published, and only repository admins can create or move `v*` tags; the release build also refuses a tag whose commit is not on `main`.
 
