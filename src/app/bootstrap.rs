@@ -89,6 +89,8 @@ impl Music {
         let (player, mut error) = match Player::new(PlayerOptions {
             credentials: None,
             check_account_at_startup,
+            initial_video: (library.video && crate::video::SUPPORTED)
+                .then_some(library.video_quality),
             volume: library.effective_volume(),
             speed: library.speed,
             ..Default::default()
