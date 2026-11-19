@@ -6837,7 +6837,7 @@ dependencies = [
 
 [[package]]
 name = "yt-music-gpui"
-version = "0.2.22"
+version = "0.2.23"
 dependencies = [
  "anyhow",
  "async-channel",
