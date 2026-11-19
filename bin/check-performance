@@ -19,22 +19,26 @@ BUDGETS = (
 )
 
 
-def build(root, target, executable):
+def build(root, target, revision, executable):
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
-    subprocess.run(["cargo", "build", "--release", "--locked"], cwd=root, env=env, check=True)
-    size = (target / "release/yt-music-gpui").stat().st_size
-    output = subprocess.check_output(
-        ["cargo", "test", "--release", "--locked", "--no-run", "--message-format=json"],
-        cwd=root, env=env, text=True,
-    )
-    artifacts = [json.loads(line) for line in output.splitlines()]
-    test, = (
-        artifact["executable"] for artifact in artifacts
-        if artifact.get("reason") == "compiler-artifact"
-        and artifact["profile"]["test"] and artifact["target"]["name"] == "yt-music-gpui"
-        and artifact["executable"]
-    )
-    shutil.copy2(test, executable)
+
+    def compile_target(selection, test):
+        # Distinguish the app's Cargo fingerprints without rebuilding shared dependencies.
+        # Cargo can otherwise reuse a newer checkout's binary for an older source tree.
+        output = subprocess.check_output([
+            "cargo", "rustc", *selection, "--release", "--locked", "--message-format=json",
+            "--", "--cfg", f'ytm_benchmark_revision="{revision}"',
+        ], cwd=root, env=env, text=True)
+        path, = (
+            artifact["executable"] for artifact in map(json.loads, output.splitlines())
+            if artifact.get("reason") == "compiler-artifact"
+            and artifact["profile"]["test"] == test
+            and artifact["target"]["name"] == "yt-music-gpui" and artifact["executable"]
+        )
+        return Path(path)
+
+    size = compile_target(["--bin", "yt-music-gpui"], test=False).stat().st_size
+    shutil.copy2(compile_target(["--tests"], test=True), executable)
     return size
 
 
@@ -135,7 +139,7 @@ def main():
             folder.mkdir(mode=0o700)
         stage_extractor(helpers / "yt-dlp", sys.argv[2] if len(sys.argv) == 3 else None)
         candidate_test = scratch / "candidate-test"
-        candidate_size = build(ROOT, target, candidate_test)
+        candidate_size = build(ROOT, target, candidate, candidate_test)
         if base == candidate:
             current = dict(measure(candidate_test, home), binary_bytes=candidate_size)
             return report(base, candidate, current, current)
@@ -143,7 +147,7 @@ def main():
         subprocess.run(["git", "worktree", "add", "--detach", base_tree, base], cwd=ROOT, check=True)
         try:
             base_test = scratch / "base-test"
-            base_size = build(base_tree, target, base_test)
+            base_size = build(base_tree, target, base, base_test)
             before = dict(measure(base_test, home), binary_bytes=base_size)
             after = dict(measure(candidate_test, home), binary_bytes=candidate_size)
         finally:

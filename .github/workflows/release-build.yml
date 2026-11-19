@@ -151,7 +151,8 @@ jobs:
             git worktree add --detach "$base_tree" "$base"
             trap 'git worktree remove "$base_tree"' EXIT
             export CARGO_TARGET_DIR="$PWD/target"
-            (cd "$base_tree" && cargo build --release --locked)
+            (cd "$base_tree" && cargo rustc --release --locked --bin yt-music-gpui -- \
+              --cfg "ytm_benchmark_revision=\"$base\"")
             baseline=$(stat -c %s target/release/yt-music-gpui)
           fi
           {
