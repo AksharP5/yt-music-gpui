@@ -132,7 +132,7 @@ pub(super) fn check_cache_window(
                     },
                     |window, cx| {
                         cx.new(|cx| {
-                            let mut view = Music::new(Startup::Guest, window, cx);
+                            let mut view = Music::new(Startup::Guest, None, window, cx);
                             view.account_commands.close();
                             view.account_worker.take().unwrap().finish().unwrap();
                             for target in CatalogTarget::ALL {
@@ -917,7 +917,7 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(40.), px(40.)), size(px(1280.), px(800.))))),
             kind: WindowKind::PopUp, focus: true, ..Default::default()
         }, |window, cx| cx.new(|cx| {
-            let mut view = Music::new(Startup::Guest, window, cx);
+            let mut view = Music::new(Startup::Guest, None, window, cx);
             view.account_commands.close();
             view.account_worker.take().unwrap().finish().unwrap();
             for target in CatalogTarget::ALL { view.catalog_requests.cancel(target); }

@@ -62,6 +62,7 @@ use dialogs::settings::{SettingMenu, SettingsSection};
 use dialogs::*;
 use interaction::Drag;
 use library_actions::is_disliked;
+pub use navigation::HomePrefetch;
 use navigation::*;
 #[cfg(test)]
 use pages::shelves::visible_cards;

@@ -3,8 +3,16 @@
 use super::*;
 
 impl Music {
-    pub fn new(startup: Startup, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_with_workers(startup, window, cx, account::start, CatalogRequests::start)
+    /// `home` is the guest Home that `HomePrefetch::start` began loading, if any.
+    pub fn new(
+        startup: Startup,
+        home: Option<HomePrefetch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_workers(startup, window, cx, account::start, |window, cx| {
+            CatalogRequests::start(window, cx, home)
+        })
     }
 
     pub(in crate::app) fn new_with_workers(
@@ -328,6 +336,7 @@ impl Music {
                 search_filters: Vec::new(),
                 correction: None,
                 library: None,
+                playlist_sort: Vec::new(),
             },
             rows: Vec::new(),
             list_rows: Vec::new(),

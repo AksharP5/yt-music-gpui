@@ -3,6 +3,7 @@
 use super::*;
 use crate::catalog::{BrowseChoice, LibraryFilters};
 use crate::playlist_choices::{ChoiceList, Choices, LIKED_MUSIC_ART};
+use std::sync::{Mutex, PoisonError, mpsc};
 
 #[derive(Clone, PartialEq)]
 pub(in crate::app) enum Route {
@@ -568,6 +569,7 @@ impl Music {
         self.page.countries.clear();
         self.page.correction = None;
         self.page.library = None;
+        self.page.playlist_sort.clear();
         if self.overlay.as_ref().is_some_and(Overlay::in_page) {
             self.drop_overlay(cx);
         }
@@ -792,6 +794,7 @@ impl Music {
             search_filters: Vec::new(),
             correction: None,
             library,
+            playlist_sort: Vec::new(),
         };
         self.rebuild_rows();
     }
@@ -965,6 +968,17 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
+                // A playlist sorted in place arrives without its header.
+                if !result.append
+                    && page.header.is_none()
+                    && !page.playlist_sort.is_empty()
+                    && let Some(header) = &self.page.header
+                {
+                    page.header = Some(header.clone());
+                    page.title = self.page.title.clone();
+                    page.description = self.page.description.clone();
+                    page.background = self.page.background.clone();
+                }
                 let reload_verified = result.append
                     || self.sync.page_reload.is_none()
                     || self.playlist_reloaded(&page, result.account_generation, cx);
@@ -1102,6 +1116,30 @@ impl Music {
     }
 }
 
+/// The guest Home, requested while the window opens.
+pub struct HomePrefetch(mpsc::Receiver<anyhow::Result<Page>>);
+
+impl HomePrefetch {
+    /// Start loading Home now when startup will show the guest Home, so the
+    /// request overlaps opening the window instead of following it.
+    pub fn start(startup: Startup) -> Option<Self> {
+        if startup == Startup::Restore
+            && auth::ACCOUNT_LOGIN_ENABLED
+            && Session::has_saved_account()
+        {
+            return None;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("home-prefetch".into())
+            .spawn(move || {
+                let _ = sender.send(Catalog::new().and_then(|catalog| catalog.home()));
+            })
+            .ok()?;
+        Some(Self(receiver))
+    }
+}
+
 impl CatalogRequests {
     #[expect(
         clippy::expect_used,
@@ -1134,10 +1172,15 @@ impl CatalogRequests {
         self
     }
 
-    pub(super) fn start(window: &mut Window, cx: &mut Context<Music>) -> Self {
+    pub(super) fn start(
+        window: &mut Window,
+        cx: &mut Context<Music>,
+        home: Option<HomePrefetch>,
+    ) -> Self {
         let catalog_requests = CatalogRequests::new();
         let (results, completed) = async_channel::unbounded::<CatalogEvent>();
         let generations = catalog_requests.generations.clone();
+        let prefetch = Arc::new(Mutex::new(home));
         let catalog_requests = catalog_requests.start_workers(move |receiver| {
             let mut catalog = None;
             while let Ok(job) = receiver.recv_blocking() {
@@ -1217,12 +1260,24 @@ impl CatalogRequests {
                     Query::Revalidate(query) => query.as_ref(),
                     query => query,
                 };
+                // The first Home job takes the prefetch, and uses it only as a guest.
+                let prefetched = matches!(query, Query::Home)
+                    .then(|| {
+                        prefetch
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                    })
+                    .flatten()
+                    .filter(|_| job.session.is_none());
                 let result = match catalog {
                     Err(e) => Err(anyhow::anyhow!("{e:#}")),
                     Ok(catalog) => {
                         let catalog = catalog.for_session(job.session);
                         match query {
-                            Query::Home => catalog.home(),
+                            Query::Home => prefetched
+                                .and_then(|home| home.0.recv().ok())
+                                .unwrap_or_else(|| catalog.home()),
                             Query::Explore => catalog.explore(),
                             Query::Library(section) => catalog.library(*section),
                             Query::SidebarPlaylists => catalog.library(Section::Playlists),

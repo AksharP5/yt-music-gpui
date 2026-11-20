@@ -1944,7 +1944,16 @@ pub(crate) fn private_tool(_: &str) -> Option<PathBuf> {
     None
 }
 
+/// Lets a native test stand in for yt-dlp. The installer's private copy comes
+/// before PATH, so a test cannot rely on PATH to replace it.
+#[cfg(all(test, unix))]
+pub(crate) static TEST_YTDLP: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 pub(crate) fn find_ytdlp() -> Result<PathBuf> {
+    #[cfg(all(test, unix))]
+    if let Some(path) = TEST_YTDLP.get() {
+        return Ok(path.clone());
+    }
     private_tool("yt-dlp")
         .into_iter()
         .chain(

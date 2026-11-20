@@ -85,33 +85,21 @@ The tests in `src/app/native_tests/` and the `native_` tests in `src/app/player_
 
 Together these keep the tests away from your library, saved account, keyring and media keys. GPUI's application loop cannot restart within one process, so each test needs its own process and a fresh runtime. The tests set their own volume to 0.
 
-Some tests compare window pixels through X11 and ImageMagick's `import`, so the recipe unsets `WAYLAND_DISPLAY`. The playback test also needs a yt-dlp that reports a different version, to show the guest fallback notice without an account. The wrapper below does that and passes every other call to the real yt-dlp. It checks every argument because the player asks for `yt-dlp --ignore-config --no-plugin-dirs --version`.
+Some tests compare window pixels through X11 and ImageMagick's `import`, so the recipe unsets `WAYLAND_DISPLAY`.
 
 ```sh
-real_ytdlp=$(command -v yt-dlp)
 for test in $(bin/test -- --ignored --list | sed -n \
   -e '/^app::native_tests::performance::carousel_render_work_and_height_stay_bounded_while_scrolling: test$/d' \
   -e '/^app::native_tests::suggestions::suggestions_refresh_cost_with_loaded_playlist: test$/d' \
   -e '/^app::native_tests::/s/: test$//p' \
   -e '/^app::player_page::comments::tests::native_/s/: test$//p'); do
   runtime=$(mktemp -d /tmp/yt-music-native.XXXXXX)
-  mkdir -p "$runtime/data/yt-music-gpui" "$runtime/cache" "$runtime/bin"
-  cat > "$runtime/bin/yt-dlp" <<EOF
-#!/bin/sh
-for arg in "\$@"; do
-  if [ "\$arg" = --version ]; then
-    echo native-test-mismatch
-    exit 0
-  fi
-done
-exec "$real_ytdlp" "\$@"
-EOF
-  chmod 700 "$runtime/bin/yt-dlp"
+  mkdir -p "$runtime/data/yt-music-gpui" "$runtime/cache"
   env -u WAYLAND_DISPLAY \
     PIPEWIRE_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse" \
     XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" XDG_CACHE_HOME="$runtime/cache" \
-    PATH="$runtime/bin:$PATH" YT_MUSIC_NATIVE_TESTS=1 \
+    YT_MUSIC_NATIVE_TESTS=1 \
     dbus-run-session --config-file=bin/private-bus.conf -- bin/test -- --ignored --exact "$test" --nocapture || break
   # Screenshots from the render checks stay in $runtime for inspection.
   echo "Native test files: $runtime"

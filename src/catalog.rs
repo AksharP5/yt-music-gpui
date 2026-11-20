@@ -662,6 +662,7 @@ pub struct PageHeader {
     pub artist_thumbnail: Option<String>,
     /// The playlist owner the web prints under the title, such as "YouTube Music".
     pub owner: String,
+    pub owner_thumbnail: Option<String>,
     pub subtitle: String,
     pub stats: String,
     pub shuffle: Option<Arc<PlaylistTarget>>,
@@ -822,6 +823,8 @@ pub struct Page {
     pub search_filters: Vec<crate::search::FilterChip>,
     pub correction: Option<crate::search::Correction>,
     pub library: Option<LibraryFilters>,
+    /// A playlist's Sort menu, such as Default ordering, Title and Artist.
+    pub playlist_sort: Vec<SortChoice>,
 }
 
 /// A library page's filter chips, sort menu and empty state.
@@ -867,6 +870,8 @@ impl Page {
                 .sort
                 .retain_mut(|choice| choice.reload.renew_session(expected, next).is_ok());
         }
+        self.playlist_sort
+            .retain_mut(|choice| choice.reload.renew_session(expected, next).is_ok());
     }
 
     pub fn track_index(&self, item_index: usize) -> Option<usize> {
@@ -1021,7 +1026,8 @@ impl Catalog {
         let sorts = page
             .library
             .iter_mut()
-            .flat_map(|filters| &mut filters.sort);
+            .flat_map(|filters| &mut filters.sort)
+            .chain(&mut page.playlist_sort);
         let mut tokens = page
             .continuation
             .iter_mut()
@@ -2258,6 +2264,13 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            owner_thumbnail: header
+                .pointer(
+                    "/facepile/avatarStackViewModel/avatars/0/avatarViewModel/image/sources/0/url",
+                )
+                .and_then(Value::as_str)
+                .filter(|url| url.starts_with("https://"))
+                .map(str::to_owned),
             stats: text(&header["secondSubtitle"]),
             subtitle: ["subtitle", "monthlyListenerCount"]
                 .into_iter()
@@ -2320,6 +2333,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         search_filters: Vec::new(),
         correction: None,
         library: library_filters(data),
+        playlist_sort: playlist_sort(data),
     };
     if let Some(album) = header.and_then(|header| {
         let kind = text(&header["subtitle"]);
@@ -2477,6 +2491,53 @@ fn library_filters(data: &Value) -> Option<LibraryFilters> {
         )
     });
     Some(filters)
+}
+
+/// A playlist's Sort options. Each one names a command entity sent alongside
+/// the page, and that entity holds the continuation that reloads the songs.
+fn playlist_sort(data: &Value) -> Vec<SortChoice> {
+    let Some(menu) = find(data, "musicPlaylistShelfRenderer")
+        .or_else(|| find(data, "musicPlaylistShelfContinuation"))
+        .and_then(|shelf| shelf.pointer("/header/musicSideAlignedItemRenderer/startItems"))
+        .and_then(|items| find(items, "sortFilterSubMenuRenderer"))
+    else {
+        return Vec::new();
+    };
+    let commands = data
+        .pointer("/frameworkUpdates/entityBatchUpdate/mutations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mutation| {
+            Some((
+                mutation["entityKey"].as_str()?,
+                mutation.pointer("/payload/commandEntity/command")?,
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    menu["subMenuItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let label = item["title"].as_str()?.trim();
+            let endpoint = &item["navigationEndpoint"];
+            let command = endpoint
+                .pointer("/executeEntityCommand/commandEntityKey")
+                .and_then(Value::as_str)
+                .and_then(|key| commands.get(key).copied())
+                .unwrap_or(endpoint);
+            let token = command
+                .pointer("/browseSectionListReloadEndpoint/continuation/reloadContinuationData/continuation")?
+                .as_str()
+                .filter(|token| !token.is_empty())?;
+            (!label.is_empty()).then(|| SortChoice {
+                label: label.to_owned(),
+                selected: item["selected"].as_bool().unwrap_or(false),
+                reload: Continuation::new(token),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn parse_home(data: &Value, title: &str) -> Result<Page> {
@@ -3567,6 +3628,7 @@ mod tests {
             search_filters: Vec::new(),
             correction: None,
             library: None,
+            playlist_sort: Vec::new(),
         };
         page.shelves = vec![
             Shelf {
@@ -4505,6 +4567,53 @@ mod tests {
                 "navigationEndpoint":{"browseEndpoint":{"browseId":"VLLM"}}
             }}],"itemSize":"COLLECTION_STYLE_ITEM_SIZE_SMALL"}}]
         }}}}]}}})
+    }
+
+    #[test]
+    fn playlist_sort_and_owner_come_from_the_captured_chart_page() {
+        // A signed-out chart playlist captured from music.youtube.com.
+        let data: Value =
+            serde_json::from_str(include_str!("fixtures/charts/chart_playlist.json")).unwrap();
+        let page = parse_page(&data, "Chart").unwrap();
+        let header = page.header.as_ref().unwrap();
+        assert_eq!(header.owner, "YouTube Charts");
+        assert!(
+            header
+                .owner_thumbnail
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://yt3.ggpht.com/"))
+        );
+        let sort = page
+            .playlist_sort
+            .iter()
+            .map(|choice| (choice.label.as_str(), choice.selected))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sort,
+            [
+                ("Top voted", false),
+                ("Default ordering", true),
+                ("Newest first", false),
+                ("Oldest first", false),
+                ("Title", false),
+                ("Artist", false),
+                ("Album", false),
+            ]
+        );
+        // Each option reloads through the command entity its item names.
+        let tokens = page
+            .playlist_sort
+            .iter()
+            .map(|choice| choice.reload.token())
+            .collect::<HashSet<_>>();
+        assert_eq!(tokens.len(), sort.len());
+        assert!(tokens.iter().all(|token| token.starts_with("4qmFsgI")));
+        assert!(
+            parse_page(&json!({"contents":[]}), "Album")
+                .unwrap()
+                .playlist_sort
+                .is_empty()
+        );
     }
 
     #[test]

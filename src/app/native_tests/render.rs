@@ -1000,6 +1000,7 @@ async fn scrolled_artist_survives_tab(
                 artist: None,
                 artist_thumbnail: None,
                 owner: String::new(),
+                owner_thumbnail: None,
                 subtitle: "Artist".into(),
                 stats: String::new(),
                 shuffle: None,
@@ -2239,7 +2240,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     },
                     |window, cx| {
                         cx.new(|cx| {
-                            let mut music = Music::new(Startup::Guest, window, cx);
+                            let mut music = Music::new(Startup::Guest, None, window, cx);
                             for target in CatalogTarget::ALL {
                                 music.catalog_requests.cancel(target);
                             }
@@ -2450,11 +2451,14 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 );
                 for tab in [PlayerTab::Lyrics, PlayerTab::Comments, PlayerTab::Related] {
                     window
-                        .update(cx, |music, _, cx| {
+                        .update(cx, |music, window, cx| {
                             if tab == PlayerTab::Comments {
                                 music.seed_comments_for_render();
                             }
                             music.select_player_tab(tab, cx);
+                            // Earlier Tab presses can leave a focus ring in the page body.
+                            // Moving it off would then read as missing content.
+                            window.focus(&music.focus, cx);
                         })
                         .unwrap();
                     wait_for_presented_frame(window, cx).await;
@@ -2621,9 +2625,11 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 cx.update(|cx| cx.quit());
             })
             .detach();
+            // Only stops a hung test. A debug build takes over two minutes,
+            // so leave room for a loaded machine.
             cx.spawn(async move |cx| {
                 cx.background_executor()
-                    .timer(Duration::from_secs(150))
+                    .timer(Duration::from_secs(300))
                     .await;
                 cx.update(|cx| cx.quit());
             })

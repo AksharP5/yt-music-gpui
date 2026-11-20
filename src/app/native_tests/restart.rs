@@ -77,7 +77,7 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
             focus: false,
             ..Default::default()
         }, |window, cx| cx.new(|cx| {
-            let mut music = Music::new(Startup::Guest, window, cx);
+            let mut music = Music::new(Startup::Guest, None, window, cx);
             for target in CatalogTarget::ALL { music.catalog_requests.cancel(target); }
             music.library.volume = 0.;
             music.player.as_ref().unwrap().set_volume(0.).unwrap();

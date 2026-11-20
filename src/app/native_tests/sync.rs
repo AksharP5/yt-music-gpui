@@ -1306,7 +1306,7 @@ fn native_sync_preserves_loaded_pages_and_rolls_back_ratings() -> Result<()> {
             titlebar:Some(TitlebarOptions { title:Some("Music sync validation".into()), ..Default::default() }),
             focus:true, ..Default::default()
         }, move |window,cx| cx.new(|cx| {
-            let mut view = Music::new(Startup::Guest,window,cx);
+            let mut view = Music::new(Startup::Guest,None,window,cx);
             view.account_commands.close();
             view.account_worker.take().unwrap().finish().unwrap();
             view.account_commands = sender;

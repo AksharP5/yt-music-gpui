@@ -101,10 +101,29 @@ impl Music {
                     .child(title),
             );
             if !header.owner.is_empty() {
+                let avatar = header.owner_thumbnail.as_deref().map(|url| {
+                    match self.artwork.get(url, size(px(24.), px(24.))) {
+                        Some(image) => img(image)
+                            .size(px(24.))
+                            .rounded_full()
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
+                        None => div()
+                            .size(px(24.))
+                            .rounded_full()
+                            .bg(self.theme.raised)
+                            .into_any_element(),
+                    }
+                });
                 heading = heading.child(
                     div()
+                        .when(avatar.is_some(), |owner| owner.h(px(32.)))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
                         .text_size(px(12.))
                         .line_height(px(18.))
+                        .children(avatar)
                         .child(header.owner),
                 );
             }
@@ -334,5 +353,102 @@ impl Music {
                     ),
                 )
             })
+    }
+
+    /// A playlist's Sort button above its songs, with the web's menu below
+    /// it. Editable playlists leave it out so a reorder never applies to a
+    /// sorted view.
+    pub(in crate::app) fn playlist_sort(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.page.editable || self.page.playlist_sort.is_empty() || self.rows.is_empty() {
+            return None;
+        }
+        let theme = self.theme;
+        let text = rgb(0xf1f1f1);
+        let bounds = Rc::new(Cell::new(Bounds::default()));
+        let measured = bounds.clone();
+        let button = div()
+            .id("playlist-sort")
+            .keyboard_control(theme)
+            .track_focus(&self.sort_focus)
+            .relative()
+            .child(
+                canvas(move |rect, _, _| measured.set(rect), |_, _, _, _| {})
+                    .absolute()
+                    .inset_0(),
+            )
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(14.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(text)
+            .cursor_pointer()
+            .child(icon("sort", 24., text.into()))
+            .child("Sort")
+            .on_click(cx.listener(|view, _, window, cx| {
+                if matches!(view.overlay, Some(Overlay::PlaylistSort)) {
+                    view.close_overlay(window, cx);
+                } else {
+                    view.open_overlay(Overlay::PlaylistSort, window, cx);
+                }
+            }));
+        let mut anchor = div().relative().flex().child(button);
+        if matches!(self.overlay, Some(Overlay::PlaylistSort)) {
+            let options = self
+                .page
+                .playlist_sort
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| {
+                    let reload = choice.reload.clone();
+                    let selected = choice.selected;
+                    div()
+                        .id(("playlist-sort-option", index))
+                        .keyboard_control(theme)
+                        .h(px(48.))
+                        .px(px(16.))
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .text_color(text)
+                        .cursor_pointer()
+                        .when(selected, |row| row.bg(gpui::white().opacity(0.1)))
+                        .hover(|row| row.bg(gpui::white().opacity(0.1)))
+                        .child(choice.label.clone())
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.close_overlay(window, cx);
+                            if !selected {
+                                view.request(Query::Reload(reload.clone()), cx);
+                            }
+                        }))
+                });
+            let menu = div()
+                .id("playlist-sort-menu")
+                .track_focus(&self.overlay_focus)
+                .tab_group()
+                .tab_stop(false)
+                .absolute()
+                .top(px(36.))
+                .left_0()
+                .py(px(8.))
+                .rounded(px(12.))
+                .bg(rgb(0x282828))
+                .shadow_lg()
+                .occlude()
+                .children(options)
+                .on_mouse_down_out(
+                    cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                        if !bounds.get().contains(&event.position) {
+                            view.close_overlay(window, cx);
+                        }
+                    }),
+                );
+            anchor = anchor.child(deferred(menu).with_priority(1));
+        }
+        // The web lines the button up with the songs' thumbnails, 18px above them.
+        Some(div().pl(px(16.)).pb(px(18.)).child(anchor))
     }
 }
