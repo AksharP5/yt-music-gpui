@@ -349,6 +349,8 @@ impl<'a> Format<'a> {
         {
             return None;
         }
+        // A ciphered format keeps its rank without a URL, so choosing it fails
+        // over to the full extractor instead of quietly lowering quality.
         let url = raw["url"].as_str().filter(|url| {
             raw.get("signatureCipher").is_none()
                 && raw.get("cipher").is_none()
