@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::PageLayout;
+use crate::catalog::{ChartMovement, ChartRank};
 
 /// Web row thumbnails dim to this on hover behind the play glyph.
 const THUMBNAIL_SCRIM: u32 = 0x000000cc;
@@ -61,6 +62,41 @@ impl Music {
                     .items_center()
                     .justify_center()
                     .child(icon("play", 24., self.theme.text)),
+            )
+            .into_any_element()
+    }
+
+    /// A chart row's thumbnail followed by its movement arrow and position.
+    fn ranked(&self, art: AnyElement, rank: Option<&ChartRank>) -> AnyElement {
+        let Some(rank) = rank else {
+            return art;
+        };
+        let movement = rank.movement.map(|movement| match movement {
+            ChartMovement::Up => icon("chart-up", 24., rgb(0x2ba640).into()),
+            ChartMovement::Down => icon("chart-down", 24., rgb(0xe1002d).into()),
+            ChartMovement::Same => icon("chart-same", 24., rgb(0xaaaaaa).into()),
+        });
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(4.))
+            .child(art)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().size(px(24.)).flex_shrink_0().children(movement))
+                    .child(
+                        div()
+                            .w(px(28.))
+                            .pl(px(4.))
+                            .flex_shrink_0()
+                            .text_size(px(14.))
+                            .line_height(px(16.8))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(rank.position.clone()),
+                    ),
             )
             .into_any_element()
     }
@@ -205,15 +241,22 @@ impl Music {
                     track.details.explicit,
                     track.details.wide_thumbnail,
                 ),
-                _ => (item.subtitle().to_owned().into_any_element(), false, false),
+                Item::Collection(collection) => (
+                    collection.subtitle.clone().into_any_element(),
+                    collection.details.explicit,
+                    false,
+                ),
+                Item::Navigation(_) => (String::new().into_any_element(), false, false),
             };
-            let art = self.row_thumbnail(
-                item.thumbnail(),
-                48.,
-                ArtworkShape::Square,
-                wide,
-                "music-row",
-            );
+            // Charts' Top artists rows show round portraits, like artist cards.
+            let shape = if matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"))
+            {
+                ArtworkShape::Circle
+            } else {
+                ArtworkShape::Square
+            };
+            let art = self.row_thumbnail(item.thumbnail(), 48., shape, wide, "music-row");
+            let art = self.ranked(art, item.rank());
             return div()
                 .id(("quick-pick", id))
                 .keyboard_control(self.theme)
@@ -561,13 +604,14 @@ impl Music {
             } else {
                 ArtworkShape::Square
             };
-            self.row_thumbnail(
+            let art = self.row_thumbnail(
                 thumbnail.as_deref(),
                 style.thumbnail(),
                 shape,
                 wide,
                 "music-row",
-            )
+            );
+            self.ranked(art, item.rank())
         };
         let title = item.title().to_owned();
         let plays = track.and_then(|track| track.details.plays.clone());

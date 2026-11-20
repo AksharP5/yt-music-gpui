@@ -352,6 +352,8 @@ pub struct TrackDetails {
     /// Video and episode frames are 16:9 and must not be cropped square.
     #[serde(skip)]
     pub wide_thumbnail: bool,
+    #[serde(skip)]
+    pub rank: Option<ChartRank>,
 }
 
 impl TrackDetails {
@@ -387,6 +389,8 @@ pub struct CollectionDetails {
     pub explicit: bool,
     #[serde(skip)]
     pub card: CardControls,
+    #[serde(skip)]
+    pub rank: Option<ChartRank>,
 }
 
 /// The buttons on a top search result, which vary by kind on the web.
@@ -404,6 +408,37 @@ pub enum CardAction {
     Play,
     Shuffle,
     Mix,
+}
+
+/// A chart row's position and how it moved since the previous chart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChartRank {
+    pub position: String,
+    pub movement: Option<ChartMovement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartMovement {
+    Up,
+    Down,
+    Same,
+}
+
+impl ChartRank {
+    fn from_row(row: &Value) -> Option<Self> {
+        let column = row.pointer("/customIndexColumn/musicCustomIndexColumnRenderer")?;
+        let position = text(&column["text"]);
+        if position.trim().is_empty() {
+            return None;
+        }
+        let movement = match column.pointer("/icon/iconType").and_then(Value::as_str) {
+            Some("ARROW_DROP_UP") => Some(ChartMovement::Up),
+            Some("ARROW_DROP_DOWN") => Some(ChartMovement::Down),
+            Some("ARROW_CHART_NEUTRAL") => Some(ChartMovement::Same),
+            _ => None,
+        };
+        Some(Self { position, movement })
+    }
 }
 
 pub(crate) struct ArtistSubscription {
@@ -577,6 +612,13 @@ impl Item {
         match self {
             Self::Track(t) => t.thumbnail.as_deref(),
             Self::Collection(c) => c.thumbnail.as_deref(),
+            Self::Navigation(_) => None,
+        }
+    }
+    pub fn rank(&self) -> Option<&ChartRank> {
+        match self {
+            Self::Track(t) => t.details.rank.as_ref(),
+            Self::Collection(c) => c.details.rank.as_ref(),
             Self::Navigation(_) => None,
         }
     }
@@ -1554,6 +1596,7 @@ pub(crate) fn parse_item(value: &Value) -> Option<Item> {
         details.byline = Some(byline).filter(|byline| !byline.is_empty());
         details.explicit = explicit(row);
         details.wide_thumbnail = wide_thumbnail(row);
+        details.rank = ChartRank::from_row(row);
         return Some(Item::Track(Track {
             id: id.to_owned(),
             title,
@@ -1668,6 +1711,7 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
         playlist_id: playlist_id.map(str::to_owned),
         saved: subscribed.or_else(|| item_rating(row).map(|rating| rating == Rating::Like)),
         explicit: explicit(row),
+        rank: ChartRank::from_row(row),
         editable: browse_id.strip_prefix("VL").filter(|id| !id.is_empty()).is_some_and(|id| {
             row.pointer("/menu/menuRenderer/items")
                 .and_then(Value::as_array)
@@ -4753,6 +4797,81 @@ mod tests {
                 "browseId":"FEmusic_moods_and_genres_category", "params":params
             }}
         }})
+    }
+
+    /// Signed-out responses captured from music.youtube.com, trimmed to a few rows.
+    fn chart_fixture(name: &str) -> Value {
+        serde_json::from_str(match name {
+            "charts" => include_str!("fixtures/charts/charts.json"),
+            "chart_playlist" => include_str!("fixtures/charts/chart_playlist.json"),
+            _ => panic!("no chart fixture named {name}"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn chart_rows_keep_their_rank_and_movement() {
+        use ChartMovement::{Down, Same, Up};
+        let ranks = |shelf: &Shelf| {
+            shelf
+                .items
+                .iter()
+                .map(|item| {
+                    let rank = item.rank().expect("every chart row is ranked");
+                    (rank.position.clone(), rank.movement)
+                })
+                .collect::<Vec<_>>()
+        };
+        let charts = parse_page(&chart_fixture("charts"), "Charts").unwrap();
+        let [albums, artists] = charts.shelves.as_slice() else {
+            panic!("expected Top albums and Top artists");
+        };
+        assert_eq!(albums.title, "Top albums");
+        assert!(
+            albums
+                .items
+                .iter()
+                .all(|item| matches!(item, Item::Collection(_)))
+        );
+        assert_eq!(
+            ranks(albums),
+            [
+                ("1".into(), Some(Up)),
+                ("2".into(), Some(Same)),
+                ("3".into(), Some(Down))
+            ]
+        );
+        assert_eq!(artists.title, "Top artists");
+        assert_eq!(
+            ranks(artists),
+            [
+                ("1".into(), Some(Same)),
+                ("3".into(), Some(Up)),
+                ("4".into(), Some(Down))
+            ]
+        );
+
+        let playlist = parse_page(&chart_fixture("chart_playlist"), "Chart").unwrap();
+        assert!(
+            playlist.shelves[0]
+                .items
+                .iter()
+                .all(|item| matches!(item, Item::Track(_)))
+        );
+        assert_eq!(
+            ranks(&playlist.shelves[0]),
+            [("1".into(), Some(Up)), ("7".into(), Some(Down))]
+        );
+        assert!(
+            parse_item(&json!({"musicResponsiveListItemRenderer":{
+                "flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Unranked"}]}}}],
+                "playlistItemData":{"videoId":"abcdefghijk"}
+            }}))
+            .unwrap()
+            .rank()
+            .is_none(),
+            "Rows outside charts have no rank"
+        );
     }
 
     #[test]
