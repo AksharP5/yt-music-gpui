@@ -280,7 +280,7 @@ impl Music {
                 .current_watch()
                 .and_then(|watch| watch.current.as_ref()?.duration);
         }
-        let playing = active && self.playback != Playback::Stopped && !self.playback.is_paused();
+        let playing = active && self.transport().status == media_controls::PlaybackStatus::Playing;
         // The hover handle overlays the thumbnail instead of reserving a gutter.
         let show_handle = dragged || self.player_page.hovered_row == Some(index);
         let handle = show_handle.then(|| {

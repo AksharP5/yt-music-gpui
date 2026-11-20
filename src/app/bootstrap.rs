@@ -29,7 +29,6 @@ impl Music {
         let restored = library.last_position.clone().filter(|last| {
             last.seconds > 0. && current.is_some_and(|track| track.id == last.track_id)
         });
-        let duration = current.and_then(|track| track.duration).unwrap_or(0) as f64;
         let position = restored.as_ref().map_or(0., |last| last.seconds);
         let store = store.map(|store| {
             let (writer, errors) = LibraryWriter::new(store);
@@ -392,7 +391,7 @@ impl Music {
             playback: Playback::Stopped,
             position,
             pending_seek: None,
-            duration,
+            measured_duration: None,
             player_page: PlayerPage::start(window, cx),
             overlay: (startup == Startup::Connect).then_some(Overlay::SignIn),
             settings_section: SettingsSection::General,

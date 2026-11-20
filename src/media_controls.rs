@@ -63,19 +63,15 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// `duration` is in seconds; zero or less means unknown.
     pub fn new(track: &Track, duration: f64) -> Self {
-        let duration = if duration.is_finite() && duration > 0. {
-            Some(duration)
-        } else {
-            track.duration.map(|seconds| seconds as f64)
-        };
         Self {
             id: track.id.clone(),
             title: track.title.clone(),
             artist: track.artist.clone(),
             album: track.album.clone(),
             art_url: track.thumbnail.clone(),
-            length: duration.map(microseconds),
+            length: (duration.is_finite() && duration > 0.).then(|| microseconds(duration)),
         }
     }
 }

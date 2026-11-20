@@ -137,7 +137,7 @@ impl Music {
             &active.scope,
             &active.track,
             active.position,
-            self.duration,
+            transport::track_duration(&active.track, self.measured_duration.as_ref()),
             completed,
         );
         active.checkpoint = Instant::now();
@@ -194,10 +194,10 @@ impl Music {
         if let Some(active) = &self.listening.active {
             // Saved only when listening ends, including on quit, to keep periodic writes rare.
             // Podcasts and long videos keep their own resume positions.
-            let seconds = crate::listening::normalize(
-                active.position,
-                (self.duration > 0.).then_some(self.duration),
-            );
+            let duration =
+                transport::track_duration(&active.track, self.measured_duration.as_ref());
+            let seconds =
+                crate::listening::normalize(active.position, (duration > 0.).then_some(duration));
             self.library.last_position = (!completed
                 && seconds > 0.
                 && !crate::listening::resumable(&active.track))

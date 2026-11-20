@@ -3,11 +3,10 @@
 pub(in crate::app) mod desktop;
 pub(in crate::app) mod listening;
 pub(in crate::app) mod queue;
+pub(in crate::app) mod transport;
 
 use super::*;
 pub(in crate::app) use queue::PlaybackChannels;
-
-const PREVIOUS_RESTART_SECONDS: f64 = 3.;
 
 #[derive(Clone)]
 pub(in crate::app) enum PlaybackQuery {
@@ -223,12 +222,6 @@ impl Music {
             .map_or(self.position, |seek| seek.seconds)
     }
 
-    pub(in crate::app) fn can_go_previous(&self) -> bool {
-        self.player.is_some()
-            && (self.library.queue.index.is_some_and(|index| index > 0)
-                || self.playback_position() > PREVIOUS_RESTART_SECONDS)
-    }
-
     pub(in crate::app) fn seek_current(&mut self, seconds: f64, cx: &mut Context<Self>) {
         self.report_listening(false);
         self.listening_discontinuity();
@@ -379,7 +372,6 @@ impl Music {
                     full_lookup: false,
                 };
                 self.position = start;
-                self.duration = track.duration.unwrap_or(0) as f64;
                 self.error = None;
                 if watch_mode != WatchMode::Details
                     || self.account.is_some()
@@ -544,14 +536,11 @@ impl Music {
                 .index
                 .and_then(|index| self.library.queue.tracks_mut().get_mut(index))
         {
-            let duration = track.duration.unwrap_or(0) as f64;
             *current = track;
             self.reset_radio();
             self.now_playing = None;
             if self.active_id.is_some() || pending_track {
                 self.play_current_at(position, paused, WatchMode::Details, cx);
-            } else {
-                self.duration = duration;
             }
         } else if changed
             && self.active_id.is_some()
@@ -858,14 +847,14 @@ impl Music {
                         .pending_seek
                         .is_some_and(|seek| seek.track_id == track_id) =>
             {
-                let can_go_previous = self.can_go_previous();
+                let transport = self.transport();
                 changed = self.position.floor() != seconds.floor();
                 self.position = seconds;
                 self.sample_listening();
                 if let Some(service) = &self.media_controls {
                     service.position_sample(track_id, seconds);
                 }
-                if changed || can_go_previous != self.can_go_previous() {
+                if changed || transport != self.transport() {
                     self.publish_desktop();
                     self.player_bar.update(cx, |_, cx| cx.notify());
                 }
@@ -894,7 +883,11 @@ impl Music {
                 }
             }
             PlayerEvent::Duration { track_id, seconds } if Some(track_id) == self.active_id => {
-                self.duration = seconds
+                self.measured_duration = self
+                    .library
+                    .queue
+                    .current()
+                    .map(|track| (track.id.clone(), seconds));
             }
             PlayerEvent::Paused { track_id, paused } if Some(track_id) == self.active_id => {
                 self.playback = self.playback.with_pause(paused);

@@ -71,7 +71,7 @@ fn the_last_song_continues_after_process_restart() -> Result<()> {
                     let last = music.library.last_position.clone().context("Quit must save the last song position")?;
                     ensure!(last.track_id == SONG && last.seconds >= 19., "Unexpected saved position {last:?}");
                     ensure!(music.playback == Playback::Stopped && music.active_id.is_none(), "A restart must not autoplay");
-                    ensure!((music.playback_position() - last.seconds).abs() < 0.01 && music.duration == 213., "The player bar must show the saved position before Play");
+                    ensure!((music.playback_position() - last.seconds).abs() < 0.01 && music.transport().duration == 213., "The player bar must show the saved position before Play");
                     if phase == "previous" {
                         music.previous(cx);
                         ensure!(music.playback_position() == 0., "Previous before Play returns the bar to the start");

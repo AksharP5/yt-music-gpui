@@ -58,7 +58,7 @@ impl Music {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if self.duration <= 0. {
+        if self.transport().duration <= 0. {
             return;
         }
         self.drag = Some(Drag::Seek {
@@ -101,7 +101,7 @@ impl Music {
                 self.drag = Some(Drag::Seek {
                     track_id,
                     generation,
-                    seconds: f64::from(fraction) * self.duration,
+                    seconds: f64::from(fraction) * self.transport().duration,
                 });
                 self.player_bar.update(cx, |_, cx| cx.notify());
             }
@@ -134,7 +134,7 @@ impl Music {
 
     fn seek_by(&mut self, seconds: f64, cx: &mut Context<Self>) {
         let target = (self.playback_position() + seconds)
-            .min(self.duration)
+            .min(self.transport().duration)
             .max(0.);
         self.seek_current(target, cx);
     }
