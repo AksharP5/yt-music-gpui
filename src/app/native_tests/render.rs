@@ -2240,7 +2240,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     },
                     |window, cx| {
                         cx.new(|cx| {
-                            let mut music = Music::new(Startup::Guest, window, cx);
+                            let mut music = Music::new(Startup::Guest, None, window, cx);
                             for target in CatalogTarget::ALL {
                                 music.catalog_requests.cancel(target);
                             }

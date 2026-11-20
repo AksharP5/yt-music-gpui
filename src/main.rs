@@ -126,6 +126,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Before the window opens, which takes hundreds of milliseconds.
+    let home = app::HomePrefetch::start(startup);
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
@@ -157,7 +159,7 @@ fn main() {
                     app_id: Some("yt-music-gpui".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| app::Music::new(startup, window, cx)),
+                |window, cx| cx.new(|cx| app::Music::new(startup, home, window, cx)),
             );
             if let Err(error) = window {
                 eprintln!("Could not open the window: {error:#}");
