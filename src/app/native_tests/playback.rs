@@ -1448,7 +1448,7 @@ fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> R
             focus: true,
             ..Default::default()
         }, |window, cx| cx.new(|cx| {
-            let mut music = Music::new(Startup::Guest, window, cx);
+            let mut music = Music::new(Startup::Guest, None, window, cx);
             for target in CatalogTarget::ALL { music.catalog_requests.cancel(target); }
             music.library.queue.replace(vec![Track {
                 id: "dQw4w9WgXcQ".into(), title: "Never Gonna Give You Up".into(), artist: "Rick Astley".into(),
