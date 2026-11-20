@@ -629,7 +629,11 @@ impl Music {
                         if stacked {
                             let row = view.list_row(index, 0., window, cx);
                             return if index == 0 {
-                                div().pt(px(STACKED_TOP)).child(row).into_any_element()
+                                div()
+                                    .pt(px(STACKED_TOP))
+                                    .children(view.playlist_sort(cx))
+                                    .child(row)
+                                    .into_any_element()
                             } else {
                                 row
                             };
@@ -641,7 +645,7 @@ impl Music {
                                 200.
                             };
                             let heading = view.page_heading(cover, layout, cx);
-                            return div()
+                            let header = div()
                                 .w_full()
                                 .px(px(inset))
                                 .pb(px(32.))
@@ -657,7 +661,10 @@ impl Music {
                                                 .child("No songs here yet."),
                                         )
                                     },
-                                ))
+                                ));
+                            return div()
+                                .child(header)
+                                .children(view.playlist_sort(cx).map(|sort| sort.ml(px(inset))))
                                 .into_any_element();
                         }
                         view.list_row(index - usize::from(inline), inset, window, cx)
