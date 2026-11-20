@@ -347,6 +347,7 @@ pub struct Player {
     events: async_channel::Receiver<PlayerEvent>,
     next_id: AtomicU64,
     next: Mutex<Option<PreparedTarget>>,
+    lookup: Option<native::Lookup>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -369,6 +370,7 @@ impl Player {
         let (commands, receiver) = command_channel()?;
         let wake = commands.wake.clone();
         let (events, event_receiver) = async_channel::unbounded();
+        let warm_up = lookup.clone();
         let worker = thread::Builder::new()
             .name("music-player".into())
             .spawn(move || {
@@ -384,8 +386,19 @@ impl Player {
             events: event_receiver,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: warm_up,
             worker: Some(worker),
         })
+    }
+
+    /// Fetch the fast lookup's visitor ID in the background, so the first
+    /// click on an unprepared song skips that page load.
+    pub fn warm_up(&self) {
+        if let Some(lookup) = self.lookup.clone() {
+            let _ = thread::Builder::new()
+                .name("lookup-warm-up".into())
+                .spawn(move || lookup.warm_up());
+        }
     }
 
     pub fn play(&self, video_id: &str, title: &str, options: PlayOptions) -> Result<u64> {
@@ -2084,10 +2097,19 @@ fn run(
                         quality: options.quality,
                         video: options.video,
                     };
+                    // A reload that skips the fast lookup must not get its stream back.
+                    // Any other play of the prepared song, such as resuming the restored
+                    // song partway in, loads the prepared stream under its own ID.
                     let resolved = prepared.take().filter(|(target, stream)| {
-                        target.track_id == track_id && stream.matches(&key)
+                        stream.matches(&key)
+                            && (target.track_id == track_id || !options.full_lookup)
                     });
-                    let prefetched = resolved.is_some()
+                    // mpv moves to an appended entry only from a file it is playing.
+                    // An idle player, as at startup, loads the prepared stream instead.
+                    let prefetched = resolved
+                        .as_ref()
+                        .is_some_and(|(target, _)| target.track_id == track_id)
+                        && state.file_active
                         && state.entries.values().any(|entry| *entry == track_id);
                     next_target = None;
                     pending_play = None;
@@ -3860,6 +3882,7 @@ YtMusicAccountIE._real_extract = extract
             events,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         player
@@ -4484,6 +4507,7 @@ YtMusicAccountIE._real_extract = extract
             events,
             next_id: AtomicU64::new(2),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -4867,6 +4891,7 @@ YtMusicAccountIE._real_extract = extract
             events,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         for start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.] {
@@ -5412,6 +5437,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             events,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         let cleared = player.clear_credentials().unwrap();

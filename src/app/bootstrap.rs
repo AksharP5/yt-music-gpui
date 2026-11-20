@@ -389,6 +389,7 @@ impl Music {
             video_error: None,
             video_click: None,
             active_id: None,
+            startup_settled: false,
             history_track: None,
             listening: playback::listening::ListeningState::default(),
             playback: Playback::Stopped,

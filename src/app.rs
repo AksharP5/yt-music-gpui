@@ -165,6 +165,8 @@ pub struct Music {
     video_error: Option<String>,
     video_click: Option<Task<()>>,
     active_id: Option<u64>,
+    /// The first page has loaded, so playback lookups no longer compete with startup.
+    startup_settled: bool,
     history_track: Option<u64>,
     listening: playback::listening::ListeningState,
     playback: Playback,

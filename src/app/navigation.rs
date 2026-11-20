@@ -966,6 +966,17 @@ impl Music {
             cx.notify();
             return;
         }
+        if !self.startup_settled && result.result.is_ok() {
+            // Startup is done with the network. Prepare the song Play would start,
+            // or with nothing queued, fetch the lookup's visitor ID for the first click.
+            self.startup_settled = true;
+            if self.library.queue.current().is_none()
+                && let Some(player) = &self.player
+            {
+                player.warm_up();
+            }
+            self.notify_playback(cx);
+        }
         match result.result {
             Ok(mut page) => {
                 // A playlist sorted in place arrives without its header.

@@ -441,19 +441,23 @@ impl Music {
     fn prepare_upcoming(&mut self) {
         let queue = &self.library.queue;
         let skip = |track: &Track| is_disliked(&self.ratings, track);
-        let next = (self.active_id.is_some() && self.playback != Playback::Stopped)
-            .then(|| {
-                queue.index?;
-                match queue.next_index(self.library.repeat, true, skip) {
+        let next = if self.active_id.is_some() && self.playback != Playback::Stopped {
+            queue.index.and_then(
+                |_| match queue.next_index(self.library.repeat, true, skip) {
                     Some(index) => queue.tracks.get(index),
                     None => self
                         .library
                         .music_autoplay()
                         .then(|| self.autoplay_tracks.iter().find(|track| !skip(track)))
                         .flatten(),
-                }
-            })
-            .flatten();
+                },
+            )
+        } else if self.playback == Playback::Stopped && self.startup_settled {
+            // Play starts the current song, such as the one restored at launch.
+            queue.current()
+        } else {
+            None
+        };
         if let Some(player) = &self.player
             && let Err(error) = player.prepare_next(
                 next.map(|track| track.id.as_str()),

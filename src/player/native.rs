@@ -56,16 +56,7 @@ impl Lookup {
         video: Option<VideoQuality>,
     ) -> Result<Selection> {
         let deadline = Instant::now() + BUDGET;
-        let epoch = {
-            let visitor = self.visitor.lock().unwrap_or_else(PoisonError::into_inner);
-            ensure!(
-                !visitor
-                    .paused_until
-                    .is_some_and(|until| until > Instant::now()),
-                "Native lookup is paused"
-            );
-            visitor.epoch
-        };
+        let epoch = self.epoch()?;
         let result = self
             .player_response(video_id, deadline, epoch)
             .and_then(|player| select(&player, audio, video));
@@ -80,6 +71,26 @@ impl Lookup {
             self.pause(STALL_COOLDOWN, epoch);
         }
         result
+    }
+
+    /// Fetch the visitor ID before the first click needs it. A paused lookup
+    /// stays paused, and a cached ID makes this a no-op.
+    pub(super) fn warm_up(&self) -> Result<()> {
+        let epoch = self.epoch()?;
+        self.visitor_data(false, Instant::now() + BUDGET, epoch)
+            .map(drop)
+    }
+
+    /// The current account session, unless a failure paused native lookups.
+    fn epoch(&self) -> Result<u64> {
+        let visitor = self.visitor.lock().unwrap_or_else(PoisonError::into_inner);
+        ensure!(
+            !visitor
+                .paused_until
+                .is_some_and(|until| until > Instant::now()),
+            "Native lookup is paused"
+        );
+        Ok(visitor.epoch)
     }
 
     fn pause(&self, duration: Duration, epoch: u64) {
@@ -891,6 +902,35 @@ pub(super) mod tests {
         // A lookup that began before the reset cannot write into the new session.
         lookup.pause(COOLDOWN, 0);
         assert!(lookup.visitor.lock().unwrap().paused_until.is_none());
+    }
+
+    #[test]
+    fn warm_up_caches_the_visitor_for_the_first_click_and_waits_out_a_pause() {
+        let (lookup, server) = self::server(vec![homepage(), fixture().to_string()]);
+        lookup.warm_up().unwrap();
+        // The click sends only the player request. A second page load would get
+        // the player response and fail.
+        lookup
+            .lookup("abcdefghijk", AudioQuality::Normal, None)
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0]["request"]
+                .as_str()
+                .unwrap()
+                .starts_with("GET / ")
+        );
+        assert_eq!(
+            requests[1]["headers"]["x-goog-visitor-id"],
+            "SYNTHETIC_VISITOR"
+        );
+        // During a pause, warming up sends nothing.
+        lookup.reset();
+        lookup.stalled();
+        assert_eq!(
+            lookup.warm_up().unwrap_err().to_string(),
+            "Native lookup is paused"
+        );
     }
 
     #[test]
