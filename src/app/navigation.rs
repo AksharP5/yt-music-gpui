@@ -648,6 +648,9 @@ impl Music {
             self.detail_list.state.remeasure();
         } else if self.grouped_rows() {
             self.detail_list.reset_rows(self.list_rows.len());
+        } else if self.collection_grid() {
+            // The grid sizes its rows from the window when it renders.
+            self.detail_list.state.remeasure();
         } else {
             self.detail_list = DetailList::new();
         }
@@ -667,7 +670,8 @@ impl Music {
                 continue;
             }
             let featured = search_all && shelf.layout == ShelfLayout::Featured;
-            let carousel = (browse_sections && !shelf.title.is_empty())
+            let carousel = (browse_sections
+                && (!shelf.title.is_empty() || shelf.layout == ShelfLayout::Grid))
                 || sectioned
                     && matches!(
                         shelf.layout,
@@ -675,6 +679,7 @@ impl Music {
                             | ShelfLayout::SmallCards
                             | ShelfLayout::Videos
                             | ShelfLayout::Episodes
+                            | ShelfLayout::Grid
                     );
             if featured {
                 self.list_rows.push(ListRow::Featured(index));

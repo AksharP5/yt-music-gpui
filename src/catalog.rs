@@ -601,6 +601,9 @@ pub enum ShelfLayout {
     Featured,
     /// Podcast episodes: 16:9 rows stacked three to a column.
     Episodes,
+    /// Square cards or mood buttons the service lays out in rows that wrap,
+    /// such as Moods & genres, rather than in a carousel.
+    Grid,
 }
 
 #[derive(Clone, Debug)]
@@ -1911,9 +1914,16 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                             {
                                 ShelfLayout::SmallCards
                             } else {
-                                contents
+                                let layout = contents
                                     .and_then(Value::as_array)
-                                    .map_or(ShelfLayout::Cards, |items| shelf_layout(items))
+                                    .map_or(ShelfLayout::Cards, |items| shelf_layout(items));
+                                if layout == ShelfLayout::Cards
+                                    && matches!(key, "gridRenderer" | "musicGridRenderer")
+                                {
+                                    ShelfLayout::Grid
+                                } else {
+                                    layout
+                                }
                             },
                             more,
                         });
@@ -4767,6 +4777,11 @@ mod tests {
         assert_eq!(page.title, "Moods & genres");
         assert_eq!(page.shelves.len(), 1);
         assert_eq!(page.shelves[0].title, "Moods & moments");
+        assert_eq!(
+            page.shelves[0].layout,
+            ShelfLayout::Grid,
+            "Like the web, the service's grid wraps instead of scrolling sideways"
+        );
         let [Item::Navigation(first), Item::Navigation(second)] = page.shelves[0].items.as_slice()
         else {
             panic!("expected two navigation links")
