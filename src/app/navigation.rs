@@ -574,7 +574,9 @@ impl Music {
         self.page.chips.clear();
         self.page.countries.clear();
         self.page.library = None;
-        self.sort_menu = false;
+        if self.overlay.as_ref().is_some_and(Overlay::in_page) {
+            self.drop_overlay(cx);
+        }
         self.rows.clear();
         self.list_rows.clear();
         if !matches!(route, Route::Search(_)) {
@@ -1060,7 +1062,7 @@ impl Music {
                     });
                     self.page = page;
                     if matches!(self.overlay, Some(Overlay::Track { .. })) {
-                        self.overlay = None;
+                        self.drop_overlay(cx);
                     }
                     self.rebuild_rows();
                 }

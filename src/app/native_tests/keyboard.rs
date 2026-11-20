@@ -9,100 +9,441 @@ use gpui::{
     AppContext, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
 };
 
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
-fn collection_dialogs_return_keyboard_focus_to_their_opening_control() -> anyhow::Result<()> {
-    check_cache_window(async |window, cx| {
-        window
-            .update(cx, |music, window, cx| {
-                let mut track = music.page.tracks()[0].clone();
-                track.details.episode = Some(Box::new(crate::catalog::EpisodeContext {
-                    chapters: vec![crate::catalog::Chapter {
-                        title: "Opening chapter".into(),
-                        start_seconds: 0,
-                    }],
-                    ..Default::default()
-                }));
-                music.route = Route::Browse(BrowseLink::new("VLdialog", "Dialog playlist"));
-                music.page.title = "Dialog playlist".into();
-                music.page.description = "Read the complete playlist description".into();
-                music.page.continuation = None;
-                music.page.shelves = vec![crate::catalog::Shelf {
-                    title: String::new(),
-                    items: vec![crate::catalog::Item::Track(track)],
-                    layout: crate::catalog::ShelfLayout::Songs,
-                    more: None,
-                }];
-                music.page.header = crate::catalog::parse_page(
-                    &serde_json::json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Dialog playlist"}}},"contents":[]}),
-                    "Dialog playlist",
-                ).unwrap().header;
-                music.rebuild_rows();
-                window.resize(gpui::size(gpui::px(850.), gpui::px(560.)));
-                window.focus(&music.focus, cx);
-                cx.notify();
-            })
-            .unwrap();
-        wait_for_presented_frame(window, cx).await;
-        // Header, compact guide and Back precede the description and collection actions.
-        let mut lost_focus = Vec::new();
-        for (tabs, chapters) in [(9, false), (13, true)] {
-            window
-                .update(cx, |music, window, cx| window.focus(&music.focus, cx))
-                .unwrap();
-            for _ in 0..tabs {
-                key(window, cx, "tab").await;
+mod focus_return {
+    use super::super::navigation::{check_cache_window, reply};
+    use super::super::render::{key, wait_for_presented_frame};
+    use crate::app::{Music, Overlay, Route, Search, SettingsSection, sync::tests::page};
+    use crate::catalog::{
+        BrowseChoice, BrowseLink, Chapter, EpisodeContext, Item, Shelf, ShelfLayout,
+    };
+    use crate::search::{SearchFilter, SearchScope};
+    use gpui::{
+        AppContext, AsyncApp, Context, FocusHandle, Focusable, MouseButton, MouseDownEvent,
+        MouseUpEvent, Pixels, PlatformInput, Point, Window, WindowHandle, point, px, size,
+    };
+
+    enum Input {
+        Keys(&'static [&'static str]),
+        Click(fn(&Music, &Window) -> Point<Pixels>),
+        Call(fn(&mut Music, &mut Window, &mut Context<Music>)),
+    }
+
+    enum Back {
+        Opener,
+        /// The opener is gone, so focus falls back to the page.
+        Page,
+    }
+
+    struct Row {
+        name: &'static str,
+        prepare: fn(&mut Music, &mut Window, &mut Context<Music>),
+        tabs: usize,
+        open: Input,
+        opened: fn(&Music) -> bool,
+        close: &'static [Input],
+        back: Back,
+    }
+
+    /// Returns where a click put focus on mouse down, which makes the clicked control the opener.
+    async fn send(
+        input: &Input,
+        window: WindowHandle<Music>,
+        cx: &mut AsyncApp,
+    ) -> Option<FocusHandle> {
+        match input {
+            Input::Keys(keys) => {
+                for name in *keys {
+                    key(window, cx, name).await;
+                }
+                None
             }
-            let opening = window
-                .update(cx, |_, window, cx| {
-                    super::render::capture(
-                        window,
-                        if chapters {
-                            "chapters-focused"
-                        } else {
-                            "description-focused"
-                        },
+            Input::Call(call) => {
+                window.update(cx, call).unwrap();
+                wait_for_presented_frame(window, cx).await;
+                None
+            }
+            Input::Click(at) => {
+                let position = window
+                    .update(cx, |view, window, _| at(view, window))
+                    .unwrap();
+                // The handle form leaves Music free for the handlers the event reaches.
+                let focused = cx
+                    .update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: Default::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        );
+                        window.focused(cx)
+                    })
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                        }),
+                        cx,
                     );
-                    window.focused(cx).unwrap()
                 })
                 .unwrap();
-            key(window, cx, "enter").await;
-            window
-                .update(cx, |music, _, _| {
-                    assert!(
-                        if chapters {
-                            matches!(music.overlay, Some(Overlay::Chapters(_)))
-                        } else {
-                            matches!(music.overlay, Some(Overlay::Description { .. }))
-                        },
-                        "Enter must open the focused collection dialog"
-                    );
-                })
-                .unwrap();
-            key(window, cx, "escape").await;
-            let restored = window
-                .update(cx, |music, window, _| {
-                    assert!(music.overlay.is_none());
-                    super::render::capture(
-                        window,
-                        if chapters {
-                            "chapters-returned"
-                        } else {
-                            "description-returned"
-                        },
-                    );
-                    opening.is_focused(window)
-                })
-                .unwrap();
-            if !restored {
-                lost_focus.push(if chapters { "Chapters" } else { "Description" });
+                wait_for_presented_frame(window, cx).await;
+                focused
             }
         }
-        assert!(
-            lost_focus.is_empty(),
-            "Closing these dialogs lost their opening control: {lost_focus:?}"
-        );
-    })
+    }
+
+    /// One episode with a chapter on an editable playlist, so its header offers every dialog.
+    fn collection(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        let mut track = page(1, false).tracks()[0].clone();
+        track.details.episode = Some(Box::new(EpisodeContext {
+            chapters: vec![Chapter {
+                title: "Opening chapter".into(),
+                start_seconds: 0,
+            }],
+            ..Default::default()
+        }));
+        // The default compact guide keeps the header tab order short.
+        view.sidebar_collapsed = None;
+        view.sidebar_playlists.clear();
+        view.route = Route::Browse(BrowseLink::new("VLdialog", "Dialog playlist"));
+        view.page = page(0, false);
+        view.page.title = "Dialog playlist".into();
+        view.page.description = "Read the complete playlist description".into();
+        view.page.editable = true;
+        view.page.privacy = Some("PRIVATE".into());
+        view.page.shelves = vec![Shelf {
+            title: String::new(),
+            items: vec![Item::Track(track)],
+            layout: ShelfLayout::Songs,
+            more: None,
+        }];
+        view.page.header = crate::catalog::parse_page(
+            &serde_json::json!({"header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Dialog playlist"}}},"contents":[]}),
+            "Dialog playlist",
+        )
+        .unwrap()
+        .header;
+        view.rebuild_rows();
+        window.resize(size(px(850.), px(560.)));
+        window.focus(&view.focus, cx);
+    }
+
+    fn countries(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        collection(view, window, cx);
+        view.page.editable = false;
+        view.page.countries = (0..4)
+            .map(|index| BrowseChoice {
+                label: format!("Country {index}"),
+                selected: index == 0,
+                target: BrowseLink::new(format!("country-{index}"), format!("Country {index}")),
+            })
+            .collect();
+    }
+
+    fn songs(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        window.resize(size(px(1280.), px(800.)));
+        view.sidebar_collapsed = Some(false);
+        view.route = Route::Browse(BrowseLink::new("VLfocus", "Songs"));
+        view.page = page(2, false);
+        view.library
+            .queue
+            .replace(vec![view.page.tracks()[0].clone()], 0);
+        view.library.autoplay = false;
+        view.rebuild_rows();
+        window.focus(&view.search.focus_handle(cx), cx);
+    }
+
+    fn sidebar_row(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        songs(view, window, cx);
+        view.sidebar_playlists = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "VLkeyboard",
+                "title": "Keyboard playlist",
+                "subtitle": "Playlist"
+            }))
+            .unwrap(),
+        ];
+        window.focus(&view.sidebar_focus.handle(0, cx), cx);
+    }
+
+    fn featured(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        songs(view, window, cx);
+        view.route = Route::Search(Search {
+            query: "Song".into(),
+            filter: SearchFilter::All,
+            scope: SearchScope::Catalog,
+        });
+        view.page.shelves[0].layout = ShelfLayout::Featured;
+        view.rebuild_rows();
+        window.focus(&view.focus, cx);
+    }
+
+    fn featured_save(view: &Music, window: &Window) -> Point<Pixels> {
+        let bounds = view.detail_list.state.bounds_for_item(1).unwrap();
+        let width = view.page_layout(window).search_width();
+        let inset = (bounds.size.width - px(width)) / 2.;
+        let save_center = if width < 800. { 115. } else { 149. };
+        point(
+            bounds.left() + inset + px(326.),
+            bounds.top() + px(save_center),
+        )
+    }
+
+    fn arriving_page(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        songs(view, window, cx);
+        view.navigate(Route::Browse(BrowseLink::new("VLarriving", "Arriving")), cx);
+    }
+
+    fn open_menu(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        view.open_item_menu(1, window, cx);
+    }
+
+    fn open_account(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
+        view.open_overlay(Overlay::Account, window, cx);
+    }
+
+    const ESCAPE: &[Input] = &[Input::Keys(&["escape"])];
+    const BACKDROP: &[Input] = &[Input::Click(|_, _| point(px(8.), px(8.)))];
+
+    /// Every kind of overlay, opened from the real control where one is reachable and closed
+    /// by Escape, a click outside, an action or code, must hand focus back to its opener.
+    #[test]
+    #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+    fn overlays_return_focus_to_their_opener() -> anyhow::Result<()> {
+        let rows = [
+            Row {
+                name: "Help, Escape",
+                prepare: sidebar_row,
+                tabs: 0,
+                open: Input::Keys(&["?"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::Help)),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Description, Escape",
+                prepare: collection,
+                tabs: 9,
+                open: Input::Keys(&["enter"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::Description { .. })),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Chapters, click outside",
+                prepare: collection,
+                tabs: 13,
+                open: Input::Keys(&["enter"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::Chapters(_))),
+                close: BACKDROP,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Playlist menu, Escape",
+                prepare: collection,
+                tabs: 12,
+                open: Input::Keys(&["enter"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::Collection(_))),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Edit playlist form, Escape",
+                prepare: collection,
+                tabs: 14,
+                open: Input::Keys(&["enter"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::PlaylistForm { .. })),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Delete playlist, Cancel",
+                prepare: collection,
+                tabs: 15,
+                open: Input::Keys(&["enter"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::DeletePlaylist { .. })),
+                close: &[Input::Keys(&["shift-tab", "enter"])],
+                back: Back::Opener,
+            },
+            Row {
+                name: "Country picker, Escape",
+                prepare: countries,
+                tabs: 14,
+                open: Input::Keys(&["enter"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::CountryPicker(_))),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Song menu, Add to queue",
+                prepare: songs,
+                tabs: 0,
+                open: Input::Call(open_menu),
+                opened: |view| matches!(view.overlay, Some(Overlay::Track { .. })),
+                close: &[Input::Keys(&["home", "down", "down", "enter"])],
+                back: Back::Opener,
+            },
+            Row {
+                name: "Song menu, Chapters, Escape",
+                prepare: collection,
+                tabs: 0,
+                open: Input::Call(|view, window, cx| view.open_item_menu(0, window, cx)),
+                opened: |view| matches!(view.overlay, Some(Overlay::Track { .. })),
+                close: &[Input::Keys(&["home", "down", "enter", "escape"])],
+                back: Back::Opener,
+            },
+            Row {
+                name: "Song menu, closed by a page arriving",
+                prepare: arriving_page,
+                tabs: 1,
+                open: Input::Call(|view, window, cx| {
+                    view.open_track_menu(page(1, false).tracks()[0].clone(), None, window, cx)
+                }),
+                opened: |view| matches!(view.overlay, Some(Overlay::Track { .. })),
+                close: &[Input::Call(|view, _, cx| {
+                    reply(view, page(2, false), cx);
+                })],
+                back: Back::Opener,
+            },
+            Row {
+                name: "Account menu, click outside",
+                prepare: songs,
+                tabs: 0,
+                open: Input::Call(open_account),
+                opened: |view| matches!(view.overlay, Some(Overlay::Account)),
+                close: BACKDROP,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Account menu, Settings, Escape",
+                prepare: songs,
+                tabs: 0,
+                open: Input::Call(open_account),
+                opened: |view| matches!(view.overlay, Some(Overlay::Account)),
+                close: &[Input::Keys(&[
+                    "down", "down", "down", "down", "enter", "escape",
+                ])],
+                back: Back::Opener,
+            },
+            Row {
+                name: "Setting choices, Escape",
+                prepare: |view, window, cx| {
+                    songs(view, window, cx);
+                    view.settings_section = SettingsSection::Playback;
+                    view.open_overlay(Overlay::Settings, window, cx);
+                },
+                tabs: 5,
+                open: Input::Keys(&["enter"]),
+                opened: |view| view.settings_menu.is_some(),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Save to playlist, New playlist, Escape",
+                prepare: songs,
+                tabs: 0,
+                open: Input::Call(|view, window, cx| {
+                    view.playlist_picker(vec![view.page.tracks()[0].clone()], window, cx)
+                }),
+                opened: |view| matches!(view.overlay, Some(Overlay::PlaylistPicker { .. })),
+                close: &[Input::Keys(&["shift-tab", "enter", "escape"])],
+                back: Back::Opener,
+            },
+            Row {
+                name: "Featured Save click, Escape",
+                prepare: featured,
+                tabs: 0,
+                open: Input::Click(featured_save),
+                opened: |view| matches!(view.overlay, Some(Overlay::PlaylistPicker { .. })),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Sidebar New playlist click, Escape",
+                prepare: |view, window, cx| {
+                    songs(view, window, cx);
+                    window.focus(&view.focus, cx);
+                },
+                tabs: 0,
+                // The wide guide's New playlist button follows its three navigation rows.
+                open: Input::Click(|_, _| point(px(120.), px(283.))),
+                opened: |view| matches!(view.overlay, Some(Overlay::PlaylistForm { .. })),
+                close: ESCAPE,
+                back: Back::Opener,
+            },
+            Row {
+                name: "Help after its opener is removed, Escape",
+                prepare: sidebar_row,
+                tabs: 0,
+                open: Input::Keys(&["?"]),
+                opened: |view| matches!(view.overlay, Some(Overlay::Help)),
+                close: &[
+                    Input::Call(|view, _, cx| {
+                        view.sidebar_playlists.clear();
+                        cx.notify();
+                    }),
+                    Input::Keys(&["escape"]),
+                ],
+                back: Back::Page,
+            },
+        ];
+        check_cache_window(async move |window, cx| {
+            let mut failures = Vec::new();
+            for row in &rows {
+                window
+                    .update(cx, |view, window, cx| {
+                        view.close_overlay(window, cx);
+                        (row.prepare)(view, window, cx);
+                        cx.notify();
+                    })
+                    .unwrap();
+                wait_for_presented_frame(window, cx).await;
+                for _ in 0..row.tabs {
+                    key(window, cx, "tab").await;
+                }
+                let focused = window
+                    .update(cx, |_, window, cx| window.focused(cx))
+                    .unwrap();
+                let opener = send(&row.open, window, cx).await.or(focused);
+                let opened = window
+                    .update(cx, |view, _, _| {
+                        (row.opened)(view)
+                            .then_some(())
+                            .ok_or_else(|| view.overlay.as_ref().map(std::mem::discriminant))
+                    })
+                    .unwrap();
+                if let Err(overlay) = opened {
+                    failures.push(format!("{}: did not open; open: {overlay:?}", row.name));
+                    continue;
+                }
+                for input in row.close {
+                    send(input, window, cx).await;
+                }
+                let returned = window
+                    .update(cx, |view, window, _| {
+                        assert!(!(row.opened)(view), "{}: did not close", row.name);
+                        match row.back {
+                            Back::Opener => opener.as_ref().is_some_and(|o| o.is_focused(window)),
+                            Back::Page => view.focus.is_focused(window),
+                        }
+                    })
+                    .unwrap();
+                println!("FOCUS_RETURN {}: {returned}", row.name);
+                if !returned {
+                    failures.push(format!("{}: focus did not return", row.name));
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        })
+    }
 }
 
 #[test]
@@ -436,236 +777,6 @@ fn compact_playlist_menu_focus_reveals_the_last_action() -> anyhow::Result<()> {
                 .unwrap();
             key(window, cx, "escape").await;
         }
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account only"]
-fn queue_menu_actions_restore_the_opening_focus() -> anyhow::Result<()> {
-    use gpui::Focusable;
-
-    use crate::library::Repeat;
-
-    check_cache_window(async |window, cx| {
-        for downs in [1, 2] {
-            let opening_focus = window
-                .update(cx, |view, window, cx| {
-                    view.route = Route::Browse(BrowseLink::new("VLfocus", "Songs"));
-                    view.page = crate::app::sync::tests::page(2, false);
-                    view.library
-                        .queue
-                        .replace(vec![view.page.tracks()[0].clone()], 0);
-                    view.library.autoplay = false;
-                    view.library.repeat = Repeat::Off;
-                    view.rebuild_rows();
-                    let opening_focus = if downs == 1 {
-                        view.focus.clone()
-                    } else {
-                        view.search.focus_handle(cx)
-                    };
-                    window.focus(&opening_focus, cx);
-                    view.open_item_menu(1, window, cx);
-                    opening_focus
-                })
-                .unwrap();
-            wait_for_presented_frame(window, cx).await;
-            key(window, cx, "home").await;
-            for _ in 0..downs {
-                key(window, cx, "down").await;
-            }
-            key(window, cx, "enter").await;
-            window
-                .update(cx, |view, window, _| {
-                    assert!(view.overlay.is_none());
-                    assert_eq!(view.library.queue.tracks.len(), 2);
-                    assert_eq!(view.library.queue.tracks[1].id, view.page.tracks()[1].id);
-                    assert!(
-                        opening_focus.is_focused(window),
-                        "The opener must regain focus after confirming queue action {downs}"
-                    );
-                })
-                .unwrap();
-            if downs == 1 {
-                key(window, cx, "r").await;
-                window
-                    .update(cx, |view, _, _| {
-                        assert_eq!(view.library.repeat, Repeat::All)
-                    })
-                    .unwrap();
-            }
-        }
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account only"]
-fn featured_save_picker_restores_focus_to_the_opening_control() -> anyhow::Result<()> {
-    use crate::app::Search;
-    use crate::catalog::ShelfLayout;
-    use crate::search::{SearchFilter, SearchScope};
-    use gpui::{px, size};
-
-    check_cache_window(async |window, cx| {
-        window
-            .update(cx, |view, window, cx| {
-                window.resize(size(px(1280.), px(800.)));
-                view.sidebar_collapsed = Some(false);
-                view.route = Route::Search(Search {
-                    query: "Song".into(),
-                    filter: SearchFilter::All,
-                    scope: SearchScope::Catalog,
-                });
-                view.page = crate::app::sync::tests::page(2, false);
-                view.page.shelves[0].layout = ShelfLayout::Featured;
-                view.rebuild_rows();
-                window.focus(&view.focus, cx);
-                cx.notify();
-            })
-            .unwrap();
-        wait_for_presented_frame(window, cx).await;
-        let position = window
-            .update(cx, |view, window, _| {
-                let bounds = view.detail_list.state.bounds_for_item(1).unwrap();
-                let width = view.page_layout(window).search_width();
-                let inset = (bounds.size.width - px(width)) / 2.;
-                let save_center = if width < 800. { 115. } else { 149. };
-                point(
-                    bounds.left() + inset + px(326.),
-                    bounds.top() + px(save_center),
-                )
-            })
-            .unwrap();
-        let click = |event, cx: &mut gpui::AsyncApp| {
-            cx.update_window(window.into(), |_, window, cx| {
-                window.dispatch_event(event, cx)
-            })
-            .unwrap();
-        };
-        click(
-            PlatformInput::MouseDown(MouseDownEvent {
-                button: MouseButton::Left,
-                position,
-                modifiers: Default::default(),
-                click_count: 1,
-                first_mouse: false,
-            }),
-            cx,
-        );
-        let opening = window
-            .update(cx, |view, window, cx| {
-                assert!(
-                    !view.focus.is_focused(window),
-                    "Save must take focus on mouse down"
-                );
-                window.focused(cx).unwrap()
-            })
-            .unwrap();
-        click(
-            PlatformInput::MouseUp(MouseUpEvent {
-                button: MouseButton::Left,
-                position,
-                modifiers: Default::default(),
-                click_count: 1,
-            }),
-            cx,
-        );
-        wait_for_presented_frame(window, cx).await;
-        let dialog_has_focus = window
-            .update(cx, |view, window, cx| {
-                assert!(
-                    matches!(&view.overlay, Some(Overlay::PlaylistPicker { tracks, .. })
-                    if tracks.len() == 1 && tracks[0].id == view.page.tracks()[0].id)
-                );
-                view.overlay_focus.contains_focused(window, cx)
-            })
-            .unwrap();
-        key(window, cx, "escape").await;
-        window
-            .update(cx, |view, window, _| {
-                assert!(view.overlay.is_none());
-                assert!(
-                    dialog_has_focus && opening.is_focused(window),
-                    "Save must move focus into the picker and restore it after Escape"
-                );
-            })
-            .unwrap();
-    })
-}
-
-#[test]
-#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic account only"]
-fn cancelling_playlist_creation_restores_the_sidebar_button() -> anyhow::Result<()> {
-    use gpui::{px, size};
-
-    check_cache_window(async |window, cx| {
-        window
-            .update(cx, |view, window, cx| {
-                window.resize(size(px(1280.), px(800.)));
-                view.sidebar_collapsed = Some(false);
-                window.focus(&view.focus, cx);
-                cx.notify();
-            })
-            .unwrap();
-        wait_for_presented_frame(window, cx).await;
-
-        // The wide guide's New playlist button follows its three navigation rows.
-        let position = point(px(120.), px(283.));
-        cx.update_window(window.into(), |_, window, cx| {
-            window.dispatch_event(
-                PlatformInput::MouseDown(MouseDownEvent {
-                    button: MouseButton::Left,
-                    position,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }),
-                cx,
-            );
-        })
-        .unwrap();
-        let opening = window
-            .update(cx, |view, window, cx| {
-                assert!(
-                    !view.focus.is_focused(window),
-                    "New playlist must take focus"
-                );
-                window.focused(cx).unwrap()
-            })
-            .unwrap();
-        cx.update_window(window.into(), |_, window, cx| {
-            window.dispatch_event(
-                PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                }),
-                cx,
-            );
-        })
-        .unwrap();
-        wait_for_presented_frame(window, cx).await;
-        window
-            .update(cx, |view, _, _| {
-                assert!(matches!(view.overlay, Some(Overlay::PlaylistForm { .. })));
-            })
-            .unwrap();
-        key(window, cx, "escape").await;
-        window
-            .update(cx, |view, window, _| {
-                assert!(view.overlay.is_none());
-                assert!(
-                    opening.is_focused(window),
-                    "New playlist must regain focus after Escape"
-                );
-            })
-            .unwrap();
-        key(window, cx, "enter").await;
-        window
-            .update(cx, |view, _, _| {
-                assert!(matches!(view.overlay, Some(Overlay::PlaylistForm { .. })));
-            })
-            .unwrap();
     })
 }
 

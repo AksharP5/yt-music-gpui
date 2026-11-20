@@ -16,6 +16,18 @@ pub(in crate::app) enum SettingMenu {
 }
 
 impl Music {
+    /// Close a setting's choices and return focus to the field that opened them.
+    pub(in crate::app) fn close_settings_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, opener)) = self.settings_menu.take() {
+            return_focus(opener, &self.overlay_focus, window, cx);
+            cx.notify();
+        }
+    }
+
     pub(in crate::app) fn setting_row(
         &self,
         title: &'static str,
@@ -71,7 +83,7 @@ impl Music {
                         Transformation::rotate(Radians(-std::f32::consts::FRAC_PI_2)),
                     ))
                     .on_click(cx.listener(move |view, _, window, cx| {
-                        view.settings_menu = Some(kind);
+                        view.settings_menu = Some((kind, window.focused(cx)));
                         window.focus(&view.settings_focus, cx);
                         let bounds = field_bounds.get();
                         view.overlay_anchor = Some(point(bounds.left(), bounds.bottom()));
@@ -272,7 +284,7 @@ impl Music {
             .absolute()
             .inset_0()
             .child(self.backdrop(body.into_any_element(), cx));
-        if let Some(kind) = self.settings_menu {
+        if let Some((kind, _)) = self.settings_menu {
             let (choices, selected): (Vec<String>, Option<usize>) = match kind {
                 SettingMenu::Speed => (
                     PlaybackSpeed::ALL
@@ -326,8 +338,7 @@ impl Music {
                         .hover(|row| row.bg(gpui::white().opacity(0.1)))
                         .child(label)
                         .on_click(cx.listener(move |view, _, window, cx| {
-                            view.settings_menu = None;
-                            window.focus(&view.overlay_focus, cx);
+                            view.close_settings_menu(window, cx);
                             match kind {
                                 SettingMenu::Speed => {
                                     let speed = PlaybackSpeed::ALL[index];
@@ -354,9 +365,7 @@ impl Music {
                         MouseButton::Left,
                         cx.listener(|view, _, window, cx| {
                             cx.stop_propagation();
-                            view.settings_menu = None;
-                            window.focus(&view.overlay_focus, cx);
-                            cx.notify();
+                            view.close_settings_menu(window, cx);
                         }),
                     )
                     .child(

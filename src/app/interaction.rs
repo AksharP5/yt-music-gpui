@@ -152,13 +152,10 @@ impl Music {
             cx.quit();
             return;
         }
-        if (self.overlay.is_some() || self.sort_menu) && key != "escape" {
-            let menu = self.sort_menu
-                || self.settings_menu.is_some()
-                || matches!(
-                    self.overlay,
-                    Some(Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Account)
-                );
+        if let Some(overlay) = &self.overlay
+            && key != "escape"
+        {
+            let menu = self.settings_menu.is_some() || overlay.is_menu();
             if !modifiers.control
                 && !modifiers.alt
                 && !modifiers.platform
@@ -279,13 +276,8 @@ impl Music {
             ("f", false) => self.toggle_video_fullscreen(window, cx),
             ("q", false) => self.toggle_player_page(cx),
             ("escape", false) => {
-                if self.sort_menu {
-                    self.dismiss_sort_menu(window, cx);
-                    return;
-                }
-                if self.settings_menu.take().is_some() {
-                    window.focus(&self.overlay_focus, cx);
-                    cx.notify();
+                if self.settings_menu.is_some() {
+                    self.close_settings_menu(window, cx);
                     return;
                 }
                 if self.overlay.is_some() {
@@ -305,12 +297,7 @@ impl Music {
                     cx.notify();
                 }
             }
-            ("?", _) | ("/", true) => {
-                self.overlay_return_focus = window.focused(cx);
-                window.focus(&self.overlay_focus, cx);
-                self.overlay = Some(Overlay::Help);
-                cx.notify();
-            }
+            ("?", _) | ("/", true) => self.open_overlay(Overlay::Help, window, cx),
             _ => {}
         }
     }

@@ -175,8 +175,7 @@ impl Music {
                                 .cursor_pointer()
                                 .child(avatar)
                                 .on_click(cx.listener(|view, _, window, cx| {
-                                    view.overlay_return_focus = window.focused(cx);
-                                    window.focus(&view.overlay_focus, cx);
+                                    view.open_overlay(Overlay::Account, window, cx);
                                     view.overlay_anchor = Some(point(
                                         window.viewport_size().width
                                             - px(if matches!(view.route, Route::Search(_)) {
@@ -187,8 +186,6 @@ impl Music {
                                             - px(300.),
                                         px(56.),
                                     ));
-                                    view.overlay = Some(Overlay::Account);
-                                    cx.notify();
                                 })),
                         )
                     })
@@ -200,14 +197,11 @@ impl Music {
                                 .gap(px(8.))
                                 .child(button("guest-account-menu", "more", self.theme).on_click(
                                     cx.listener(move |view, _, window, cx| {
-                                        view.overlay_return_focus = window.focused(cx);
-                                        window.focus(&view.overlay_focus, cx);
+                                        view.open_overlay(Overlay::Account, window, cx);
                                         view.overlay_anchor = Some(point(
                                             window.viewport_size().width - px(account_inset + 380.),
                                             px(56.),
                                         ));
-                                        view.overlay = Some(Overlay::Account);
-                                        cx.notify();
                                     }),
                                 ))
                                 .child(

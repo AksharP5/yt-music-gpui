@@ -385,7 +385,7 @@ impl Music {
                     self.autoplay_seeded = false;
                     if matches!(self.overlay, Some(Overlay::SongText { .. })) {
                         self.song_text.cancel();
-                        self.overlay = None;
+                        self.drop_overlay(cx);
                     }
                     self.playback_request(
                         PlaybackQuery::Watch {
