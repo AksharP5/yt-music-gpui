@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context as _, Result, ensure};
 use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 use std::time::{Duration, Instant};
-use std::{collections::HashSet, process::Command};
+use std::{collections::HashSet, path::PathBuf};
 
 fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> crate::catalog::Page {
     crate::app::sync::tests::response(&[("Songs", indices.collect())], token, true)
@@ -1426,17 +1426,27 @@ fn queue_retry_button_preserves_pause_and_a_stopped_retry_cannot_start_playback(
 }
 
 #[test]
-#[ignore = "requires isolated desktop/D-Bus, network and a yt-dlp version-mismatch wrapper; set YT_MUSIC_NATIVE_TESTS=1"]
+#[ignore = "requires isolated desktop/D-Bus and network; set YT_MUSIC_NATIVE_TESTS=1"]
 fn fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist() -> Result<()> {
+    use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
     super::isolate()?;
-    let version = Command::new("yt-dlp")
-        .args(["--ignore-config", "--no-plugin-dirs", "--version"])
-        .output()?;
-    ensure!(
-        version.status.success() && String::from_utf8_lossy(&version.stdout).trim() != "2026.08.19",
-        "Use a synthetic version-mismatch wrapper that also handles --version after other flags; got {:?}",
-        String::from_utf8_lossy(&version.stdout).trim()
-    );
+    // Stand in for the yt-dlp the app would run, reporting an unreviewed version
+    // so the account falls back to guest streams.
+    let ytdlp = crate::player::find_ytdlp()?;
+    let ytdlp = ytdlp
+        .to_str()
+        .filter(|path| !path.contains('\''))
+        .context("Unquotable yt-dlp path")?;
+    let wrapper =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("Set private runtime")?)
+            .join("yt-dlp");
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&wrapper)?.write_all(format!(
+        "#!/bin/sh\nfor arg; do\n  if [ \"$arg\" = --version ]; then echo native-test-mismatch; exit 0; fi\ndone\nexec '{ytdlp}' \"$@\"\n"
+    ).as_bytes())?;
+    crate::player::TEST_YTDLP
+        .set(wrapper)
+        .ok()
+        .context("yt-dlp stand-in already set")?;
 
     let (completed, result) = async_channel::bounded::<Result<()>>(1);
     gpui_platform::application().with_assets(crate::assets::Assets).run(move |cx| {
