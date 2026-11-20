@@ -276,6 +276,23 @@ impl Music {
                         view.refresh_session(false, cx);
                     }
                 }
+                SearchBoxEvent::Like(track) => view.toggle_like(track, cx),
+                SearchBoxEvent::Dislike(track) => {
+                    // The web answers a guest with a sign-in prompt rather than opening sign-in.
+                    if view.account.is_none() {
+                        view.notice = Some("Sign in to dislike songs".into());
+                        cx.notify();
+                        return;
+                    }
+                    view.toggle_dislike(track, window, cx);
+                }
+                SearchBoxEvent::Menu(item) => match item.as_ref().clone() {
+                    Item::Track(track) => view.open_track_menu(track, None, window, cx),
+                    Item::Collection(collection) => {
+                        view.open_collection_menu(collection, window, cx)
+                    }
+                    Item::Navigation(_) => {}
+                },
                 SearchBoxEvent::Blur => window.focus(&view.focus, cx),
             });
         let activation = cx.observe_window_activation(window, Self::window_activated);
@@ -286,12 +303,26 @@ impl Music {
         });
         let music = cx.entity();
         let weak = music.downgrade();
+        let ratings = weak.clone();
         search.update(cx, |search, _| {
             search.set_artwork(Box::new(move |url, size, cx| {
                 weak.update(cx, |music, _| music.artwork.get(url, size))
                     .ok()
                     .flatten()
-            }))
+            }));
+            search.set_rating(Box::new(move |track, cx| {
+                let Some(music) = ratings.upgrade() else {
+                    return Rating::Indifferent;
+                };
+                let music = music.read(cx);
+                if music.is_liked(track) {
+                    Rating::Like
+                } else if is_disliked(&music.ratings, track) {
+                    Rating::Dislike
+                } else {
+                    Rating::Indifferent
+                }
+            }));
         });
         let content_view = cx.new(|cx| MusicContent::new(music.clone(), cx));
         let player_bar = cx.new(|cx| PlayerBar::new(music.downgrade(), cx));
