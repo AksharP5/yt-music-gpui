@@ -1522,6 +1522,7 @@ async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                     query: "Synthetic search".into(),
                     filter: crate::search::SearchFilter::Songs,
                     scope: crate::search::SearchScope::Catalog,
+                    params: None,
                 });
                 music.page = crate::app::sync::tests::page(3, false);
                 for item in &mut music.page.shelves[0].items {
@@ -1594,7 +1595,7 @@ async fn responsive_search(window: WindowHandle<Music>, cx: &mut AsyncApp) {
             music.catalog_requests = crate::app::CatalogRequests::new();
             music.player_open = false;
             music.library.queue = Default::default();
-            music.route = Route::Search(Search { query: "daft punk".into(), filter: SearchFilter::All, scope: SearchScope::Catalog });
+            music.route = Route::Search(Search { query: "daft punk".into(), filter: SearchFilter::All, scope: SearchScope::Catalog, params: None });
             music.search.update(cx, |search, cx| search.set_query("daft punk".into(), cx));
             let mut page = crate::app::sync::tests::page(3, false);
             let artist = crate::catalog::parse_page(&serde_json::json!({"contents":[{"musicCardShelfRenderer":{
@@ -1608,6 +1609,8 @@ async fn responsive_search(window: WindowHandle<Music>, cx: &mut AsyncApp) {
             assert!(matches!(&artist, Item::Collection(_)));
             page.shelves[0].items.insert(0, artist);
             page.shelves[0].layout = ShelfLayout::Featured;
+            // A top result's shelf is titled by its related heading; this one has none.
+            page.shelves[0].title.clear();
             music.page = page;
             music.error = None;
             music.notice = None;
@@ -2146,6 +2149,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                     Route::Search(Search {
                         query: "daft punk".into(),
                         filter: SearchFilter::All,
+                        params: None,
                         scope: SearchScope::Catalog,
                     })
                 } else {

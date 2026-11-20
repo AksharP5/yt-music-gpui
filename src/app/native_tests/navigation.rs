@@ -185,6 +185,7 @@ fn playlist_add_does_not_copy_a_saved_song_from_an_invalidated_page() -> Result<
                         query: "song to save".into(),
                         filter: SearchFilter::Songs,
                         scope: SearchScope::Catalog,
+                        params: None,
                     }),
                     cx,
                 );
@@ -1028,11 +1029,11 @@ fn native_navigation_reuses_pages_and_preserves_account_isolation() -> Result<()
                 assert!(view.rows.is_empty(), "Country filters are part of the route");
                 reply(view, page("Canada", "canada-tail"), cx);
                 for filter in [SearchFilter::Songs, SearchFilter::Albums] {
-                    view.navigate(Route::Search(Search { query: "same query".into(), filter, scope: SearchScope::Catalog }), cx);
+                    view.navigate(Route::Search(Search { query: "same query".into(), filter, scope: SearchScope::Catalog, params: None }), cx);
                     assert!(view.rows.is_empty(), "Search filters must not collide");
                     reply(view, page("Search", "search-tail"), cx);
                 }
-                view.navigate(Route::Search(Search { query: "same query".into(), filter: SearchFilter::Songs, scope: SearchScope::Library }), cx);
+                view.navigate(Route::Search(Search { query: "same query".into(), filter: SearchFilter::Songs, scope: SearchScope::Library, params: None }), cx);
                 assert!(view.rows.is_empty(), "Search scopes must not collide");
                 reply(view, page("Library search", "library-tail"), cx);
 
@@ -3311,5 +3312,36 @@ fn playlist_drag_scrolls_to_songs_outside_the_original_viewport() -> Result<()> 
             &*mutation, Mutation::MoveInPlaylist { id, set_video_id, before:Some(before) }
                 if id == "VLPLdrag" && set_video_id == "occurrence-1" && *before == successor
         ));
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn a_new_query_searches_every_category_again() -> Result<()> {
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, _, cx| {
+                view.navigate(
+                    Route::Search(Search {
+                        filter: SearchFilter::Songs,
+                        params: Some("songs-chip-params".into()),
+                        ..Search::new("daft punk", SearchScope::Catalog)
+                    }),
+                    cx,
+                );
+                view.search.update(cx, |_, cx| {
+                    cx.emit(crate::search_box::SearchBoxEvent::Submit("lofi".into()))
+                });
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    view.route == Route::Search(Search::new("lofi", SearchScope::Catalog)),
+                    "A new query must leave the previous category, as on the web"
+                );
+            })
+            .unwrap();
     })
 }

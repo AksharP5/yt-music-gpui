@@ -385,6 +385,25 @@ pub struct CollectionDetails {
     pub editable: bool,
     #[serde(skip)]
     pub explicit: bool,
+    #[serde(skip)]
+    pub card: CardControls,
+}
+
+/// The buttons on a top search result, which vary by kind on the web.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardControls {
+    /// The service's buttons in order; the first is filled.
+    pub actions: Vec<CardAction>,
+    /// Artists, albums and playlists end in a chevron to their page; radios
+    /// end in a menu instead.
+    pub chevron: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardAction {
+    Play,
+    Shuffle,
+    Mix,
 }
 
 pub(crate) struct ArtistSubscription {
@@ -755,7 +774,8 @@ pub struct Page {
     pub privacy: Option<String>,
     pub chips: Vec<BrowseChoice>,
     pub countries: Vec<BrowseChoice>,
-    pub search_filters: Vec<crate::search::SearchFilter>,
+    pub search_filters: Vec<crate::search::FilterChip>,
+    pub correction: Option<crate::search::Correction>,
     pub library: Option<LibraryFilters>,
 }
 
@@ -1658,6 +1678,22 @@ fn collection_details(row: &Value, browse_id: &str) -> CollectionDetails {
                         .and_then(Value::as_str) == Some(id)
                 })
         }),
+        card: CardControls {
+            actions: row["buttons"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|button| {
+                    match button.pointer("/buttonRenderer/icon/iconType")?.as_str()? {
+                        "PLAY_ARROW" => Some(CardAction::Play),
+                        "MUSIC_SHUFFLE" => Some(CardAction::Shuffle),
+                        "MIX" => Some(CardAction::Mix),
+                        _ => None,
+                    }
+                })
+                .collect(),
+            chevron: row.get("endIcon").is_some(),
+        },
     }
 }
 
@@ -1815,14 +1851,24 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                 "gridRenderer",
             ] {
                 if let Some(shelf) = map.get(key) {
+                    let contents = shelf.get("contents").or_else(|| shelf.get("items"));
                     let title = if key == "musicCarouselShelfRenderer" {
                         text(&shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"])
                     } else if key == "gridRenderer" {
                         text(&shelf["header"]["gridHeaderRenderer"]["title"])
+                    } else if key == "musicCardShelfRenderer" {
+                        // A top result's shelf takes its related items' heading,
+                        // such as "More from YouTube".
+                        contents
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .find_map(|item| item.pointer("/messageRenderer/text"))
+                            .map(text)
+                            .unwrap_or_default()
                     } else {
                         text(&shelf["title"])
                     };
-                    let contents = shelf.get("contents").or_else(|| shelf.get("items"));
                     let mut items: Vec<Item> = if key == "musicCardShelfRenderer" {
                         parse_item(value).into_iter().collect()
                     } else {
@@ -1836,12 +1882,13 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                             .filter_map(parse_item),
                     );
                     if key == "musicCardShelfRenderer" {
+                        let card_title = text(&shelf["title"]);
                         for item in &mut items {
                             if let Item::Track(track) = item
                                 && (track.artist == "YouTube Music"
                                     || track.artist.ends_with(" plays"))
                             {
-                                track.artist = title.clone();
+                                track.artist = card_title.clone();
                             }
                         }
                     }
@@ -2211,6 +2258,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
         chips: Vec::new(),
         countries: Vec::new(),
         search_filters: Vec::new(),
+        correction: None,
         library: library_filters(data),
     };
     if let Some(album) = header.and_then(|header| {
@@ -3177,6 +3225,44 @@ mod tests {
     }
 
     #[test]
+    fn top_results_show_the_buttons_and_heading_the_service_gives_each_kind() {
+        // Captured from signed-out searches for "lofi", "ado うっせぇわ" and
+        // "random access memories".
+        let cards: Value =
+            serde_json::from_str(include_str!("fixtures/search/top_results.json")).unwrap();
+        let top = |kind: &str| {
+            let page = parse_page(&json!({"contents":[cards[kind]]}), "Search").unwrap();
+            page.shelves.into_iter().next().unwrap()
+        };
+        let controls = |shelf: &Shelf| match &shelf.items[0] {
+            Item::Collection(collection) => collection.details.card.clone(),
+            _ => panic!("expected a collection"),
+        };
+        // A radio offers only Play, then its menu rather than a page chevron.
+        let radio = top("radio");
+        assert_eq!(
+            controls(&radio),
+            CardControls {
+                actions: vec![CardAction::Play],
+                chevron: false
+            }
+        );
+        let album = top("album");
+        assert_eq!(
+            controls(&album),
+            CardControls {
+                actions: vec![CardAction::Play, CardAction::Shuffle],
+                chevron: true
+            }
+        );
+        // A video's related items sit under the service's heading.
+        let video = top("video");
+        assert_eq!(video.title, "More from YouTube");
+        assert!(matches!(&video.items[0], Item::Track(track) if track.details.wide_thumbnail));
+        assert_eq!(video.items.len(), 2);
+    }
+
+    #[test]
     fn collection_header_keeps_save_state_and_distinct_issued_actions() {
         for saved in [false, true] {
             let page = parse_page(&json!({
@@ -3419,6 +3505,7 @@ mod tests {
             chips: Vec::new(),
             countries: Vec::new(),
             search_filters: Vec::new(),
+            correction: None,
             library: None,
         };
         page.shelves = vec![

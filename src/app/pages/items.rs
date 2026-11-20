@@ -711,14 +711,13 @@ impl Music {
                     }),
             )
         };
+        // A category's results are divided; the web's mixed results are not.
+        let divided =
+            matches!(&self.route, Route::Search(search) if search.filter != SearchFilter::All);
         let wrap_row = |row| {
-            div()
-                .w_full()
-                .px(px(inset))
-                .child(row)
-                .when(style == RowStyle::Search, |d| {
-                    d.child(div().h(px(1.)).bg(gpui::white().opacity(0.1)))
-                })
+            div().w_full().px(px(inset)).child(row).when(divided, |d| {
+                d.child(div().h(px(1.)).bg(gpui::white().opacity(0.1)))
+            })
         };
         let Some(track) = track.cloned() else {
             row = row.child(

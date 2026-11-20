@@ -1044,6 +1044,7 @@ mod tests {
             chips: Vec::new(),
             countries: Vec::new(),
             search_filters: Vec::new(),
+            correction: None,
             library: None,
         }
     }
