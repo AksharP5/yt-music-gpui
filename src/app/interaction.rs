@@ -189,7 +189,8 @@ impl Music {
             if self.player_open && window.is_fullscreen() {
                 self.toggle_video_fullscreen(window, cx);
             }
-            window.focus(&self.search.focus_handle(cx), cx);
+            self.search
+                .update(cx, |search, cx| search.activate(window, cx));
             cx.stop_propagation();
             return;
         }
