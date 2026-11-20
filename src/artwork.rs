@@ -353,12 +353,8 @@ fn google_sized(url: &str, width: u32, height: u32) -> Option<String> {
     Some(format!("{base}={options}"))
 }
 
-fn load_source(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    resolution: Resolution,
-    disk: &Mutex<DiskCache>,
-) -> anyhow::Result<RenderImage> {
+/// Parses `url` if it is served by one of YouTube's image hosts.
+fn artwork_url(url: &str) -> anyhow::Result<reqwest::Url> {
     let parsed = reqwest::Url::parse(url)?;
     anyhow::ensure!(
         parsed.scheme() == "https"
@@ -367,10 +363,22 @@ fn load_source(
                 || h.ends_with(".ggpht.com")
                 // Library art such as Liked Music and Episodes for Later.
                 || (h == "www.gstatic.com" && parsed.path().starts_with("/youtube/media/ytm/"))
-                // A radio's collage, which the service draws without cookies.
-                || (h == "music.youtube.com" && parsed.path() == "/image/radioart")),
+                // Collages the service draws without cookies: a radio's, and
+                // generated mix covers such as New releases' New Release Mix.
+                || (h == "music.youtube.com"
+                    && matches!(parsed.path(), "/image/radioart" | "/image/mixart"))),
         "Unsupported artwork host"
     );
+    Ok(parsed)
+}
+
+fn load_source(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    resolution: Resolution,
+    disk: &Mutex<DiskCache>,
+) -> anyhow::Result<RenderImage> {
+    let parsed = artwork_url(url)?;
     let still = parsed.host_str() == Some("i.ytimg.com");
     let key = format!("{:x}", Sha1::digest(url.as_bytes()));
     let cached = disk
@@ -963,6 +971,23 @@ mod tests {
         );
         let library = "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-music.png";
         assert_eq!(sources(library, HERO), [library]);
+    }
+
+    #[test]
+    fn music_youtube_serves_only_generated_covers() {
+        for allowed in [
+            "https://music.youtube.com/image/mixart?r=EMgBGMgB",
+            "https://music.youtube.com/image/radioart?r=EMgBGMgB",
+        ] {
+            assert!(artwork_url(allowed).is_ok(), "{allowed}");
+        }
+        for refused in [
+            "https://music.youtube.com/youtubei/v1/browse",
+            "https://music.youtube.com/image/mixart/../../watch",
+            "http://music.youtube.com/image/mixart?r=EMgBGMgB",
+        ] {
+            assert!(artwork_url(refused).is_err(), "{refused}");
+        }
     }
 
     #[test]
