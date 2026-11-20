@@ -21,7 +21,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
@@ -34,7 +34,7 @@ jobs:
           bin/test -- --ignored --exact \
             player::tests::plays_with_the_installed_libmpv \
             player::tests::playback_checks_the_account_version_once_when_needed
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         id: python
         with:
           python-version: "3.x"
@@ -54,7 +54,7 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: bin/test
@@ -70,7 +70,7 @@ jobs:
     steps:
       # Git for Windows checks out CRLF by default, which breaks bin/test.
       - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: bin/test
@@ -81,7 +81,7 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 2
