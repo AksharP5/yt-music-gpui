@@ -1301,7 +1301,7 @@ mod tests {
                 kind: WindowKind::PopUp,
                 ..Default::default()
             }, |window, cx| cx.new(|cx| {
-                let mut music = Music::new(Startup::Guest, window, cx);
+                let mut music = Music::new(Startup::Guest, None, window, cx);
                 for target in CatalogTarget::ALL { music.catalog_requests.cancel(target); }
                 music.library.volume = 0.;
                 music.library.video = false;

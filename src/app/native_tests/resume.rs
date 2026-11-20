@@ -50,7 +50,7 @@ fn the_last_song_continues_after_process_restart() -> Result<()> {
             focus: false,
             ..Default::default()
         }, |window, cx| cx.new(|cx| {
-            let mut music = Music::new(Startup::Guest, window, cx);
+            let mut music = Music::new(Startup::Guest, None, window, cx);
             music.library.volume = 0.;
             music.player.as_ref().unwrap().set_volume(0.).unwrap();
             music

@@ -49,6 +49,10 @@ debug = 0
 strip = true
 debug = 0
 
+[lints.rust]
+# bin/check-performance builds with `--cfg ytm_perf` for startup timestamps.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ytm_perf)"] }
+
 [lints.clippy]
 expect_used = "deny"
 panic = "deny"
