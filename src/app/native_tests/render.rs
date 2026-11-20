@@ -2625,9 +2625,11 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 cx.update(|cx| cx.quit());
             })
             .detach();
+            // Only stops a hung test. A debug build takes over two minutes,
+            // so leave room for a loaded machine.
             cx.spawn(async move |cx| {
                 cx.background_executor()
-                    .timer(Duration::from_secs(150))
+                    .timer(Duration::from_secs(300))
                     .await;
                 cx.update(|cx| cx.quit());
             })
