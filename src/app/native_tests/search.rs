@@ -179,6 +179,74 @@ fn arrows_preview_suggestions_and_escape_closes_in_one_press() -> anyhow::Result
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn typing_requests_at_once_then_throttles_to_the_newest_text() -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    check_cache_window(async |window, cx| {
+        let requests = window
+            .update(cx, |music, window, cx| {
+                window.focus(&music.search.focus_handle(cx), cx);
+                music
+                    .search
+                    .update(cx, |search, _| search.intercept_requests())
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        // Each key is its own event, without waiting for a frame in between.
+        let typed = |cx: &mut AsyncApp, keys: &[&str]| {
+            for key in keys {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+                })
+                .unwrap();
+            }
+        };
+        let collect = async |cx: &mut AsyncApp, start: Instant| {
+            let mut sent = Vec::new();
+            while start.elapsed() < Duration::from_millis(400) {
+                while let Some((query, _)) = requests() {
+                    sent.push((query, start.elapsed()));
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(5))
+                    .await;
+            }
+            sent
+        };
+
+        let start = Instant::now();
+        typed(cx, &["l", "o", "f", "i"]);
+        let first = requests().map(|(query, _)| query);
+        assert_eq!(
+            first.as_deref(),
+            Some("l"),
+            "The first keystroke must be requested without a pause"
+        );
+        let sent = collect(cx, start).await;
+        assert_eq!(
+            sent.iter()
+                .map(|(query, _)| query.as_str())
+                .collect::<Vec<_>>(),
+            ["lofi"],
+            "Keystrokes within 100ms must collapse into one request for the newest text"
+        );
+        assert!(sent[0].1 >= Duration::from_millis(100), "{sent:?}");
+
+        // Leaving the field drops a request still waiting for its turn.
+        let start = Instant::now();
+        typed(cx, &["x", "y", "escape"]);
+        let sent = collect(cx, start).await;
+        assert_eq!(
+            sent.iter()
+                .map(|(query, _)| query.as_str())
+                .collect::<Vec<_>>(),
+            ["lofix"]
+        );
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn tab_reaches_the_clear_button() -> anyhow::Result<()> {
     check_cache_window(async |window, cx| {
         type_with_suggestions(window, cx).await;

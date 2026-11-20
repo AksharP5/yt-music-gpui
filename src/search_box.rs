@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub enum SearchBoxEvent {
@@ -30,6 +30,9 @@ pub type ArtworkLookup = Box<dyn Fn(&str, Size<Pixels>, &mut App) -> Option<Arc<
 /// The web's search box: 480px wide, with the dropdown joined beneath it.
 pub(crate) const WIDTH: f32 = 480.;
 const HEIGHT: f32 = 42.;
+/// Like the web, a changed query is requested at once, then at most once per 100ms while typing
+/// continues.
+const THROTTLE: Duration = Duration::from_millis(100);
 
 struct SuggestionRequest {
     id: u64,
@@ -38,8 +41,10 @@ struct SuggestionRequest {
 }
 
 impl SuggestionRequest {
-    fn matches(&self, id: u64, query: &str, session: Option<&Arc<Session>>) -> bool {
-        self.id == id && self.query == query && same_session(self.session.as_ref(), session)
+    /// Only the latest request counts, as on the web: its reply may answer a query the user
+    /// has since extended, and it stays until the next reply arrives.
+    fn matches(&self, id: u64, session: Option<&Arc<Session>>) -> bool {
+        self.id == id && same_session(self.session.as_ref(), session)
     }
 }
 
@@ -69,8 +74,10 @@ pub struct SearchBox {
     theme: Theme,
     generation: Arc<AtomicU64>,
     jobs: async_channel::Sender<SuggestionRequest>,
-    // Retain it until the query is invalidated so session renewal can resume it.
-    debounce: Option<Task<()>>,
+    /// When the latest request left.
+    requested: Option<Instant>,
+    /// The request waiting out the rest of THROTTLE; replacing or dropping it cancels it.
+    trailing: Option<Task<()>>,
     _subscriptions: [Subscription; 3],
 }
 
@@ -129,7 +136,8 @@ impl SearchBox {
             theme: Theme::load(),
             generation,
             jobs,
-            debounce: None,
+            requested: None,
+            trailing: None,
             _subscriptions: [subscription, blur, activation],
         }
     }
@@ -195,7 +203,8 @@ impl SearchBox {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let retry = self.debounce.is_some()
+        let waiting = !self.typed.trim().is_empty() && self.answered != self.typed.trim();
+        let retry = waiting
             && previous.is_some_and(|previous| {
                 same_session(self.session.as_ref(), Some(previous)) && !Arc::ptr_eq(previous, &next)
             })
@@ -210,7 +219,7 @@ impl SearchBox {
     pub(crate) fn intercept_requests(
         &mut self,
     ) -> impl Fn() -> Option<(String, Option<Arc<Session>>)> + 'static + use<> {
-        let (jobs, requests) = async_channel::bounded::<SuggestionRequest>(1);
+        let (jobs, requests) = async_channel::unbounded::<SuggestionRequest>();
         self.jobs.close();
         self.jobs = jobs;
         move || {
@@ -245,7 +254,7 @@ impl SearchBox {
     /// Drop pending requests so no reply for an older query can arrive.
     fn cancel_requests(&mut self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.debounce = None;
+        self.trailing = None;
     }
 
     fn invalidate(&mut self, cx: &mut Context<Self>) {
@@ -286,13 +295,13 @@ impl SearchBox {
     }
 
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cancel_requests();
         self.typed = self.input.read(cx).value().to_owned();
         self.selected = None;
         self.error = None;
         self.open = true;
         // Earlier suggestions stay until the new ones arrive, as on the web.
         if self.typed.trim().is_empty() {
+            self.cancel_requests();
             self.suggestions.clear();
             self.answered.clear();
         }
@@ -301,40 +310,47 @@ impl SearchBox {
     }
 
     fn request_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.typed.trim().to_owned();
-        if query.is_empty() {
+        if self.typed.trim().is_empty() {
             return;
         }
+        let wait = self.requested.map_or(Duration::ZERO, |requested| {
+            THROTTLE.saturating_sub(requested.elapsed())
+        });
+        if wait.is_zero() {
+            self.trailing = None;
+            self.send_request(window, cx);
+            return;
+        }
+        // Later keystrokes in the same window replace this task, so it sends the newest text.
+        self.trailing = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = view.update_in(cx, |view, window, cx| view.send_request(window, cx));
+        }));
+    }
+
+    fn send_request(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let query = self.typed.trim();
+        if query.is_empty() || !self.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        // A new request supersedes the older ones: workers skip them if still queued, and
+        // their replies are dropped.
+        let id = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.requested = Some(Instant::now());
         let request = SuggestionRequest {
-            id: self.generation.load(Ordering::Acquire),
-            query,
+            id,
+            query: query.to_owned(),
             session: self.session.clone(),
         };
-        self.debounce = Some(cx.spawn_in(window, async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(225))
-                .await;
-            let _ = view.update_in(cx, |view, window, cx| {
-                if !request.matches(
-                    view.generation.load(Ordering::Acquire),
-                    view.typed.trim(),
-                    view.session.as_ref(),
-                ) || !view.focus_handle(cx).is_focused(window)
-                {
-                    return;
-                }
-                if view.jobs.force_send(request).is_err() {
-                    view.error = Some("The search suggestions connection stopped".into());
-                    cx.notify();
-                }
-            });
-        }));
+        if self.jobs.force_send(request).is_err() {
+            self.error = Some("The search suggestions connection stopped".into());
+            cx.notify();
+        }
     }
 
     fn received(&mut self, result: SuggestionResult, window: &Window, cx: &mut Context<Self>) {
         if !result.request.matches(
             self.generation.load(Ordering::Acquire),
-            self.typed.trim(),
             self.session.as_ref(),
         ) || !self.focus_handle(cx).is_focused(window)
         {
@@ -759,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_require_the_exact_query_generation_and_account() {
+    fn suggestions_require_the_latest_request_and_account() {
         let session: Session = serde_json::from_value(json!({
             "cookie":"SAPISID=synthetic","playback_cookie":"# Netscape HTTP Cookie File\n",
             "authuser":"0","delegated_session_id":null,"data_sync_id":"user||","client_version":"test"
@@ -770,18 +786,17 @@ mod tests {
             query: "a song".into(),
             session: Some(session.clone()),
         };
-        assert!(request.matches(7, "a song", Some(&session)));
-        assert!(!request.matches(8, "a song", Some(&session)));
-        assert!(!request.matches(7, "another song", Some(&session)));
-        assert!(!request.matches(7, "a song", None));
+        assert!(request.matches(7, Some(&session)));
+        assert!(!request.matches(8, Some(&session)));
+        assert!(!request.matches(7, None));
         let restored = Arc::new((*session).clone());
-        assert!(!request.matches(7, "a song", Some(&restored)));
+        assert!(!request.matches(7, Some(&restored)));
         let guest = SuggestionRequest {
             id: 1,
             query: "a song".into(),
             session: None,
         };
-        assert!(guest.matches(1, "a song", None));
-        assert!(!guest.matches(1, "a song", Some(&session)));
+        assert!(guest.matches(1, None));
+        assert!(!guest.matches(1, Some(&session)));
     }
 }
