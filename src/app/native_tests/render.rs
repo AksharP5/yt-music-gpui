@@ -2450,11 +2450,14 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                 );
                 for tab in [PlayerTab::Lyrics, PlayerTab::Comments, PlayerTab::Related] {
                     window
-                        .update(cx, |music, _, cx| {
+                        .update(cx, |music, window, cx| {
                             if tab == PlayerTab::Comments {
                                 music.seed_comments_for_render();
                             }
                             music.select_player_tab(tab, cx);
+                            // Earlier Tab presses can leave a focus ring in the page body.
+                            // Moving it off would then read as missing content.
+                            window.focus(&music.focus, cx);
                         })
                         .unwrap();
                     wait_for_presented_frame(window, cx).await;
