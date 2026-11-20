@@ -1,33 +1,50 @@
 #!/usr/bin/env python3
-"""Compare two locked Linux release builds with local, silent playback."""
+"""Compare two locked Linux release builds: size, local playback, lookup requests and startup."""
 import ast
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
+# Gated against the base: (label, key, unit). Binary size fails the check; the
+# timings only warn, since shared runners vary. Request counts do not vary, so
+# any increase fails.
 BUDGETS = (
     ("Stripped binary", "binary_bytes", "bytes"),
     ("First play", "first_position_ms", "ms"),
     ("Warm switch", "warm_switch_ms", "ms"),
+    ("Requests for a prepared play", "prepared_play_requests", "requests"),
+    ("Requests for the first unprepared play", "cold_play_requests", "requests"),
+    ("Requests for a later unprepared play", "warm_play_requests", "requests"),
 )
+# Reported only: these vary too much on shared runners to gate.
+REPORTED = (
+    ("PSS while playing local audio", "playing_pss_mib", "MiB"),
+    ("Launch to first frame", "first_frame_ms", "ms"),
+    ("Launch to Home, from a fixture", "home_frame_ms", "ms"),
+    ("PSS on Home, settled", "home_pss_mib", "MiB"),
+)
+STARTUP_RUNS = 5
 
 
-def build(root, target, revision, executable):
+def build(root, target, revision, scratch, name):
+    """Return the stripped binary's size, a test binary and a binary with startup marks."""
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
 
-    def compile_target(selection, test):
+    def compile_target(selection, test, *cfg):
         # Distinguish the app's Cargo fingerprints without rebuilding shared dependencies.
         # Cargo can otherwise reuse a newer checkout's binary for an older source tree.
         output = subprocess.check_output([
             "cargo", "rustc", *selection, "--release", "--locked", "--message-format=json",
-            "--", "--cfg", f'ytm_benchmark_revision="{revision}"',
+            "--", "--cfg", f'ytm_benchmark_revision="{revision}"', *cfg,
         ], cwd=root, env=env, text=True)
         path, = (
             artifact["executable"] for artifact in map(json.loads, output.splitlines())
@@ -38,8 +55,12 @@ def build(root, target, revision, executable):
         return Path(path)
 
     size = compile_target(["--bin", "yt-music-gpui"], test=False).stat().st_size
-    shutil.copy2(compile_target(["--tests"], test=True), executable)
-    return size
+    tests = scratch / f"{name}-test"
+    shutil.copy2(compile_target(["--tests"], test=True), tests)
+    # A base from before the marks existed builds the same app and reports no startup times.
+    app = scratch / f"{name}-app"
+    shutil.copy2(compile_target(["--bin", "yt-music-gpui"], False, "--cfg", "ytm_perf"), app)
+    return size, tests, app
 
 
 def stage_extractor(destination, source):
@@ -65,22 +86,146 @@ def stage_extractor(destination, source):
     destination.chmod(0o700)
 
 
-def measure(executable, scratch):
+def run_test(executable, home, name, prefix):
+    """Run one ignored measurement test and parse its JSON line, or None if this build lacks it."""
     with tempfile.TemporaryDirectory(prefix="yt-music-ci.", dir="/dev/shm") as runtime:
         env = dict(
-            os.environ, HOME=str(scratch), XDG_DATA_HOME=str(scratch / "data"),
+            os.environ, HOME=str(home), XDG_DATA_HOME=str(home / "data"),
             XDG_RUNTIME_DIR=runtime,
         )
         output = subprocess.check_output([
-            executable, "--ignored", "--exact", "player::tests::measure_local_guest_playback",
-            "--nocapture",
+            executable, "--ignored", "--exact", f"player::tests::{name}", "--nocapture",
         ], env=env, text=True)
-    prefix = "playback_samples "
-    samples, = (json.loads(line.split(prefix, 1)[1]) for line in output.splitlines() if prefix in line)
-    return {key: statistics.median(values) for key, values in samples.items()}
+    # libtest can print the test name on the same line, and it contains the prefix.
+    marker = prefix + "{"
+    lines = [json.loads(line[line.find(marker) + len(prefix):]) for line in output.splitlines() if marker in line]
+    return lines[0] if lines else None
 
 
-def report(base, candidate, before, after):
+def measure(executable, home):
+    samples = run_test(executable, home, "measure_local_guest_playback", "playback_samples ")
+    result = {key: statistics.median(values) for key, values in samples.items()}
+    result |= run_test(executable, home, "measure_play_requests", "play_requests ") or {}
+    return result
+
+
+def fixture_home(path):
+    """A Home response with the shape of YouTube Music's: shelves of cards with artwork."""
+    def card(shelf, index):
+        return {"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": f"Playlist {shelf}.{index}"}]},
+            "subtitle": {"runs": [{"text": "Playlist"}, {"text": " • "}, {"text": "YouTube Music"}]},
+            "navigationEndpoint": {"browseEndpoint": {"browseId": f"VLPLperf{shelf:02}{index:02}"}},
+            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{
+                "url": f"https://lh3.googleusercontent.com/perf{shelf}{index}=w226-h226-l90-rj",
+                "width": 226, "height": 226,
+            }]}}},
+        }}
+
+    shelves = [{"musicCarouselShelfRenderer": {
+        "header": {"musicCarouselShelfBasicHeaderRenderer": {
+            "title": {"runs": [{"text": f"Shelf {shelf}"}]},
+        }},
+        "contents": [card(shelf, index) for index in range(12)],
+    }} for shelf in range(8)]
+    path.write_text(json.dumps({"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [
+        {"tabRenderer": {"content": {"sectionListRenderer": {"contents": shelves}}}},
+    ]}}}))
+
+
+def launch(app, home, fixture, directory):
+    """Start the app with the fixture Home and no network, then time its frames and memory."""
+    data = directory / "data"
+    (data / "yt-music-gpui").mkdir(parents=True)
+    (data / "yt-music-gpui" / "library.json").write_text('{"volume":0}')
+    runtime = directory / "runtime"
+    runtime.mkdir(mode=0o700)
+    log = directory / "stderr"
+    pid_file = directory / "pid"
+    env = {key: value for key, value in os.environ.items() if key != "WAYLAND_DISPLAY"}
+    # Every connection goes to a closed port, so artwork and lookups fail at once.
+    dead = "http://127.0.0.1:9"
+    env.update(
+        HOME=str(home), XDG_DATA_HOME=str(data), XDG_CACHE_HOME=str(directory / "cache"),
+        XDG_RUNTIME_DIR=str(runtime), YTM_PERF_HOME=str(fixture),
+        HTTP_PROXY=dead, HTTPS_PROXY=dead, ALL_PROXY=dead, NO_PROXY="",
+        http_proxy=dead, https_proxy=dead, all_proxy=dead, no_proxy="",
+    )
+    started = time.time_ns()
+    # A private bus keeps the app's media controls off any desktop session.
+    session = subprocess.Popen([
+        "dbus-run-session", f"--config-file={ROOT / 'bin/private-bus.conf'}", "--",
+        "sh", "-c", 'echo $$ > "$1"; exec "$2" --guest', "sh", pid_file, app,
+    ], env=env, stdout=subprocess.DEVNULL, stderr=log.open("w"))
+
+    def marks():
+        found = {}
+        for line in log.read_text(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "ytm_perf":
+                found.setdefault(parts[1], (int(parts[2]) * 1000 - started) / 1e6)
+        return found
+
+    try:
+        deadline = time.monotonic() + 30
+        while "home_frame" not in marks() and time.monotonic() < deadline and session.poll() is None:
+            # A build without startup marks prints nothing.
+            if not marks() and time.monotonic() > deadline - 20:
+                break
+            time.sleep(0.02)
+        result = marks()
+        if "home_frame" not in result:
+            return result
+        # Let artwork failures and idle work settle before sampling memory.
+        time.sleep(3)
+        pid = int(pid_file.read_text())
+        rollup = Path(f"/proc/{pid}/smaps_rollup").read_text()
+        pss = next(int(line.split()[1]) for line in rollup.splitlines() if line.startswith("Pss:"))
+        result["home_pss_mib"] = pss / 1024
+        return result
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        try:
+            session.wait(15)
+        except subprocess.TimeoutExpired:
+            session.kill()
+            session.wait()
+
+
+def measure_startup(apps, home, scratch):
+    """Alternate the builds' launches and return each build's medians, or None without a display."""
+    if not os.environ.get("DISPLAY"):
+        return None
+    fixture = scratch / "home.json"
+    fixture_home(fixture)
+    samples = {name: {} for name in apps}
+    marked = set(apps)
+    for run in range(STARTUP_RUNS):
+        order = list(apps) if run % 2 == 0 else list(reversed(apps))
+        for name in filter(marked.__contains__, order):
+            # The app keeps its private runtime in RAM, so the whole profile lives there.
+            directory = Path(tempfile.mkdtemp(prefix="yt-music-ci.", dir="/dev/shm"))
+            measured = launch(apps[name], home, fixture, directory)
+            if not measured:
+                # Most likely a base from before the startup marks: launching it again tells nothing.
+                marked.discard(name)
+                log = (directory / "stderr").read_text(errors="replace").splitlines()[-15:]
+                print(f"The {name} build printed no startup marks. Its last output:", *log, sep="\n")
+            shutil.rmtree(directory)
+            for key, value in measured.items():
+                samples[name].setdefault(key, []).append(value)
+    return {
+        name: {f"{key}_ms" if not key.endswith("_mib") else key: statistics.median(values)
+               for key, values in measured.items()}
+        for name, measured in samples.items()
+    }
+
+
+def report(base, candidate, before, after, startup_note):
     budgets = json.loads((ROOT / "bin/performance-budget.json").read_text())
     rows = [
         "### Linux release performance",
@@ -90,36 +235,64 @@ def report(base, candidate, before, after):
         "| Measurement | Base | Candidate | Change | Allowed increase | Result |",
         "| --- | ---: | ---: | ---: | ---: | --- |",
     ]
+    failed = False
     size_limit = budgets["max_binary_bytes"]
     size_cap_exceeded = after["binary_bytes"] > size_limit
     for label, key, unit in BUDGETS:
-        change = after[key] - before[key]
         allowed = budgets[key]
+        decimals = 1 if unit == "ms" else 0
+        if after.get(key) is None:
+            rows.append(f"| {label} ({unit}) | - | - | - | {allowed:,} | Not measured |")
+            continue
+        if before.get(key) is None:
+            # A base from before this measurement: hold the candidate to the budget alone.
+            exceeded = unit == "requests" and after[key] > budgets[f"max_{key}"]
+            rows.append(
+                f"| {label} ({unit}) | - | {after[key]:,.{decimals}f} | - | {allowed:,} | "
+                f"{'Regression' if exceeded else 'New'} |"
+            )
+            if exceeded:
+                failed = True
+                print(f"::error::{label} is {after[key]} (at most {budgets[f'max_{key}']}).")
+            continue
+        change = after[key] - before[key]
         exceeds_delta = change > allowed
-        exceeds_size = key == "binary_bytes" and size_cap_exceeded
-        exceeded = exceeds_delta or exceeds_size
-        decimals = 0 if unit == "bytes" else 1
+        exceeded = exceeds_delta or (key == "binary_bytes" and size_cap_exceeded)
         rows.append(
             f"| {label} ({unit}) | {before[key]:,.{decimals}f} | {after[key]:,.{decimals}f} | "
             f"{change:+,.{decimals}f} | {allowed:,} | {'Regression' if exceeded else 'Within budget'} |"
         )
         if exceeds_delta:
-            level = "error" if key == "binary_bytes" else "warning"
+            level = "warning" if unit == "ms" else "error"
+            failed |= level == "error"
             print(f"::{level}::{label} grew by {change:,.{decimals}f} {unit} (budget {allowed:,}).")
     if size_cap_exceeded:
+        failed = True
         print(f"::error::Stripped binary is {after['binary_bytes']:,} bytes (cap {size_limit:,}).")
-    size_growth_exceeded = after["binary_bytes"] - before["binary_bytes"] > budgets["binary_bytes"]
+    rows += [
+        "",
+        "| Reported only | Base | Candidate | Change |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for label, key, unit in REPORTED:
+        values = [before.get(key), after.get(key)]
+        shown = ["-" if value is None else f"{value:,.1f}" for value in values]
+        change = "-" if None in values else f"{values[1] - values[0]:+,.1f}"
+        rows.append(f"| {label} ({unit}) | {shown[0]} | {shown[1]} | {change} |")
     rows += [
         "",
         f"The stripped binary is capped at {size_limit:,} bytes.",
         "Playback uses silent local WAV files and excludes streaming and network latency.",
+        "Requests count what the fast lookup sends between Play and mpv opening the stream, "
+        "against a local server.",
+        startup_note,
     ]
     summary = "\n".join(rows) + "\n"
     print(summary)
     if path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(path, "a") as file:
             file.write(summary)
-    return int(size_cap_exceeded or size_growth_exceeded)
+    return int(failed)
 
 
 def main():
@@ -138,21 +311,31 @@ def main():
         for folder in [home, local, share, helpers]:
             folder.mkdir(mode=0o700)
         stage_extractor(helpers / "yt-dlp", sys.argv[2] if len(sys.argv) == 3 else None)
-        candidate_test = scratch / "candidate-test"
-        candidate_size = build(ROOT, target, candidate, candidate_test)
+        candidate_size, candidate_test, candidate_app = build(ROOT, target, candidate, scratch, "candidate")
+        apps = {"candidate": candidate_app}
         if base == candidate:
-            current = dict(measure(candidate_test, home), binary_bytes=candidate_size)
-            return report(base, candidate, current, current)
-        base_tree = scratch / "base"
-        subprocess.run(["git", "worktree", "add", "--detach", base_tree, base], cwd=ROOT, check=True)
-        try:
-            base_test = scratch / "base-test"
-            base_size = build(base_tree, target, base, base_test)
-            before = dict(measure(base_test, home), binary_bytes=base_size)
             after = dict(measure(candidate_test, home), binary_bytes=candidate_size)
-        finally:
-            subprocess.run(["git", "worktree", "remove", base_tree], cwd=ROOT, check=True)
-        return report(base, candidate, before, after)
+            before = after
+        else:
+            base_tree = scratch / "base"
+            subprocess.run(["git", "worktree", "add", "--detach", base_tree, base], cwd=ROOT, check=True)
+            try:
+                base_size, base_test, apps["base"] = build(base_tree, target, base, scratch, "base")
+                before = dict(measure(base_test, home), binary_bytes=base_size)
+                after = dict(measure(candidate_test, home), binary_bytes=candidate_size)
+            finally:
+                subprocess.run(["git", "worktree", "remove", base_tree], cwd=ROOT, check=True)
+        startup = measure_startup(apps, home, scratch)
+        if startup is None:
+            note = "Startup was not measured: no X display."
+        elif not startup["candidate"]:
+            note = "Startup was not measured: the app printed no startup marks (output above)."
+        else:
+            after |= startup["candidate"]
+            before |= startup.get("base", startup["candidate"])
+            note = (f"Startup is the median of {STARTUP_RUNS} alternating launches with a fixture Home "
+                    "and no network, rendered in software on CI.")
+        return report(base, candidate, before, after, note)
 
 
 if __name__ == "__main__":

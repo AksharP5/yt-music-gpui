@@ -14,6 +14,8 @@ mod listening;
 mod media_controls;
 #[cfg_attr(windows, path = "os_windows.rs")]
 mod os;
+#[cfg(ytm_perf)]
+mod perf;
 mod player;
 mod playlist_choices;
 mod playlist_form;
