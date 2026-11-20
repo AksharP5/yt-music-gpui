@@ -247,6 +247,77 @@ fn typing_requests_at_once_then_throttles_to_the_newest_text() -> anyhow::Result
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn song_suggestion_actions_never_open_sign_in_for_a_guest() -> anyhow::Result<()> {
+    use crate::app::Overlay;
+    use crate::catalog::{Item, Track};
+
+    check_cache_window(async |window, cx| {
+        let track: Track = serde_json::from_value(
+            serde_json::json!({"id":"song","title":"Song","artist":"Synthetic"}),
+        )
+        .unwrap();
+        window
+            .update(cx, |music, window, cx| {
+                music.account = None;
+                window.focus(&music.search.focus_handle(cx), cx);
+                music.search.update(cx, |search, cx| {
+                    search.set_query("song".into(), cx);
+                    search.show_items(vec![Item::Track(track)], cx);
+                });
+            })
+            .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        // At 1280px the only row spans 59-115px, and its actions end 12px inside the 820px edge,
+        // where the web puts Like at 682, Dislike at 720 and the menu at 772.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: point(px(580.), px(87.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        wait_for_presented_frame(window, cx).await;
+        let click = async |cx: &mut AsyncApp, x: f32| {
+            mouse(window, cx, x, 87., true);
+            mouse(window, cx, x, 87., false);
+            wait_for_presented_frame(window, cx).await;
+        };
+
+        click(cx, 699.).await;
+        window
+            .update(cx, |music, _, _| {
+                assert!(music.library.liked.iter().any(|liked| liked.id == "song"));
+                assert!(music.overlay.is_none());
+            })
+            .unwrap();
+
+        click(cx, 737.).await;
+        window
+            .update(cx, |music, _, _| {
+                assert_eq!(music.notice.as_deref(), Some("Sign in to dislike songs"));
+                assert!(music.overlay.is_none() && music.account_operation.is_none());
+            })
+            .unwrap();
+        assert!(
+            searched(window, cx).is_empty(),
+            "An action must not open the row"
+        );
+
+        click(cx, 789.).await;
+        window
+            .update(cx, |music, _, _| {
+                assert!(matches!(music.overlay, Some(Overlay::Track { .. })));
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
 fn tab_reaches_the_clear_button() -> anyhow::Result<()> {
     check_cache_window(async |window, cx| {
         type_with_suggestions(window, cx).await;
