@@ -1154,7 +1154,11 @@ impl ResolvedStream {
                 parsed.scheme() == "https"
                     && parsed
                         .host_str()
-                        .is_some_and(|host| host.ends_with(".googlevideo.com")),
+                        .is_some_and(|host| host.ends_with(".googlevideo.com"))
+                    // Tests play prepared streams from local files with this suffix.
+                    || cfg!(test)
+                        && parsed.scheme() == "file"
+                        && parsed.path().ends_with(".test-stream.wav"),
                 "Unsupported prepared stream host"
             );
             if let Some(expiry) = parsed.query_pairs().find_map(|(name, value)| {
@@ -6529,6 +6533,85 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 }
             }
             assert_eq!(requested, reload, "buffer {buffer}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires libmpv; uses a synthetic extractor, local silent audio, null audio and no network"]
+    fn idle_player_plays_the_restored_song_from_its_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("restored.test-stream.wav");
+        fs::rename(silent_audio(directory.path(), 60), &path).unwrap();
+        // Each resolution appends a line, so a play that resolves again is caught.
+        let calls = directory.path().join("calls");
+        let extractor = directory.path().join("extractor");
+        fs::write(
+            &extractor,
+            format!(
+                "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\necho >> '{}'\nprintf 'file://%s\\n' '{}'\n",
+                calls.display(),
+                path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let resolutions = || fs::read_to_string(&calls).map_or(0, |calls| calls.lines().count());
+        // A new player each time, idle as at launch: the restored song from the
+        // start, then one restored partway in.
+        for (start, step) in [(0., "from the start"), (20., "resumed at 0:20")] {
+            let player = Player::with_extractor(
+                PlayerOptions {
+                    volume: 0.,
+                    audio_output: Some("null".into()),
+                    ..Default::default()
+                },
+                extractor.clone(),
+            )
+            .unwrap();
+            let wait_for = |stage: &str, predicate: &dyn Fn(&PlayerEvent) -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{step}, {stage}: the player never got there"
+                    );
+                    match player.try_recv() {
+                        Some(PlayerEvent::Error { message, .. }) => {
+                            panic!("{step}, {stage}: {message}")
+                        }
+                        Some(event) if predicate(&event) => break,
+                        Some(_) => {}
+                        None => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            };
+            player
+                .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+                .unwrap();
+            wait_for("preparing", &|event| {
+                matches!(event, PlayerEvent::Prepared { .. })
+            });
+            let prepared = resolutions();
+            let id = player
+                .play(
+                    "abcdefghijk",
+                    "Restored",
+                    PlayOptions {
+                        start,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            wait_for("playing", &|event| {
+                matches!(event, PlayerEvent::Position { track_id, seconds }
+                    if *track_id == id && *seconds > start + 0.2)
+            });
+            assert_eq!(
+                resolutions(),
+                prepared,
+                "{step}: Play resolved the song again"
+            );
         }
     }
 
