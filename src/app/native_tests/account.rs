@@ -682,7 +682,6 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                         page: cached,
                         fetched_at: Instant::now(),
                         coverage: Default::default(),
-                        sort: None,
                     });
                     if case == "signout" {
                         let operation = Operation::default();

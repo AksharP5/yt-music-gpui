@@ -279,11 +279,13 @@ fn merge_first_page<T>(
 }
 
 pub(super) fn merge_page(loaded: &mut Page, mut fresh: Page, coverage: &mut PageCoverage) {
+    let same_order = loaded.selected_sort().map(|sort| &sort.label)
+        == fresh.selected_sort().map(|sort| &sort.label);
     if merge_first_page(
         &mut loaded.shelves,
         std::mem::take(&mut fresh.shelves),
         coverage,
-        fresh.continuation.is_some(),
+        same_order && fresh.continuation.is_some(),
         |tail, fresh| {
             let keys: HashSet<_> = fresh
                 .iter()
@@ -1272,6 +1274,9 @@ impl Music {
 
     #[expect(clippy::expect_used, reason = "every library route has a section")]
     pub(super) fn page_query(&self) -> Query {
+        if let Some(sort) = self.page.selected_sort() {
+            return Query::Reload(sort.reload.clone());
+        }
         match &self.route {
             Route::Home => Query::Home,
             Route::Explore => Query::Explore,

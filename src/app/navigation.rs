@@ -87,7 +87,7 @@ pub(in crate::app) enum Query {
         playlist: BrowseLink,
         token: Option<Continuation>,
     },
-    /// The current page again in another order, replacing it.
+    /// The library's first page in the order specified by this reply's sort control.
     Reload(Continuation),
     Revalidate(Box<Query>),
 }
@@ -362,8 +362,6 @@ pub(in crate::app) struct CachedPage {
     pub(in crate::app) page: Page,
     pub(in crate::app) fetched_at: Instant,
     pub(in crate::app) coverage: sync::PageCoverage,
-    // Forward revisits need the order of the cached response too.
-    pub(in crate::app) sort: Option<Continuation>,
 }
 
 // A Back restore changes list_id without adopting this forward visit's cache metadata.
@@ -372,7 +370,6 @@ pub(in crate::app) struct ForwardPage {
     pub(super) fetched_at: Option<Instant>,
     account_generation: u64,
     history_generation: u64,
-    pub(super) sort: Option<Continuation>,
 }
 
 impl ForwardPage {
@@ -382,7 +379,6 @@ impl ForwardPage {
             fetched_at: None,
             account_generation,
             history_generation,
-            sort: None,
         }
     }
 }
@@ -419,17 +415,9 @@ impl Music {
         if target == CatalogTarget::Page {
             if let Some(page) = &mut self.forward_page
                 && page.list_id == self.list_id
+                && matches!(&query, Query::Reload(_))
             {
-                // Remember the order the next response will show, so a stale
-                // revisit refreshes in that order.
-                match &query {
-                    Query::Reload(token) => {
-                        page.sort = Some(token.clone());
-                        page.fetched_at = None;
-                    }
-                    Query::More { .. } => {}
-                    _ => page.sort = None,
-                }
+                page.fetched_at = None;
             }
             self.sync.page_changes.clear();
             self.sync.page_reload = None;
@@ -508,7 +496,6 @@ impl Music {
                 page: self.page.clone(),
                 fetched_at,
                 coverage: self.sync.page_coverage,
-                sort: active.sort.clone(),
             });
         }
         self.clear_suggestions();
@@ -609,17 +596,12 @@ impl Music {
                 fetched_at: Some(entry.fetched_at),
                 account_generation: entry.account_generation,
                 history_generation: entry.history_generation,
-                sort: entry.sort.clone(),
             });
             self.rebuild_rows();
             self.overlay_ratings();
             if sync::needs_refresh(Some(entry.fetched_at), Instant::now()) {
                 // Forward visits start at the top and replace expired loaded tails.
-                let query = entry
-                    .sort
-                    .map(Query::Reload)
-                    .unwrap_or_else(|| self.page_query());
-                self.request(query, cx);
+                self.request(self.page_query(), cx);
             } else {
                 self.load_suggestions(true, cx);
             }

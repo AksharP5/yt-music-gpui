@@ -102,6 +102,8 @@ The player keeps the selected tab when you change tracks. Lyrics, Comments and R
 
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 
+Library refresh and Back keep the selected sort order when YouTube provides it.
+
 In **Save to playlist**, use Tab and Shift+Tab to move through the destinations. The list scrolls to the focused playlist. Press Enter to choose it. Confirmed songs appear in a fully loaded destination even if you changed the queue while the save was pending. If the same account reconnects while the picker is open, it keeps the selected songs and reloads the destinations.
 
 While dragging a song in **Up next**, press Escape to cancel the move. Press Escape again to close the player page. Leaving Up next, shuffling, or replacing the queue also cancels the move.
