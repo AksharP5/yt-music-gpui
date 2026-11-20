@@ -134,7 +134,14 @@ bin/test --release -- --ignored --exact app::native_tests::suggestions::suggesti
 
 The two player measurements use silent local audio and null audio output; give `measure_local_guest_playback` a private, RAM-backed `XDG_RUNTIME_DIR`. Set `YT_MUSIC_COMMENTS_PROFILE=1` when running the native comments test to sample the app with `bin/profile`.
 
-The Linux performance job in CI compares the stripped release binary size and local playback timings with the pull request's base commit. It fails when the binary grows past the budget in `bin/performance-budget.json` and warns on playback regressions, since shared runners vary. Reproduce it with `bin/check-performance BASE_COMMIT`, optionally passing the reviewed yt-dlp zipapp as a second argument to skip the download.
+The Linux performance job in CI compares the pull request with its base commit on:
+
+- the stripped release binary size,
+- local playback timings and memory while playing (`measure_local_guest_playback`),
+- how many requests the fast lookup sends between Play and mpv opening the stream, for a prepared play, the first unprepared play and a later one (`measure_play_requests`, against a local server),
+- launch to the first frame and to the first Home frame, and memory on a settled Home. The app is built with `--cfg ytm_perf`, which prints frame timestamps and reads Home from the fixture in `YTM_PERF_HOME`. It runs under a private bus, with every connection sent to a closed port.
+
+It fails when the binary grows past the budget in `bin/performance-budget.json` or a play sends more requests, and warns on playback timing regressions, since shared runners vary. Memory and startup times are reported, not gated: CI renders in software in Xvfb. Reproduce it with `bin/check-performance BASE_COMMIT`, optionally passing the reviewed yt-dlp zipapp as a second argument to skip the download. Startup is measured only when `DISPLAY` is set; the launches open windows on that display.
 
 ## Run an isolated instance
 

@@ -2,5 +2,11 @@
   "binary_bytes": 262144,
   "max_binary_bytes": 41943040,
   "first_position_ms": 75,
-  "warm_switch_ms": 25
+  "warm_switch_ms": 25,
+  "prepared_play_requests": 0,
+  "max_prepared_play_requests": 0,
+  "cold_play_requests": 0,
+  "max_cold_play_requests": 2,
+  "warm_play_requests": 0,
+  "max_warm_play_requests": 1
 }

@@ -931,6 +931,12 @@ impl Catalog {
     }
 
     pub fn home(&self) -> Result<Page> {
+        // bin/check-performance measures startup against a fixed Home response.
+        #[cfg(ytm_perf)]
+        if let Some(path) = std::env::var_os("YTM_PERF_HOME") {
+            let data: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            return self.bind_page(parse_home(&data, "Home")?, &data, None);
+        }
         self.browse(&BrowseLink::new("FEmusic_home", "Home"))
     }
 

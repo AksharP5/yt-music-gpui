@@ -79,11 +79,30 @@ impl Music {
         window.focus(focus, cx);
     }
 
+    /// Mark when the first frame, and the first frame showing Home, reach the screen.
+    #[cfg(ytm_perf)]
+    fn mark_startup_frames(&self, window: &mut Window) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static FIRST: AtomicBool = AtomicBool::new(false);
+        static HOME: AtomicBool = AtomicBool::new(false);
+        if !FIRST.swap(true, Ordering::Relaxed) {
+            window.on_next_frame(|_, _| crate::perf::mark("first_frame"));
+        }
+        if self.route.is_home()
+            && !self.page.shelves.is_empty()
+            && !HOME.swap(true, Ordering::Relaxed)
+        {
+            window.on_next_frame(|_, _| crate::perf::mark("home_frame"));
+        }
+    }
+
     pub(in crate::app) fn sidebar_compact(&self, width: f32) -> bool {
         self.sidebar_collapsed.unwrap_or(width < 936.)
     }
 
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(ytm_perf)]
+        self.mark_startup_frames(window);
         let player_page = self.player_open && self.library.queue.current().is_some();
         let fullscreen = player_page && self.library.video && window.is_fullscreen();
         let viewport = window.viewport_size();

@@ -6140,6 +6140,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         ];
         let mut first_play = Vec::new();
         let mut switches = Vec::new();
+        let mut playing_pss = Vec::new();
         for _ in 0..5 {
             let player = Player::new(PlayerOptions {
                 volume: 0.,
@@ -6179,10 +6180,157 @@ os.kill(os.getpid(), signal.SIGSTOP)
                     switches.push(elapsed);
                 }
             }
+            // Memory once the last track has played for a second.
+            thread::sleep(Duration::from_secs(1));
+            let rollup = fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+            let pss_kib: f64 = rollup
+                .lines()
+                .find_map(|line| line.strip_prefix("Pss:"))
+                .and_then(|value| value.trim().strip_suffix("kB")?.trim().parse().ok())
+                .unwrap();
+            playing_pss.push(pss_kib / 1024.);
         }
         println!(
             "playback_samples {}",
-            json!({"first_position_ms": first_play, "warm_switch_ms": switches})
+            json!({
+                "first_position_ms": first_play,
+                "warm_switch_ms": switches,
+                "playing_pss_mib": playing_pss,
+            })
+        );
+    }
+
+    /// A lookup server that answers every request: the page with visitor data,
+    /// and a player response for the requested video.
+    #[cfg(target_os = "linux")]
+    fn counting_lookup() -> (native::Lookup, Arc<AtomicU64>) {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let lookup =
+            native::tests::lookup_at(&format!("http://{}", listener.local_addr().unwrap()));
+        let requests = Arc::new(AtomicU64::new(0));
+        let served = requests.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                served.fetch_add(1, Ordering::SeqCst);
+                let mut input = BufReader::new(&stream);
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    input.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = header.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                input.read_exact(&mut body).unwrap();
+                let response = if line.starts_with("GET ") {
+                    native::tests::homepage()
+                } else {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let mut player = native::tests::fixture();
+                    player["videoDetails"]["videoId"] = request["videoId"].clone();
+                    player.to_string()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        (lookup, requests)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "count sample with libmpv and a local lookup server; streams fail to open without network"]
+    fn measure_play_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let extractor = synthetic_full_extractor(directory.path(), false);
+        let (lookup, requests) = counting_lookup();
+        let player = Player::with_lookup(
+            PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            extractor,
+            Some(lookup),
+        )
+        .unwrap();
+        // mpv refuses every stream URL at once, so no request leaves the machine.
+        player
+            .command(json!([
+                "set_property",
+                "stream-lavf-o",
+                "protocol_whitelist=file"
+            ]))
+            .unwrap();
+        let wait_for = |step: &str, predicate: &dyn Fn(&PlayerEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "{step}: the player never got there"
+                );
+                match player.try_recv() {
+                    Some(event) if predicate(&event) => break,
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        };
+        // Requests from Play until mpv was asked to open the stream and failed.
+        let count_play = |video_id: &str| {
+            let before = requests.load(Ordering::SeqCst);
+            let id = player
+                .play(video_id, "Requests", PlayOptions::default())
+                .unwrap();
+            wait_for(
+                video_id,
+                &|event| matches!(event, PlayerEvent::Error { track_id: Some(track), .. } if *track == id),
+            );
+            requests.load(Ordering::SeqCst) - before
+        };
+        let unprepared_cold = count_play("aaaaaaaaaaa");
+        let unprepared_warm = count_play("bbbbbbbbbbb");
+        // As for Next: the following song is prepared while one plays.
+        let path = silent_audio(directory.path(), 30);
+        let playing = player
+            .play_url(
+                path.to_string_lossy().into_owned(),
+                "Silence",
+                PlayOptions::default(),
+            )
+            .unwrap();
+        wait_for(
+            "local file",
+            &|event| matches!(event, PlayerEvent::Started { track_id, .. } if *track_id == playing),
+        );
+        player
+            .prepare_next(Some("ccccccccccc"), PlayOptions::default())
+            .unwrap();
+        wait_for(
+            "preparation",
+            &|event| matches!(event, PlayerEvent::Prepared { video_id } if video_id == "ccccccccccc"),
+        );
+        let prepared = count_play("ccccccccccc");
+        println!(
+            "play_requests {}",
+            json!({
+                "prepared_play_requests": prepared,
+                "cold_play_requests": unprepared_cold,
+                "warm_play_requests": unprepared_warm,
+            })
         );
     }
 
