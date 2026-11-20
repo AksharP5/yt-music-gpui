@@ -1,7 +1,7 @@
 use crate::{
     app::HEADER_HEIGHT,
     auth::{self, Session},
-    catalog::{Catalog, Item},
+    catalog::{Catalog, Item, Rating, Track},
     input::{InputEvent, SearchInput},
     search::Suggestion,
     theme::Theme,
@@ -20,12 +20,17 @@ pub enum SearchBoxEvent {
     Submit(String),
     /// A suggested artist, album or song chosen straight from the dropdown.
     Open(Box<Item>),
+    Like(Box<Track>),
+    Dislike(Box<Track>),
+    Menu(Box<Item>),
     SessionRejected(Arc<Session>),
     Blur,
 }
 
 /// Looks up a cached thumbnail, requesting it when missing.
 pub type ArtworkLookup = Box<dyn Fn(&str, Size<Pixels>, &mut App) -> Option<Arc<RenderImage>>>;
+/// Reads the user's current rating of a song.
+pub type RatingLookup = Box<dyn Fn(&Track, &App) -> Rating>;
 
 /// The web's search box: 480px wide, with the dropdown joined beneath it.
 pub(crate) const WIDTH: f32 = 480.;
@@ -65,11 +70,14 @@ pub struct SearchBox {
     /// The row reached with the arrow keys, previewed in the field. Enter opens it instead
     /// of the typed text; the pointer only highlights rows, like the web.
     selected: Option<usize>,
+    /// The row under the pointer. It and the selected row show their actions.
+    hovered: Option<usize>,
     /// Like the web, typing or clicking the field opens the suggestions, and Escape, Tab or
     /// leaving the field closes them, keeping them for the next click.
     open: bool,
     clear_focus: FocusHandle,
     artwork: Option<ArtworkLookup>,
+    rating: Option<RatingLookup>,
     error: Option<String>,
     theme: Theme,
     generation: Arc<AtomicU64>,
@@ -129,9 +137,11 @@ impl SearchBox {
             typed: String::new(),
             answered: String::new(),
             selected: None,
+            hovered: None,
             open: false,
             clear_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             artwork: None,
+            rating: None,
             error,
             theme: Theme::load(),
             generation,
@@ -164,15 +174,34 @@ impl SearchBox {
     #[cfg(test)]
     #[cfg(unix)]
     pub(crate) fn show_suggestions(&mut self, queries: &[&str], cx: &mut Context<Self>) {
-        self.suggestions = queries
-            .iter()
-            .map(|query| Suggestion::Query {
-                query: (*query).into(),
-                label: (*query).into(),
-                bold: Vec::new(),
-                history: false,
-            })
-            .collect();
+        self.show_test_suggestions(
+            queries
+                .iter()
+                .map(|query| Suggestion::Query {
+                    query: (*query).into(),
+                    label: (*query).into(),
+                    bold: Vec::new(),
+                    history: false,
+                })
+                .collect(),
+            cx,
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn show_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
+        self.show_test_suggestions(
+            items
+                .into_iter()
+                .map(|item| Suggestion::Item(Box::new(item)))
+                .collect(),
+            cx,
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    fn show_test_suggestions(&mut self, suggestions: Vec<Suggestion>, cx: &mut Context<Self>) {
+        self.suggestions = suggestions;
         self.answered = self.typed.trim().to_owned();
         self.open = true;
         cx.notify();
@@ -185,6 +214,10 @@ impl SearchBox {
 
     pub fn set_artwork(&mut self, lookup: ArtworkLookup) {
         self.artwork = Some(lookup);
+    }
+
+    pub fn set_rating(&mut self, lookup: RatingLookup) {
+        self.rating = Some(lookup);
     }
 
     pub fn set_session(&mut self, session: Option<Arc<Session>>, cx: &mut Context<Self>) {
@@ -263,6 +296,7 @@ impl SearchBox {
             self.suggestion_scroll = ScrollHandle::new();
         }
         self.suggestions.clear();
+        self.hovered = None;
         self.answered.clear();
         self.error = None;
         self.select(None, cx);
@@ -359,6 +393,7 @@ impl SearchBox {
         match result.result {
             Ok(suggestions) => {
                 self.suggestions = suggestions;
+                self.hovered = None;
                 self.answered = result.request.query;
                 self.error = None;
             }
@@ -400,8 +435,15 @@ impl SearchBox {
         self.activate(window, cx);
     }
 
-    fn suggestion_row(&mut self, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn suggestion_row(
+        &mut self,
+        index: usize,
+        large: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let theme = self.theme;
+        let hovered = self.hovered == Some(index);
+        let actions = hovered || self.selected == Some(index);
         let row = div()
             .id(("suggestion", index))
             .w_full()
@@ -422,6 +464,14 @@ impl SearchBox {
                 )
             })
             .hover(|row| row.bg(gpui::white().opacity(0.1)))
+            .on_hover(cx.listener(move |view, hovered: &bool, _, cx| {
+                if *hovered {
+                    view.hovered = Some(index);
+                } else if view.hovered == Some(index) {
+                    view.hovered = None;
+                }
+                cx.notify();
+            }))
             .cursor_pointer()
             // Like the web, a row opens on release.
             .on_click(cx.listener(move |view, _, _, cx| {
@@ -481,38 +531,65 @@ impl SearchBox {
                     _ => item.subtitle().to_owned(),
                 };
                 let round = matches!(item.as_ref(), Item::Collection(collection) if collection.id.starts_with("UC"));
+                let playable = !round && !matches!(item.as_ref(), Item::Navigation(_));
                 let edge = 32.;
+                // A video's 16:9 still sits inside the square, as on the web.
+                let height = match item.as_ref() {
+                    Item::Track(track) if track.details.wide_thumbnail => edge * 9. / 16.,
+                    _ => edge,
+                };
                 let radius = if round { edge / 2. } else { 2. };
                 let image = match (item.thumbnail().map(str::to_owned), &self.artwork) {
-                    (Some(url), Some(lookup)) => lookup(&url, size(px(edge), px(edge)), cx),
+                    (Some(url), Some(lookup)) => lookup(&url, size(px(edge), px(height)), cx),
                     _ => None,
                 };
-                row.h(px(56.))
-                    .pl(px(12.))
-                    .pr(px(16.))
-                    .gap(px(16.))
-                    .child(
-                        div()
-                            .size(px(edge))
-                            .flex_shrink_0()
+                let thumbnail = div()
+                    .relative()
+                    .size(px(edge))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(match image {
+                        Some(image) => img(image)
+                            .w(px(edge))
+                            .h(px(height))
+                            .rounded(px(radius))
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
+                        None => div()
+                            .size_full()
                             .rounded(px(radius))
                             .bg(theme.raised)
-                            .when_some(image, |frame, image| {
-                                frame.child(
-                                    img(image)
-                                        .size_full()
-                                        .rounded(px(radius))
-                                        .object_fit(ObjectFit::Cover),
-                                )
-                            }),
-                    )
+                            .into_any_element(),
+                    })
+                    .when(hovered && playable, |thumbnail| {
+                        thumbnail.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(radius))
+                                .bg(rgba(0x000000cc))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(svg().path("play").size(px(24.)).text_color(theme.text)),
+                        )
+                    });
+                let item = item.as_ref().clone();
+                row.h(px(56.))
+                    .pl(px(12.))
+                    .pr(px(if actions { 12. } else { 16. }))
+                    .gap(px(16.))
+                    .child(thumbnail)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .line_height(px(16.8))
+                            .text_size(px(if large { 16. } else { 14. }))
+                            .line_height(relative(1.2))
                             .gap(px(3.))
                             .child(
                                 div()
@@ -528,8 +605,74 @@ impl SearchBox {
                                     .child(subtitle),
                             ),
                     )
+                    .when(actions, |row| row.child(self.row_actions(index, item, cx)))
             }
         }
+    }
+
+    /// The web's row actions: Like and Dislike for songs and videos, then a menu.
+    fn row_actions(&self, index: usize, item: Item, cx: &mut Context<Self>) -> Div {
+        let action = |id: &'static str, icon: &'static str| {
+            div()
+                .id((id, index))
+                .size(px(36.))
+                .flex_shrink_0()
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|button| button.bg(gpui::white().opacity(0.1)))
+                .child(svg().path(icon).size(px(24.)).text_color(rgb(0xf1f1f1)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
+        let rated = match (&item, &self.rating) {
+            (Item::Track(track), Some(rating)) => Some((track.clone(), rating(track, cx))),
+            _ => None,
+        };
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(16.))
+            .when_some(rated, |actions, (track, rating)| {
+                let disliked = track.clone();
+                let like = if rating == Rating::Like {
+                    "thumb-up-filled"
+                } else {
+                    "thumb-up"
+                };
+                let dislike = if rating == Rating::Dislike {
+                    "thumb-down-filled"
+                } else {
+                    "thumb-down"
+                };
+                actions.child(
+                    div()
+                        .flex()
+                        .gap(px(2.))
+                        .child(action("suggestion-like", like).on_click(cx.listener(
+                            move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(SearchBoxEvent::Like(Box::new(track.clone())));
+                                cx.notify();
+                            },
+                        )))
+                        .child(action("suggestion-dislike", dislike).on_click(cx.listener(
+                            move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(SearchBoxEvent::Dislike(Box::new(disliked.clone())));
+                                cx.notify();
+                            },
+                        ))),
+                )
+            })
+            .child(
+                action("suggestion-menu", "more").on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(SearchBoxEvent::Menu(Box::new(item.clone())));
+                })),
+            )
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -571,6 +714,8 @@ impl Drop for SearchBox {
 impl Render for SearchBox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        // Song, video and collection rows use 16px text from the web's 1364px breakpoint.
+        let large = window.viewport_size().width >= px(1364.);
         let typing = self.focus_handle(cx).is_focused(window);
         let open = self.open && typing;
         let focused = typing || self.clear_focus.is_focused(window);
@@ -629,7 +774,7 @@ impl Render for SearchBox {
             });
         if open {
             let rows = (0..self.suggestions.len())
-                .map(|index| self.suggestion_row(index, cx))
+                .map(|index| self.suggestion_row(index, large, cx))
                 .collect::<Vec<_>>();
             let dropdown = div()
                 .id("search-suggestions")
