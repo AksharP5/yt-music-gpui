@@ -8,6 +8,15 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         Ok(match path {
             "sort" => Some(Cow::Borrowed(include_bytes!("../assets/icons/sort.svg"))),
+            "chart-up" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/chart-up.svg"
+            ))),
+            "chart-down" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/chart-down.svg"
+            ))),
+            "chart-same" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/chart-same.svg"
+            ))),
             "comment-expand" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/comment-expand.svg"
             ))),

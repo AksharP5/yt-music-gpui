@@ -1,0 +1,655 @@
+{
+ "contents": {
+  "twoColumnBrowseResultsRenderer": {
+   "tabs": [
+    {
+     "tabRenderer": {
+      "content": {
+       "sectionListRenderer": {
+        "contents": [
+         {
+          "musicResponsiveHeaderRenderer": {
+           "thumbnail": {
+            "musicThumbnailRenderer": {
+             "thumbnail": {
+              "thumbnails": [
+               {
+                "url": "https://yt3.googleusercontent.com/dhuKvIrkIFie2ihBg3R6zYrBSFbnDqu_hx8U4iC48swVxEwCE9NBIcW8-yzTikC8Jd5UgXh7ZQ=s192",
+                "width": 192,
+                "height": 192
+               }
+              ]
+             },
+             "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+             "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_UNSPECIFIED"
+            }
+           },
+           "title": {
+            "runs": [
+             {
+              "text": "Top 100 Live Performances - United States"
+             }
+            ]
+           },
+           "subtitle": {
+            "runs": [
+             {
+              "text": "Chart"
+             },
+             {
+              "text": " • "
+             },
+             {
+              "text": "2026"
+             }
+            ]
+           },
+           "secondSubtitle": {
+            "runs": [
+             {
+              "text": "100 songs"
+             },
+             {
+              "text": " • "
+             },
+             {
+              "text": "10 hours, 31 minutes"
+             }
+            ]
+           },
+           "facepile": {
+            "avatarStackViewModel": {
+             "avatars": [
+              {
+               "avatarViewModel": {
+                "image": {
+                 "sources": [
+                  {
+                   "url": "https://yt3.ggpht.com/5iPdTXalfmmE2Tn5hFiB1IGwXOo5Gi-igbDFZybbGlPKwn9pHTp23oxFMRLY4uzdTtc2gDWa=s48-c-k-c0x00000000-no-cc-rj-rp"
+                  }
+                 ],
+                 "processor": {
+                  "borderImageProcessor": {
+                   "circular": true
+                  }
+                 }
+                },
+                "avatarImageSize": "AVATAR_SIZE_XS"
+               }
+              }
+             ],
+             "text": {
+              "content": "YouTube Charts"
+             },
+             "rendererContext": {
+              "accessibilityContext": {
+               "label": "YouTube Charts"
+              },
+              "commandContext": {
+               "onTap": {
+                "innertubeCommand": {
+                 "browseEndpoint": {
+                  "browseId": "FEmusic_charts",
+                  "browseEndpointContextSupportedConfigs": {
+                   "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_USER_CHANNEL"
+                   }
+                  }
+                 }
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ],
+   "secondaryContents": {
+    "sectionListRenderer": {
+     "contents": [
+      {
+       "musicPlaylistShelfRenderer": {
+        "playlistId": "PL4fGSI1pDJn4yCNzulPkUbxgr4pl0gmI-",
+        "header": {
+         "musicSideAlignedItemRenderer": {
+          "startItems": [
+           {
+            "sortFilterSubMenuRenderer": {
+             "subMenuItems": [
+              {
+               "title": "Top voted",
+               "selected": false,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElNtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX1RPUF9WT1RFRCDxAigB"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Top voted"
+                }
+               }
+              },
+              {
+               "title": "Default ordering",
+               "selected": true,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElFtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX05PX1NPUlQg8QIoAQ%3D%3D"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Default ordering"
+                }
+               }
+              },
+              {
+               "title": "Newest first",
+               "selected": false,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElZtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX05FV0VTVF9BRERFRCDxAigB"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Newest first"
+                }
+               }
+              },
+              {
+               "title": "Oldest first",
+               "selected": false,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElZtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX09MREVTVF9BRERFRCDxAigB"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Oldest first"
+                }
+               }
+              },
+              {
+               "title": "Title",
+               "selected": false,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElNtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9USVRMRSDxAigB"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Title"
+                }
+               }
+              },
+              {
+               "title": "Artist",
+               "selected": false,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElRtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9BUlRJU1Qg8QIoAQ%3D%3D"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Artist"
+                }
+               }
+              },
+              {
+               "title": "Album",
+               "selected": false,
+               "navigationEndpoint": {
+                "executeEntityCommand": {
+                 "commandEntityKey": "ElVtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9SRUxFQVNFIPECKAE%3D"
+                }
+               },
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "Album"
+                }
+               }
+              }
+             ],
+             "title": "Sort",
+             "icon": {
+              "iconType": "SORT"
+             },
+             "accessibility": {
+              "accessibilityData": {
+               "label": "Ordering"
+              }
+             }
+            }
+           }
+          ]
+         }
+        },
+        "contents": [
+         {
+          "musicResponsiveListItemRenderer": {
+           "thumbnail": {
+            "musicThumbnailRenderer": {
+             "thumbnail": {
+              "thumbnails": [
+               {
+                "url": "https://i.ytimg.com/vi/_HZM0QiuUS8/hqdefault.jpg?sqp=-oaymwEWCJADEOEBIAQqCggAEOADGC0guwJIWg&rs=AMzJL3mOUAepuQzSW8-He_rdY4geprdL-A",
+                "width": 400,
+                "height": 225
+               }
+              ]
+             },
+             "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+             "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_ASPECT_FIT"
+            }
+           },
+           "flexColumns": [
+            {
+             "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "Iris (Live)",
+                 "navigationEndpoint": {
+                  "watchEndpoint": {
+                   "videoId": "_HZM0QiuUS8",
+                   "playlistId": "PL4fGSI1pDJn4yCNzulPkUbxgr4pl0gmI-",
+                   "loggingContext": {
+                    "vssLoggingContext": {
+                     "serializedContextData": "GiJQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUkt"
+                    }
+                   },
+                   "watchEndpointMusicSupportedConfigs": {
+                    "watchEndpointMusicConfig": {
+                     "musicVideoType": "MUSIC_VIDEO_TYPE_OMV"
+                    }
+                   }
+                  }
+                 }
+                }
+               ]
+              },
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH"
+             }
+            },
+            {
+             "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "The Goo Goo Dolls",
+                 "navigationEndpoint": {
+                  "browseEndpoint": {
+                   "browseId": "UCjOkbXu7vYeeQrA7R3-OfXQ",
+                   "browseEndpointContextSupportedConfigs": {
+                    "browseEndpointContextMusicConfig": {
+                     "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                    }
+                   }
+                  }
+                 }
+                }
+               ]
+              },
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH"
+             }
+            },
+            {
+             "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {},
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_MEDIUM"
+             }
+            }
+           ],
+           "fixedColumns": [
+            {
+             "musicResponsiveListItemFixedColumnRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "5:43"
+                }
+               ],
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "5 minutes, 43 seconds"
+                }
+               }
+              },
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH",
+              "size": "MUSIC_RESPONSIVE_LIST_ITEM_FIXED_COLUMN_SIZE_SMALL"
+             }
+            }
+           ],
+           "playlistItemData": {
+            "playlistSetVideoId": "95CF762ED1370878",
+            "videoId": "_HZM0QiuUS8",
+            "voteSortValue": 1795122205
+           },
+           "customIndexColumn": {
+            "musicCustomIndexColumnRenderer": {
+             "text": {
+              "runs": [
+               {
+                "text": "1"
+               }
+              ]
+             },
+             "icon": {
+              "iconType": "ARROW_DROP_UP"
+             },
+             "iconColorStyle": "CUSTOM_INDEX_COLUMN_ICON_COLOR_STYLE_GREEN",
+             "accessibilityData": {
+              "accessibilityData": {
+               "label": "Rank increased to 1"
+              }
+             }
+            }
+           },
+           "multiSelectCheckbox": {
+            "checkboxRenderer": {
+             "onSelectionChangeCommand": {
+              "updateMultiSelectStateCommand": {
+               "multiSelectParams": "CAISIlBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0=",
+               "multiSelectItem": "Ch8KC19IWk0wUWl1VVM4EhA5NUNGNzYyRUQxMzcwODc4"
+              }
+             },
+             "checkedState": "CHECKBOX_CHECKED_STATE_UNCHECKED"
+            }
+           }
+          }
+         },
+         {
+          "musicResponsiveListItemRenderer": {
+           "thumbnail": {
+            "musicThumbnailRenderer": {
+             "thumbnail": {
+              "thumbnails": [
+               {
+                "url": "https://i.ytimg.com/vi/wyf5YaVdhIA/hqdefault.jpg?sqp=-oaymwEWCJADEOEBIAQqCggAEOADGC0guwJIWg&rs=AMzJL3m9FfKhwwtMR4zWVKRY1m1UA4xD7Q",
+                "width": 400,
+                "height": 225
+               }
+              ]
+             },
+             "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+             "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_ASPECT_FIT"
+            }
+           },
+           "flexColumns": [
+            {
+             "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "Before AC/DC Were the Headliners, This Is How They Opened the Show | “Live Wire” 1979",
+                 "navigationEndpoint": {
+                  "watchEndpoint": {
+                   "videoId": "wyf5YaVdhIA",
+                   "playlistId": "PL4fGSI1pDJn4yCNzulPkUbxgr4pl0gmI-",
+                   "loggingContext": {
+                    "vssLoggingContext": {
+                     "serializedContextData": "GiJQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUkt"
+                    }
+                   },
+                   "watchEndpointMusicSupportedConfigs": {
+                    "watchEndpointMusicConfig": {
+                     "musicVideoType": "MUSIC_VIDEO_TYPE_UGC"
+                    }
+                   }
+                  }
+                 }
+                }
+               ]
+              },
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH"
+             }
+            },
+            {
+             "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "The Mosh Pit",
+                 "navigationEndpoint": {
+                  "browseEndpoint": {
+                   "browseId": "UCnfqPaTchy2w8GNRdu3joYA",
+                   "browseEndpointContextSupportedConfigs": {
+                    "browseEndpointContextMusicConfig": {
+                     "pageType": "MUSIC_PAGE_TYPE_USER_CHANNEL"
+                    }
+                   }
+                  }
+                 }
+                }
+               ]
+              },
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH"
+             }
+            },
+            {
+             "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {},
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_MEDIUM"
+             }
+            }
+           ],
+           "fixedColumns": [
+            {
+             "musicResponsiveListItemFixedColumnRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "5:58"
+                }
+               ],
+               "accessibility": {
+                "accessibilityData": {
+                 "label": "5 minutes, 58 seconds"
+                }
+               }
+              },
+              "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH",
+              "size": "MUSIC_RESPONSIVE_LIST_ITEM_FIXED_COLUMN_SIZE_SMALL"
+             }
+            }
+           ],
+           "playlistItemData": {
+            "playlistSetVideoId": "9D682B7B77216576",
+            "videoId": "wyf5YaVdhIA",
+            "voteSortValue": 1795122205
+           },
+           "customIndexColumn": {
+            "musicCustomIndexColumnRenderer": {
+             "text": {
+              "runs": [
+               {
+                "text": "7"
+               }
+              ]
+             },
+             "icon": {
+              "iconType": "ARROW_DROP_DOWN"
+             },
+             "iconColorStyle": "CUSTOM_INDEX_COLUMN_ICON_COLOR_STYLE_RED",
+             "accessibilityData": {
+              "accessibilityData": {
+               "label": "Rank decreased to 7"
+              }
+             }
+            }
+           },
+           "multiSelectCheckbox": {
+            "checkboxRenderer": {
+             "onSelectionChangeCommand": {
+              "updateMultiSelectStateCommand": {
+               "multiSelectParams": "CAISIlBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0=",
+               "multiSelectItem": "Ch8KC3d5ZjVZYVZkaElBEhA5RDY4MkI3Qjc3MjE2NTc2"
+              }
+             },
+             "checkedState": "CHECKBOX_CHECKED_STATE_UNCHECKED"
+            }
+           }
+          }
+         }
+        ],
+        "collapsedItemCount": 100,
+        "contentsMultiSelectable": true,
+        "targetId": "PL4fGSI1pDJn4yCNzulPkUbxgr4pl0gmI-"
+       }
+      }
+     ]
+    }
+   }
+  }
+ },
+ "frameworkUpdates": {
+  "entityBatchUpdate": {
+   "mutations": [
+    {
+     "entityKey": "ElNtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX1RPUF9WT1RFRCDxAigB",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElNtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX1RPUF9WT1RFRCDxAigB",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI8EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aFG9BWUJ3Z1lDSWdEYUNBUUlBaEFF",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "entityKey": "ElFtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX05PX1NPUlQg8QIoAQ%3D%3D",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElFtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX05PX1NPUlQg8QIoAQ%3D%3D",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI6EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aEm9BWUJ3Z1lDSWdEYUNBQSUzRA%3D%3D",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "entityKey": "ElZtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX05FV0VTVF9BRERFRCDxAigB",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElZtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX05FV0VTVF9BRERFRCDxAigB",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI8EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aFG9BWUJ3Z1lDSWdEYUNBUUlBaEFE",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "entityKey": "ElZtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX09MREVTVF9BRERFRCDxAigB",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElZtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX09MREVTVF9BRERFRCDxAigB",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI8EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aFG9BWUJ3Z1lDSWdEYUNBUUlBUkFE",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "entityKey": "ElNtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9USVRMRSDxAigB",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElNtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9USVRMRSDxAigB",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI8EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aFG9BWUJ3Z1lDSWdEYUNBUUlBUkFG",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "entityKey": "ElRtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9BUlRJU1Qg8QIoAQ%3D%3D",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElRtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9BUlRJU1Qg8QIoAQ%3D%3D",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI8EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aFG9BWUJ3Z1lDSWdEYUNBUUlBUkFH",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "entityKey": "ElVtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9SRUxFQVNFIPECKAE%3D",
+     "type": "ENTITY_MUTATION_TYPE_REPLACE",
+     "payload": {
+      "commandEntity": {
+       "key": "ElVtdXNpY19zb3J0X29wdGlvbl9jb21tYW5kX2VudGl0eV9rZXlfVkxQTDRmR1NJMXBESm40eUNOenVsUGtVYnhncjRwbDBnbUktX0FfWl9SRUxFQVNFIPECKAE%3D",
+       "command": {
+        "browseSectionListReloadEndpoint": {
+         "continuation": {
+          "reloadContinuationData": {
+           "continuation": "4qmFsgI8EiRWTFBMNGZHU0kxcERKbjR5Q056dWxQa1VieGdyNHBsMGdtSS0aFG9BWUJ3Z1lDSWdEYUNBUUlBUkFI",
+           "showSpinnerOverlay": true
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ]
+  }
+ }
+}
