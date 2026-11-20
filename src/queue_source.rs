@@ -5,7 +5,7 @@ use crate::{
         PlaylistTarget, Track, WatchTarget,
     },
     library::Queue,
-    search::{SearchFilter, SearchScope},
+    search::Search,
     watch::{Watch, WatchContinuation},
 };
 use anyhow::{Result, ensure};
@@ -23,11 +23,7 @@ use std::{
 pub enum PageRequest {
     Browse,
     Collection(String),
-    Search {
-        query: String,
-        filter: SearchFilter,
-        scope: SearchScope,
-    },
+    Search(Search),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,11 +287,7 @@ fn load_page(catalog: &Catalog, continuation: &SourceContinuation) -> Result<Que
         SourceContinuation::Page { page, continuation } => {
             let response = match page {
                 PageRequest::Browse | PageRequest::Collection(_) => catalog.more(continuation),
-                PageRequest::Search {
-                    query,
-                    filter,
-                    scope,
-                } => catalog.search_more(query, *filter, *scope, continuation),
+                PageRequest::Search(search) => catalog.search_more(search, continuation),
             }?;
             Ok(QueuePage {
                 tracks: response
@@ -811,6 +803,7 @@ mod tests {
     use crate::{
         catalog::{Item, Shelf},
         library::{Library, Repeat},
+        search::{SearchFilter, SearchScope},
     };
     use serde_json::json;
     use std::{collections::VecDeque, sync::mpsc, time::Duration};

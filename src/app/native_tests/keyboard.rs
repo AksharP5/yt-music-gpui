@@ -180,6 +180,7 @@ mod focus_return {
             query: "Song".into(),
             filter: SearchFilter::All,
             scope: SearchScope::Catalog,
+            params: None,
         });
         view.page.shelves[0].layout = ShelfLayout::Featured;
         view.rebuild_rows();

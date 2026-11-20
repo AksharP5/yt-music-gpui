@@ -5,13 +5,6 @@ use crate::catalog::{BrowseChoice, LibraryFilters};
 use crate::playlist_choices::{ChoiceList, Choices, LIKED_MUSIC_ART};
 
 #[derive(Clone, PartialEq)]
-pub(in crate::app) struct Search {
-    pub(in crate::app) query: String,
-    pub(in crate::app) filter: SearchFilter,
-    pub(in crate::app) scope: SearchScope,
-}
-
-#[derive(Clone, PartialEq)]
 pub(in crate::app) enum Route {
     Home,
     Explore,
@@ -573,6 +566,7 @@ impl Music {
         self.page.privacy = None;
         self.page.chips.clear();
         self.page.countries.clear();
+        self.page.correction = None;
         self.page.library = None;
         if self.overlay.as_ref().is_some_and(Overlay::in_page) {
             self.drop_overlay(cx);
@@ -791,6 +785,7 @@ impl Music {
             chips: Vec::new(),
             countries: Vec::new(),
             search_filters: Vec::new(),
+            correction: None,
             library,
         };
         self.rebuild_rows();
@@ -1241,19 +1236,12 @@ impl CatalogRequests {
                                 refresh.order_page(),
                                 || generations[target as usize].load(Ordering::Relaxed) == job.id,
                             ),
-                            Query::Search(search) => {
-                                catalog.search_filtered(&search.query, search.filter, search.scope)
-                            }
+                            Query::Search(search) => catalog.search(search),
                             Query::Browse(link) => catalog.browse(link),
                             Query::More {
                                 token,
                                 search: Some(search),
-                            } => catalog.search_more(
-                                &search.query,
-                                search.filter,
-                                search.scope,
-                                token,
-                            ),
+                            } => catalog.search_more(search, token),
                             Query::More {
                                 token,
                                 search: None,

@@ -239,18 +239,12 @@ impl Music {
             cx.subscribe_in(&search, window, |view, _, event, window, cx| match event {
                 SearchBoxEvent::Submit(query) => {
                     if !query.is_empty() {
-                        let search = match &view.route {
-                            Route::Search(search) => Search {
-                                query: query.clone(),
-                                ..search.clone()
-                            },
-                            _ => Search {
-                                query: query.clone(),
-                                filter: SearchFilter::All,
-                                scope: SearchScope::Catalog,
-                            },
+                        // Like the web, a new query shows every category again.
+                        let scope = match &view.route {
+                            Route::Search(search) => search.scope,
+                            _ => SearchScope::Catalog,
                         };
-                        view.navigate(Route::Search(search), cx);
+                        view.navigate(Route::Search(Search::new(query.clone(), scope)), cx);
                         window.focus(&view.focus, cx);
                     }
                 }
@@ -332,6 +326,7 @@ impl Music {
                 chips: Vec::new(),
                 countries: Vec::new(),
                 search_filters: Vec::new(),
+                correction: None,
                 library: None,
             },
             rows: Vec::new(),

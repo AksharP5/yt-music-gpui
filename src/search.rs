@@ -83,7 +83,7 @@ impl SearchFilter {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchScope {
     #[default]
     Catalog,
@@ -140,41 +140,100 @@ impl SearchScope {
     }
 }
 
+/// One search as the app runs it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Search {
+    pub query: String,
+    pub filter: SearchFilter,
+    pub scope: SearchScope,
+    /// The service's own request params from the chip or spelling link that
+    /// led here. They keep its chip order and spelling choice; without them,
+    /// the params follow from the filter and scope.
+    pub params: Option<String>,
+}
+
+impl Search {
+    /// Every category of `scope`, as a query typed into the search box.
+    pub fn new(query: impl Into<String>, scope: SearchScope) -> Self {
+        Self {
+            query: query.into(),
+            filter: SearchFilter::All,
+            scope,
+            params: None,
+        }
+    }
+
+    /// This search under a service link that names a query.
+    fn follow(&self, endpoint: &Value) -> Option<Self> {
+        let endpoint = endpoint.get("searchEndpoint")?;
+        let query = endpoint["query"]
+            .as_str()
+            .filter(|query| !query.trim().is_empty())?;
+        Some(Self {
+            query: query.to_owned(),
+            params: endpoint["params"].as_str().map(str::to_owned),
+            ..self.clone()
+        })
+    }
+}
+
+/// A category chip, with the service's params for it when it gave them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterChip {
+    pub filter: SearchFilter,
+    pub params: Option<String>,
+}
+
+/// The service's spelling note above the results.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Correction {
+    /// The corrected query as shown, with its corrected words in italics.
+    pub label: String,
+    pub italic: Vec<Range<usize>>,
+    pub corrected: Search,
+    /// The search as typed, when the results are already for the correction.
+    pub original: Option<Search>,
+}
+
 impl Catalog {
+    #[cfg(test)]
     pub fn search_filtered(
         &self,
         query: &str,
         filter: SearchFilter,
         scope: SearchScope,
     ) -> Result<Page> {
-        self.search_results(query, filter, scope, None)
+        self.search(&Search {
+            filter,
+            ..Search::new(query, scope)
+        })
     }
 
-    pub fn search_more(
-        &self,
-        query: &str,
-        filter: SearchFilter,
-        scope: SearchScope,
-        continuation: &Continuation,
-    ) -> Result<Page> {
-        self.search_results(query, filter, scope, Some(continuation))
+    pub fn search(&self, search: &Search) -> Result<Page> {
+        self.search_results(search, None)
     }
 
-    fn search_results(
-        &self,
-        query: &str,
-        filter: SearchFilter,
-        scope: SearchScope,
-        continuation: Option<&Continuation>,
-    ) -> Result<Page> {
-        let body = search_request(query, filter, scope, continuation.map(Continuation::token))?;
+    pub fn search_more(&self, search: &Search, continuation: &Continuation) -> Result<Page> {
+        self.search_results(search, Some(continuation))
+    }
+
+    fn search_results(&self, search: &Search, continuation: Option<&Continuation>) -> Result<Page> {
+        let mut body = search_request(
+            &search.query,
+            search.filter,
+            search.scope,
+            continuation.map(Continuation::token),
+        )?;
+        if let Some(params) = &search.params {
+            body["params"] = json!(params);
+        }
         ensure!(
-            !scope.requires_account() || self.session.is_some(),
+            !search.scope.requires_account() || self.session.is_some(),
             "Connect your Google account to search your library or uploads"
         );
         let response = self.request_with_continuation("search", body, continuation)?;
         self.bind_page(
-            parse_search_page(&response, query.trim(), filter, scope)?,
+            parse_search_page(&response, search)?,
             &response,
             continuation,
         )
@@ -232,12 +291,8 @@ fn search_request(
     Ok(body)
 }
 
-fn parse_search_page(
-    response: &Value,
-    query: &str,
-    filter: SearchFilter,
-    scope: SearchScope,
-) -> Result<Page> {
+fn parse_search_page(response: &Value, search: &Search) -> Result<Page> {
+    let (query, filter, scope) = (search.query.trim(), search.filter, search.scope);
     ensure!(
         !scope.requires_account()
             || (response["LOGGED_IN"] != false
@@ -277,19 +332,67 @@ fn parse_search_page(
         contents
     };
     let mut page = parse_page(results, &title)?;
-    // The service orders categories by relevance to each query.
+    // The service orders categories by relevance to each query. Each chip's
+    // params repeat that order, so following them keeps every chip in place.
     page.search_filters = results
         .pointer("/sectionListRenderer/header/chipCloudRenderer/chips")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|chip| {
-            SearchFilter::from_label(&crate::catalog::text(
-                &chip["chipCloudChipRenderer"]["text"],
-            ))
+            let chip = &chip["chipCloudChipRenderer"];
+            Some(FilterChip {
+                filter: SearchFilter::from_label(&crate::catalog::text(&chip["text"]))?,
+                params: chip
+                    .pointer("/navigationEndpoint/searchEndpoint/params")
+                    .and_then(Value::as_str)
+                    .filter(|_| scope == SearchScope::Catalog)
+                    .map(str::to_owned),
+            })
         })
         .collect();
+    page.correction = results
+        .pointer("/sectionListRenderer/contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|section| section.pointer("/itemSectionRenderer/contents")?.as_array())
+        .flatten()
+        .find_map(|item| parse_correction(item, search));
     Ok(page)
+}
+
+/// "Showing results for" with a link to the spelling as typed, or "Did you
+/// mean" on a search run as typed.
+fn parse_correction(item: &Value, search: &Search) -> Option<Correction> {
+    let (renderer, original) = match item.get("showingResultsForRenderer") {
+        Some(renderer) => (
+            renderer,
+            Some(search.follow(&renderer["originalQueryEndpoint"])?),
+        ),
+        None => (item.get("didYouMeanRenderer")?, None),
+    };
+    let (label, italic) = marked_runs(&renderer["correctedQuery"], "italics");
+    Some(Correction {
+        label,
+        italic,
+        corrected: search.follow(&renderer["correctedQueryEndpoint"])?,
+        original,
+    })
+}
+
+/// A text's runs joined, with the byte ranges of the runs that set `mark`.
+fn marked_runs(text: &Value, mark: &str) -> (String, Vec<Range<usize>>) {
+    let mut label = String::new();
+    let mut marked = Vec::new();
+    for run in text["runs"].as_array().into_iter().flatten() {
+        let run_text = run["text"].as_str().unwrap_or_default();
+        if run[mark] == true {
+            marked.push(label.len()..label.len() + run_text.len());
+        }
+        label.push_str(run_text);
+    }
+    (label, marked)
 }
 
 /// One row of the search box dropdown, in the service's order.
@@ -334,20 +437,7 @@ fn parse_suggestions(response: &Value) -> Result<Vec<Suggestion>> {
                 .and_then(Value::as_str)
                 .filter(|query| !query.trim().is_empty())
                 .context("YouTube Music returned an unreadable search suggestion")?;
-            let mut label = String::new();
-            let mut bold = Vec::new();
-            for run in renderer
-                .pointer("/suggestion/runs")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let text = run["text"].as_str().unwrap_or_default();
-                if run["bold"] == true {
-                    bold.push(label.len()..label.len() + text.len());
-                }
-                label.push_str(text);
-            }
+            let (mut label, mut bold) = marked_runs(&renderer["suggestion"], "bold");
             if label.trim().is_empty() {
                 label = query.to_owned();
                 bold.clear();
@@ -366,6 +456,21 @@ fn parse_suggestions(response: &Value) -> Result<Vec<Suggestion>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_search_page(
+        response: &Value,
+        query: &str,
+        filter: SearchFilter,
+        scope: SearchScope,
+    ) -> Result<Page> {
+        super::parse_search_page(
+            response,
+            &Search {
+                filter,
+                ..Search::new(query, scope)
+            },
+        )
+    }
 
     fn tab(name: &str, token: &str, selected: bool) -> Value {
         json!({"tabRenderer":{"selected":selected,"content":{"sectionListRenderer":{"contents":[{
@@ -442,7 +547,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            page.search_filters,
+            page.search_filters
+                .iter()
+                .map(|chip| chip.filter)
+                .collect::<Vec<_>>(),
             [
                 SearchFilter::Videos,
                 SearchFilter::CommunityPlaylists,
@@ -454,6 +562,70 @@ mod tests {
             search_request("a song", SearchFilter::Profiles, SearchScope::Catalog, None).unwrap()["params"],
             "EgWKAQJYAWoMEA4QChADEAQQCRAF"
         );
+    }
+
+    #[test]
+    fn spelling_corrections_link_to_the_corrected_and_typed_searches() {
+        // Captured from signed-out searches for "taylor swfit love story" and
+        // for "radiohed" through its "Search instead for" link.
+        let typed = Search::new("taylor swfit love story", SearchScope::Catalog);
+        let page = super::parse_search_page(
+            &serde_json::from_str(include_str!("fixtures/search/showing_results_for.json"))
+                .unwrap(),
+            &typed,
+        )
+        .unwrap();
+        let correction = page.correction.unwrap();
+        assert_eq!(correction.label, "taylor swift love story");
+        assert_eq!(
+            correction
+                .italic
+                .iter()
+                .map(|range| correction.label.get(range.clone()))
+                .collect::<Vec<_>>(),
+            [Some("swift")]
+        );
+        assert_eq!(
+            correction.corrected,
+            Search::new("taylor swift love story", SearchScope::Catalog)
+        );
+        // "Search instead for" runs the query exactly as typed.
+        assert_eq!(
+            correction.original,
+            Some(Search {
+                params: Some("QgIIAQ%3D%3D".into()),
+                ..typed
+            })
+        );
+        // Each chip carries the params that keep all nine chips on its page.
+        assert_eq!(page.search_filters.len(), 9);
+        let profiles = page
+            .search_filters
+            .iter()
+            .find(|chip| chip.filter == SearchFilter::Profiles)
+            .unwrap();
+        assert_eq!(
+            profiles.params.as_deref(),
+            Some("EgWKAQJYAWoSEAQQAxAFEAkQChAQEBUQDhAR")
+        );
+
+        let exact = Search {
+            params: Some("QgIIAQ%3D%3D".into()),
+            ..Search::new("radiohed", SearchScope::Catalog)
+        };
+        let correction = super::parse_search_page(
+            &serde_json::from_str(include_str!("fixtures/search/did_you_mean.json")).unwrap(),
+            &exact,
+        )
+        .unwrap()
+        .correction
+        .unwrap();
+        assert_eq!(correction.label, "radiohead");
+        assert_eq!(
+            correction.corrected,
+            Search::new("radiohead", SearchScope::Catalog)
+        );
+        assert_eq!(correction.original, None);
     }
 
     #[test]
@@ -682,7 +854,13 @@ mod tests {
             );
             assert!(
                 catalog
-                    .search_more("a song", filter, SearchScope::Uploads, &continuation)
+                    .search_more(
+                        &Search {
+                            filter,
+                            ..Search::new("a song", SearchScope::Uploads)
+                        },
+                        &continuation
+                    )
                     .is_err()
             );
         }
@@ -729,7 +907,13 @@ mod tests {
                     .as_ref()
                     .expect("song search should paginate");
                 let more = catalog
-                    .search_more(query, filter, SearchScope::Catalog, continuation)
+                    .search_more(
+                        &Search {
+                            filter,
+                            ..Search::new(query, SearchScope::Catalog)
+                        },
+                        continuation,
+                    )
                     .unwrap();
                 assert!(!more.tracks().is_empty());
             }

@@ -1,0 +1,50 @@
+{
+  "contents": {
+    "tabbedSearchResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "title": "YT Music",
+            "selected": true,
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "itemSectionRenderer": {
+                      "contents": [
+                        {
+                          "didYouMeanRenderer": {
+                            "didYouMean": {
+                              "runs": [
+                                {
+                                  "text": "Did you mean:"
+                                }
+                              ]
+                            },
+                            "correctedQuery": {
+                              "runs": [
+                                {
+                                  "text": "radiohead",
+                                  "italics": true
+                                }
+                              ]
+                            },
+                            "correctedQueryEndpoint": {
+                              "searchEndpoint": {
+                                "query": "radiohead"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

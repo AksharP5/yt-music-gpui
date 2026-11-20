@@ -366,7 +366,9 @@ fn load_source(
                 || h.ends_with(".googleusercontent.com")
                 || h.ends_with(".ggpht.com")
                 // Library art such as Liked Music and Episodes for Later.
-                || (h == "www.gstatic.com" && parsed.path().starts_with("/youtube/media/ytm/"))),
+                || (h == "www.gstatic.com" && parsed.path().starts_with("/youtube/media/ytm/"))
+                // A radio's collage, which the service draws without cookies.
+                || (h == "music.youtube.com" && parsed.path() == "/image/radioart")),
         "Unsupported artwork host"
     );
     let still = parsed.host_str() == Some("i.ytimg.com");

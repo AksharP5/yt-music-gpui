@@ -1,0 +1,471 @@
+{
+  "radio": {
+    "musicCardShelfRenderer": {
+      "thumbnail": {
+        "musicThumbnailRenderer": {
+          "thumbnail": {
+            "thumbnails": [
+              {
+                "url": "https://music.youtube.com/image/radioart?r=CjwKDS9nLzExYnYwZ2NsNXkKDS9nLzExZ3JieXgyejAKDS9nLzExZjdieXI5MHEKDS9nLzExYngxeTRzZ3oQyAEYyAFiCAoGCgQKAmVu",
+                "width": 200,
+                "height": 200
+              },
+              {
+                "url": "https://music.youtube.com/image/radioart?r=CjwKDS9nLzExYnYwZ2NsNXkKDS9nLzExZ3JieXgyejAKDS9nLzExZjdieXI5MHEKDS9nLzExYngxeTRzZ3oQ2AQY2ARiCAoGCgQKAmVu",
+                "width": 600,
+                "height": 600
+              },
+              {
+                "url": "https://music.youtube.com/image/radioart?r=CjwKDS9nLzExYnYwZ2NsNXkKDS9nLzExZ3JieXgyejAKDS9nLzExZjdieXI5MHEKDS9nLzExYngxeTRzZ3oQoAYYoAZiCAoGCgQKAmVu",
+                "width": 800,
+                "height": 800
+              },
+              {
+                "url": "https://music.youtube.com/image/radioart?r=CjwKDS9nLzExYnYwZ2NsNXkKDS9nLzExZ3JieXgyejAKDS9nLzExZjdieXI5MHEKDS9nLzExYngxeTRzZ3oQ6AcY6AdiCAoGCgQKAmVu",
+                "width": 1000,
+                "height": 1000
+              }
+            ]
+          },
+          "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+          "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_ASPECT_FIT"
+        }
+      },
+      "title": {
+        "runs": [
+          {
+            "text": "Radio • Lofi",
+            "navigationEndpoint": {
+              "browseEndpoint": {
+                "browseId": "VLRDATfcbG9maQ",
+                "browseEndpointContextSupportedConfigs": {
+                  "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "subtitle": {
+        "runs": [
+          {
+            "text": "Saib, Sleepy Fish, Toonorth, and more"
+          }
+        ]
+      },
+      "buttons": [
+        {
+          "buttonRenderer": {
+            "style": "STYLE_DARK_ON_WHITE",
+            "size": "SIZE_DEFAULT",
+            "isDisabled": false,
+            "text": {
+              "runs": [
+                {
+                  "text": "Play"
+                }
+              ]
+            },
+            "icon": {
+              "iconType": "PLAY_ARROW"
+            },
+            "command": {
+              "watchPlaylistEndpoint": {
+                "playlistId": "RDATfcbG9maQ",
+                "params": "wAEB8gECGAI%3D"
+              }
+            }
+          }
+        }
+      ],
+      "contents": null
+    }
+  },
+  "video": {
+    "musicCardShelfRenderer": {
+      "thumbnail": {
+        "musicThumbnailRenderer": {
+          "thumbnail": {
+            "thumbnails": [
+              {
+                "url": "https://i.ytimg.com/vi/Qp3b-RXtz4w/hqdefault.jpg?sqp=-oaymwEWCJADEOEBIAQqCggAEOADGC0guwJIWg&rs=AMzJL3kv00vFsibCT-utBjmVh4Ep-ubhyA",
+                "width": 400,
+                "height": 225
+              }
+            ]
+          },
+          "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+          "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_ASPECT_FIT"
+        }
+      },
+      "title": {
+        "runs": [
+          {
+            "text": "うっせぇわ - Usseewa",
+            "navigationEndpoint": {
+              "watchEndpoint": {
+                "videoId": "Qp3b-RXtz4w",
+                "watchEndpointMusicSupportedConfigs": {
+                  "watchEndpointMusicConfig": {
+                    "musicVideoType": "MUSIC_VIDEO_TYPE_OMV"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "subtitle": {
+        "runs": [
+          {
+            "text": "Video"
+          },
+          {
+            "text": " • "
+          },
+          {
+            "text": "Ado",
+            "navigationEndpoint": {
+              "browseEndpoint": {
+                "browseId": "UC5DHwv9N4OQ9AWtKr8YSefw",
+                "browseEndpointContextSupportedConfigs": {
+                  "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "text": " • "
+          },
+          {
+            "text": "431M views"
+          },
+          {
+            "text": " • "
+          },
+          {
+            "text": "3:23"
+          }
+        ]
+      },
+      "contents": [
+        {
+          "messageRenderer": {
+            "text": {
+              "runs": [
+                {
+                  "text": "More from YouTube"
+                }
+              ]
+            },
+            "style": {
+              "value": "RENDER_STYLE_SIMPLE_HEADER"
+            }
+          }
+        },
+        {
+          "musicResponsiveListItemRenderer": {
+            "thumbnail": {
+              "musicThumbnailRenderer": {
+                "thumbnail": {
+                  "thumbnails": [
+                    {
+                      "url": "https://i.ytimg.com/vi/8dnjqzodjgo/hqdefault.jpg?sqp=-oaymwEWCJADEOEBIAQqCggAEOADGC0guwJIWg&rs=AMzJL3nlpFs79PKNkZf_Y6rL-8OFmyzMMA",
+                      "width": 400,
+                      "height": 225
+                    }
+                  ]
+                },
+                "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+                "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_ASPECT_FIT"
+              }
+            },
+            "flexColumns": [
+              {
+                "musicResponsiveListItemFlexColumnRenderer": {
+                  "text": {
+                    "runs": [
+                      {
+                        "text": "うっせぇわ - Usseewa",
+                        "navigationEndpoint": {
+                          "watchEndpoint": {
+                            "videoId": "8dnjqzodjgo",
+                            "watchEndpointMusicSupportedConfigs": {
+                              "watchEndpointMusicConfig": {
+                                "musicVideoType": "MUSIC_VIDEO_TYPE_OMV"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH"
+                }
+              },
+              {
+                "musicResponsiveListItemFlexColumnRenderer": {
+                  "text": {
+                    "runs": [
+                      {
+                        "text": "Ado",
+                        "navigationEndpoint": {
+                          "browseEndpoint": {
+                            "browseId": "UC5DHwv9N4OQ9AWtKr8YSefw",
+                            "browseEndpointContextSupportedConfigs": {
+                              "browseEndpointContextMusicConfig": {
+                                "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "text": " • "
+                      },
+                      {
+                        "text": "4.7M views"
+                      },
+                      {
+                        "text": " • "
+                      },
+                      {
+                        "text": "3:36"
+                      }
+                    ]
+                  },
+                  "displayPriority": "MUSIC_RESPONSIVE_LIST_ITEM_COLUMN_DISPLAY_PRIORITY_HIGH"
+                }
+              }
+            ],
+            "playlistItemData": {
+              "videoId": "8dnjqzodjgo"
+            },
+            "flexColumnDisplayStyle": "MUSIC_RESPONSIVE_LIST_ITEM_FLEX_COLUMN_DISPLAY_STYLE_TWO_LINE_STACK",
+            "itemHeight": "MUSIC_RESPONSIVE_LIST_ITEM_HEIGHT_TALL"
+          }
+        }
+      ],
+      "buttons": [
+        {
+          "buttonRenderer": {
+            "style": "STYLE_DARK_ON_WHITE",
+            "size": "SIZE_DEFAULT",
+            "isDisabled": false,
+            "text": {
+              "runs": [
+                {
+                  "text": "Play"
+                }
+              ]
+            },
+            "icon": {
+              "iconType": "PLAY_ARROW"
+            },
+            "command": {
+              "watchEndpoint": {
+                "videoId": "Qp3b-RXtz4w",
+                "params": "wAEB",
+                "watchEndpointMusicSupportedConfigs": {
+                  "watchEndpointMusicConfig": {
+                    "musicVideoType": "MUSIC_VIDEO_TYPE_OMV"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "buttonRenderer": {
+            "style": "STYLE_WHITE_TRANSLUCENT",
+            "text": {
+              "runs": [
+                {
+                  "text": "Save"
+                }
+              ]
+            },
+            "icon": {
+              "iconType": "PLAYLIST_ADD"
+            },
+            "command": {
+              "modalEndpoint": {
+                "modal": {
+                  "modalWithTitleAndButtonRenderer": {
+                    "title": {
+                      "runs": [
+                        {
+                          "text": "Save this for later"
+                        }
+                      ]
+                    },
+                    "content": {
+                      "runs": [
+                        {
+                          "text": "Make playlists and share them after signing in"
+                        }
+                      ]
+                    },
+                    "button": {
+                      "buttonRenderer": {
+                        "style": "STYLE_BLUE_TEXT",
+                        "isDisabled": false,
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Sign in"
+                            }
+                          ]
+                        },
+                        "navigationEndpoint": {
+                          "signInEndpoint": {
+                            "hack": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "album": {
+    "musicCardShelfRenderer": {
+      "thumbnail": {
+        "musicThumbnailRenderer": {
+          "thumbnail": {
+            "thumbnails": [
+              {
+                "url": "https://yt3.googleusercontent.com/N55arCGj69gtw6thXK8JUPisxoVYiwuIEQ7I6SGlkEyNcSJ7xIWPe76Vuu1SiUqRyx5w9qvR_zV8fV3CWQ=w60-h60-l90-rj",
+                "width": 60,
+                "height": 60
+              },
+              {
+                "url": "https://yt3.googleusercontent.com/N55arCGj69gtw6thXK8JUPisxoVYiwuIEQ7I6SGlkEyNcSJ7xIWPe76Vuu1SiUqRyx5w9qvR_zV8fV3CWQ=w120-h120-l90-rj",
+                "width": 120,
+                "height": 120
+              },
+              {
+                "url": "https://yt3.googleusercontent.com/N55arCGj69gtw6thXK8JUPisxoVYiwuIEQ7I6SGlkEyNcSJ7xIWPe76Vuu1SiUqRyx5w9qvR_zV8fV3CWQ=w226-h226-l90-rj",
+                "width": 226,
+                "height": 226
+              },
+              {
+                "url": "https://yt3.googleusercontent.com/N55arCGj69gtw6thXK8JUPisxoVYiwuIEQ7I6SGlkEyNcSJ7xIWPe76Vuu1SiUqRyx5w9qvR_zV8fV3CWQ=w544-h544-l90-rj",
+                "width": 544,
+                "height": 544
+              }
+            ]
+          },
+          "thumbnailCrop": "MUSIC_THUMBNAIL_CROP_UNSPECIFIED",
+          "thumbnailScale": "MUSIC_THUMBNAIL_SCALE_ASPECT_FIT"
+        }
+      },
+      "title": {
+        "runs": [
+          {
+            "text": "Random Access Memories",
+            "navigationEndpoint": {
+              "browseEndpoint": {
+                "browseId": "MPREb_K8qWMWVqXGi",
+                "browseEndpointContextSupportedConfigs": {
+                  "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "subtitle": {
+        "runs": [
+          {
+            "text": "Album"
+          },
+          {
+            "text": " • "
+          },
+          {
+            "text": "Daft Punk",
+            "navigationEndpoint": {
+              "browseEndpoint": {
+                "browseId": "UCRr1xG_2WIDs18a6cIiCxeA",
+                "browseEndpointContextSupportedConfigs": {
+                  "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "text": " • "
+          },
+          {
+            "text": "2013"
+          }
+        ]
+      },
+      "buttons": [
+        {
+          "buttonRenderer": {
+            "style": "STYLE_DARK_ON_WHITE",
+            "size": "SIZE_DEFAULT",
+            "isDisabled": false,
+            "text": {
+              "runs": [
+                {
+                  "text": "Play"
+                }
+              ]
+            },
+            "icon": {
+              "iconType": "PLAY_ARROW"
+            },
+            "command": {
+              "watchPlaylistEndpoint": {
+                "playlistId": "OLAK5uy_kNhM2yaBTOVwrcZJepB1C9P3-n5_Sfy5c",
+                "params": "wAEB"
+              }
+            }
+          }
+        },
+        {
+          "buttonRenderer": {
+            "style": "STYLE_WHITE_TRANSLUCENT",
+            "size": "SIZE_DEFAULT",
+            "text": {
+              "runs": [
+                {
+                  "text": "Shuffle"
+                }
+              ]
+            },
+            "icon": {
+              "iconType": "MUSIC_SHUFFLE"
+            },
+            "command": {
+              "watchPlaylistEndpoint": {
+                "playlistId": "OLAK5uy_kNhM2yaBTOVwrcZJepB1C9P3-n5_Sfy5c",
+                "params": "wAEB8gECKAE%3D"
+              }
+            }
+          }
+        }
+      ],
+      "endIcon": {
+        "iconType": "CHEVRON_RIGHT"
+      },
+      "contents": null
+    }
+  }
+}

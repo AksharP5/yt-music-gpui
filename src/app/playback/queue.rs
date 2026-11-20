@@ -431,11 +431,7 @@ impl Music {
         self.reset_radio();
         self.now_playing = None;
         let request = match &self.route {
-            Route::Search(search) => PageRequest::Search {
-                query: search.query.clone(),
-                filter: search.filter,
-                scope: search.scope,
-            },
+            Route::Search(search) => PageRequest::Search(search.clone()),
             Route::Browse(link) if link.id.starts_with("VL") || link.id.starts_with("MPREb") => {
                 PageRequest::Collection(link.id.clone())
             }

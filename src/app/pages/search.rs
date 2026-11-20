@@ -2,6 +2,8 @@
 
 use super::super::*;
 use super::artist::soft_edges;
+use crate::catalog::CardAction;
+use crate::search::{Correction, FilterChip};
 
 /// A top result action: the web fills the first and outlines the second.
 fn result_action(
@@ -9,7 +11,7 @@ fn result_action(
     glyph: &'static str,
     label: &'static str,
     filled: bool,
-    width: f32,
+    size: Size<Pixels>,
     theme: Theme,
 ) -> Stateful<Div> {
     let ink: Hsla = if filled {
@@ -20,8 +22,8 @@ fn result_action(
     div()
         .id(id)
         .keyboard_control(theme)
-        .w(px(width))
-        .h(px(36.))
+        .w(size.width)
+        .h(size.height)
         .flex_shrink_0()
         .rounded_full()
         .flex()
@@ -63,15 +65,25 @@ impl Music {
         let item = self.rows[index].clone();
         let artist =
             matches!(&item, Item::Collection(collection) if collection.id.starts_with("UC"));
-        let art = self.art(
-            item.thumbnail(),
-            100.,
-            if artist {
-                ArtworkShape::Circle
-            } else {
-                ArtworkShape::Square
-            },
-        );
+        // The web fits a video's 16:9 still inside the square, as rows do.
+        let art = match &item {
+            Item::Track(track) if track.details.wide_thumbnail => self.row_thumbnail(
+                item.thumbnail(),
+                100.,
+                ArtworkShape::Square,
+                true,
+                "featured-result",
+            ),
+            _ => self.art(
+                item.thumbnail(),
+                100.,
+                if artist {
+                    ArtworkShape::Circle
+                } else {
+                    ArtworkShape::Square
+                },
+            ),
+        };
         let title = item.title().to_owned();
         let subtitle = match &item {
             Item::Track(track) => track
@@ -81,6 +93,7 @@ impl Music {
                 .unwrap_or_else(|| track.artist.clone()),
             _ => item.subtitle().to_owned(),
         };
+        let heading = self.page.shelves[shelf].title.clone();
         let mut related = Vec::new();
         for offset in 1..self.page.shelves[shelf].items.len().min(4) {
             let id = index + offset;
@@ -163,47 +176,51 @@ impl Music {
                     .on_click(cx.listener(move |view, _, _, cx| view.play_item(id, cx))),
             );
         }
-        // The web sizes these buttons per card: albums and playlists 137px,
-        // artists 125px and songs 119px.
+        // Without related songs the web lays the card out as one 132px row:
+        // art, text, then the actions and the end control.
+        let compact = related.is_empty();
+        // The web shows each card's own buttons and sizes them per layout.
+        // In one row: a radio's lone Play 180px, songs and videos 101 by
+        // 40px, and others 137px. Beside related songs: artists 125px, songs
+        // and videos 119px, and others 137px.
+        let button = match (&item, compact) {
+            (Item::Track(_), true) => size(px(101.), px(40.)),
+            (Item::Track(_), false) => size(px(119.), px(36.)),
+            (Item::Collection(collection), true) if collection.details.card.actions.len() == 1 => {
+                size(px(180.), px(36.))
+            }
+            (_, false) if artist => size(px(125.), px(36.)),
+            _ => size(px(137.), px(36.)),
+        };
         let mut actions = div().flex().items_center().gap(px(16.));
         match &item {
             Item::Collection(collection) => {
-                let play = if artist {
-                    None
-                } else {
-                    Some((
-                        "featured-play",
-                        "play",
-                        "Play",
-                        PlaybackQuery::collection(collection, PlaybackOrder::Original),
-                    ))
-                };
-                let shuffle = Some((
-                    "featured-shuffle",
-                    "shuffle",
-                    "Shuffle",
-                    PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
-                ));
-                let mix =
-                    artist.then(|| ("featured-mix", "mix", "Mix", PlaybackQuery::mix(collection)));
-                // Playlists lead with Shuffle on the web; albums with Play.
-                let order = if collection.id.starts_with("VL") {
-                    [shuffle, play, mix]
-                } else {
-                    [play, shuffle, mix]
-                };
-                let width = if artist { 125. } else { 137. };
-                for (position, (id, glyph, label, query)) in order.into_iter().flatten().enumerate()
-                {
+                for (position, action) in collection.details.card.actions.iter().enumerate() {
+                    let (id, glyph, label, query) = match action {
+                        CardAction::Play => (
+                            "featured-play",
+                            "play",
+                            "Play",
+                            PlaybackQuery::collection(collection, PlaybackOrder::Original),
+                        ),
+                        CardAction::Shuffle => (
+                            "featured-shuffle",
+                            "shuffle",
+                            "Shuffle",
+                            PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
+                        ),
+                        CardAction::Mix => {
+                            ("featured-mix", "mix", "Mix", PlaybackQuery::mix(collection))
+                        }
+                    };
                     let Some(query) = query else { continue };
                     actions = actions.child(
-                        result_action(id, glyph, label, position == 0, width, self.theme).on_click(
-                            cx.listener(move |view, _, window, cx| {
+                        result_action(id, glyph, label, position == 0, button, self.theme)
+                            .on_click(cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&view.focus, cx);
                                 view.start_queue(query.clone(), cx);
-                            }),
-                        ),
+                            })),
                     );
                 }
             }
@@ -211,7 +228,7 @@ impl Music {
                 let track = track.clone();
                 actions = actions
                     .child(
-                        result_action("featured-play", "play", "Play", true, 119., self.theme)
+                        result_action("featured-play", "play", "Play", true, button, self.theme)
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&view.focus, cx);
@@ -224,7 +241,7 @@ impl Music {
                             "playlist-add",
                             "Save",
                             false,
-                            119.,
+                            button,
                             self.theme,
                         )
                         .on_click(cx.listener(
@@ -263,18 +280,25 @@ impl Music {
                     .text_color(self.theme.muted)
                     .child(subtitle),
             );
-        let details = details_chevron(("featured-details", shelf), self.theme).on_click(
-            cx.listener(move |view, _, _, cx| {
-                cx.stop_propagation();
-                view.play_item(index, cx);
-            }),
-        );
-        // Albums and playlists without related songs use the web's single
-        // 132px row: art, text, then the actions and a details chevron.
-        let compact = matches!(&item, Item::Collection(_)) && !artist && related.is_empty();
+        // Cards with a page end in a chevron to it; songs, videos and radios
+        // end in their menu.
+        let end = if matches!(&item, Item::Collection(collection) if collection.details.card.chevron)
+        {
+            details_chevron(("featured-details", shelf), self.theme).on_click(cx.listener(
+                move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.play_item(index, cx);
+                },
+            ))
+        } else {
+            self.menu_button(("featured-menu", index), cx, move |view, window, cx| {
+                view.open_item_menu(index, window, cx);
+            })
+        };
         let card = div()
             .id(("featured-result", shelf))
             .keyboard_control(self.theme)
+            .group("featured-result")
             .relative()
             .flex_1()
             .min_w(px(280.))
@@ -293,24 +317,20 @@ impl Music {
             )
             .on_click(cx.listener(move |view, _, _, cx| view.play_item(index, cx)));
         let card = if compact {
+            // The menu matches the buttons' height, 8px past the last one.
             card.h(px(132.))
                 .pr(px(7.))
                 .child(text)
                 .child(actions)
-                .child(details.ml(px(-8.)))
+                .child(end.max_w(button.height).max_h(button.height).ml(px(-8.)))
         } else {
-            let corner = if matches!(&item, Item::Track(_)) {
-                self.menu_button(("featured-menu", index), cx, move |view, window, cx| {
-                    view.open_item_menu(index, window, cx);
-                })
-                .into_any_element()
-            } else {
-                details.into_any_element()
-            };
-            card.h(px(if stacked { 164. } else { 232. }))
+            // Beside related songs the card grows with them, as it does when
+            // the web heads them "More from YouTube".
+            card.when(stacked, |card| card.h(px(164.)))
+                .when(!stacked, |card| card.min_h(px(232.)))
                 .pr(px(15.))
                 .child(text.child(actions.mt(px(4.))))
-                .child(div().absolute().top(px(4.)).right(px(8.)).child(corner))
+                .child(div().absolute().top(px(4.)).right(px(8.)).child(end))
         };
         // The web lays the result over its own art, blurred by 60px at 70%
         // under a gradient to black, then lightens the card by 10% and the
@@ -360,6 +380,18 @@ impl Music {
                         .py(px(8.))
                         .rounded_r(px(8.))
                         .bg(gpui::white().opacity(0.05))
+                        .when(!heading.is_empty(), |songs| {
+                            songs.child(
+                                div()
+                                    .mt(px(8.))
+                                    .mb(px(8.))
+                                    .text_size(px(14.))
+                                    .line_height(px(17.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(gpui::white().opacity(0.7))
+                                    .child(heading.to_uppercase()),
+                            )
+                        })
                         .children(related),
                 )
             });
@@ -409,8 +441,11 @@ impl Music {
                         .gap(px(32.))
                         .children(SearchScope::ALL.into_iter().enumerate().map(
                             |(index, scope)| {
-                                let mut next = search.clone();
-                                next.scope = scope;
+                                let mut next = Search {
+                                    scope,
+                                    params: None,
+                                    ..search.clone()
+                                };
                                 if !scope.supports(next.filter) {
                                     next.filter = SearchFilter::All;
                                 }
@@ -450,18 +485,22 @@ impl Music {
     ) -> Div {
         if let Route::Search(search) = &self.route {
             let filters = if self.page.search_filters.is_empty() {
-                search.scope.supported_filters()
+                search
+                    .scope
+                    .supported_filters()
+                    .iter()
+                    .map(|&filter| FilterChip {
+                        filter,
+                        params: None,
+                    })
+                    .collect()
             } else {
-                self.page.search_filters.as_slice()
+                self.page.search_filters.clone()
             }
-            .iter()
-            .copied()
-            .filter(|filter| *filter != SearchFilter::All)
+            .into_iter()
+            .filter(|chip| chip.filter != SearchFilter::All)
             .collect::<Vec<_>>();
-            let clear = Search {
-                filter: SearchFilter::All,
-                ..search.clone()
-            };
+            let clear = Search::new(search.query.clone(), search.scope);
             content = content.child(
                 chip_row("search-filters")
                     .mx(px(inset))
@@ -469,6 +508,7 @@ impl Music {
                     .mb(px(6.))
                     .flex_shrink_0()
                     .when(search.filter != SearchFilter::All, |chips| {
+                        let clear = clear.clone();
                         chips.child(
                             search_chip("search-filter-clear", None, false, self.theme).on_click(
                                 cx.listener(move |view, _, _, cx| {
@@ -477,15 +517,20 @@ impl Music {
                             ),
                         )
                     })
-                    .children(filters.into_iter().enumerate().map(|(index, filter)| {
-                        let selected = filter == search.filter;
-                        let next = Search {
-                            filter: if selected { SearchFilter::All } else { filter },
-                            ..search.clone()
+                    .children(filters.into_iter().enumerate().map(|(index, chip)| {
+                        let selected = chip.filter == search.filter;
+                        let next = if selected {
+                            clear.clone()
+                        } else {
+                            Search {
+                                filter: chip.filter,
+                                params: chip.params,
+                                ..search.clone()
+                            }
                         };
                         search_chip(
                             ("search-filter", index),
-                            Some(filter.label().into()),
+                            Some(chip.filter.label().into()),
                             selected,
                             self.theme,
                         )
@@ -494,8 +539,74 @@ impl Music {
                         }))
                     })),
             );
+            if let Some(correction) = self.page.correction.clone() {
+                content = content.child(self.spelling_correction(correction, inset, cx));
+            }
         }
         content
+    }
+
+    /// The web's line under the chips: "Showing results for" the corrected
+    /// query with a link to the spelling as typed, or "Did you mean".
+    fn spelling_correction(
+        &self,
+        correction: Correction,
+        inset: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label = |text: &'static str| {
+            div()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(rgb(0xf1f1f1))
+                .child(text)
+        };
+        let link = |id: &'static str, text: StyledText, target: Search, color: Hsla| {
+            div()
+                .id(id)
+                .keyboard_control(self.theme)
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .cursor_pointer()
+                .child(text)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.navigate(Route::Search(target.clone()), cx)
+                }))
+        };
+        let italic = correction.italic.iter().map(|range| {
+            (
+                range.clone(),
+                HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                },
+            )
+        });
+        let corrected = link(
+            "search-corrected",
+            StyledText::new(correction.label.clone()).with_highlights(italic),
+            correction.corrected,
+            gpui::white(),
+        );
+        // The web separates the parts with a space at 10px, and the second
+        // label with 8px more.
+        let line = div().flex().items_center().gap(px(2.5));
+        let line = match correction.original {
+            Some(original) => line
+                .child(label("Showing results for"))
+                .child(corrected)
+                .child(label("Search instead for").ml(px(8.)))
+                .child(link(
+                    "search-original",
+                    StyledText::new(original.query.clone()),
+                    original,
+                    rgb(0xf1f1f1).into(),
+                )),
+            None => line.child(label("Did you mean:")).child(corrected),
+        };
+        div().mx(px(inset)).py(px(24.)).child(line)
     }
 }
 
