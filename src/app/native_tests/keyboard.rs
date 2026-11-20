@@ -711,7 +711,7 @@ fn queue_menu_actions_show_the_first_song_without_starting_playback() -> anyhow:
                     assert_eq!(queue.tracks.len(), 2);
                     if queue.current().map(|track| track.id.as_str()) != Some(&tracks[0].id)
                         || queue.tracks[1].id != tracks[1].id
-                        || view.duration != 120.
+                        || view.transport().duration != 120.
                         || !view.player_open
                     {
                         failed.push(first_action);

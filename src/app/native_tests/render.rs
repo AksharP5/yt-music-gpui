@@ -1971,7 +1971,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
             music.player = None;
             music.now_playing = None;
             music.autoplay_tracks.clear();
-            music.duration = 337.8;
+            music.measured_duration = Some(("khnokW3Mw24".into(), 337.8));
             music.position = 3.;
             music.playback = Playback::Loaded {
                 paused: true,
@@ -2289,7 +2289,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                                 paused: false,
                                 buffering: false,
                             };
-                            music.duration = 120.;
+                            music.measured_duration = Some(("render-test".into(), 120.));
                             // Playback opens the player page, so measure with it showing.
                             music.player_open = true;
                             music
@@ -2378,7 +2378,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                             music.content_view.read(cx).renders > after.0,
                             "Other playback changes must still update the page"
                         );
-                        assert_eq!(music.duration, 180.);
+                        assert_eq!(music.transport().duration, 180.);
                     })
                     .unwrap();
                 println!(

@@ -206,7 +206,8 @@ fn removing_the_last_loaded_song_updates_desktop_metadata_while_loading_more() -
                 let tracks = view.library.queue.tracks_mut();
                 tracks[0].duration = Some(83);
                 tracks[1].duration = Some(232);
-                view.duration = 232.;
+                view.measured_duration =
+                    Some((view.library.queue.current().unwrap().id.clone(), 232.));
                 view.publish_desktop();
             })
             .unwrap();
@@ -264,7 +265,8 @@ fn desktop_metadata_follows_stopped_queue_selection() -> Result<()> {
                 tracks[1].duration = Some(83);
                 tracks[2].duration = None;
                 view.library.queue.replace(tracks, 0);
-                view.duration = 232.;
+                view.measured_duration =
+                    Some((view.library.queue.current().unwrap().id.clone(), 232.));
                 view.publish_desktop();
                 window.focus(&view.focus, cx);
             })
@@ -351,7 +353,8 @@ fn seek_drag_does_not_seek_a_replacement_song() -> Result<()> {
                     paused: true,
                     buffering: false,
                 };
-                view.duration = 100.;
+                view.measured_duration =
+                    Some((view.library.queue.current().unwrap().id.clone(), 100.));
                 view.position = 10.;
                 cx.notify();
             })
@@ -418,7 +421,8 @@ fn seek_drag_does_not_seek_a_replacement_song() -> Result<()> {
                     paused: true,
                     buffering: false,
                 };
-                view.duration = 80.;
+                view.measured_duration =
+                    Some((view.library.queue.current().unwrap().id.clone(), 80.));
                 view.position = 2.;
                 view.notify_playback(cx);
             })
@@ -633,7 +637,8 @@ fn desktop_seek_past_end_uses_next_availability() -> Result<()> {
                     buffering: false,
                 };
                 view.seekable = true;
-                view.duration = 30.;
+                view.measured_duration =
+                    Some((view.library.queue.current().unwrap().id.clone(), 30.));
                 view.position = 20.;
                 view.publish_desktop();
                 view.media_controls.as_ref().unwrap().events()

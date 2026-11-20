@@ -168,22 +168,21 @@ impl Music {
         let current = self.library.queue.current().cloned();
         let seek_position = self.seek_drag_position();
         let position = seek_position.unwrap_or_else(|| self.playback_position());
-        let progress = if self.duration > 0. {
-            (position / self.duration).clamp(0., 1.) as f32
+        let transport = self.transport();
+        let progress = if transport.duration > 0. {
+            (position / transport.duration).clamp(0., 1.) as f32
         } else {
             0.
         };
-        let playing = self.active_id.is_some()
-            && self.playback != Playback::Stopped
-            && !self.playback.is_paused();
+        let playing = transport.status == media_controls::PlaybackStatus::Playing;
         let previous = transport_control(
             "previous",
-            self.can_go_previous(),
+            transport.can_go_previous,
             theme,
             cx,
             Music::previous,
         );
-        let next = transport_control("next", self.can_go_next(), theme, cx, Music::skip_next);
+        let next = transport_control("next", transport.can_go_next, theme, cx, Music::skip_next);
         // Sized to its content and centered, so the rating buttons follow the title as on the web.
         let mut details = div().min_w_0().max_w(px(660.)).flex().items_center();
         if let Some(track) = current {
@@ -370,7 +369,7 @@ impl Music {
                                     format!(
                                         "{} / {}",
                                         clock(position.floor()),
-                                        clock(self.duration)
+                                        clock(transport.duration)
                                     ),
                                 ))
                             }),

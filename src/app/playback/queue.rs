@@ -1,7 +1,7 @@
 //! Watch workers, queue changes, autoplay, and track advancement.
 
 use super::super::*;
-use super::PREVIOUS_RESTART_SECONDS;
+use super::transport::PREVIOUS_RESTART_SECONDS;
 
 impl Music {
     pub(in crate::app) fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
@@ -581,7 +581,6 @@ impl Music {
         self.queue_source.cancel();
         self.track_state.cancel();
         self.track_state_id = None;
-        self.duration = 0.;
         self.library.queue = Default::default();
         self.media_pair = None;
         self.save();
@@ -659,59 +658,8 @@ impl Music {
             && matches!(self.playback, Playback::Loading { .. })
     }
 
-    pub(in crate::app) fn can_go_next(&self) -> bool {
-        if self.player.is_none() {
-            return false;
-        }
-        let queue = &self.library.queue;
-        let skip = |track: &Track| is_disliked(&self.ratings, track);
-        let seed_available = !self.autoplay_seeded
-            && self.now_playing.as_ref().is_some_and(|watch| {
-                watch
-                    .current
-                    .as_ref()
-                    .zip(queue.current())
-                    .is_some_and(|(issued, current)| issued.id == current.id)
-                    && watch.current_index.is_some_and(|index| {
-                        index + 1 < watch.queue.len() || watch.continuation.is_some()
-                    })
-            });
-        queue.next_index(self.library.repeat, false, skip).is_some()
-            || matches!(
-                &self.watch_pending,
-                Some(
-                    PlaybackQuery::Playlist(_)
-                        | PlaybackQuery::Collection(_)
-                        | PlaybackQuery::Watch {
-                            mode: WatchMode::Issued | WatchMode::Radio,
-                            ..
-                        }
-                )
-            )
-            || matches!(
-                &self.account_operation,
-                Some(
-                    AccountOperation::Refreshing { resume, .. }
-                    | AccountOperation::Activating { resume, .. }
-                    | AccountOperation::RefreshFailed { resume }
-                ) if matches!(
-                    resume,
-                    Some(PlaybackIntent::Queue { .. } | PlaybackIntent::Track(PlaybackResume {
-                        mode: WatchMode::Issued, ..
-                    }))
-                )
-            )
-            || (queue.incomplete && (self.queue_source.can_continue() || queue.source.is_some()))
-            || (self.library.music_autoplay()
-                && (self.autoplay_tracks.iter().any(|track| !skip(track))
-                    || self.radio.is_some()
-                    || self.watch_pending.is_some()
-                    || self.radio_loading
-                    || seed_available))
-    }
-
     pub(in crate::app) fn skip_next(&mut self, cx: &mut Context<Self>) {
-        if self.can_go_next() {
+        if self.transport().can_go_next {
             self.next(false, cx);
         }
     }
@@ -799,7 +747,7 @@ impl Music {
             self.seekable = false;
             self.pending_seek = None;
             self.playback = Playback::Stopped;
-            self.position = self.duration;
+            self.position = self.transport().duration;
             self.notice = None;
             if wait_for_queue {
                 self.queue_waiting = Some(intent);
@@ -854,7 +802,7 @@ impl Music {
     }
 
     pub(in crate::app) fn previous(&mut self, cx: &mut Context<Self>) {
-        if !self.can_go_previous() {
+        if !self.transport().can_go_previous {
             return;
         }
         let playback = self
@@ -885,19 +833,10 @@ impl Music {
             self.play_current_resuming(playback.is_paused(), WatchMode::Details, cx);
             return;
         }
-        self.duration = self.selected_track_duration();
         self.stop_playback(cx);
         self.refresh_current_account(cx);
         self.prefetch_queue(cx);
         self.save();
-    }
-
-    fn selected_track_duration(&self) -> f64 {
-        self.library
-            .queue
-            .current()
-            .and_then(|track| track.duration)
-            .unwrap_or(0) as f64
     }
 
     pub(in crate::app) fn enqueue(&mut self, track: Track, cx: &mut Context<Self>) {
@@ -916,7 +855,6 @@ impl Music {
             && self.library.queue.current().is_none()
             && self.library.queue.select(0)
         {
-            self.duration = self.selected_track_duration();
             self.position = 0.;
         }
         self.prefetch_queue(cx);
@@ -937,7 +875,6 @@ impl Music {
         }
         if self.library.queue.remove(index) {
             if unloaded_next {
-                self.duration = self.selected_track_duration();
                 self.advance_queue(
                     QueueAdvance {
                         natural: false,

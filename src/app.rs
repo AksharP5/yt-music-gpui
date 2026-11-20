@@ -171,7 +171,8 @@ pub struct Music {
     playback: Playback,
     position: f64,
     pending_seek: Option<SeekIntent>,
-    duration: f64,
+    /// The player's length for the video it measured last, by video ID.
+    measured_duration: Option<(String, f64)>,
     player_page: PlayerPage,
     overlay: Option<Overlay>,
     settings_section: SettingsSection,

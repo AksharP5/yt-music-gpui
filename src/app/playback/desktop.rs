@@ -8,20 +8,15 @@ impl Music {
             return;
         };
         let queue = &self.library.queue;
+        let transport = self.transport();
         let waiting = self.queue_waiting.is_some()
             || self.autoplay_waiting.is_some()
             || self.waiting_for_watch();
         service.publish(media_controls::State {
-            playback: if self.playback == Playback::Stopped {
-                media_controls::PlaybackStatus::Stopped
-            } else if self.playback.is_paused() {
-                media_controls::PlaybackStatus::Paused
-            } else {
-                media_controls::PlaybackStatus::Playing
-            },
+            playback: transport.status,
             metadata: queue
                 .current()
-                .map(|track| media_controls::Metadata::new(track, self.duration)),
+                .map(|track| media_controls::Metadata::new(track, transport.duration)),
             track_id: self.active_id,
             position: self.position,
             advancing: self.playback.is_advancing(),
@@ -33,8 +28,8 @@ impl Music {
                 .map(|collection| collection.order == queue_source::PlaybackOrder::Shuffled),
             can_play: self.player.is_some() && (!queue.tracks.is_empty() || waiting),
             can_pause: self.active_id.is_some() || waiting,
-            can_go_next: self.can_go_next(),
-            can_go_previous: self.can_go_previous(),
+            can_go_next: transport.can_go_next,
+            can_go_previous: transport.can_go_previous,
             can_seek: self.seekable
                 && self.active_id.is_some()
                 && !matches!(self.playback, Playback::Stopped | Playback::Loading { .. }),
@@ -50,12 +45,12 @@ impl Music {
             media_controls::Event::Next => return self.skip_next(cx),
             media_controls::Event::Previous => self.previous(cx),
             media_controls::Event::Play
-                if self.playback == Playback::Stopped || self.playback.is_paused() =>
+                if self.transport().status != media_controls::PlaybackStatus::Playing =>
             {
                 self.toggle_play(cx)
             }
             media_controls::Event::Pause
-                if self.playback != Playback::Stopped && !self.playback.is_paused() =>
+                if self.transport().status == media_controls::PlaybackStatus::Playing =>
             {
                 self.toggle_play(cx)
             }
@@ -66,18 +61,20 @@ impl Music {
                 if Some(track_id) == self.active_id && self.seekable =>
             {
                 let seconds = (self.playback_position() + offset).max(0.);
-                if self.duration > 0. && seconds > self.duration {
+                let duration = self.transport().duration;
+                if duration > 0. && seconds > duration {
                     return self.skip_next(cx);
                 } else {
                     self.seek_current(seconds, cx);
                 }
             }
             media_controls::Event::SetPosition { track_id, seconds }
-                if Some(track_id) == self.active_id
-                    && self.seekable
-                    && (self.duration <= 0. || seconds <= self.duration) =>
+                if Some(track_id) == self.active_id && self.seekable =>
             {
-                self.seek_current(seconds, cx)
+                let duration = self.transport().duration;
+                if duration <= 0. || seconds <= duration {
+                    self.seek_current(seconds, cx);
+                }
             }
             media_controls::Event::Seek { .. } | media_controls::Event::SetPosition { .. } => {}
             media_controls::Event::Volume(volume) => {
