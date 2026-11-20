@@ -24,9 +24,9 @@ impl Music {
         })
     }
 
+    /// An album, playlist or podcast header: cover, title, metadata and actions.
     pub(in crate::app) fn page_heading(
         &mut self,
-        stacked: bool,
         edge: f32,
         layout: PageLayout,
         cx: &mut Context<Self>,
@@ -43,7 +43,9 @@ impl Music {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .when(stacked, |d| d.w_full().items_center().text_center());
+            .w_full()
+            .items_center()
+            .text_center();
         if let Some(header) = header {
             let avatar = header.artist_thumbnail.as_deref().and_then(|url| {
                 self.artwork.get(url, size(px(16.), px(16.))).map(|image| {
@@ -92,12 +94,8 @@ impl Music {
             }
             heading = heading.child(
                 div()
-                    .w(relative(if stacked { 1.04 } else { 1. }))
-                    .text_size(px(if stacked {
-                        layout.heading_size().min(28.)
-                    } else {
-                        32.
-                    }))
+                    .w(relative(1.04))
+                    .text_size(px(layout.heading_size().min(28.)))
                     .line_height(relative(1.2))
                     .font_weight(FontWeight::BOLD)
                     .child(title),
@@ -115,7 +113,7 @@ impl Music {
                     div()
                         .flex()
                         .flex_col()
-                        .when(stacked, |d| d.items_center())
+                        .items_center()
                         .text_size(px(text_size))
                         .line_height(relative(1.2))
                         .text_color(self.theme.muted)
@@ -123,14 +121,6 @@ impl Music {
                         .when(!header.stats.is_empty(), |d| d.child(header.stats)),
                 );
             }
-        } else {
-            heading = heading.child(
-                div()
-                    .w_full()
-                    .text_size(px(32.))
-                    .font_weight(FontWeight::BOLD)
-                    .child(title),
-            );
         }
         if !self.page.description.is_empty() {
             let description = div()
@@ -161,8 +151,9 @@ impl Music {
             .flex()
             .items_center()
             .flex_wrap()
-            .gap(px(if stacked { 32. } else { 12. }))
-            .when(stacked, |d| d.mt(px(8.)).justify_center());
+            .gap(px(32.))
+            .mt(px(8.))
+            .justify_center();
         if let Some(collection) = collection.as_ref() {
             let selected = collection.clone();
             let saved = self.is_saved(collection);
@@ -186,31 +177,7 @@ impl Music {
             );
         }
         if has_tracks && !podcast {
-            actions = actions.child(
-                div()
-                    .id("play-all")
-                    .keyboard_control(self.theme)
-                    .size(px(64.))
-                    .rounded_full()
-                    .bg(self.theme.text)
-                    .text_color(self.theme.bg)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0xe0e0e0)))
-                    .tooltip(|_, cx| {
-                        cx.new(|_| Hint {
-                            text: "Play",
-                            theme: Theme::load(),
-                        })
-                        .into()
-                    })
-                    .child(icon("play", 32., self.theme.bg))
-                    .on_click(cx.listener(|view, _, _, cx| view.replace_page_queue(0, cx))),
-            );
+            actions = actions.child(self.play_all_button(cx));
         }
         if let Some(collection) = collection {
             actions = actions.child(
@@ -239,19 +206,6 @@ impl Music {
                     .on_click(cx.listener(move |view, _, window, cx| {
                         view.open_overlay(Overlay::Chapters(Box::new(track.clone())), window, cx);
                     })),
-            );
-        }
-        if !self.page.countries.is_empty() {
-            let label = self
-                .page
-                .countries
-                .iter()
-                .find(|choice| choice.selected)
-                .map_or("Country", |choice| choice.label.as_str())
-                .to_owned();
-            actions = actions.child(
-                filter_chip("chart-country", label, false, self.theme)
-                    .on_click(cx.listener(|view, _, window, cx| view.country_picker(window, cx))),
             );
         }
         if self.account.is_some() && self.page.editable {
@@ -293,7 +247,7 @@ impl Music {
         }
         let heading = heading.child(actions);
         match cover {
-            Some(cover) if stacked => div()
+            Some(cover) => div()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -309,21 +263,6 @@ impl Music {
                 )
                 .child(heading)
                 .into_any_element(),
-            Some(cover) => div()
-                .flex()
-                .items_start()
-                .gap(px(24.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap(px(16.))
-                        .children(creator)
-                        .child(cover),
-                )
-                .child(heading.flex_1().min_w_0())
-                .into_any_element(),
             None => div()
                 .flex()
                 .flex_col()
@@ -332,5 +271,68 @@ impl Music {
                 .child(heading)
                 .into_any_element(),
         }
+    }
+
+    fn play_all_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("play-all")
+            .keyboard_control(self.theme)
+            .size(px(64.))
+            .rounded_full()
+            .bg(self.theme.text)
+            .text_color(self.theme.bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0xe0e0e0)))
+            .tooltip(|_, cx| {
+                cx.new(|_| Hint {
+                    text: "Play",
+                    theme: Theme::load(),
+                })
+                .into()
+            })
+            .child(icon("play", 32., self.theme.bg))
+            .on_click(cx.listener(|view, _, _, cx| view.replace_page_queue(0, cx)))
+    }
+
+    /// The title of a page without a collection header, such as Charts with
+    /// its country menu. Explore's pages have no play button on the web.
+    pub(in crate::app) fn browse_heading(&mut self, inset: f32, cx: &mut Context<Self>) -> Div {
+        let play = !matches!(self.route, Route::Browse(_))
+            && self.rows.iter().any(|item| matches!(item, Item::Track(_)));
+        let country = self
+            .page
+            .countries
+            .iter()
+            .find(|choice| choice.selected)
+            .map(|choice| choice.label.clone())
+            .or_else(|| (!self.page.countries.is_empty()).then(|| "Country".into()));
+        div()
+            .px(px(inset))
+            .py(px(16.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(16.))
+            .child(
+                div()
+                    .text_size(px(28.))
+                    .line_height(px(38.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(self.page.title.clone()),
+            )
+            .when(play, |heading| heading.child(self.play_all_button(cx)))
+            .when_some(country, |heading, country| {
+                heading.child(
+                    menu_chip("chart-country", country, self.theme).on_click(
+                        cx.listener(|view, _, window, cx| view.country_picker(window, cx)),
+                    ),
+                )
+            })
     }
 }

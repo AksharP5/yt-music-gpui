@@ -492,6 +492,34 @@ pub(in crate::app) fn filter_chip(
         })
         .child(label.into())
 }
+/// The web's translucent pill that opens a menu, such as Library's sort and
+/// the Charts country.
+pub(in crate::app) fn menu_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    theme: Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .keyboard_control(theme)
+        .h(px(38.))
+        .pl(px(16.))
+        .pr(px(12.))
+        .flex_shrink_0()
+        .rounded_full()
+        .border_1()
+        .border_color(gpui::white().opacity(0.1))
+        .bg(gpui::white().opacity(0.1))
+        .hover(|button| button.bg(gpui::white().opacity(0.2)))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(14.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .child(label.into())
+        .child(icon("expand-more", 24., theme.text))
+}
 pub(in crate::app) fn slider(
     ratio: f32,
     bounds: Rc<Cell<Bounds<Pixels>>>,

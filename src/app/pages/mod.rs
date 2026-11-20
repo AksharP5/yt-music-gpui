@@ -99,6 +99,12 @@ impl DetailList {
         self.state.reset(rows + usize::from(self.inline_header));
         self.state.scroll_to(top);
     }
+    /// Sizes the list to `rows` plus its inline header, keeping its position.
+    pub(in crate::app) fn set_rows(&self, rows: usize) {
+        if self.state.item_count() != rows + usize::from(self.inline_header) {
+            self.reset_rows(rows);
+        }
+    }
     pub(in crate::app) fn replace_tail(&self, start: usize, rows: usize) {
         let top = self.state.logical_scroll_top();
         let end = self.state.item_count();
@@ -215,9 +221,10 @@ impl PageLayout {
         match layout {
             ShelfLayout::Songs | ShelfLayout::Episodes => self.song_width(),
             ShelfLayout::Videos => self.card_width() * 16. / 9.,
-            ShelfLayout::Cards | ShelfLayout::SmallCards | ShelfLayout::Featured => {
-                self.card_width()
-            }
+            ShelfLayout::Cards
+            | ShelfLayout::SmallCards
+            | ShelfLayout::Featured
+            | ShelfLayout::Grid => self.card_width(),
         }
     }
 
@@ -250,14 +257,17 @@ impl PageLayout {
         })
     }
 
-    /// The library's small-card grid: columns, gap, card edge, and the
-    /// layout its cards use. The web keeps these cards' text at 14px.
+    /// The small-card grid of the library and of pages that are a single
+    /// grid of albums or playlists: columns, gap, card edge, and the layout
+    /// its cards use. The web keeps these cards' text at 14px.
     pub(in crate::app) fn small_grid(self) -> (usize, f32, f32, Self) {
+        // The web's library column count and small-card margin, for windows
+        // at least as wide as the app's 850px minimum.
         let (columns, gap) = match self.tier {
             Tier::Narrow | Tier::Medium => (5, 16.),
             Tier::Wide => (6, 16.),
             Tier::Large => (7, 24.),
-            Tier::Huge if self.window < 1792. => (8, 24.),
+            Tier::Huge if self.window < 1800. => (8, 24.),
             Tier::Huge => (9, 24.),
         };
         let width = (self.column - (columns - 1) as f32 * gap) / columns as f32;
@@ -266,6 +276,15 @@ impl PageLayout {
             ..self
         };
         (columns, gap, width, cards)
+    }
+
+    /// Mood and genre buttons per row in the web's Moods & genres grid.
+    pub(in crate::app) fn mood_columns(self) -> usize {
+        match self.tier {
+            Tier::Narrow => 3,
+            Tier::Medium | Tier::Wide | Tier::Large => 4,
+            Tier::Huge => 5,
+        }
     }
 
     /// Card title and subtitle each reserve two lines, like the web's line clamp.
@@ -307,6 +326,19 @@ impl Music {
             || self.browse_sections()
             || self.history_groups()
             || matches!(self.route, Route::Search(_))
+    }
+
+    /// A page that is one grid of albums or playlists, such as a library
+    /// section or New releases' Albums & singles.
+    pub(in crate::app) fn collection_grid(&self) -> bool {
+        !self.route.is_home()
+            && !matches!(self.route, Route::Explore | Route::Search(_))
+            && !self.grouped_rows()
+            && !self.rows.is_empty()
+            && self
+                .rows
+                .iter()
+                .all(|item| matches!(item, Item::Collection(_)))
     }
 
     pub(in crate::app) fn list_row(
@@ -434,10 +466,10 @@ impl Music {
                     ),
             );
         }
-        if !home && !artist && !search && !floating_back && !library {
+        if collection && !artist && !floating_back {
             content = content.child(
                 div()
-                    .h(px(if collection { 24. } else { 48. }))
+                    .h(px(24.))
                     .px(px(inset))
                     .flex_shrink_0()
                     .flex()
@@ -450,9 +482,12 @@ impl Music {
                     }),
             );
         }
-        if !home && !search && !collection && !library {
-            let heading = self.page_heading(false, 128., layout, cx);
-            content = content.child(div().px(px(inset)).pb(px(28.)).child(heading));
+        // Like the web, Explore pages such as Charts and Moods & genres have no
+        // back button, and their title scrolls away with the page.
+        let titled = !home && !search && !collection && !library;
+        let title_scrolls = titled && (self.grouped_rows() || self.collection_grid());
+        if titled && !title_scrolls {
+            content = content.child(self.browse_heading(inset, cx));
         }
         if !home {
             content = self.home_filters(content, layout, cx);
@@ -535,7 +570,7 @@ impl Music {
                 .into_any_element();
         }
         let (header_width, list_width, cover) = layout.collection_columns();
-        let heading = (collection && stacked).then(|| self.page_heading(true, cover, layout, cx));
+        let heading = (collection && stacked).then(|| self.page_heading(cover, layout, cx));
         if self.rows.is_empty()
             && !collection
             && let Some(empty) = self.library_empty()
@@ -564,12 +599,6 @@ impl Music {
         if home {
             content = self.home_content(content, cx);
         } else {
-            let grid = !collection
-                && !search
-                && self
-                    .rows
-                    .iter()
-                    .all(|item| matches!(item, Item::Collection(_)));
             let grouped = self.grouped_rows();
             let empty_stacked =
                 collection && stacked && self.rows.is_empty() && self.suggestions.is_none();
@@ -611,7 +640,7 @@ impl Music {
                             } else {
                                 200.
                             };
-                            let heading = view.page_heading(true, cover, layout, cx);
+                            let heading = view.page_heading(cover, layout, cx);
                             return div()
                                 .w_full()
                                 .px(px(inset))
@@ -638,8 +667,9 @@ impl Music {
                 .min_h_0()
                 .into_any_element()
             } else if grouped {
-                // Search results carry their chips as the first row.
-                self.detail_list.set_inline_header(search);
+                // Search results carry their chips as the first row, and other
+                // pages their title.
+                self.detail_list.set_inline_header(search || title_scrolls);
                 list(
                     self.detail_list.state.clone(),
                     cx.processor(move |view, index, window, cx| {
@@ -648,21 +678,22 @@ impl Music {
                                 .search_filters(div().w_full().flex().flex_col(), inset, cx)
                                 .into_any_element();
                         }
-                        view.list_row(index - usize::from(search), inset, window, cx)
+                        if title_scrolls && index == 0 {
+                            return view.browse_heading(inset, cx).into_any_element();
+                        }
+                        view.list_row(
+                            index - usize::from(search || title_scrolls),
+                            inset,
+                            window,
+                            cx,
+                        )
                     }),
                 )
                 .flex_1()
                 .min_h_0()
                 .into_any_element()
-            } else if grid {
-                let (columns, gap, card_width, layout) = if library {
-                    layout.small_grid()
-                } else {
-                    let gap = layout.card_gap();
-                    let width = layout.card_width();
-                    let columns = ((layout.column + gap) / (width + gap)).floor().max(1.) as usize;
-                    (columns, gap, width, layout)
-                };
+            } else if library && self.collection_grid() {
+                let (columns, gap, card_width, layout) = layout.small_grid();
                 let row_height = card_width + layout.card_text_height() + 24.;
                 uniform_list(
                     ("collection-grid", self.list_id),
@@ -671,41 +702,39 @@ impl Music {
                         view.prefetch_page(range.end, view.rows.len().div_ceil(columns), 2, cx);
                         range
                             .map(|row| {
-                                let items = view
-                                    .rows
-                                    .iter()
-                                    .skip(row * columns)
-                                    .take(columns)
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                div()
+                                view.card_row(row, columns, card_width, gap, layout, cx)
                                     .h(px(row_height))
                                     .px(px(inset))
-                                    .flex()
-                                    .items_start()
-                                    .gap(px(gap))
-                                    .children(
-                                        items
-                                            .into_iter()
-                                            .enumerate()
-                                            .map(|(column, item)| {
-                                                view.card(
-                                                    item,
-                                                    row * columns + column,
-                                                    card_width,
-                                                    ShelfLayout::Cards,
-                                                    layout,
-                                                    cx,
-                                                )
-                                            })
-                                            .collect::<Vec<_>>(),
-                                    )
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>()
                     }),
                 )
                 .track_scroll(&self.list_scroll)
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            } else if title_scrolls {
+                // A grid page such as Albums & singles: its title scrolls with
+                // the rows, so one list row holds one row of cards.
+                let (columns, gap, card_width, cards) = layout.small_grid();
+                let rows = self.rows.len().div_ceil(columns);
+                self.detail_list.set_inline_header(true);
+                self.detail_list.set_rows(rows);
+                list(
+                    self.detail_list.state.clone(),
+                    cx.processor(move |view, index: usize, _, cx| {
+                        let Some(row) = index.checked_sub(1) else {
+                            return view.browse_heading(inset, cx).into_any_element();
+                        };
+                        view.prefetch_page(row + 1, rows, 2, cx);
+                        // The web's library grid leaves 40px between rows.
+                        view.card_row(row, columns, card_width, gap, cards, cx)
+                            .px(px(inset))
+                            .pb(px(40.))
+                            .into_any_element()
+                    }),
+                )
                 .flex_1()
                 .min_h_0()
                 .into_any_element()
@@ -773,6 +802,35 @@ impl Music {
 }
 
 impl Music {
+    /// One row of a collection grid's cards.
+    fn card_row(
+        &mut self,
+        row: usize,
+        columns: usize,
+        width: f32,
+        gap: f32,
+        layout: PageLayout,
+        cx: &Context<Self>,
+    ) -> Div {
+        let first = row * columns;
+        let items = self
+            .rows
+            .iter()
+            .skip(first)
+            .take(columns)
+            .cloned()
+            .collect::<Vec<_>>();
+        div().flex().items_start().gap(px(gap)).children(
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(column, item)| {
+                    self.card(item, first + column, width, ShelfLayout::Cards, layout, cx)
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub(in crate::app) fn prefetch_page(
         &mut self,
         visible_end: usize,

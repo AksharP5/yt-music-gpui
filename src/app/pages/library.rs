@@ -74,9 +74,7 @@ impl Music {
         let theme = self.theme;
         let bounds = Rc::new(Cell::new(Bounds::default()));
         let measured = bounds.clone();
-        let button = div()
-            .id("library-sort")
-            .keyboard_control(theme)
+        let button = menu_chip("library-sort", label, theme)
             .track_focus(&self.sort_focus)
             .relative()
             .child(
@@ -84,23 +82,6 @@ impl Music {
                     .absolute()
                     .inset_0(),
             )
-            .h(px(38.))
-            .pl(px(16.))
-            .pr(px(12.))
-            .flex_shrink_0()
-            .rounded_full()
-            .border_1()
-            .border_color(gpui::white().opacity(0.1))
-            .bg(gpui::white().opacity(0.1))
-            .hover(|button| button.bg(gpui::white().opacity(0.2)))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .text_size(px(14.))
-            .font_weight(FontWeight::MEDIUM)
-            .cursor_pointer()
-            .child(label)
-            .child(icon("expand-more", 24., theme.text))
             .on_click(cx.listener(|view, _, window, cx| {
                 view.toggle_sort_menu(window, cx);
             }));

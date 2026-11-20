@@ -137,8 +137,14 @@ mod focus_return {
     }
 
     fn countries(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
-        collection(view, window, cx);
-        view.page.editable = false;
+        view.sidebar_collapsed = None;
+        view.sidebar_playlists.clear();
+        view.route = Route::Browse(BrowseLink::new("FEmusic_charts", "Charts"));
+        view.page = page(1, false);
+        view.page.title = "Charts".into();
+        view.rebuild_rows();
+        window.resize(size(px(850.), px(560.)));
+        window.focus(&view.focus, cx);
         view.page.countries = (0..4)
             .map(|index| BrowseChoice {
                 label: format!("Country {index}"),
@@ -277,7 +283,7 @@ mod focus_return {
             Row {
                 name: "Country picker, Escape",
                 prepare: countries,
-                tabs: 14,
+                tabs: 8,
                 open: Input::Keys(&["enter"]),
                 opened: |view| matches!(view.overlay, Some(Overlay::CountryPicker(_))),
                 close: ESCAPE,

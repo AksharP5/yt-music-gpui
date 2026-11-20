@@ -115,13 +115,13 @@ impl Music {
         let Some(shelf) = self.display_shelf(index) else {
             return div().into_any_element();
         };
+        if shelf.layout == ShelfLayout::Grid {
+            return self.grid_shelf(index, inset, window, cx);
+        }
         let title = shelf.title.clone();
         let more = shelf.more.clone();
         let layout = shelf.layout;
-        let start = self.page.shelves[..index.min(self.page.shelves.len())]
-            .iter()
-            .map(|shelf| shelf.items.len())
-            .sum::<usize>();
+        let start = self.first_item(index);
         let navigation = shelf
             .items
             .iter()
@@ -364,6 +364,82 @@ impl Music {
             self.shelf_render_times.push(started.elapsed());
         }
         element
+    }
+}
+
+impl Music {
+    /// The page-wide index of a shelf's first item.
+    fn first_item(&self, index: usize) -> usize {
+        self.page.shelves[..index.min(self.page.shelves.len())]
+            .iter()
+            .map(|shelf| shelf.items.len())
+            .sum()
+    }
+
+    /// A shelf the web lays out in rows that wrap: Moods & genres' buttons,
+    /// or the cards that open New releases.
+    fn grid_shelf(
+        &mut self,
+        index: usize,
+        inset: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(shelf) = self.display_shelf(index) else {
+            return div().into_any_element();
+        };
+        let title = shelf.title.clone();
+        let items = shelf.items.clone();
+        let start = self.first_item(index);
+        let page = self.page_layout(window);
+        let (columns, width, gap) = if items.iter().all(|item| matches!(item, Item::Navigation(_)))
+        {
+            let columns = page.mood_columns();
+            let width = (page.column - (columns - 1) as f32 * 16.) / columns as f32;
+            (columns, width, 16.)
+        } else {
+            let (width, gap) = (page.card_width(), page.card_gap());
+            let columns = ((page.column + gap) / (width + gap)).floor().max(1.) as usize;
+            (columns, width, gap)
+        };
+        let narrow = page.tier == Tier::Narrow;
+        div()
+            .id(("grid-shelf", index))
+            .w_full()
+            .px(px(inset))
+            .pb(px(if narrow { 38. } else { 56. }))
+            .when(!title.is_empty(), |grid| {
+                grid.child(
+                    div()
+                        .mb(px(24.))
+                        .text_size(px(if narrow { 20. } else { 24. }))
+                        .line_height(relative(1.2))
+                        .font_weight(FontWeight::BOLD)
+                        .child(title),
+                )
+            })
+            .child(
+                div().flex().flex_col().gap(px(gap)).children(
+                    items
+                        .chunks(columns)
+                        .enumerate()
+                        .map(|(row, items)| {
+                            div().flex().items_start().gap(px(gap)).children(
+                                items
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(column, item)| {
+                                        let id = start + row * columns + column;
+                                        let item = item.clone();
+                                        self.card(item, id, width, ShelfLayout::Cards, page, cx)
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .into_any_element()
     }
 }
 
