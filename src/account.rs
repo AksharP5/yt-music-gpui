@@ -1043,6 +1043,7 @@ mod tests {
             editable: true,
             chips: Vec::new(),
             countries: Vec::new(),
+            playlist_sort: Vec::new(),
             search_filters: Vec::new(),
             correction: None,
             library: None,
