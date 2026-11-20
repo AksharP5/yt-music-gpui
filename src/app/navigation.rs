@@ -568,6 +568,7 @@ impl Music {
         self.page.countries.clear();
         self.page.correction = None;
         self.page.library = None;
+        self.page.playlist_sort.clear();
         if self.overlay.as_ref().is_some_and(Overlay::in_page) {
             self.drop_overlay(cx);
         }
@@ -792,6 +793,7 @@ impl Music {
             search_filters: Vec::new(),
             correction: None,
             library,
+            playlist_sort: Vec::new(),
         };
         self.rebuild_rows();
     }
@@ -965,6 +967,17 @@ impl Music {
         }
         match result.result {
             Ok(mut page) => {
+                // A playlist sorted in place arrives without its header.
+                if !result.append
+                    && page.header.is_none()
+                    && !page.playlist_sort.is_empty()
+                    && let Some(header) = &self.page.header
+                {
+                    page.header = Some(header.clone());
+                    page.title = self.page.title.clone();
+                    page.description = self.page.description.clone();
+                    page.background = self.page.background.clone();
+                }
                 let reload_verified = result.append
                     || self.sync.page_reload.is_none()
                     || self.playlist_reloaded(&page, result.account_generation, cx);
