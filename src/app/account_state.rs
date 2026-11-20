@@ -82,7 +82,7 @@ impl Music {
         let _ = self.pending_playback_jobs.try_recv();
         self.now_playing = None;
         self.media_pair = None;
-        self.overlay = None;
+        self.drop_overlay(cx);
         self.overlay_subscription = None;
         for collection in &mut self.library.saved {
             collection.details.play = None;
@@ -661,7 +661,7 @@ impl Music {
                 match result {
                     Ok(connection) => {
                         self.error = None;
-                        self.overlay = None;
+                        self.drop_overlay(cx);
                         self.account_event(
                             account::Event::Connected {
                                 operation,
@@ -894,7 +894,7 @@ impl Music {
                                                     *error = None;
                                                     view.refresh_playlist_choices(cx);
                                                 }
-                                                Some(Overlay::Track { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. }) => view.overlay = None,
+                                                Some(Overlay::Track { .. } | Overlay::AlreadyAdded { .. } | Overlay::SongText { .. } | Overlay::CommentSort) => view.drop_overlay(cx),
                                                 _ => {}
                                             }
                                             view.search.update(cx, |search, cx| search.renew_session(previous_session.as_ref(), session.clone(), window, cx));

@@ -24,11 +24,9 @@ impl Music {
             .hover(|row| row.bg(gpui::white().opacity(0.1)))
             .child(icon(glyph, 18., self.theme.text))
             .child(label)
-            .on_click(cx.listener(move |view, _, window, cx| {
-                let previous = view.overlay.as_ref().map(std::mem::discriminant);
-                action(view, window, cx);
-                view.finish_menu_action(previous, window, cx);
-            }))
+            .on_click(
+                cx.listener(move |view, _, window, cx| view.choose_menu_item(&action, window, cx)),
+            )
     }
 
     pub(in crate::app) fn account_popup(
@@ -105,10 +103,7 @@ impl Music {
                             "logout",
                             "Sign out",
                             cx,
-                            |view, _, cx| {
-                                view.overlay = None;
-                                view.disconnect_account(cx);
-                            },
+                            |view, _, cx| view.disconnect_account(cx),
                         )),
                 );
         }
@@ -119,11 +114,7 @@ impl Music {
                     "settings",
                     "Settings",
                     cx,
-                    |view, _, cx| {
-                        view.settings_menu = None;
-                        view.overlay = Some(Overlay::Settings);
-                        cx.notify();
-                    },
+                    |view, window, cx| view.open_overlay(Overlay::Settings, window, cx),
                 ),
             ))
             .child(div().py(px(8.)).child(self.account_action(
@@ -131,11 +122,7 @@ impl Music {
                 "help",
                 "Help",
                 cx,
-                |view, _, cx| {
-                    view.overlay = None;
-                    cx.open_url("https://support.google.com/youtubemusic");
-                    cx.notify();
-                },
+                |_, _, cx| cx.open_url("https://support.google.com/youtubemusic"),
             )));
         div()
             .id("account-focus")

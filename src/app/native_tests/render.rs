@@ -1,4 +1,4 @@
-use crate::app::{CatalogTarget, Music, Playback, Startup, player_page::PlayerTab};
+use crate::app::{CatalogTarget, Music, Overlay, Playback, Startup, player_page::PlayerTab};
 use crate::player::PlayerEvent;
 use anyhow::{Result, ensure};
 use gpui::{
@@ -454,7 +454,7 @@ async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut 
     key(window, cx, "enter").await;
     let first = window
         .update(cx, |music, window, cx| {
-            assert!(music.sort_menu);
+            assert!(matches!(music.overlay, Some(Overlay::LibrarySort)));
             assert!(music.overlay_focus.contains_focused(window, cx));
             window.focused(cx).unwrap()
         })
@@ -496,7 +496,7 @@ async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut 
     key(window, cx, "escape").await;
     window
         .update(cx, |music, window, _| {
-            assert!(!music.sort_menu);
+            assert!(music.overlay.is_none());
             assert!(music.sort_focus.is_focused(window));
         })
         .unwrap();
@@ -504,7 +504,7 @@ async fn library_sort_and_compact_layouts(window: WindowHandle<Music>, cx: &mut 
     key(window, cx, "down").await;
     key(window, cx, "enter").await;
     window.update(cx,|music,window,_| {
-        assert!(!music.sort_menu);
+        assert!(music.overlay.is_none());
         assert!(music.sort_focus.is_focused(window));
         assert!(matches!(music.catalog_requests.pending.try_recv().unwrap().query,Query::Reload(ref reload) if reload.token()=="saved"));
     }).unwrap();

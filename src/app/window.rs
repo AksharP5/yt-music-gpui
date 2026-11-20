@@ -43,7 +43,6 @@ impl Music {
         cx: &mut Context<Self>,
     ) {
         if self.overlay.is_none()
-            && !self.sort_menu
             && let MouseButton::Navigate(direction) = event.button
         {
             self.navigate_history(direction, cx);
@@ -72,7 +71,7 @@ impl Music {
         }
         let focus = if self.settings_menu.is_some() {
             &self.settings_focus
-        } else if self.overlay.is_some() || self.sort_menu {
+        } else if self.overlay.is_some() {
             &self.overlay_focus
         } else {
             &self.focus
@@ -150,7 +149,7 @@ impl Render for Music {
         }
         let native_video = self.player_open
             && self.library.video
-            && self.overlay.is_none()
+            && self.overlay.as_ref().is_none_or(Overlay::in_page)
             && self.active_id.is_some()
             && self.playback != Playback::Stopped
             && self.video_error.is_none();
@@ -182,12 +181,10 @@ impl Render for Music {
             ..Default::default()
         });
         let player = has_player.then(|| self.player_bar.clone());
-        let overlay = if matches!(self.overlay, Some(Overlay::Account)) {
-            Some(self.account_popup(window, cx))
-        } else {
-            self.overlay
-                .as_ref()
-                .map(|kind| self.overlay(kind, window, cx))
+        let overlay = match &self.overlay {
+            Some(Overlay::Account) => Some(self.account_popup(window, cx)),
+            Some(kind) if !kind.in_page() => Some(self.overlay(kind, window, cx)),
+            _ => None,
         }
         .map(|overlay| {
             div()

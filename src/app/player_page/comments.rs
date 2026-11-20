@@ -68,7 +68,6 @@ pub(super) struct State {
     retry: Option<(Load, Continuation)>,
     count: String,
     sorts: Vec<Sort>,
-    menu: bool,
     sort_bounds: Rc<Cell<Bounds<Pixels>>>,
     entries: Vec<Entry>,
     measured_width: Option<Pixels>,
@@ -95,7 +94,6 @@ impl State {
             retry: None,
             count: "Comments".into(),
             sorts: Vec::new(),
-            menu: false,
             sort_bounds: Rc::new(Cell::new(Bounds::default())),
             entries: Vec::new(),
             measured_width: None,
@@ -115,10 +113,6 @@ impl State {
 
     pub(super) fn pending_id(&self) -> Option<u64> {
         self.pending.as_ref().map(|pending| pending.id)
-    }
-
-    pub(super) fn close_menu(&mut self) {
-        self.menu = false;
     }
 
     pub(super) fn cancel(&mut self) -> bool {
@@ -437,6 +431,10 @@ impl Music {
             *state = State::new();
             state.track = track;
             state.session = session;
+            if matches!(self.overlay, Some(Overlay::CommentSort)) {
+                // Its options belonged to the previous song; focus falls back to the page.
+                self.overlay = None;
+            }
         }
         if state.pending.is_none()
             && state.error.is_none()
@@ -555,7 +553,7 @@ impl Music {
                 )
             })
             .collect::<Vec<_>>();
-        let menu = state.menu;
+        let menu = matches!(self.overlay, Some(Overlay::CommentSort));
         let sort_bounds = state.sort_bounds.clone();
         let measured_sort = sort_bounds.clone();
         let loading = state.pending.is_some();
@@ -576,39 +574,6 @@ impl Music {
         div()
             .relative()
             .id("comments-tab")
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                let state = &mut view.player_page.comments;
-                if !state.menu || event.keystroke.modifiers.modified() {
-                    return;
-                }
-                let count = state.sorts.len();
-                if count == 0 {
-                    return;
-                }
-                let current = (0..count).find(|index| {
-                    state
-                        .focus
-                        .get(&Control::SortOption(*index))
-                        .is_some_and(|focus| focus.is_focused(window))
-                });
-                let next = match event.keystroke.key.as_str() {
-                    "escape" => {
-                        state.menu = false;
-                        window.focus(&state.handle(Control::Sort, cx), cx);
-                        None
-                    }
-                    "down" => Some(current.map_or(0, |index| (index + 1) % count)),
-                    "up" => Some(current.map_or(count - 1, |index| (index + count - 1) % count)),
-                    "home" => Some(0),
-                    "end" => Some(count - 1),
-                    _ => return,
-                };
-                if let Some(index) = next {
-                    window.focus(&state.handle(Control::SortOption(index), cx), cx);
-                }
-                cx.stop_propagation();
-                cx.notify();
-            }))
             .flex_1()
             .min_h_0()
             .flex()
@@ -649,10 +614,12 @@ impl Music {
                                 .items_center()
                                 .justify_center()
                                 .child(icon("sort", 24., rgb(0xf1f1f1).into()).flex_shrink_0())
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.player_page.comments.menu =
-                                        !view.player_page.comments.menu;
-                                    cx.notify();
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    if matches!(view.overlay, Some(Overlay::CommentSort)) {
+                                        view.close_overlay(window, cx);
+                                    } else {
+                                        view.open_overlay(Overlay::CommentSort, window, cx);
+                                    }
                                 })),
                         )
                     }),
@@ -669,6 +636,9 @@ impl Music {
                             .child(
                                 div()
                                     .id("comments-sort-menu")
+                                    .track_focus(&self.overlay_focus)
+                                    .tab_group()
+                                    .tab_stop(false)
                                     .w(px(294.))
                                     .py(px(8.))
                                     .rounded(px(12.))
@@ -708,12 +678,7 @@ impl Music {
                                                 })
                                                 .on_click(cx.listener(
                                                     move |view, _, window, cx| {
-                                                        view.player_page.comments.menu = false;
-                                                        let focus = view
-                                                            .player_page
-                                                            .comments
-                                                            .handle(Control::Sort, cx);
-                                                        window.focus(&focus, cx);
+                                                        view.close_overlay(window, cx);
                                                         if let Some(sort) = view
                                                             .player_page
                                                             .comments
@@ -736,23 +701,14 @@ impl Music {
                                     ))
                                     .on_mouse_down_out(cx.listener(
                                         |view, event: &MouseDownEvent, window, cx| {
-                                            if view.player_page.comments.menu
-                                                && !view
-                                                    .player_page
-                                                    .comments
-                                                    .sort_bounds
-                                                    .get()
-                                                    .contains(&event.position)
+                                            if !view
+                                                .player_page
+                                                .comments
+                                                .sort_bounds
+                                                .get()
+                                                .contains(&event.position)
                                             {
-                                                view.player_page.comments.menu = false;
-                                                window.focus(
-                                                    &view
-                                                        .player_page
-                                                        .comments
-                                                        .handle(Control::Sort, cx),
-                                                    cx,
-                                                );
-                                                cx.notify();
+                                                view.close_overlay(window, cx);
                                             }
                                         },
                                     )),
@@ -1169,7 +1125,7 @@ mod tests {
         super::{Control, PlayerTab},
         crate::{
             app::{
-                CatalogTarget, Music, Startup,
+                CatalogTarget, Music, Overlay, Startup,
                 native_tests::{
                     isolate,
                     render::{capture, wait_for_presented_frame},
@@ -1454,12 +1410,12 @@ mod tests {
                     })?;
                     wait_for_presented_frame(window, cx).await;
                     window.update(cx, |music, window, _| {
-                        assert!(music.player_page.comments.menu);
+                        assert!(matches!(music.overlay, Some(Overlay::CommentSort)));
                         capture_panel(music, window, "sort");
                     })?;
                     key(window, cx, "escape").await;
                     window.update(cx, |music, window, _| {
-                        assert!(!music.player_page.comments.menu && music.player_open);
+                        assert!(music.overlay.is_none() && music.player_open);
                         assert!(music.player_page.comments.focus[&Control::Sort].is_focused(window));
                     })?;
                     key(window, cx, "enter").await;

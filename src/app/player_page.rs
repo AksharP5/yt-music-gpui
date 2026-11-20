@@ -188,7 +188,9 @@ impl Music {
             if self.player_page.tab == PlayerTab::Comments && self.player_page.comments.cancel() {
                 self.player_page.worker.cancel();
             }
-            self.player_page.comments.close_menu();
+            if matches!(self.overlay, Some(Overlay::CommentSort)) {
+                self.drop_overlay(cx);
+            }
             self.player_page.tab = tab;
             cx.notify();
         }

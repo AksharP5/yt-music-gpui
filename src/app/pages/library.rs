@@ -105,7 +105,7 @@ impl Music {
                 view.toggle_sort_menu(window, cx);
             }));
         let mut anchor = div().relative().flex_shrink_0().child(button);
-        if self.sort_menu {
+        if matches!(self.overlay, Some(Overlay::LibrarySort)) {
             let options = choices.iter().enumerate().map(|(index, choice)| {
                 let reload = choice.reload.clone();
                 let selected = choice.selected;
@@ -128,11 +128,10 @@ impl Music {
                     )
                     .child(choice.label.clone())
                     .on_click(cx.listener(move |view, _, window, cx| {
-                        view.dismiss_sort_menu(window, cx);
+                        view.close_overlay(window, cx);
                         if !selected {
                             view.request(Query::Reload(reload.clone()), cx);
                         }
-                        cx.notify();
                     }))
             });
             let menu = div()
@@ -165,7 +164,7 @@ impl Music {
                 .on_mouse_down_out(
                     cx.listener(move |view, event: &MouseDownEvent, window, cx| {
                         if !bounds.get().contains(&event.position) {
-                            view.dismiss_sort_menu(window, cx);
+                            view.close_overlay(window, cx);
                         }
                     }),
                 );
@@ -174,34 +173,12 @@ impl Music {
         anchor
     }
 
-    pub(in crate::app) fn toggle_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sort_menu {
-            self.dismiss_sort_menu(window, cx);
-            return;
+    fn toggle_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::LibrarySort)) {
+            self.close_overlay(window, cx);
+        } else {
+            self.open_overlay(Overlay::LibrarySort, window, cx);
         }
-        self.sort_menu = true;
-        window.focus(&self.overlay_focus, cx);
-        let view = cx.weak_entity();
-        window.on_next_frame(move |window, _| {
-            window.on_next_frame(move |window, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    if view.sort_menu && view.overlay_focus.is_focused(window) {
-                        view.move_overlay_focus(false, window, cx);
-                    }
-                });
-            });
-        });
-        cx.notify();
-    }
-
-    pub(in crate::app) fn dismiss_sort_menu(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.sort_menu = false;
-        window.focus(&self.sort_focus, cx);
-        cx.notify();
     }
 
     /// The web's centered empty library message.

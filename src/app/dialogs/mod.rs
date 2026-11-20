@@ -52,6 +52,30 @@ pub(in crate::app) enum Overlay {
         title: String,
         content: Option<Result<SongText, String>>,
     },
+    /// The library's Sort by menu, drawn in the page under its button.
+    LibrarySort,
+    /// The Comments tab's sort menu, drawn in the panel under its button.
+    CommentSort,
+}
+
+impl Overlay {
+    /// Popovers drawn in the page beside their button rather than above it. They leave the
+    /// rest of the page clickable and native video visible.
+    pub(in crate::app) fn in_page(&self) -> bool {
+        matches!(self, Self::LibrarySort | Self::CommentSort)
+    }
+
+    /// Arrow keys move between a menu's items, and choosing one closes the menu.
+    pub(in crate::app) fn is_menu(&self) -> bool {
+        matches!(
+            self,
+            Self::Track { .. }
+                | Self::Collection(_)
+                | Self::Account
+                | Self::LibrarySort
+                | Self::CommentSort
+        )
+    }
 }
 
 impl Music {
@@ -217,6 +241,7 @@ impl Music {
             return;
         }
         let picker = cx.new(|cx| CountryPicker::new(self.page.countries.clone(), cx));
+        self.open_overlay(Overlay::CountryPicker(picker.clone()), window, cx);
         self.overlay_subscription = Some(cx.subscribe_in(
             &picker,
             window,
@@ -231,8 +256,6 @@ impl Music {
             },
         ));
         window.focus(&picker.focus_handle(cx), cx);
-        self.overlay = Some(Overlay::CountryPicker(picker));
-        cx.notify();
     }
 
     pub(in crate::app) fn open_track_menu(
@@ -242,28 +265,21 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.overlay_return_focus = window.focused(cx);
-        window.focus(&self.overlay_focus, cx);
-        self.overlay_anchor = Some(window.mouse_position());
-        self.overlay_button = None;
-        self.menu_scroll = ScrollHandle::new();
         if self.account.is_some() {
             self.prefetch_playlist_covers();
         }
-        self.overlay = Some(Overlay::Track {
-            track,
-            index,
-            queue_index: None,
-        });
-        let view = cx.weak_entity();
-        window.on_next_frame(move |window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                if view.overlay_focus.is_focused(window) {
-                    view.move_overlay_focus(false, window, cx);
-                }
-            });
-        });
-        cx.notify();
+        self.open_overlay(
+            Overlay::Track {
+                track,
+                index,
+                queue_index: None,
+            },
+            window,
+            cx,
+        );
+        self.overlay_anchor = Some(window.mouse_position());
+        self.overlay_button = None;
+        self.menu_scroll = ScrollHandle::new();
     }
 
     pub(in crate::app) fn open_item_menu(
@@ -285,21 +301,10 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.overlay_return_focus = window.focused(cx);
-        window.focus(&self.overlay_focus, cx);
+        self.open_overlay(Overlay::Collection(collection), window, cx);
         self.overlay_anchor = Some(window.mouse_position());
         self.overlay_button = None;
         self.menu_scroll = ScrollHandle::new();
-        self.overlay = Some(Overlay::Collection(collection));
-        let view = cx.weak_entity();
-        window.on_next_frame(move |window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                if view.overlay_focus.is_focused(window) {
-                    view.move_overlay_focus(false, window, cx);
-                }
-            });
-        });
-        cx.notify();
     }
 
     pub(in crate::app) fn move_overlay_focus(
@@ -399,38 +404,93 @@ impl Music {
         true
     }
 
+    /// Every dialog, menu and popover opens here. It takes keyboard focus, Tab stays inside
+    /// it (`move_overlay_focus`), and `close_overlay` or `drop_overlay` returns focus to the
+    /// control focused now, or to the page when that control has gone.
     pub(in crate::app) fn open_overlay(
         &mut self,
         overlay: Overlay,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.overlay.is_some() {
-            self.close_overlay(window, cx);
-        }
-        self.overlay_return_focus = window.focused(cx);
+        // Focus returns to the replaced overlay's opener, so it is this overlay's opener too.
+        self.close_overlay(window, cx);
+        let first_item = matches!(
+            overlay,
+            Overlay::Track { .. } | Overlay::Collection(_) | Overlay::LibrarySort
+        );
+        self.overlay_opener = window.focused(cx);
         self.overlay = Some(overlay);
         window.focus(&self.overlay_focus, cx);
+        if first_item {
+            // These menus start on their first item once it has rendered.
+            let view = cx.weak_entity();
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        if view.overlay_focus.is_focused(window) {
+                            view.move_overlay_focus(false, window, cx);
+                        }
+                    });
+                });
+            });
+        }
+        cx.notify();
     }
 
     pub(in crate::app) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.overlay, Some(Overlay::SignIn)) {
+        let Some(overlay) = self.overlay.take() else {
+            return;
+        };
+        if matches!(overlay, Overlay::SignIn) {
             self.cancel_connection(cx);
         }
         self.song_text.cancel();
         self.catalog_requests.cancel(CatalogTarget::PlaylistChoices);
-        self.overlay = None;
         self.settings_menu = None;
         self.overlay_anchor = None;
         self.overlay_button = None;
         self.overlay_subscription = None;
-        window.focus(
-            self.overlay_return_focus
-                .take()
-                .as_ref()
-                .unwrap_or(&self.focus),
-            cx,
-        );
+        return_focus(self.overlay_opener.take(), &self.focus, window, cx);
+        cx.notify();
+    }
+
+    /// Close an overlay that a reply or page change made stale, where no window is at hand.
+    /// Unlike `close_overlay` it cancels nothing; focus returns before the next frame.
+    pub(in crate::app) fn drop_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.overlay.take().is_none() {
+            return;
+        }
+        let opener = self.overlay_opener.take();
+        let view = cx.weak_entity();
+        cx.defer(move |cx| {
+            // An overlay opened meanwhile keeps the focus it took.
+            let Ok(Some(page)) = view.read_with(cx, |view, _| {
+                view.overlay.is_none().then(|| view.focus.clone())
+            }) else {
+                return;
+            };
+            for window in cx.windows() {
+                let _ = window.update(cx, |_, window, cx| {
+                    return_focus(opener.clone(), &page, window, cx)
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    /// Choosing a menu item closes the menu before its action runs. The action then starts
+    /// from the opener's focus, and a dialog it opens returns there too.
+    pub(in crate::app) fn choose_menu_item(
+        &mut self,
+        action: &dyn Fn(&mut Self, &mut Window, &mut Context<Self>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.as_ref().is_some_and(Overlay::is_menu) {
+            self.close_overlay(window, cx);
+        }
+        action(self, window, cx);
         cx.notify();
     }
 
@@ -438,6 +498,7 @@ impl Music {
         &mut self,
         query: TextQuery,
         title: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let label = match &query {
@@ -448,15 +509,18 @@ impl Music {
         };
         let title = format!("{label} · {title}");
         let session = self.account.as_ref().map(|account| account.session.clone());
-        self.overlay = None;
+        // Closing an overlay cancels song text, so close before this load starts.
+        self.close_overlay(window, cx);
         match self.song_text.load(query, session) {
-            Ok(id) => {
-                self.overlay = Some(Overlay::SongText {
+            Ok(id) => self.open_overlay(
+                Overlay::SongText {
                     id,
                     title,
                     content: None,
-                })
-            }
+                },
+                window,
+                cx,
+            ),
             Err(error) => self.error = Some(format!("{error:#}")),
         }
         cx.notify();
@@ -506,37 +570,10 @@ impl Music {
             .hover(|d| d.bg(self.theme.raised))
             .children(glyph.map(|glyph| div().mx(px(8.)).child(icon(glyph, 18., self.theme.text))))
             .child(div().mx(px(8.)).flex_1().min_w_0().child(label.into()))
-            .on_click(cx.listener(move |view, _, window, cx| {
-                let previous = view.overlay.as_ref().map(std::mem::discriminant);
-                action(view, window, cx);
-                view.finish_menu_action(previous, window, cx);
-            }))
-            .into_any_element()
-    }
-
-    pub(in crate::app) fn finish_menu_action(
-        &mut self,
-        previous: Option<std::mem::Discriminant<Overlay>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.overlay.is_none() {
-            // Some actions already dismissed the menu and restored focus.
-            if self.overlay_return_focus.is_some()
-                || self.overlay_focus.contains_focused(window, cx)
-            {
-                self.close_overlay(window, cx);
-            }
-            return;
-        }
-        if previous != self.overlay.as_ref().map(std::mem::discriminant)
-            && !matches!(
-                self.overlay,
-                Some(Overlay::CountryPicker(_) | Overlay::PlaylistForm { .. })
+            .on_click(
+                cx.listener(move |view, _, window, cx| view.choose_menu_item(&action, window, cx)),
             )
-        {
-            window.focus(&self.overlay_focus, cx);
-        }
+            .into_any_element()
     }
 
     pub(in crate::app) fn backdrop(&self, body: AnyElement, cx: &Context<Self>) -> AnyElement {
@@ -638,9 +675,10 @@ impl Music {
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::NoKeyring(_) => "No keyring found".into(),
                                 Overlay::SongText { title, .. } => title.clone(),
-                                Overlay::PlaylistForm { .. } | Overlay::CountryPicker(_) => {
-                                    String::new()
-                                }
+                                Overlay::PlaylistForm { .. }
+                                | Overlay::CountryPicker(_)
+                                | Overlay::LibrarySort
+                                | Overlay::CommentSort => String::new(),
                             }),
                     )
                     .child(
@@ -711,8 +749,8 @@ impl Music {
                             )
                             .child(div().flex_1().min_w_0().child(chapter.title.clone()))
                             .on_click(cx.listener(move |view, _, window, cx| {
-                                view.play_chapter((*selected).clone(), seconds, cx);
                                 view.close_overlay(window, cx);
+                                view.play_chapter((*selected).clone(), seconds, cx);
                             })),
                     );
                 }
@@ -754,7 +792,6 @@ impl Music {
                     "Episode details",
                     cx,
                     move |view, _, cx| {
-                        view.overlay = None;
                         view.navigate(Route::Browse(target.clone()), cx);
                     },
                 ));
@@ -765,9 +802,11 @@ impl Music {
                         "Chapters",
                         cx,
                         move |view, window, cx| {
-                            window.focus(&view.focus, cx);
-                            view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
-                            cx.notify();
+                            view.open_overlay(
+                                Overlay::Chapters(Box::new(track.clone())),
+                                window,
+                                cx,
+                            );
                         },
                     ));
                 }
@@ -778,7 +817,6 @@ impl Music {
                         "Go to podcast",
                         cx,
                         move |view, _, cx| {
-                            view.overlay = None;
                             view.navigate(Route::Browse(target.clone()), cx);
                         },
                     ));
@@ -790,7 +828,6 @@ impl Music {
                     "Start mix",
                     cx,
                     move |view, _, cx| {
-                        view.overlay = None;
                         view.start_queue(
                             PlaybackQuery::Watch {
                                 track: Box::new(song.clone()),
@@ -807,7 +844,6 @@ impl Music {
                     view.cancel_queue_drag();
                     let index = view.library.queue.index.map_or(0, |i| i + 1);
                     view.library.queue.tracks_mut().insert(index, song.clone());
-                    view.overlay = None;
                     view.queue_changed(cx);
                 }),
             );
@@ -817,7 +853,6 @@ impl Music {
                 "Add to queue",
                 cx,
                 move |view, _, cx| {
-                    view.overlay = None;
                     view.enqueue(song.clone(), cx);
                 },
             ));
@@ -835,7 +870,6 @@ impl Music {
                     },
                     cx,
                     move |view, _, cx| {
-                        view.overlay = None;
                         view.mutate(
                             Mutation::SongLibrary {
                                 track: song.clone(),
@@ -859,7 +893,6 @@ impl Music {
                     },
                     cx,
                     move |view, _, cx| {
-                        view.overlay = None;
                         view.toggle_like(&song, cx);
                     },
                 ));
@@ -871,7 +904,6 @@ impl Music {
                 cx,
                 move |view, window, cx| {
                     if view.account.is_none() {
-                        view.overlay = None;
                         view.connect_account(window, cx);
                         return;
                     }
@@ -890,7 +922,6 @@ impl Music {
                     "Remove from queue",
                     cx,
                     move |view, _, cx| {
-                        view.overlay = None;
                         view.remove_queue_track(queued, cx);
                     },
                 ));
@@ -903,7 +934,6 @@ impl Music {
                         "Remove from history",
                         cx,
                         move |view, _, cx| {
-                            view.overlay = None;
                             view.mutate(
                                 Mutation::RemoveHistory {
                                     token: token.clone(),
@@ -926,7 +956,6 @@ impl Music {
                         "Remove from playlist",
                         cx,
                         move |view, _, cx| {
-                            view.overlay = None;
                             view.mutate(
                                 Mutation::RemoveFromPlaylist {
                                     id: playlist.clone(),
@@ -948,7 +977,6 @@ impl Music {
                             let playlist = link.id.clone();
                             let set = set_id.clone();
                             actions.push(self.menu_action(key, label, cx, move |view, _, cx| {
-                                view.overlay = None;
                                 view.mutate(
                                     Mutation::MoveInPlaylist {
                                         id: playlist.clone(),
@@ -983,7 +1011,6 @@ impl Music {
                 if let Some(target) = target {
                     let target = target.clone();
                     actions.push(self.menu_action(id, label, cx, move |view, _, cx| {
-                        view.overlay = None;
                         view.navigate(Route::Browse(BrowseLink::new(target.clone(), title)), cx);
                     }));
                 }
@@ -994,8 +1021,8 @@ impl Music {
                     "menu-credits",
                     "View song credits",
                     cx,
-                    move |view, _, cx| {
-                        view.show_song_text(TextQuery::Credits(id.clone()), &title, cx)
+                    move |view, window, cx| {
+                        view.show_song_text(TextQuery::Credits(id.clone()), &title, window, cx)
                     },
                 ));
             }
@@ -1003,7 +1030,6 @@ impl Music {
             actions.push(
                 self.menu_action("menu-share", "Share", cx, move |view, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                    view.overlay = None;
                     view.notice = Some("Link copied".into());
                     cx.notify();
                 }),
@@ -1018,8 +1044,7 @@ impl Music {
                 ("menu-radio", "Start mix", PlaybackQuery::mix(collection)),
             ] {
                 if let Some(query) = query {
-                    actions.push(self.menu_action(id, label, cx, move |view, window, cx| {
-                        view.close_overlay(window, cx);
+                    actions.push(self.menu_action(id, label, cx, move |view, _, cx| {
                         view.start_queue(query.clone(), cx);
                     }));
                 }
@@ -1029,8 +1054,7 @@ impl Music {
                     "collection-play",
                     "Play",
                     cx,
-                    move |view, window, cx| {
-                        view.close_overlay(window, cx);
+                    move |view, _, cx| {
                         view.start_queue(query.clone(), cx);
                     },
                 ));
@@ -1048,7 +1072,6 @@ impl Music {
                 },
                 cx,
                 move |view, window, cx| {
-                    view.close_overlay(window, cx);
                     if selected.id.starts_with("UC") && view.account.is_none() {
                         view.connect_account(window, cx);
                         return;
@@ -1058,9 +1081,8 @@ impl Music {
             ));
             let url = format!("https://music.youtube.com/browse/{}", collection.id);
             actions.push(
-                self.menu_action("menu-share", "Share", cx, move |view, window, cx| {
+                self.menu_action("menu-share", "Share", cx, move |view, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                    view.close_overlay(window, cx);
                     view.notice = Some("Link copied".into());
                 }),
             );
@@ -1196,12 +1218,12 @@ impl Music {
                     }
                 },
             ));
-            body = body.child(
-                self.menu_action("cancel-delete", "Cancel", cx, |view, _, cx| {
-                    view.overlay = None;
-                    cx.notify();
-                }),
-            );
+            body = body.child(self.menu_action(
+                "cancel-delete",
+                "Cancel",
+                cx,
+                |view, window, cx| view.close_overlay(window, cx),
+            ));
             if let Some(error) = &self.error {
                 body = body.child(
                     div()
@@ -1610,6 +1632,18 @@ const PICKER_PREFETCH: usize = 8;
 
 /// The song menu's width on music.youtube.com, including its 1 px border.
 const MENU_WIDTH: f32 = 242.;
+
+/// Focus the control that opened a dialog, menu or popover if the last frame rendered it
+/// inside `scope`. When the opener has gone, such as a removed row, focus `scope` itself.
+pub(in crate::app) fn return_focus(
+    opener: Option<FocusHandle>,
+    scope: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let opener = opener.filter(|opener| scope.contains(opener, window));
+    window.focus(opener.as_ref().unwrap_or(scope), cx);
+}
 
 /// Place a menu against the button that opened it, as music.youtube.com does: below and
 /// left-aligned, aligned to the button's right edge when that would overflow, and above

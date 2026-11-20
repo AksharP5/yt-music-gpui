@@ -148,13 +148,11 @@ impl Music {
                 .cursor_pointer()
                 .child(self.page.description.clone())
                 .on_click(cx.listener(|view, _, window, cx| {
-                    view.overlay_return_focus = window.focused(cx);
-                    window.focus(&view.overlay_focus, cx);
-                    view.overlay = Some(Overlay::Description {
+                    let description = Overlay::Description {
                         title: view.page.title.clone(),
                         text: view.page.description.clone(),
-                    });
-                    cx.notify();
+                    };
+                    view.open_overlay(description, window, cx);
                 }));
             // Extra measured width avoids GPUI wrapping a line that fits on the web.
             heading = heading.child(div().w_full().flex().child(description));
@@ -239,10 +237,7 @@ impl Music {
                     .cursor_pointer()
                     .child("Chapters")
                     .on_click(cx.listener(move |view, _, window, cx| {
-                        view.overlay_return_focus = window.focused(cx);
-                        window.focus(&view.overlay_focus, cx);
-                        view.overlay = Some(Overlay::Chapters(Box::new(track.clone())));
-                        cx.notify();
+                        view.open_overlay(Overlay::Chapters(Box::new(track.clone())), window, cx);
                     })),
             );
         }
@@ -271,13 +266,12 @@ impl Music {
                 .child(
                     filter_chip("delete-playlist", "Delete", false, self.theme).on_click(
                         cx.listener(|view, _, window, cx| {
-                            window.focus(&view.focus, cx);
                             if let Route::Browse(link) = &view.route {
-                                view.overlay = Some(Overlay::DeletePlaylist {
+                                let delete = Overlay::DeletePlaylist {
                                     id: link.id.clone(),
                                     title: view.page.title.clone(),
-                                });
-                                cx.notify();
+                                };
+                                view.open_overlay(delete, window, cx);
                             }
                         }),
                     ),

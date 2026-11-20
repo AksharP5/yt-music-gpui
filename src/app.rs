@@ -158,8 +158,6 @@ pub struct Music {
     video: Option<VideoAttachment>,
     /// The full-window player page, showing artwork or video beside its tabs.
     player_open: bool,
-    /// The library sort menu is open.
-    sort_menu: bool,
     sort_focus: FocusHandle,
     video_fullscreen: bool,
     video_transparent: bool,
@@ -176,7 +174,8 @@ pub struct Music {
     player_page: PlayerPage,
     overlay: Option<Overlay>,
     settings_section: SettingsSection,
-    settings_menu: Option<SettingMenu>,
+    /// A setting's open choices, with the field that opened them.
+    settings_menu: Option<(SettingMenu, Option<FocusHandle>)>,
     overlay_anchor: Option<Point<Pixels>>,
     /// The "More options" button whose menu is open, so the menu can align to it.
     overlay_button: Option<Bounds<Pixels>>,
@@ -185,7 +184,8 @@ pub struct Music {
     picker_focus: VirtualListFocus<crate::playlist_choices::Destination>,
     picker_scroll: UniformListScrollHandle,
     settings_focus: FocusHandle,
-    overlay_return_focus: Option<FocusHandle>,
+    /// The control focused when the overlay opened, which regains focus when it closes.
+    overlay_opener: Option<FocusHandle>,
     overlay_subscription: Option<Subscription>,
     drag: Option<Drag>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
