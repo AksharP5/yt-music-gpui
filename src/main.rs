@@ -14,6 +14,8 @@ mod listening;
 mod media_controls;
 #[cfg_attr(windows, path = "os_windows.rs")]
 mod os;
+#[cfg(ytm_perf)]
+mod perf;
 mod player;
 mod playlist_choices;
 mod playlist_form;
@@ -53,6 +55,13 @@ fn shutdown_on_signal(cx: &mut App) -> std::io::Result<()> {
 }
 
 fn main() {
+    // glibc gives busy threads their own malloc arenas, up to eight per core, and
+    // freed memory stays resident in each. Two arenas cut playing PSS by about
+    // 20 MiB with no measurable CPU cost. Set before any thread starts.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
     if os::disable_core_dumps().is_err() {
         eprintln!("Could not disable credential-bearing crash dumps.");
         std::process::exit(1);
@@ -119,6 +128,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Before the window opens, which takes hundreds of milliseconds.
+    let home = app::HomePrefetch::start(startup);
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
@@ -150,7 +161,7 @@ fn main() {
                     app_id: Some("yt-music-gpui".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| app::Music::new(startup, window, cx)),
+                |window, cx| cx.new(|cx| app::Music::new(startup, home, window, cx)),
             );
             if let Err(error) = window {
                 eprintln!("Could not open the window: {error:#}");

@@ -641,14 +641,19 @@ pub(super) mod tests {
             .collect()
     }
 
+    /// A lookup that sends its page and player requests to a local server.
+    pub(in crate::player) fn lookup_at(base: &str) -> Lookup {
+        let mut lookup = Lookup::new().unwrap();
+        lookup.homepage = format!("{base}/");
+        lookup.player = format!("{base}/player");
+        lookup
+    }
+
     pub(in crate::player) fn server(
         responses: Vec<String>,
     ) -> (Lookup, thread::JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut lookup = Lookup::new().unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        lookup.homepage = format!("{base}/");
-        lookup.player = format!("{base}/player");
+        let lookup = lookup_at(&format!("http://{}", listener.local_addr().unwrap()));
         let server = thread::spawn(move || {
             responses.into_iter().map(|response| {
             let (mut stream, _) = listener.accept().unwrap();

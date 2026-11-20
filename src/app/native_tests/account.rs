@@ -409,7 +409,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
             titlebar: Some(TitlebarOptions { title: Some("Music account recovery test".into()), ..Default::default() }),
             focus: false, ..Default::default()
         }, move |window, cx| cx.new(|cx| {
-            let mut view = Music::new(Startup::Guest, window, cx);
+            let mut view = Music::new(Startup::Guest, None, window, cx);
             view.account_commands.close();
             view.account_worker.take().unwrap().finish().unwrap();
             view.account_commands = sender;
