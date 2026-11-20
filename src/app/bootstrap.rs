@@ -328,6 +328,7 @@ impl Music {
                 search_filters: Vec::new(),
                 correction: None,
                 library: None,
+                playlist_sort: Vec::new(),
             },
             rows: Vec::new(),
             list_rows: Vec::new(),

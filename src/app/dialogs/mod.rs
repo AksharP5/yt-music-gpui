@@ -54,6 +54,8 @@ pub(in crate::app) enum Overlay {
     },
     /// The library's Sort by menu, drawn in the page under its button.
     LibrarySort,
+    /// A playlist's Sort menu, drawn in the page under its button.
+    PlaylistSort,
     /// The Comments tab's sort menu, drawn in the panel under its button.
     CommentSort,
 }
@@ -62,7 +64,10 @@ impl Overlay {
     /// Popovers drawn in the page beside their button rather than above it. They leave the
     /// rest of the page clickable and native video visible.
     pub(in crate::app) fn in_page(&self) -> bool {
-        matches!(self, Self::LibrarySort | Self::CommentSort)
+        matches!(
+            self,
+            Self::LibrarySort | Self::PlaylistSort | Self::CommentSort
+        )
     }
 
     /// Arrow keys move between a menu's items, and choosing one closes the menu.
@@ -73,6 +78,7 @@ impl Overlay {
                 | Self::Collection(_)
                 | Self::Account
                 | Self::LibrarySort
+                | Self::PlaylistSort
                 | Self::CommentSort
         )
     }
@@ -417,7 +423,10 @@ impl Music {
         self.close_overlay(window, cx);
         let first_item = matches!(
             overlay,
-            Overlay::Track { .. } | Overlay::Collection(_) | Overlay::LibrarySort
+            Overlay::Track { .. }
+                | Overlay::Collection(_)
+                | Overlay::LibrarySort
+                | Overlay::PlaylistSort
         );
         self.overlay_opener = window.focused(cx);
         self.overlay = Some(overlay);
@@ -678,6 +687,7 @@ impl Music {
                                 Overlay::PlaylistForm { .. }
                                 | Overlay::CountryPicker(_)
                                 | Overlay::LibrarySort
+                                | Overlay::PlaylistSort
                                 | Overlay::CommentSort => String::new(),
                             }),
                     )

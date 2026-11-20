@@ -1000,6 +1000,7 @@ async fn scrolled_artist_survives_tab(
                 artist: None,
                 artist_thumbnail: None,
                 owner: String::new(),
+                owner_thumbnail: None,
                 subtitle: "Artist".into(),
                 stats: String::new(),
                 shuffle: None,
