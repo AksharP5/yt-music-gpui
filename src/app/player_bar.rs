@@ -98,18 +98,25 @@ fn tinted_control(
         }))
 }
 
-/// The bar's "Artist • Album • Year" line and the artist and album links in
-/// it. Search and chart rows can omit the album and its link, so the watch
-/// response for the current song fills them in once it loads.
+/// The bar's second line and the artist and album links in it. Once the
+/// watch response for the current song loads, its byline shows as the web
+/// shows it: "Artist • Album • Year" for a song, "Artist • 1.1B views •
+/// 8.8M likes" for a video. Until then, and for a queue restored at launch,
+/// the line is built from the queued track, whose search or chart row can
+/// omit the album.
 fn track_byline<'a>(track: &'a Track, issued: Option<&'a Track>) -> (String, &'a [BrowseLink]) {
-    let album = track.album.as_deref().or_else(|| issued?.album.as_deref());
-    let year = issued.and_then(|issued| issued.details.year.as_deref());
-    let text = [Some(track.artist.as_str()), album, year]
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" • ");
+    let text = issued
+        .and_then(|issued| issued.details.byline.clone())
+        .unwrap_or_else(|| {
+            let album = track.album.as_deref().or_else(|| issued?.album.as_deref());
+            let year = issued.and_then(|issued| issued.details.year.as_deref());
+            [Some(track.artist.as_str()), album, year]
+                .into_iter()
+                .flatten()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" • ")
+        });
     let links = issued
         .map(|issued| issued.details.links.as_slice())
         .filter(|links| !links.is_empty())
@@ -227,19 +234,32 @@ impl Music {
         // Sized to its content and centered, so the rating buttons follow the title as on the web.
         let mut details = div().min_w_0().max_w(px(660.)).flex().items_center();
         if let Some(track) = current {
+            let wide = track.details.wide_thumbnail
+                || self
+                    .current_watch()
+                    .and_then(|watch| watch.current.as_ref())
+                    .is_some_and(|issued| issued.details.wide_thumbnail);
+            // A video's frame keeps its 16:9 shape, 71 × 40 on the web.
+            let art_size = if wide {
+                size(px(40. * 16. / 9.), px(40.))
+            } else {
+                size(px(40.), px(40.))
+            };
             // The web rounds the bar's art by only 2px.
             let art = match self
                 .current_thumbnail()
-                .and_then(|url| self.artwork.get(&url, size(px(40.), px(40.))))
+                .and_then(|url| self.artwork.get(&url, art_size))
             {
                 Some(image) => img(image)
-                    .size(px(40.))
+                    .w(art_size.width)
+                    .h(art_size.height)
                     .flex_shrink_0()
                     .rounded(px(2.))
                     .object_fit(ObjectFit::Cover)
                     .into_any_element(),
                 None => div()
-                    .size(px(40.))
+                    .w(art_size.width)
+                    .h(art_size.height)
                     .flex_shrink_0()
                     .rounded(px(2.))
                     .bg(theme.raised)
@@ -664,6 +684,20 @@ mod tests {
                 link(" • ", None),
                 link("Señorita", Some("MPREsenorita")),
                 link(" • 2019", None),
+            ]
+        );
+
+        // A video's watch byline carries its views and likes instead of an album.
+        let mut video = issued.clone();
+        video.details.byline = Some("Shawn Mendes & Camila Cabello • 2B views • 22M likes".into());
+        video.details.links = artists.to_vec();
+        assert_eq!(
+            targets(&searched, Some(&video)),
+            [
+                link("Shawn Mendes", Some("UCshawn")),
+                link(" & ", None),
+                link("Camila Cabello", Some("UCcamila")),
+                link(" • 2B views • 22M likes", None),
             ]
         );
 

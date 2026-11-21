@@ -3,7 +3,7 @@ use crate::{
     catalog::{
         Catalog, PODCAST_EPISODE, PlaybackActions, PlaylistTarget, Track, duration,
         episode_context, episode_header, text, thumbnail, track_details, valid_service_params,
-        valid_video_id,
+        valid_video_id, wide_thumbnail,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -547,6 +547,9 @@ fn parse_track(row: &Value, current_id: &str) -> Option<Track> {
     });
     let mut details = track_details(row, &runs, id);
     details.episode = episode_context(row, id, &runs).ok()?;
+    // The player bar shows this line as is, "Artist • 1.1B views • 8.8M likes" for a video.
+    details.byline = Some(text(&row["longBylineText"])).filter(|byline| !byline.is_empty());
+    details.wide_thumbnail = wide_thumbnail(row);
     if id != current_id {
         details.clear_account_state();
     }

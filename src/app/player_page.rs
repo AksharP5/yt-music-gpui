@@ -58,6 +58,8 @@ pub(in crate::app) struct PlayerPage {
     pub(in crate::app) press: Option<Point<Pixels>>,
     pub(in crate::app) autoscrolling: bool,
     pub(in crate::app) video_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The dialogs and menus drawn over the page this frame, collected by `covers_video`.
+    pub(in crate::app) video_covers: Rc<std::cell::RefCell<Vec<Bounds<Pixels>>>>,
 }
 
 impl PlayerPage {
@@ -103,6 +105,7 @@ impl PlayerPage {
             press: None,
             autoscrolling: false,
             video_bounds: Rc::new(Cell::new(None)),
+            video_covers: Rc::default(),
         }
     }
 
