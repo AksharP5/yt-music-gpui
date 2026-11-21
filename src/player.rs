@@ -243,6 +243,11 @@ pub enum PlayerEvent {
         track_id: u64,
         buffering: bool,
     },
+    /// How far into the song mpv has downloaded, for the seek bar's buffered range.
+    Buffered {
+        track_id: u64,
+        seconds: f64,
+    },
     Ended {
         track_id: u64,
     },
@@ -2057,9 +2062,16 @@ fn run(
     let mut pending = Vec::new();
     // UI and MPRIS own volume. Delayed mpv acknowledgments must not
     // replace the retained level with an earlier mute's zero.
-    for (id, name) in ["time-pos", "duration", "pause", "paused-for-cache", "speed"]
-        .iter()
-        .enumerate()
+    for (id, name) in [
+        "time-pos",
+        "duration",
+        "pause",
+        "paused-for-cache",
+        "speed",
+        "demuxer-cache-time",
+    ]
+    .iter()
+    .enumerate()
     {
         write_command(&mut socket, json!(["observe_property", id + 1, name]), None)?;
     }
@@ -2977,6 +2989,10 @@ impl PlaybackState {
                                 buffering,
                             })
                     }
+                    Some("demuxer-cache-time") => value["data"]
+                        .as_f64()
+                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
+                        .map(|seconds| PlayerEvent::Buffered { track_id, seconds }),
                     _ => None,
                 };
                 if let Some(event) = event {

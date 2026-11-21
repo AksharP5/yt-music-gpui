@@ -427,6 +427,7 @@ impl Music {
             position,
             pending_seek: None,
             measured_duration: None,
+            buffered: None,
             player_page: PlayerPage::start(window, cx),
             overlay: (startup == Startup::Connect).then_some(Overlay::SignIn),
             settings_section: SettingsSection::General,

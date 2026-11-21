@@ -6,6 +6,8 @@ pub(super) struct PlayerBar {
     music: WeakEntity<Music>,
     pub(super) controls_expanded: bool,
     controls_focus: FocusHandle,
+    /// Where the pointer rests on the seek bar, as a fraction of its width.
+    seek_hover: Option<f32>,
     #[cfg(test)]
     pub(super) renders: usize,
 }
@@ -16,6 +18,7 @@ impl PlayerBar {
             music,
             controls_expanded: false,
             controls_focus: cx.focus_handle(),
+            seek_hover: None,
             #[cfg(test)]
             renders: 0,
         }
@@ -34,8 +37,11 @@ impl Render for PlayerBar {
         }
         let expanded = self.controls_expanded && width < 1120.;
         let focus = self.controls_focus.clone();
+        let hover = self.seek_hover;
         self.music
-            .update(cx, |music, cx| music.player_bar(width, expanded, focus, cx))
+            .update(cx, |music, cx| {
+                music.player_bar(width, expanded, focus, hover, cx)
+            })
             .unwrap_or_else(|_| div().into_any_element())
     }
 }
@@ -187,19 +193,35 @@ impl Music {
         width: f32,
         expanded: bool,
         controls_focus: FocusHandle,
+        seek_hover: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let compact = width < 1120.;
         let theme = self.theme;
         let current = self.library.queue.current().cloned();
         let seek_position = self.seek_drag_position();
-        let position = seek_position.unwrap_or_else(|| self.playback_position());
+        // A drag previews its time above the bar; the time beside the
+        // controls keeps showing where playback is, as on the web.
+        let position = self.playback_position();
         let transport = self.transport();
-        let progress = if transport.duration > 0. {
-            (position / transport.duration).clamp(0., 1.) as f32
-        } else {
-            0.
+        let fraction = |seconds: f64| {
+            if transport.duration > 0. {
+                (seconds / transport.duration).clamp(0., 1.) as f32
+            } else {
+                0.
+            }
         };
+        let progress = fraction(seek_position.unwrap_or(position));
+        let buffered = fraction(
+            self.buffered
+                .filter(|(id, _)| Some(*id) == self.active_id)
+                .map_or(0., |(_, seconds)| seconds),
+        );
+        let preview = seek_position
+            .map(fraction)
+            .or(seek_hover)
+            .filter(|_| transport.duration > 0.)
+            .map(|at| (at, seek_label(at, transport.duration)));
         let playing = transport.status == media_controls::PlaybackStatus::Playing;
         let previous = transport_control(
             "previous",
@@ -353,8 +375,27 @@ impl Music {
                             view.start_seek_drag(event.position, cx);
                         }),
                     )
+                    .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                        let bounds = view.seek_bounds.get();
+                        let at =
+                            ((event.position.x - bounds.left()) / bounds.size.width).clamp(0., 1.);
+                        view.player_bar.update(cx, |bar, cx| {
+                            bar.seek_hover = Some(at);
+                            cx.notify();
+                        });
+                    }))
+                    .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                        if !hovered {
+                            view.player_bar.update(cx, |bar, cx| {
+                                bar.seek_hover = None;
+                                cx.notify();
+                            });
+                        }
+                    }))
                     .child(seek_bar(
                         progress,
+                        buffered,
+                        preview,
                         seek_bounds,
                         seek_position.is_some(),
                         theme,
