@@ -168,7 +168,6 @@ impl Render for Music {
         }
         let native_video = self.player_open
             && self.library.video
-            && self.overlay.as_ref().is_none_or(Overlay::in_page)
             && self.active_id.is_some()
             && self.playback != Playback::Stopped
             && self.video_error.is_none();
@@ -204,9 +203,25 @@ impl Render for Music {
             Some(Overlay::Account) => Some(self.account_popup(window, cx)),
             Some(kind) if !kind.in_page() => Some(self.overlay(kind, window, cx)),
             _ => None,
+        };
+        if overlay.is_none()
+            && let Some(video) = &self.video
+        {
+            video.set_cutouts(&[], window);
         }
-        .map(|overlay| {
+        let covers = self.player_page.video_covers.clone();
+        let view = cx.weak_entity();
+        let overlay = overlay.map(|overlay| {
             div()
+                // Runs once the dialog or menu inside has reported where it covers the video.
+                .on_children_prepainted(move |_, window, cx| {
+                    let covers = covers.take();
+                    let _ = view.update(cx, |view, _| {
+                        if let Some(video) = &view.video {
+                            video.set_cutouts(&covers, window);
+                        }
+                    });
+                })
                 .id("overlay-focus")
                 .track_focus(&self.overlay_focus)
                 .tab_group()

@@ -374,7 +374,11 @@ impl Music {
                                 point(window.viewport_size().width / 2., px(200.))
                             }))
                             .snap_to_window_with_margin(px(24.))
-                            .child(menu),
+                            .child(
+                                div()
+                                    .on_children_prepainted(self.covers_video())
+                                    .child(menu),
+                            ),
                     ),
             );
         }

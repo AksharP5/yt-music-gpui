@@ -35,6 +35,10 @@ impl NativeVideo {
         match *self {}
     }
 
+    pub(crate) fn set_cutouts(&self, _: &[Bounds<Pixels>], _: f32) {
+        match *self {}
+    }
+
     pub(crate) fn stop(&self) {
         match *self {}
     }

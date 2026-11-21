@@ -23,12 +23,16 @@ unsafe extern "C" {
         pixel_width: i32,
         pixel_height: i32,
     ) -> i32;
+    fn video_set_cutouts(video: *mut c_void, rects: *const i32, count: i32) -> i32;
     fn video_status(video: *mut c_void) -> i32;
     fn video_stop(video: *mut c_void);
     fn video_destroy(video: *mut c_void);
 }
 
 pub const SUPPORTED: bool = true;
+
+/// `VIDEO_CUTOUTS` in native/video.c.
+const CUTOUTS: usize = 4;
 
 /// Call before GPUI or libmpv starts: hardware decoders can also use Xlib.
 pub fn initialize() -> Result<()> {
@@ -198,6 +202,27 @@ impl NativeVideo {
             "Could not resize the video surface"
         );
         Ok(())
+    }
+
+    /// X11 draws the video window above the app, so it leaves out the given window
+    /// rectangles, where dialogs and menus cover the video. Wayland places the video
+    /// below the window, where they already draw over it.
+    pub(crate) fn set_cutouts(&self, cutouts: &[Bounds<Pixels>], scale: f32) {
+        if !self.x11 {
+            return;
+        }
+        let rects: Vec<i32> = cutouts
+            .iter()
+            .filter_map(|bounds| Geometry::new(*bounds, scale, true).ok())
+            .take(CUTOUTS)
+            .flat_map(|cutout| [cutout.x, cutout.y, cutout.width, cutout.height])
+            .collect();
+        let Ok(handle) = self.handle.try_lock() else {
+            return;
+        };
+        if let Some(handle) = *handle {
+            unsafe { video_set_cutouts(handle.as_ptr(), rects.as_ptr(), rects.len() as i32 / 4) };
+        }
     }
 
     pub(crate) fn stop(&self) {

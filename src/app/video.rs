@@ -3,6 +3,16 @@
 use super::*;
 
 impl Music {
+    /// Collects the bounds of the children of the element it is attached to: a dialog or
+    /// menu that can sit over the video. X11 draws the video above the app, so the window
+    /// cuts these out of it.
+    pub(in crate::app) fn covers_video(
+        &self,
+    ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
+        let covers = self.player_page.video_covers.clone();
+        move |bounds, _, _| covers.borrow_mut().extend(bounds)
+    }
+
     /// The video surface. libmpv draws into its bounds through the transparent window.
     pub(in crate::app) fn video_viewport(
         &mut self,
@@ -11,8 +21,7 @@ impl Music {
     ) -> Stateful<Div> {
         let fullscreen = window.is_fullscreen();
         let current = self.library.queue.current();
-        let native = self.overlay.is_none()
-            && self.active_id.is_some()
+        let native = self.active_id.is_some()
             && self.playback != Playback::Stopped
             && self.video_error.is_none()
             && self.video.is_some();
