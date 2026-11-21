@@ -96,6 +96,8 @@ Right-click a song, card or collection for its menu. Use ↑ and ↓ to move bet
 
 The player keeps the selected tab when you change tracks. Lyrics, Comments and Related show when their content is unavailable.
 
+In short windows with enough width, the player moves the tabs and queue beside the artwork or video to keep both usable.
+
 **Add to queue** and **Play next** show the first song in an empty queue. Press Play to start listening. When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected duration when available, including when switching between Song and Video.
 
 Adding, scheduling, or removing a queued song shows a confirmation, including in **Up next**.

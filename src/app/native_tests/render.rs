@@ -2643,6 +2643,46 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires a private native desktop and D-Bus; synthetic tracks only"]
+fn short_player_window_keeps_video_and_queue_visible() -> Result<()> {
+    super::navigation::check_cache_window(async |window, cx| {
+        for (width, height, side_by_side) in [(914., 481., true), (850., 700., false)] {
+            window
+                .update(cx, |music, window, cx| {
+                    let songs = music.page.tracks();
+                    music.library.queue.replace(songs, 0);
+                    music.library.video = true;
+                    music.player_open = true;
+                    window.resize(size(px(width), px(height)));
+                    cx.notify();
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            window
+                .update(cx, |music, window, _| {
+                    assert_eq!(window.viewport_size(), size(px(width), px(height)));
+                    let video = music.player_page.video_bounds.get().unwrap();
+                    let queue = music.player_page.queue_bounds.get();
+                    assert!(
+                        video.size.width >= px(240.),
+                        "Video must be legible at {width}x{height}: {video:?}"
+                    );
+                    assert!(
+                        queue.size.height >= px(57.),
+                        "Up next must show a complete song row: {queue:?}"
+                    );
+                    if side_by_side {
+                        assert!(video.right() <= queue.left());
+                    } else {
+                        assert!(video.bottom() <= queue.top());
+                    }
+                })
+                .unwrap();
+        }
+    })
+}
+
+#[test]
 #[ignore = "requires an isolated X11 desktop and ImageMagick to read player panel frames"]
 fn player_tabs_stop_loading_when_track_details_fail() -> Result<()> {
     use crate::app::playback::{PlaybackQuery, PlaybackResult, QueueUpdate};
