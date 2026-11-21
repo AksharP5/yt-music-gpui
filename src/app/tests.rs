@@ -513,6 +513,14 @@ fn displayed_durations_round_partial_seconds_up_like_the_web() {
 }
 
 #[test]
+fn the_seek_preview_counts_whole_seconds_under_the_pointer() {
+    // Hover times music.youtube.com showed across Levitating's 230.121 s video.
+    for (at, expected) in [(0.0874, "0:20"), (0.5874, "2:15"), (0.9824, "3:46")] {
+        assert_eq!(super::seek_label(at, 230.121), expected);
+    }
+}
+
+#[test]
 fn the_restored_position_applies_once_and_only_to_its_song() {
     let track = |id: &str| Track {
         id: id.into(),
