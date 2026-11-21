@@ -163,7 +163,7 @@ struct Spacing {
 impl Spacing {
     fn for_width(width: f32) -> Self {
         let (vertical, horizontal, gap, side) = match width {
-            ..936. => (16., 32., 32., 1.),
+            ..936. => (16., 32., 32., 0.42),
             ..1150. => (24., 48., 48., 0.4),
             ..1364. => (32., 56., 56., 0.36),
             ..1578. => (40., 56., 56., 0.36),
@@ -345,8 +345,14 @@ impl Music {
         }
         self.load_visible_tab();
         let spacing = Spacing::for_width(width);
-        let stacked = width < 936.;
         let inner = width - sidebar - spacing.horizontal * 2.;
+        // Stacking reserves room for the tabs, queue header, Autoplay and a song row.
+        let stacked_height = (width * 0.5625)
+            .min(height * 0.5)
+            .min((height - spacing.vertical - 256.).max(TOGGLE_HEIGHT));
+        // Short windows can have enough width for both panes even when stacking
+        // leaves almost no room for artwork or video above the queue.
+        let stacked = width < 936. && (inner < 560. || stacked_height - TOGGLE_HEIGHT >= 96.);
         let side = if stacked { inner } else { inner * spacing.side };
         let main_width = if stacked {
             inner
@@ -354,10 +360,7 @@ impl Music {
             inner - side - spacing.gap
         };
         let main_height = if stacked {
-            // Leave room for the tabs, queue header, Autoplay and one complete row.
-            (width * 0.5625)
-                .min(height * 0.5)
-                .min((height - spacing.vertical - 256.).max(TOGGLE_HEIGHT))
+            stacked_height
         } else {
             height - spacing.vertical * 2.
         };
