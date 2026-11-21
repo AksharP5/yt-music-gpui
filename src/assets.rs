@@ -104,6 +104,11 @@ impl AssetSource for Assets {
                 "../assets/icons/exit-fullscreen.svg"
             ))),
             "help" => Some(Cow::Borrowed(include_bytes!("../assets/icons/help.svg"))),
+            "premium" => Some(Cow::Borrowed(include_bytes!("../assets/icons/premium.svg"))),
+            "policy" => Some(Cow::Borrowed(include_bytes!("../assets/icons/policy.svg"))),
+            "feedback" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/feedback.svg"
+            ))),
             "menu" => Some(Cow::Borrowed(include_bytes!("../assets/icons/menu.svg"))),
             "person" => Some(Cow::Borrowed(include_bytes!("../assets/icons/person.svg"))),
             "more" => Some(Cow::Borrowed(include_bytes!("../assets/icons/more.svg"))),

@@ -198,9 +198,11 @@ impl Music {
                                 .child(button("guest-account-menu", "more", self.theme).on_click(
                                     cx.listener(move |view, _, window, cx| {
                                         view.open_overlay(Overlay::Account, window, cx);
+                                        // Like the web, the menu hangs from the button's bottom
+                                        // edge, its right edge level with the icon's.
                                         view.overlay_anchor = Some(point(
-                                            window.viewport_size().width - px(account_inset + 380.),
-                                            px(56.),
+                                            window.viewport_size().width - px(account_inset + 391.),
+                                            px(52.),
                                         ));
                                     }),
                                 ))
