@@ -45,20 +45,78 @@ impl Music {
             }))
     }
 
-    pub(in crate::app) fn sidebar(&self, compact: bool, cx: &Context<Self>) -> impl IntoElement {
+    /// The full guide drawn over the dimmed window, as the web opens it below 936px.
+    pub(in crate::app) fn guide_drawer(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("guide-drawer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::black().opacity(0.5))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.guide_drawer = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("guide-drawer-panel")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(240.))
+                    .flex()
+                    .flex_col()
+                    .bg(self.theme.bg)
+                    .border_r_1()
+                    .border_color(self.theme.border)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .h(px(HEADER_HEIGHT))
+                            .flex_shrink_0()
+                            .px(px(16.))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(button("guide-close", "close", self.theme).on_click(
+                                cx.listener(|view, _, _, cx| {
+                                    view.guide_drawer = false;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(self.brand_home("drawer-brand-home", cx)),
+                    )
+                    .child(self.sidebar(false, true, cx)),
+            )
+            .into_any_element()
+    }
+
+    pub(in crate::app) fn sidebar(
+        &self,
+        compact: bool,
+        drawer: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let width = if compact { 72. } else { 240. };
-        let scrolled = self.page_scrolled();
+        // The drawer draws its own background and edge.
+        let scrolled = !drawer && self.page_scrolled();
         let mut sidebar = div()
             .id("sidebar")
             .relative()
             .w(px(width))
-            .h_full()
+            .when(drawer, |sidebar| sidebar.flex_1().min_h_0())
+            .when(!drawer, |sidebar| sidebar.h_full())
             .flex_shrink_0()
             .flex()
             .flex_col()
             .px(px(8.))
-            .pt(px(8.))
-            .when(!compact, |sidebar| {
+            .when(!drawer, |sidebar| sidebar.pt(px(8.)))
+            .when(!compact && !drawer, |sidebar| {
                 sidebar.border_r_1().border_color(self.theme.border)
             })
             .when(!compact || scrolled, |sidebar| sidebar.bg(self.theme.bg))

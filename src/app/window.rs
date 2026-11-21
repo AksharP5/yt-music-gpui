@@ -97,7 +97,7 @@ impl Music {
     }
 
     pub(in crate::app) fn sidebar_compact(&self, width: f32) -> bool {
-        self.sidebar_collapsed.unwrap_or(width < 936.)
+        width < GUIDE_DRAWER_BELOW || self.sidebar_collapsed
     }
 
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -114,7 +114,7 @@ impl Music {
         let inset = if width >= 1150. { 100. } else { 56. };
         let background = self.page_background(compact, width, height, window, cx);
         let header = (!fullscreen).then(|| self.header(inset, compact, width, cx));
-        let sidebar = (!fullscreen).then(|| self.sidebar(compact, cx).into_any_element());
+        let sidebar = (!fullscreen).then(|| self.sidebar(compact, false, cx).into_any_element());
         let divider = (!fullscreen).then(|| self.header_divider()).flatten();
         let content = if player_page {
             let body = height - player_bar_height(width) - if fullscreen { 0. } else { 64. };
@@ -199,6 +199,8 @@ impl Render for Music {
             ..Default::default()
         });
         let player = has_player.then(|| self.player_bar.clone());
+        let drawer =
+            (self.guide_drawer && width < GUIDE_DRAWER_BELOW).then(|| self.guide_drawer(cx));
         let overlay = match &self.overlay {
             Some(Overlay::Account) => Some(self.account_popup(window, cx)),
             Some(kind) if !kind.in_page() => Some(self.overlay(kind, window, cx)),
@@ -270,6 +272,7 @@ impl Render for Music {
             )
             .child(content)
             .children(player)
+            .children(drawer)
             .children(overlay)
             .children(toast)
     }
