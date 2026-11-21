@@ -731,6 +731,14 @@ impl VideoAttachment {
         }
     }
 
+    /// Leave the window rectangles of dialogs and menus out of the video, for the
+    /// platforms that draw it above the window.
+    pub fn set_cutouts(&self, cutouts: &[Bounds<Pixels>], window: &Window) {
+        if let VideoState::Attached(binding) = &*self.binding.borrow() {
+            binding.video.set_cutouts(cutouts, window.scale_factor());
+        }
+    }
+
     /// Retire the renderer off the UI thread. Window close and app quit drain cleanup.
     /// Also clears a previous failure to allow an explicit user retry.
     pub fn detach(&self) {

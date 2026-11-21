@@ -65,7 +65,7 @@ pub(in crate::app) enum Overlay {
 
 impl Overlay {
     /// Popovers drawn in the page beside their button rather than above it. They leave the
-    /// rest of the page clickable and native video visible.
+    /// rest of the page clickable.
     pub(in crate::app) fn in_page(&self) -> bool {
         matches!(
             self,
@@ -590,6 +590,7 @@ impl Music {
 
     pub(in crate::app) fn backdrop(&self, body: AnyElement, cx: &Context<Self>) -> AnyElement {
         div()
+            .on_children_prepainted(self.covers_video())
             .id("dialog-focus")
             .absolute()
             .inset_0()
@@ -1274,13 +1275,15 @@ impl Music {
                         .position(position)
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            body.children(actions)
-                                .w(px(MENU_WIDTH))
-                                .px(px(0.))
-                                .py(px(16.))
-                                .rounded(px(2.))
-                                .max_h(viewport.height - px(16.))
-                                .track_scroll(&self.menu_scroll),
+                            div().on_children_prepainted(self.covers_video()).child(
+                                body.children(actions)
+                                    .w(px(MENU_WIDTH))
+                                    .px(px(0.))
+                                    .py(px(16.))
+                                    .rounded(px(2.))
+                                    .max_h(viewport.height - px(16.))
+                                    .track_scroll(&self.menu_scroll),
+                            ),
                         ),
                 )
                 .into_any_element();
