@@ -347,6 +347,7 @@ pub struct Player {
     events: async_channel::Receiver<PlayerEvent>,
     next_id: AtomicU64,
     next: Mutex<Option<PreparedTarget>>,
+    lookup: Option<native::Lookup>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -369,6 +370,7 @@ impl Player {
         let (commands, receiver) = command_channel()?;
         let wake = commands.wake.clone();
         let (events, event_receiver) = async_channel::unbounded();
+        let warm_up = lookup.clone();
         let worker = thread::Builder::new()
             .name("music-player".into())
             .spawn(move || {
@@ -384,8 +386,19 @@ impl Player {
             events: event_receiver,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: warm_up,
             worker: Some(worker),
         })
+    }
+
+    /// Fetch the fast lookup's visitor ID in the background, so the first
+    /// click on an unprepared song skips that page load.
+    pub fn warm_up(&self) {
+        if let Some(lookup) = self.lookup.clone() {
+            let _ = thread::Builder::new()
+                .name("lookup-warm-up".into())
+                .spawn(move || lookup.warm_up());
+        }
     }
 
     pub fn play(&self, video_id: &str, title: &str, options: PlayOptions) -> Result<u64> {
@@ -1141,7 +1154,11 @@ impl ResolvedStream {
                 parsed.scheme() == "https"
                     && parsed
                         .host_str()
-                        .is_some_and(|host| host.ends_with(".googlevideo.com")),
+                        .is_some_and(|host| host.ends_with(".googlevideo.com"))
+                    // Tests play prepared streams from local files with this suffix.
+                    || cfg!(test)
+                        && parsed.scheme() == "file"
+                        && parsed.path().ends_with(".test-stream.wav"),
                 "Unsupported prepared stream host"
             );
             if let Some(expiry) = parsed.query_pairs().find_map(|(name, value)| {
@@ -2084,10 +2101,19 @@ fn run(
                         quality: options.quality,
                         video: options.video,
                     };
+                    // A reload that skips the fast lookup must not get its stream back.
+                    // Any other play of the prepared song, such as resuming the restored
+                    // song partway in, loads the prepared stream under its own ID.
                     let resolved = prepared.take().filter(|(target, stream)| {
-                        target.track_id == track_id && stream.matches(&key)
+                        stream.matches(&key)
+                            && (target.track_id == track_id || !options.full_lookup)
                     });
-                    let prefetched = resolved.is_some()
+                    // mpv moves to an appended entry only from a file it is playing.
+                    // An idle player, as at startup, loads the prepared stream instead.
+                    let prefetched = resolved
+                        .as_ref()
+                        .is_some_and(|(target, _)| target.track_id == track_id)
+                        && state.file_active
                         && state.entries.values().any(|entry| *entry == track_id);
                     next_target = None;
                     pending_play = None;
@@ -3860,6 +3886,7 @@ YtMusicAccountIE._real_extract = extract
             events,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         player
@@ -4484,6 +4511,7 @@ YtMusicAccountIE._real_extract = extract
             events,
             next_id: AtomicU64::new(2),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -4867,6 +4895,7 @@ YtMusicAccountIE._real_extract = extract
             events,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         for start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.] {
@@ -5412,6 +5441,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
             events,
             next_id: AtomicU64::new(1),
             next: Mutex::new(None),
+            lookup: None,
             worker: None,
         };
         let cleared = player.clear_credentials().unwrap();
@@ -6503,6 +6533,85 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 }
             }
             assert_eq!(requested, reload, "buffer {buffer}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires libmpv; uses a synthetic extractor, local silent audio, null audio and no network"]
+    fn idle_player_plays_the_restored_song_from_its_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("restored.test-stream.wav");
+        fs::rename(silent_audio(directory.path(), 60), &path).unwrap();
+        // Each resolution appends a line, so a play that resolves again is caught.
+        let calls = directory.path().join("calls");
+        let extractor = directory.path().join("extractor");
+        fs::write(
+            &extractor,
+            format!(
+                "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\necho >> '{}'\nprintf 'file://%s\\n' '{}'\n",
+                calls.display(),
+                path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let resolutions = || fs::read_to_string(&calls).map_or(0, |calls| calls.lines().count());
+        // A new player each time, idle as at launch: the restored song from the
+        // start, then one restored partway in.
+        for (start, step) in [(0., "from the start"), (20., "resumed at 0:20")] {
+            let player = Player::with_extractor(
+                PlayerOptions {
+                    volume: 0.,
+                    audio_output: Some("null".into()),
+                    ..Default::default()
+                },
+                extractor.clone(),
+            )
+            .unwrap();
+            let wait_for = |stage: &str, predicate: &dyn Fn(&PlayerEvent) -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{step}, {stage}: the player never got there"
+                    );
+                    match player.try_recv() {
+                        Some(PlayerEvent::Error { message, .. }) => {
+                            panic!("{step}, {stage}: {message}")
+                        }
+                        Some(event) if predicate(&event) => break,
+                        Some(_) => {}
+                        None => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            };
+            player
+                .prepare_next(Some("abcdefghijk"), PlayOptions::default())
+                .unwrap();
+            wait_for("preparing", &|event| {
+                matches!(event, PlayerEvent::Prepared { .. })
+            });
+            let prepared = resolutions();
+            let id = player
+                .play(
+                    "abcdefghijk",
+                    "Restored",
+                    PlayOptions {
+                        start,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            wait_for("playing", &|event| {
+                matches!(event, PlayerEvent::Position { track_id, seconds }
+                    if *track_id == id && *seconds > start + 0.2)
+            });
+            assert_eq!(
+                resolutions(),
+                prepared,
+                "{step}: Play resolved the song again"
+            );
         }
     }
 
