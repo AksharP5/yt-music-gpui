@@ -836,9 +836,9 @@ impl Music {
     }
 
     pub(in crate::app) fn enqueue(&mut self, track: Track, cx: &mut Context<Self>) {
-        self.notice = Some(format!("Added {} to the queue", track.title));
         self.library.queue.tracks_mut().push(track);
         self.queue_changed(cx);
+        self.show_toast("Added to queue", cx);
     }
 
     pub(in crate::app) fn queue_changed(&mut self, cx: &mut Context<Self>) {
@@ -859,6 +859,9 @@ impl Music {
     }
 
     pub(in crate::app) fn remove_queue_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.library.queue.tracks.len() {
+            return;
+        }
         self.cancel_queue_drag();
         let playback = self
             .queue_waiting
@@ -882,6 +885,7 @@ impl Music {
                 self.follow_queue_selection(playback, cx);
             }
         }
+        self.show_toast("Removed from queue", cx);
         if self.library.queue.tracks.is_empty() && !self.library.queue.incomplete {
             self.clear_queue(cx);
             return;

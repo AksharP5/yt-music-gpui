@@ -809,7 +809,9 @@ fn queue_menu_actions_show_the_first_song_without_starting_playback() -> anyhow:
                     window.focus(&view.focus, cx);
                 })
                 .unwrap();
-            for (track, steps) in tracks.iter().zip([first_action, second_action]) {
+            for (index, (track, steps)) in
+                tracks.iter().zip([first_action, second_action]).enumerate()
+            {
                 window
                     .update(cx, |view, window, cx| {
                         view.open_track_menu(track.clone(), None, window, cx);
@@ -821,8 +823,24 @@ fn queue_menu_actions_show_the_first_song_without_starting_playback() -> anyhow:
                     key(window, cx, "down").await;
                 }
                 key(window, cx, "enter").await;
+                let confirmation = if steps == 1 {
+                    "Will play next"
+                } else {
+                    "Added to queue"
+                };
+                window
+                    .update(cx, |view, _, _| {
+                        assert_eq!(
+                            view.toast.as_ref().map(|toast| toast.text.as_ref()),
+                            Some(confirmation)
+                        );
+                        assert_eq!(view.player_open, index == 1);
+                    })
+                    .unwrap();
+                if index == 0 {
+                    key(window, cx, "q").await;
+                }
             }
-            key(window, cx, "q").await;
             window
                 .update(cx, |view, _, _| {
                     let queue = &view.library.queue;
