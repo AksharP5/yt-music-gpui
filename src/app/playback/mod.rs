@@ -468,7 +468,7 @@ impl Music {
                 },
             )
         {
-            self.error = Some(error.to_string());
+            self.error.get_or_insert_with(|| error.to_string());
         }
     }
 

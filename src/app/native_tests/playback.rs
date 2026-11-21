@@ -13,6 +13,43 @@ fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> cr
     crate::app::sync::tests::response(&[("Songs", indices.collect())], token, true)
 }
 
+#[test]
+#[ignore = "requires an isolated desktop, private D-Bus and libmpv; uses null audio"]
+fn restored_song_preparation_preserves_the_player_startup_error() -> Result<()> {
+    use super::navigation::{check_cache_window, reply};
+    use crate::player::{Player, PlayerEvent, PlayerOptions};
+
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, _, cx| {
+                view.startup_settled = false;
+                view.navigate(Route::Home, cx);
+                let page = continuation_page(0..1, None);
+                view.library.queue.replace(page.tracks(), 0);
+                let mut player = Player::new(PlayerOptions {
+                    audio_output: Some("null".into()),
+                    volume: 0.,
+                    ..Default::default()
+                })
+                .unwrap();
+                player.shutdown().unwrap();
+                view.player = Some(player);
+                let error = "Could not initialize mpv";
+                view.player_event(
+                    PlayerEvent::Error {
+                        track_id: None,
+                        message: error.into(),
+                    },
+                    cx,
+                );
+
+                reply(view, page, cx);
+                assert_eq!(view.error.as_deref(), Some(error));
+            })
+            .unwrap();
+    })
+}
+
 fn collection_source() -> CollectionPlayback {
     let details = crate::catalog::parse_page(&serde_json::json!({
         "header":{"musicResponsiveHeaderRenderer":{"title":{"simpleText":"Synthetic playlist"},"buttons":[

@@ -31,7 +31,7 @@ bin/install
 
 ## How playback works
 
-The player runs on its own thread (`src/player.rs`). It blocks on mpv's IPC socket, a command eventfd and the extractor's output, so an idle player has no timer.
+The player runs on its own thread (`src/player.rs`). It blocks on mpv's IPC socket, a command eventfd and the extractor's output. A stopped player blocks without a timer when it has no prepared track or active lookup.
 
 A clicked song uses a native, cookie-free player request (`src/player/native.rs`) that skips the watch page and never waits on yt-dlp. If that request fails, or the chosen format needs JavaScript to decode its URL, the same play falls back to yt-dlp. The next song is prepared in the background. Once the first page has loaded, the app also prepares the song Play would start while nothing plays, such as the one restored at launch, or with an empty queue fetches the visitor ID the first click needs. Signed-in High audio quality and video above 1080p always go through yt-dlp, which uses your account to get Premium formats.
 
