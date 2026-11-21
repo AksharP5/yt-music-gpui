@@ -184,6 +184,7 @@ pub struct Music {
     overlay_button: Option<Bounds<Pixels>>,
     overlay_focus: FocusHandle,
     menu_scroll: ScrollHandle,
+    collection_header_scroll: ScrollHandle,
     picker_focus: VirtualListFocus<crate::playlist_choices::Destination>,
     picker_scroll: UniformListScrollHandle,
     settings_focus: FocusHandle,

@@ -435,6 +435,7 @@ impl Music {
             overlay_button: None,
             overlay_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
+            collection_header_scroll: ScrollHandle::new(),
             picker_focus: VirtualListFocus::default(),
             picker_scroll: UniformListScrollHandle::new(),
             settings_focus: cx.focus_handle(),
