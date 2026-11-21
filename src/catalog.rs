@@ -344,8 +344,9 @@ pub struct TrackDetails {
     /// "Song • Daft Punk • 28M plays" in search results.
     #[serde(skip)]
     pub byline: Option<String>,
-    /// Artist, album and show links in service byline order.
-    #[serde(skip)]
+    /// Artist, album and show links in service byline order. Saved so a
+    /// restored queue's player bar links its artists before the song plays.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<BrowseLink>,
     #[serde(skip)]
     pub explicit: bool,
@@ -487,13 +488,16 @@ pub struct Collection {
     pub details: CollectionDetails,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowseLink {
     pub title: String,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chart_country: Option<String>,
     /// The colored stripe on a mood or genre button, as 0xRRGGBB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accent: Option<u32>,
 }
 

@@ -92,6 +92,25 @@ fn tinted_control(
         }))
 }
 
+/// The bar's "Artist • Album • Year" line and the artist and album links in
+/// it. Search and chart rows can omit the album and its link, so the watch
+/// response for the current song fills them in once it loads.
+fn track_byline<'a>(track: &'a Track, issued: Option<&'a Track>) -> (String, &'a [BrowseLink]) {
+    let album = track.album.as_deref().or_else(|| issued?.album.as_deref());
+    let year = issued.and_then(|issued| issued.details.year.as_deref());
+    let text = [Some(track.artist.as_str()), album, year]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" • ");
+    let links = issued
+        .map(|issued| issued.details.links.as_slice())
+        .filter(|links| !links.is_empty())
+        .unwrap_or(&track.details.links);
+    (text, links)
+}
+
 impl Music {
     pub(in crate::app) fn collection_playback(&self) -> Option<&queue_source::CollectionPlayback> {
         let pending = self
@@ -207,24 +226,17 @@ impl Music {
             let liked = self.is_liked(&track);
             let disliked = is_disliked(&self.ratings, &track);
             let subtitle = match self.playback {
-                Playback::Loading { .. } => "Loading track…".into(),
+                Playback::Loading { .. } => "Loading track…".into_any_element(),
                 Playback::Loaded {
                     paused: false,
                     buffering: true,
-                } => "Buffering…".into(),
+                } => "Buffering…".into_any_element(),
                 _ => {
-                    // Search and chart rows can omit the album; the watch response has it.
                     let issued = self
                         .current_watch()
                         .and_then(|watch| watch.current.as_ref());
-                    let album = track.album.as_deref().or_else(|| issued?.album.as_deref());
-                    let year = issued.and_then(|issued| issued.details.year.as_deref());
-                    [Some(track.artist.as_str()), album, year]
-                        .into_iter()
-                        .flatten()
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" • ")
+                    let (text, links) = track_byline(&track, issued);
+                    self.linked_text(text, links, cx)
                 }
             };
             // music.youtube.com switches the bar text to 16 px at its large breakpoint.
@@ -562,5 +574,68 @@ impl Music {
                 cx,
                 |view, _, cx| view.shuffle_queue(cx),
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::track_byline;
+    use crate::app::pages::items::link_spans;
+    use crate::catalog::{BrowseLink, Track};
+
+    #[test]
+    fn current_track_links_each_artist_and_the_album_once_details_load() {
+        let artists = [
+            BrowseLink::new("UCshawn", "Shawn Mendes"),
+            BrowseLink::new("UCcamila", "Camila Cabello"),
+        ];
+        // A search row names both artists but not the album.
+        let mut searched = Track {
+            id: "abcdefghijk".into(),
+            title: "Señorita".into(),
+            artist: "Shawn Mendes & Camila Cabello".into(),
+            album: None,
+            duration: None,
+            thumbnail: None,
+            details: Default::default(),
+        };
+        searched.details.links = artists.to_vec();
+        let mut issued = searched.clone();
+        issued.album = Some("Señorita".into());
+        issued.details.year = Some("2019".into());
+        issued.details.links =
+            [&artists[..], &[BrowseLink::new("MPREsenorita", "Señorita")]].concat();
+
+        let targets = |track: &Track, issued: Option<&Track>| {
+            let (text, links) = track_byline(track, issued);
+            link_spans(&text, links)
+                .into_iter()
+                .map(|(text, link)| (text, link.map(|link| link.id)))
+                .collect::<Vec<_>>()
+        };
+        let link = |text: &str, id: Option<&str>| (text.to_owned(), id.map(str::to_owned));
+        assert_eq!(
+            targets(&searched, Some(&issued)),
+            [
+                link("Shawn Mendes", Some("UCshawn")),
+                link(" & ", None),
+                link("Camila Cabello", Some("UCcamila")),
+                link(" • ", None),
+                link("Señorita", Some("MPREsenorita")),
+                link(" • 2019", None),
+            ]
+        );
+
+        // A queue restored at launch has no watch details until it plays.
+        let restored: Track =
+            serde_json::from_str(&serde_json::to_string(&searched).unwrap()).unwrap();
+        assert_eq!(
+            targets(&restored, None),
+            [
+                link("Shawn Mendes", Some("UCshawn")),
+                link(" & ", None),
+                link("Camila Cabello", Some("UCcamila")),
+            ]
+        );
     }
 }

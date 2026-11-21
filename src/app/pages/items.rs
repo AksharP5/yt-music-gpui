@@ -131,20 +131,11 @@ impl Music {
         if spans.iter().all(|(_, link)| link.is_none()) {
             return text.into_any_element();
         }
-        let last = spans.len() - 1;
-        div()
-            .flex()
-            .min_w_0()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .children(spans.into_iter().enumerate().map(|(index, (span, link))| {
-                let span = div().child(span);
-                // Only the last span shrinks, so the line ends in an ellipsis.
-                let span = if index == last {
-                    span.min_w_0().truncate()
-                } else {
-                    span.flex_shrink_0()
-                };
+        let mut spans: Vec<_> = spans
+            .into_iter()
+            .enumerate()
+            .map(|(index, (span, link))| {
+                let span = div().min_w_0().truncate().child(span);
                 let Some(link) = link else {
                     return span.into_any_element();
                 };
@@ -158,7 +149,31 @@ impl Music {
                         view.navigate(Route::Browse(link.clone()), cx);
                     }))
                     .into_any_element()
-            }))
+            })
+            .collect();
+        // Like the web's one-line bylines, the text gives way from its end
+        // and ellipsizes there. Each span sits beside everything after it,
+        // and that tail shrinks to nothing before the span shrinks at all.
+        let Some(mut line) = spans.pop() else {
+            return text.into_any_element();
+        };
+        while let Some(span) = spans.pop() {
+            let mut tail = div().flex().min_w_0().overflow_hidden().child(line);
+            tail.style().flex_shrink = Some(1e9);
+            line = div()
+                .flex()
+                .min_w_0()
+                .overflow_hidden()
+                .child(span)
+                .child(tail)
+                .into_any_element();
+        }
+        div()
+            .flex()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(line)
             .into_any_element()
     }
 
@@ -920,7 +935,7 @@ impl RowStyle {
 /// Splits text into plain spans and the names that `links` open. Links come in
 /// the text's order, so each is looked for after the previous match; one the
 /// text does not contain is skipped.
-fn link_spans<'a>(
+pub(in crate::app) fn link_spans<'a>(
     text: &str,
     links: impl IntoIterator<Item = &'a BrowseLink>,
 ) -> Vec<(String, Option<BrowseLink>)> {
