@@ -1336,7 +1336,7 @@ fn natural_advancement_retries_a_failed_prefetch_and_continues_the_queue() -> Re
 
 #[test]
 #[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic queue and local connection failures only"]
-fn queue_retry_button_preserves_pause_and_a_stopped_retry_cannot_start_playback() -> Result<()> {
+fn queue_retry_keeps_the_next_intent_and_a_stopped_retry_cannot_play() -> Result<()> {
     use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
     super::navigation::check_cache_window(async |window, cx| {
         let client = reqwest::blocking::Client::builder()
@@ -1390,7 +1390,11 @@ fn queue_retry_button_preserves_pause_and_a_stopped_retry_cannot_start_playback(
                     "Failed prefetch must not change the current song's pause state"
                 );
                 view.next(false, cx);
-                assert!(view.queue_waiting.unwrap().playback.is_paused());
+                let intent = view.queue_waiting.unwrap().playback;
+                assert!(
+                    intent != Playback::Stopped && !intent.is_paused(),
+                    "Next from pause plays the song it reaches, as on the web"
+                );
             })
             .unwrap();
         let event = events.recv().await.unwrap();
@@ -1398,7 +1402,7 @@ fn queue_retry_button_preserves_pause_and_a_stopped_retry_cannot_start_playback(
             .update(cx, move |view, _, cx| {
                 view.queue_source_result(event, cx);
                 assert_eq!(view.playback, Playback::Stopped);
-                assert!(view.queue_waiting.unwrap().playback.is_paused());
+                assert!(!view.queue_waiting.unwrap().playback.is_paused());
                 assert!(view.queue_source.error().is_some());
                 assert!(view.library.queue.incomplete);
                 assert_eq!(view.library.queue.index, Some(0));
@@ -1439,10 +1443,10 @@ fn queue_retry_button_preserves_pause_and_a_stopped_retry_cannot_start_playback(
                     view.queue_source.error().is_none(),
                     "Clicking Retry must dispatch a new continuation request"
                 );
-                assert!(view.queue_waiting.unwrap().playback.is_paused());
+                assert!(!view.queue_waiting.unwrap().playback.is_paused());
                 assert!(
-                    view.playback.is_paused(),
-                    "Retry must preserve the paused queue's intent"
+                    matches!(view.playback, Playback::Loading { paused: false, .. }),
+                    "Retry must preserve the queue's intent"
                 );
                 view.stop_playback(cx);
             })
