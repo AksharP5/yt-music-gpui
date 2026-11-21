@@ -2854,3 +2854,158 @@ fn stacked_playlist_back_stays_above_a_retained_page_error() -> anyhow::Result<(
         );
     })
 }
+
+#[test]
+#[ignore = "requires an isolated X11 desktop, network, yt-dlp and ImageMagick; set YT_MUSIC_NATIVE_TESTS=1"]
+fn paused_video_stays_visible_under_menus() -> Result<()> {
+    use crate::{catalog::Track, player::VideoStatus, watch::WatchMode};
+
+    super::isolate()?;
+    let passed = Arc::new(AtomicBool::new(false));
+    let result = passed.clone();
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(move |cx| {
+            cx.text_system()
+                .add_fonts(vec![std::borrow::Cow::Borrowed(
+                    include_bytes!("../../../assets/fonts/Roboto.ttf").as_slice(),
+                )])
+                .unwrap();
+            crate::input::init(cx);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(0.), px(0.)),
+                            size(px(1280.), px(800.)),
+                        ))),
+                        kind: WindowKind::PopUp,
+                        focus: false,
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        cx.new(|cx| {
+                            let mut music = Music::new(Startup::Guest, None, window, cx);
+                            music.library.volume = 0.;
+                            music.player.as_ref().unwrap().set_volume(0.).unwrap();
+                            music
+                        })
+                    },
+                )
+                .unwrap();
+            cx.spawn(async move |cx| {
+                window
+                    .update(cx, |music, _, cx| {
+                        let video: Track = serde_json::from_value(serde_json::json!({
+                            "id": "kTJczUoc26U", "title": "STAY (Official Video)",
+                            "artist": "The Kid LAROI & Justin Bieber", "duration": 158,
+                        }))
+                        .unwrap();
+                        music.library.video = true;
+                        music.library.queue.replace(vec![video], 0);
+                        music.player_open = true;
+                        music.play_current_resuming(false, WatchMode::Details, cx);
+                    })
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !window
+                    .update(cx, |music, _, _| {
+                        music.playback.is_advancing()
+                            && music.position > 3.
+                            && music
+                                .video
+                                .as_ref()
+                                .is_some_and(|video| video.status() == VideoStatus::Ready)
+                    })
+                    .unwrap()
+                {
+                    assert!(Instant::now() < deadline, "The video did not start");
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                window
+                    .update(cx, |music, _, cx| music.toggle_play(cx))
+                    .unwrap();
+                let settle = async |cx: &mut AsyncApp| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(800))
+                        .await;
+                    wait_for_presented_frame(window, cx).await;
+                };
+                settle(cx).await;
+                let (paused, video, scale) = window
+                    .update(cx, |music, window, _| {
+                        assert!(music.playback.is_paused());
+                        (
+                            capture(window, "video-paused"),
+                            music.player_page.video_bounds.get().unwrap(),
+                            window.scale_factor(),
+                        )
+                    })
+                    .unwrap();
+                let pixel = |image: &image::RgbaImage, at: gpui::Point<gpui::Pixels>| {
+                    *image.get_pixel(
+                        (f32::from(at.x) * scale) as u32,
+                        (f32::from(at.y) * scale) as u32,
+                    )
+                };
+                let close = |a: image::Rgba<u8>, b: image::Rgba<u8>| {
+                    a.0.iter().zip(b.0).all(|(a, b)| a.abs_diff(b) <= 8)
+                };
+                let menu_color = image::Rgba([0x21, 0x21, 0x21, 0xff]);
+                // The menu opens over the right half of the frame and leaves its left half clear.
+                let beside = point(video.left() + px(60.), video.center().y);
+                let under = point(video.center().x + px(60.), video.center().y);
+                assert!(
+                    !close(pixel(&paused, under), menu_color),
+                    "Pick a frame point that differs from the menu"
+                );
+                window
+                    .update(cx, |music, window, cx| {
+                        let track = music.library.queue.current().unwrap().clone();
+                        music.open_track_menu(track, None, window, cx);
+                        music.overlay_anchor = Some(point(video.center().x, video.top()));
+                    })
+                    .unwrap();
+                settle(cx).await;
+                let menu = window
+                    .update(cx, |_, window, _| capture(window, "video-paused-menu"))
+                    .unwrap();
+                assert!(
+                    close(pixel(&menu, beside), pixel(&paused, beside)),
+                    "The paused frame must stay visible beside an open menu"
+                );
+                assert!(
+                    close(pixel(&menu, under), menu_color),
+                    "The menu must draw above the video"
+                );
+                window
+                    .update(cx, |music, window, cx| music.close_overlay(window, cx))
+                    .unwrap();
+                settle(cx).await;
+                let closed = window
+                    .update(cx, |_, window, _| capture(window, "video-paused-closed"))
+                    .unwrap();
+                assert!(
+                    close(pixel(&closed, under), pixel(&paused, under)),
+                    "Closing the menu must show the paused frame again"
+                );
+                passed.store(true, Ordering::SeqCst);
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(120))
+                    .await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    ensure!(
+        result.load(Ordering::SeqCst),
+        "Native video check exited before its assertions"
+    );
+    Ok(())
+}

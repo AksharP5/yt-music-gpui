@@ -16,6 +16,8 @@
 #include <string.h>
 #include "viewporter-client-protocol.h"
 
+#define VIDEO_CUTOUTS 4
+
 int video_initialize(void) {
     return XInitThreads() != 0;
 }
@@ -43,6 +45,9 @@ struct video {
     pthread_t worker;
     int started, stop, status, wake, geometry_dirty, x11, notify_fd;
     int x, y, width, height, pixel_width, pixel_height;
+    /* X11 only: window rectangles of dialogs and menus drawn over the video. */
+    XRectangle cutouts[VIDEO_CUTOUTS];
+    int cutout_count;
     mpv_handle *core;
 };
 
@@ -188,6 +193,30 @@ int video_resize(struct video *v, int x, int y, int width, int height, int pixel
     return 1;
 }
 
+/* An X11 child window covers its parent, so the app's dialogs and menus over the video
+   are cut out of it. A Wayland subsurface sits below the window and needs none.
+   `rects` holds x, y, width and height in window pixels for each cutout. */
+int video_set_cutouts(struct video *v, const int *rects, int count) {
+    if (!v->x11 || count < 0 || count > VIDEO_CUTOUTS) return 0;
+    XRectangle cutouts[VIDEO_CUTOUTS];
+    for (int i = 0; i < count; i++) {
+        const int *r = rects + 4 * i;
+        if (r[2] < 1 || r[3] < 1 || r[0] < -32768 || r[1] < -32768 ||
+            r[0] + r[2] > 32767 || r[1] + r[3] > 32767 || r[2] > 65535 || r[3] > 65535)
+            return 0;
+        cutouts[i] = (XRectangle){ r[0], r[1], r[2], r[3] };
+    }
+    pthread_mutex_lock(&v->mutex);
+    if (v->cutout_count != count || memcmp(v->cutouts, cutouts, count * sizeof(XRectangle)) != 0) {
+        memcpy(v->cutouts, cutouts, count * sizeof(XRectangle));
+        v->cutout_count = count;
+        v->geometry_dirty = 1;
+        pthread_cond_signal(&v->condition);
+    }
+    pthread_mutex_unlock(&v->mutex);
+    return 1;
+}
+
 static void wake_worker(void *data) {
     struct video *v = data;
     pthread_mutex_lock(&v->mutex);
@@ -291,6 +320,9 @@ static void *render_worker(void *data) {
         int stop = v->stop, dirty = v->geometry_dirty;
         int width = v->pixel_width, height = v->pixel_height;
         int x = v->x, y = v->y;
+        XRectangle cutouts[VIDEO_CUTOUTS];
+        int cutout_count = v->cutout_count;
+        memcpy(cutouts, v->cutouts, sizeof(cutouts));
         v->wake = 0;
         v->geometry_dirty = 0;
         pthread_mutex_unlock(&v->mutex);
@@ -299,6 +331,15 @@ static void *render_worker(void *data) {
         if (dirty) {
             if (v->x_display) {
                 XMoveResizeWindow(v->x_display, v->x_child, x, y, width, height);
+                if (cutout_count) {
+                    XRectangle whole = { 0, 0, width, height };
+                    XShapeCombineRectangles(v->x_display, v->x_child, ShapeBounding, 0, 0,
+                        &whole, 1, ShapeSet, Unsorted);
+                    XShapeCombineRectangles(v->x_display, v->x_child, ShapeBounding, -x, -y,
+                        cutouts, cutout_count, ShapeSubtract, Unsorted);
+                } else {
+                    XShapeCombineMask(v->x_display, v->x_child, ShapeBounding, 0, 0, None, ShapeSet);
+                }
                 if (!mapped) { XMapWindow(v->x_display, v->x_child); mapped = 1; }
                 XFlush(v->x_display);
             } else {
