@@ -49,6 +49,16 @@ impl Transport {
     }
 }
 
+/// Next and Previous play the song they move to, even from pause, as on
+/// music.youtube.com. Restarting the current song keeps its pause, and a stopped
+/// player only changes its selection.
+pub(in crate::app) fn skip_playback(playback: Playback) -> Playback {
+    match playback {
+        Playback::Stopped => Playback::Stopped,
+        playback => playback.with_pause(false),
+    }
+}
+
 /// The player's measurement when it belongs to this track, else the catalog length.
 pub(in crate::app) fn track_duration(track: &Track, measured: Option<&(String, f64)>) -> f64 {
     measured
@@ -125,7 +135,7 @@ impl Music {
 
 #[cfg(test)]
 mod tests {
-    use super::{Playback, Transport};
+    use super::{Playback, Transport, skip_playback};
     use crate::{
         catalog::Track,
         library::{Library, Repeat},
@@ -163,6 +173,25 @@ mod tests {
             thumbnail: None,
             details: Default::default(),
         }
+    }
+
+    #[test]
+    fn next_and_previous_play_from_pause_but_not_from_stop() {
+        for paused in [
+            Playback::Loaded {
+                paused: true,
+                buffering: false,
+            },
+            Playback::Loading {
+                paused: true,
+                retried: false,
+                full_lookup: false,
+            },
+        ] {
+            let playback = skip_playback(paused);
+            assert!(!playback.is_paused() && playback != Playback::Stopped);
+        }
+        assert_eq!(skip_playback(Playback::Stopped), Playback::Stopped);
     }
 
     #[test]
