@@ -465,6 +465,7 @@ impl Music {
     }
 
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.close_narrow_search(cx);
         // A guest's Liked Music is the local list of liked songs.
         let route = match route {
             Route::Browse(link) if self.account.is_none() && link.id == "VLLM" => Route::Liked,

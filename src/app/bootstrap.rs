@@ -294,6 +294,7 @@ impl Music {
                     Item::Navigation(_) => {}
                 },
                 SearchBoxEvent::Blur => window.focus(&view.focus, cx),
+                SearchBoxEvent::Collapse => view.close_narrow_search(cx),
             });
         let activation = cx.observe_window_activation(window, Self::window_activated);
         let focus_lost = cx.on_focus_lost(window, Self::restore_keyboard_focus);
@@ -352,6 +353,7 @@ impl Music {
             sidebar_focus: VirtualListFocus::default(),
             queue_focus: VirtualListFocus::default(),
             search,
+            search_open: false,
             route: Route::Home,
             page: Page {
                 title: "Home".into(),

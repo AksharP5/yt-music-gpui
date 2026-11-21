@@ -339,8 +339,12 @@ fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
     check_cache_window(async |window, cx| {
         window
             .update(cx, |music, window, cx| {
-                music.sidebar_collapsed = Some(false);
                 window.resize(size(px(850.), px(560.)));
+                // A narrow window shows the field once its search button opens it.
+                music.search_open = true;
+                music
+                    .search
+                    .update(cx, |search, cx| search.set_back(true, cx));
                 cx.notify();
             })
             .unwrap();
@@ -365,6 +369,15 @@ fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
             "Clicking outside must not select a suggestion"
         );
 
+        // Leaving the field folded it back into its button.
+        window
+            .update(cx, |music, _, cx| {
+                music.search_open = true;
+                music
+                    .search
+                    .update(cx, |search, cx| search.set_back(true, cx));
+            })
+            .unwrap();
         type_with_suggestions(window, cx).await;
         click(cx, 400.);
         wait_for_presented_frame(window, cx).await;
@@ -378,8 +391,12 @@ fn last_search_suggestion_is_clickable_in_a_short_window() -> anyhow::Result<()>
     check_cache_window(async |window, cx| {
         window
             .update(cx, |music, window, cx| {
-                music.sidebar_collapsed = Some(false);
                 window.resize(size(px(850.), px(560.)));
+                // A narrow window shows the field once its search button opens it.
+                music.search_open = true;
+                music
+                    .search
+                    .update(cx, |search, cx| search.set_back(true, cx));
                 cx.notify();
             })
             .unwrap();
