@@ -551,16 +551,30 @@ pub(in crate::app) fn slider(
     )
     .size_full()
 }
-/// The player bar's progress line: 2 px at rest, 4 px with a knob while hovered or dragged.
+/// The time the seek bar previews at a fraction of its width. Like the web,
+/// it counts whole elapsed seconds.
+pub(in crate::app) fn seek_label(at: f32, duration: f64) -> String {
+    clock((f64::from(at) * duration).floor())
+}
+
+/// The player bar's progress line: 2 px at rest, 4 px with a knob while
+/// hovered or dragged. The buffered range shows in a lighter grey, and
+/// `preview`, set while the pointer is on the bar or dragging, floats the
+/// time under it above the bar.
 pub(in crate::app) fn seek_bar(
     ratio: f32,
+    buffered: f32,
+    preview: Option<(f32, String)>,
     bounds: Rc<Cell<Bounds<Pixels>>>,
     dragging: bool,
     theme: Theme,
 ) -> impl IntoElement {
+    // The web scales its 14 px knob by 1.5 while dragging.
+    let knob = if dragging { 21. } else { 14. };
+    let active = preview.is_some();
+    let track = || div().absolute().top_0().left_0().h_full();
     div()
         .size_full()
-        .group("seek")
         .relative()
         .child(
             canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
@@ -575,9 +589,9 @@ pub(in crate::app) fn seek_bar(
                 .top(px(8.))
                 .h(px(2.))
                 .bg(gpui::white().opacity(0.1))
-                .when(dragging, |track| track.top(px(7.)).h(px(4.)))
-                .group_hover("seek", |track| track.top(px(7.)).h(px(4.)))
-                .child(div().h_full().w(relative(ratio)).bg(linear_gradient(
+                .when(active, |track| track.top(px(7.)).h(px(4.)))
+                .child(track().w(relative(buffered)).bg(gpui::white().opacity(0.1)))
+                .child(track().w(relative(ratio)).bg(linear_gradient(
                     90.,
                     linear_color_stop(theme.accent, 0.8),
                     linear_color_stop(rgb(0xff2791), 1.),
@@ -586,16 +600,39 @@ pub(in crate::app) fn seek_bar(
         .child(
             div()
                 .absolute()
-                .top(px(2.))
+                .top(px(9. - knob / 2.))
                 .left(relative(ratio))
-                .ml(px(-7.))
-                .size(px(14.))
+                .ml(px(-knob / 2.))
+                .size(px(knob))
                 .rounded_full()
                 .bg(theme.accent)
-                .invisible()
-                .when(dragging, |knob| knob.visible())
-                .group_hover("seek", |knob| knob.visible()),
+                .when(!active, |knob| knob.invisible()),
         )
+        .when_some(preview, |bar, (at, label)| {
+            // A zero-width anchor at the pointer centers the label on it.
+            bar.child(
+                div()
+                    .absolute()
+                    .bottom(px(16.))
+                    .left(relative(at))
+                    .w_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(2.))
+                            .bg(rgb(0x212121))
+                            .text_size(px(12.))
+                            .line_height(px(14.4))
+                            .text_color(gpui::white())
+                            .whitespace_nowrap()
+                            .child(label),
+                    ),
+            )
+        })
 }
 pub(in crate::app) fn clock(seconds: f64) -> String {
     let seconds = seconds.max(0.).round() as u64;
