@@ -1,7 +1,7 @@
 //! Watch workers, queue changes, autoplay, and track advancement.
 
 use super::super::*;
-use super::transport::PREVIOUS_RESTART_SECONDS;
+use super::transport::{PREVIOUS_RESTART_SECONDS, skip_playback};
 
 impl Music {
     pub(in crate::app) fn start_queue(&mut self, query: PlaybackQuery, cx: &mut Context<Self>) {
@@ -662,7 +662,14 @@ impl Music {
 
     pub(in crate::app) fn next(&mut self, natural: bool, cx: &mut Context<Self>) {
         self.finish_listening(natural);
-        let playback = self.playback;
+        let chosen = |playback| {
+            if natural {
+                playback
+            } else {
+                skip_playback(playback)
+            }
+        };
+        let playback = chosen(self.playback);
         if let Some(resume) = self
             .account_operation
             .as_mut()
@@ -699,6 +706,7 @@ impl Music {
             .take()
             .or(self.autoplay_waiting.take())
             .map_or(self.playback, |intent| intent.playback);
+        let playback = chosen(playback);
         self.advance_queue(QueueAdvance { natural, playback }, cx);
     }
 
@@ -806,17 +814,20 @@ impl Music {
             .take()
             .or(self.autoplay_waiting.take())
             .map_or(self.playback, |intent| intent.playback);
+        let restart = self.playback_position() > PREVIOUS_RESTART_SECONDS;
         if self.active_id.is_none() {
-            if self.playback_position() <= PREVIOUS_RESTART_SECONDS {
-                self.library.queue.previous();
-            }
+            let playback = if !restart && self.library.queue.previous() {
+                skip_playback(playback)
+            } else {
+                playback
+            };
             self.follow_queue_selection(playback, cx);
             return;
         }
-        if self.playback_position() > PREVIOUS_RESTART_SECONDS {
+        if restart {
             self.seek_current(0., cx);
         } else if self.library.queue.previous() {
-            self.follow_queue_selection(playback, cx);
+            self.follow_queue_selection(skip_playback(playback), cx);
         }
     }
 
