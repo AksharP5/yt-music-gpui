@@ -2,9 +2,11 @@
 
 pub(in crate::app) mod account;
 pub(in crate::app) mod settings;
+pub(in crate::app) mod share;
 
 use super::*;
 use crate::playlist_choices::{ChoiceList, Destination};
+use share::Share;
 
 // Music holds a single overlay, so the inline song in `Track` costs nothing worth a box.
 #[allow(clippy::large_enum_variant)]
@@ -58,11 +60,12 @@ pub(in crate::app) enum Overlay {
     PlaylistSort,
     /// The Comments tab's sort menu, drawn in the panel under its button.
     CommentSort,
+    Share(Share),
 }
 
 impl Overlay {
     /// Popovers drawn in the page beside their button rather than above it. They leave the
-    /// rest of the page clickable and native video visible.
+    /// rest of the page clickable.
     pub(in crate::app) fn in_page(&self) -> bool {
         matches!(
             self,
@@ -587,6 +590,7 @@ impl Music {
 
     pub(in crate::app) fn backdrop(&self, body: AnyElement, cx: &Context<Self>) -> AnyElement {
         div()
+            .on_children_prepainted(self.covers_video())
             .id("dialog-focus")
             .absolute()
             .inset_0()
@@ -619,6 +623,7 @@ impl Music {
             Overlay::PlaylistPicker { .. } => {
                 return self.playlist_picker_dialog(window, cx);
             }
+            Overlay::Share(share) => return self.share_dialog(share, cx),
             _ => {}
         }
         if let Overlay::CountryPicker(picker) = kind {
@@ -672,7 +677,8 @@ impl Music {
                                 Overlay::Settings
                                 | Overlay::Account
                                 | Overlay::SignIn
-                                | Overlay::PlaylistPicker { .. } => {
+                                | Overlay::PlaylistPicker { .. }
+                                | Overlay::Share(_) => {
                                     // Rendered by their own dialogs above.
                                     String::new()
                                 }
@@ -1037,12 +1043,10 @@ impl Music {
                     },
                 ));
             }
-            let url = format!("https://music.youtube.com/watch?v={}", track.id);
+            let shared = track.clone();
             actions.push(
-                self.menu_action("menu-share", "Share", cx, move |view, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                    view.notice = Some("Link copied".into());
-                    cx.notify();
+                self.menu_action("menu-share", "Share", cx, move |view, window, cx| {
+                    view.share_track(&shared, window, cx)
                 }),
             );
         } else if let Overlay::Collection(collection) = kind {
@@ -1090,11 +1094,10 @@ impl Music {
                     view.save_collection(selected.clone(), cx);
                 },
             ));
-            let url = format!("https://music.youtube.com/browse/{}", collection.id);
+            let shared = collection.clone();
             actions.push(
-                self.menu_action("menu-share", "Share", cx, move |view, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                    view.notice = Some("Link copied".into());
+                self.menu_action("menu-share", "Share", cx, move |view, window, cx| {
+                    view.share_collection(&shared, window, cx)
                 }),
             );
         } else if let Overlay::SongText { content, .. } = kind {
@@ -1272,13 +1275,15 @@ impl Music {
                         .position(position)
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            body.children(actions)
-                                .w(px(MENU_WIDTH))
-                                .px(px(0.))
-                                .py(px(16.))
-                                .rounded(px(2.))
-                                .max_h(viewport.height - px(16.))
-                                .track_scroll(&self.menu_scroll),
+                            div().on_children_prepainted(self.covers_video()).child(
+                                body.children(actions)
+                                    .w(px(MENU_WIDTH))
+                                    .px(px(0.))
+                                    .py(px(16.))
+                                    .rounded(px(2.))
+                                    .max_h(viewport.height - px(16.))
+                                    .track_scroll(&self.menu_scroll),
+                            ),
                         ),
                 )
                 .into_any_element();

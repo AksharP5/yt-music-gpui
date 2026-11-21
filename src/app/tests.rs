@@ -488,8 +488,10 @@ fn a_failed_stream_keeps_its_song_on_the_full_lookup_after_quality_changes() {
 }
 
 #[test]
-fn displayed_durations_round_to_the_nearest_second() {
+fn displayed_durations_round_partial_seconds_up_like_the_web() {
     for (seconds, expected) in [
+        // Levitating's video measures 230.121 s; the web shows 3:51.
+        (230.121, "3:51"),
         (337.8, "5:38"),
         (59.5, "1:00"),
         (3599.5, "1:00:00"),

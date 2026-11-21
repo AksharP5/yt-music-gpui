@@ -144,7 +144,11 @@ impl Music {
                         }),
                     )
                     .snap_to_window_with_margin(px(8.))
-                    .child(body),
+                    .child(
+                        div()
+                            .on_children_prepainted(self.covers_video())
+                            .child(body),
+                    ),
             )
             .into_any_element()
     }
