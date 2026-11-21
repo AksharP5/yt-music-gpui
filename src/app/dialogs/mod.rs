@@ -855,6 +855,7 @@ impl Music {
                     let index = view.library.queue.index.map_or(0, |i| i + 1);
                     view.library.queue.tracks_mut().insert(index, song.clone());
                     view.queue_changed(cx);
+                    view.show_toast("Will play next", cx);
                 }),
             );
             let song = track.clone();

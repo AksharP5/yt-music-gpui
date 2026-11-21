@@ -98,6 +98,8 @@ The player keeps the selected tab when you change tracks. Lyrics, Comments and R
 
 **Add to queue** and **Play next** show the first song in an empty queue. Press Play to start listening. When playback is stopped, Next and Previous select songs without starting playback. Desktop controls show the selected duration when available, including when switching between Song and Video.
 
+Adding, scheduling, or removing a queued song shows a confirmation, including in **Up next**.
+
 While searching, scroll through suggestions or use ↑ and ↓ to reveal and select them. Press Enter to open the selected suggestion.
 
 In **Save to playlist**, use Tab and Shift+Tab to move through the destinations. The list scrolls to the focused playlist. Press Enter to choose it.

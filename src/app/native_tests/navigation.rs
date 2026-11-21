@@ -2518,6 +2518,10 @@ fn removing_the_last_queued_song_leaves_back_available() -> Result<()> {
             .update(cx, |view, _, _| {
                 assert!(view.library.queue.tracks.is_empty());
                 assert!(matches!(&view.route, Route::Browse(link) if link.id == "VLemptyQueue"));
+                assert_eq!(
+                    view.toast.as_ref().map(|toast| toast.text.as_ref()),
+                    Some("Removed from queue")
+                );
             })
             .unwrap();
 
