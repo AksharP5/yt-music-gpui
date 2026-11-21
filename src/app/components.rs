@@ -597,8 +597,11 @@ pub(in crate::app) fn seek_bar(
                 .group_hover("seek", |knob| knob.visible()),
         )
 }
+/// Formats a time the way music.youtube.com does. A partial second rounds up,
+/// as the web does for a video's measured length (230.1 s reads 3:51), so
+/// pass elapsed times through `floor` first.
 pub(in crate::app) fn clock(seconds: f64) -> String {
-    let seconds = seconds.max(0.).round() as u64;
+    let seconds = seconds.max(0.).ceil() as u64;
     if seconds >= 3600 {
         format!(
             "{}:{:02}:{:02}",
