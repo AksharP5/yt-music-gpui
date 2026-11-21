@@ -27,7 +27,7 @@ BUDGETS = (
 )
 # Reported only: these vary too much on shared runners to gate.
 REPORTED = (
-    ("PSS while playing local audio", "playing_pss_mib", "MiB"),
+    ("Playback test PSS with local audio", "playing_pss_mib", "MiB"),
     ("Launch to first frame", "first_frame_ms", "ms"),
     ("Launch to Home, from a fixture", "home_frame_ms", "ms"),
     ("PSS on Home, settled", "home_pss_mib", "MiB"),
@@ -92,6 +92,8 @@ def run_test(executable, home, name, prefix):
         env = dict(
             os.environ, HOME=str(home), XDG_DATA_HOME=str(home / "data"),
             XDG_RUNTIME_DIR=runtime,
+            # The libtest executable bypasses the two-arena cap in main().
+            MALLOC_ARENA_MAX="2",
         )
         output = subprocess.check_output([
             executable, "--ignored", "--exact", f"player::tests::{name}", "--nocapture",
@@ -283,6 +285,7 @@ def report(base, candidate, before, after, startup_note):
         "",
         f"The stripped binary is capped at {size_limit:,} bytes.",
         "Playback uses silent local WAV files and excludes streaming and network latency.",
+        "Playback memory samples use the test process with the app's two-arena glibc cap.",
         "Requests count what the fast lookup sends between Play and mpv opening the stream, "
         "against a local server.",
         startup_note,

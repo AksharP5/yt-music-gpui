@@ -125,7 +125,7 @@ The two player measurements use silent local audio and null audio output; give `
 The Linux performance job in CI compares the pull request with its base commit on:
 
 - the stripped release binary size,
-- local playback timings and memory while playing (`measure_local_guest_playback`),
+- local playback timings and playback-test memory (`measure_local_guest_playback`), with the app's two-arena glibc cap,
 - how many requests the fast lookup sends between Play and mpv opening the stream, for a prepared play, the first unprepared play and a later one (`measure_play_requests`, against a local server),
 - launch to the first frame and to the first Home frame, and memory on a settled Home. The app is built with `--cfg ytm_perf`, which prints frame timestamps and reads Home from the fixture in `YTM_PERF_HOME`. It runs under a private bus, with every connection sent to a closed port.
 
