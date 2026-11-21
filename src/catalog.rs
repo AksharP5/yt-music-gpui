@@ -1651,7 +1651,7 @@ fn explicit(row: &Value) -> bool {
         })
 }
 
-fn wide_thumbnail(row: &Value) -> bool {
+pub(crate) fn wide_thumbnail(row: &Value) -> bool {
     find(row, "thumbnails")
         .and_then(Value::as_array)
         .and_then(|thumbnails| thumbnails.last())
