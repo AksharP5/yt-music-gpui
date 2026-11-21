@@ -25,6 +25,9 @@ const STEPS: [u32; 13] = [
     32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
 ];
 const WASH: u32 = 64;
+/// How far a smaller loaded size may be stretched while the shown size loads.
+/// Adjacent steps differ by no more, so a window resize keeps its art.
+const MAX_STAND_IN_STRETCH: f32 = 1.5;
 /// The widest fixed-size video still the catalog lists (`hqdefault`).
 const LISTED_STILL_WIDTH: u32 = 480;
 
@@ -80,7 +83,7 @@ pub struct Artwork {
     cache: HashMap<ArtworkRequest, CachedArtwork>,
     recent: VecDeque<ArtworkRequest>,
     cache_bytes: usize,
-    /// The last loaded size of each URL, drawn while a different size loads.
+    /// The largest loaded size of each URL, drawn while a different size loads.
     shown: HashMap<String, Resolution>,
     scale: f32,
 }
@@ -168,8 +171,9 @@ impl Artwork {
     }
 
     /// Artwork with enough pixels to cover `size` (logical pixels) on this
-    /// display. A zero side is unconstrained. Until that size loads, a size
-    /// already loaded for the URL stands in.
+    /// display. A zero side is unconstrained. Until that size loads, the
+    /// largest size already loaded for the URL stands in, unless stretching it
+    /// would blur it: like the web, nothing shows until the art is sharp.
     pub fn get(&mut self, url: &str, size: Size<Pixels>) -> Option<Arc<RenderImage>> {
         let resolution = Resolution::cover(size, self.scale);
         self.get_resolution(url, resolution).or_else(|| {
@@ -177,10 +181,15 @@ impl Artwork {
                 url: url.to_owned(),
                 resolution: *self.shown.get(url)?,
             };
-            match self.cache.get(&shown)? {
-                CachedArtwork::Loaded { image, .. } => Some(image.clone()),
-                CachedArtwork::Failed(_) => None,
-            }
+            let CachedArtwork::Loaded { image, .. } = self.cache.get(&shown)? else {
+                return None;
+            };
+            let pixels = image.size(0);
+            let sharp = |length: Pixels, pixels: i32| {
+                f32::from(length) * self.scale <= pixels as f32 * MAX_STAND_IN_STRETCH
+            };
+            (sharp(size.width, pixels.width.0) && sharp(size.height, pixels.height.0))
+                .then(|| image.clone())
         })
     }
 
@@ -228,7 +237,26 @@ impl Artwork {
             evicted.push(image);
         }
         self.recent.push_back(loaded.request.clone());
-        if loaded.image.is_some() && loaded.request.resolution != Resolution::Wash {
+        let bytes = loaded
+            .image
+            .as_ref()
+            .and_then(|image| image.as_bytes(0))
+            .map_or(0, <[u8]>::len);
+        let shown_bytes = self.shown.get(&loaded.request.url).and_then(|resolution| {
+            match self.cache.get(&ArtworkRequest {
+                url: loaded.request.url.clone(),
+                resolution: *resolution,
+            })? {
+                CachedArtwork::Loaded { bytes, .. } => Some(*bytes),
+                CachedArtwork::Failed(_) => None,
+            }
+        });
+        // A player bar thumbnail loading after the player page's cover must
+        // not replace it as the stand-in.
+        if loaded.image.is_some()
+            && loaded.request.resolution != Resolution::Wash
+            && shown_bytes.is_none_or(|shown| bytes > shown)
+        {
             self.shown
                 .insert(loaded.request.url.clone(), loaded.request.resolution);
         }
@@ -236,7 +264,6 @@ impl Artwork {
             loaded.request,
             match loaded.image {
                 Some(image) => {
-                    let bytes = image.as_bytes(0).map_or(0, <[u8]>::len);
                     self.cache_bytes += bytes;
                     CachedArtwork::Loaded { image, bytes }
                 }
@@ -991,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_size_shows_the_loaded_size_until_it_arrives() {
+    fn a_much_smaller_size_never_stands_in_blurred() {
         let (mut artwork, queued) = fixture();
         artwork.get("art", edge(48.));
         let row = image(48, 48);
@@ -999,8 +1026,10 @@ mod tests {
             request: queued.try_recv().unwrap(),
             image: Some(row.clone()),
         });
-        let shown = artwork.get("art", edge(1200.)).unwrap();
-        assert!(Arc::ptr_eq(&shown, &row));
+        assert!(
+            artwork.get("art", edge(1200.)).is_none(),
+            "a row thumbnail stretched over the player page is a blur"
+        );
         let hero = queued.try_recv().unwrap();
         assert_eq!(hero, request("art", HERO));
         let large = image(1536, 1536);
@@ -1016,6 +1045,37 @@ mod tests {
         assert!(
             artwork.get_wash("art").is_none(),
             "a wash is never the sharp art"
+        );
+    }
+
+    #[test]
+    fn a_resize_shows_the_largest_loaded_size_until_the_new_one_arrives() {
+        let (mut artwork, queued) = fixture();
+        let cover = image(768, 768);
+        let row = image(48, 48);
+        // The player page's cover loads, then the player bar's thumbnail.
+        artwork.get("art", edge(700.));
+        artwork.get("art", edge(40.));
+        for image in [&cover, &row] {
+            artwork.insert(LoadedArtwork {
+                request: queued.try_recv().unwrap(),
+                image: Some(image.clone()),
+            });
+        }
+        // A wider window asks for the next step; the cover stands in sharp.
+        assert!(Arc::ptr_eq(
+            &artwork.get("art", edge(1000.)).unwrap(),
+            &cover
+        ));
+        assert_eq!(
+            queued.try_recv().unwrap(),
+            request(
+                "art",
+                Resolution::Cover {
+                    width: 1024,
+                    height: 1024
+                }
+            )
         );
     }
 }
