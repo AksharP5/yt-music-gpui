@@ -65,7 +65,7 @@ use library_actions::is_disliked;
 pub use navigation::HomePrefetch;
 use navigation::*;
 #[cfg(test)]
-use pages::shelves::visible_cards;
+use pages::shelves::{carousel_page, visible_cards};
 use pages::{DetailList, ListRow};
 #[cfg(test)]
 use playback::queue::adopt_watch_queue;

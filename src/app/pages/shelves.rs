@@ -184,9 +184,23 @@ impl Music {
         } else {
             self.shelf_scroll.entry(index).or_default().clone()
         };
-        let range = visible_cards(count, (-scroll.offset().x).into(), available, width + gap);
+        // Below 936px the web lets cards scroll under the page margins, out to the
+        // window's edge, so four whole cards fit at 900px.
+        let lead = if page.tier == Tier::Narrow && !related {
+            inset
+        } else {
+            0.
+        };
+        let viewport = available + 2. * lead;
         let stride = width + gap;
+        let row_width = (count as f32 * stride - gap).max(0.) + 2. * lead;
+        let offset = -f32::from(scroll.offset().x);
+        let range = visible_cards(count, offset - lead, viewport, stride);
         let overflows = count as f32 * stride - gap > available + 1.;
+        let at_start = offset < 1.;
+        let at_end = offset + viewport + 1. >= row_width;
+        let page_step = px(carousel_page(viewport, width, gap));
+        let end = px((row_width - viewport).max(0.));
         // The web scales shelf titles with the window on Home, Explore and
         // album pages; artist titles stay small and playlists stop at 28px.
         let heading_size = match &self.route {
@@ -236,10 +250,11 @@ impl Music {
             .collect::<Vec<_>>();
         let contents = div()
             .id(("carousel", index))
-            .w(px(available + 8.))
+            .w(px(viewport + 8.))
             .min_w_0()
             .p(px(4.))
             .m(px(-4.))
+            .ml(px(-4. - lead))
             .flex()
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
@@ -249,7 +264,8 @@ impl Music {
                     .flex()
                     .gap(px(gap))
                     .flex_shrink_0()
-                    .w(px((count as f32 * stride - gap).max(0.)))
+                    .w(px(row_width))
+                    .px(px(lead))
                     .min_h(px(card_height))
                     .when(range.start > 0, |row| {
                         row.child(
@@ -316,18 +332,14 @@ impl Music {
                                 controls.child(
                                     button(("shelf-previous", index), "back", self.theme)
                                         .size(px(36.))
-                                        .tab_stop(scroll.offset().x < px(-1.))
+                                        .tab_stop(!at_start)
                                         .border_1()
                                         .border_color(self.theme.border)
-                                        .opacity(if scroll.offset().x < px(-1.) {
-                                            1.
-                                        } else {
-                                            0.35
-                                        })
+                                        .opacity(if at_start { 0.35 } else { 1. })
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             let offset = previous.offset();
                                             previous.set_offset(point(
-                                                (offset.x + px(stride * 3.)).min(px(0.)),
+                                                (offset.x + page_step).min(px(0.)),
                                                 offset.y,
                                             ));
                                             cx.notify();
@@ -338,17 +350,14 @@ impl Music {
                                 controls.child(
                                     button(("shelf-next", index), "forward", self.theme)
                                         .size(px(36.))
-                                        .tab_stop(
-                                            -f32::from(scroll.offset().x) + available + 1.
-                                                < count as f32 * stride - gap,
-                                        )
+                                        .tab_stop(!at_end)
                                         .border_1()
                                         .border_color(self.theme.border)
+                                        .opacity(if at_end { 0.35 } else { 1. })
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             let offset = next.offset();
                                             next.set_offset(point(
-                                                (offset.x - px(stride * 3.))
-                                                    .max(-next.max_offset().x),
+                                                (offset.x - page_step).max(-end),
                                                 offset.y,
                                             ));
                                             cx.notify();
@@ -555,6 +564,15 @@ impl Music {
             }))
             .into_any_element()
     }
+}
+
+/// How far Previous and Next move a carousel: every card that fits in its
+/// viewport, as the web pages its shelves.
+pub(in crate::app) fn carousel_page(viewport: f32, width: f32, gap: f32) -> f32 {
+    let stride = width + gap;
+    // A viewport holding exactly five cards and their gaps can land a hair under
+    // five strides in floating point.
+    ((viewport + gap) / stride + 0.001).floor().max(1.) * stride
 }
 
 pub(in crate::app) fn visible_cards(
