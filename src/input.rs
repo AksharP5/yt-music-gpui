@@ -53,6 +53,7 @@ pub struct SearchInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_x: Pixels,
+    text_size: Pixels,
     theme: Theme,
 }
 
@@ -103,6 +104,7 @@ impl SearchInput {
             last_bounds: None,
             is_selecting: false,
             scroll_x: px(0.),
+            text_size: px(16.),
             theme: Theme::load(),
         }
     }
@@ -113,6 +115,9 @@ impl SearchInput {
     ) {
         self.placeholder = placeholder.into();
         cx.notify();
+    }
+    pub fn set_text_size(&mut self, size: Pixels) {
+        self.text_size = size;
     }
     pub fn value(&self) -> &str {
         &self.content
@@ -788,7 +793,7 @@ impl Render for SearchInput {
             .overflow_hidden()
             .text_color(self.theme.text)
             .line_height(px(24.))
-            .text_size(px(16.))
+            .text_size(self.text_size)
             .child(
                 div()
                     .w_full()

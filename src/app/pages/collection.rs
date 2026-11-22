@@ -2,8 +2,162 @@
 
 use super::super::*;
 use super::PageLayout;
+use crate::input::{InputEvent, SearchInput};
+
+/// Find in playlist: the bar above a playlist's songs and its text.
+pub(in crate::app) struct PlaylistFind {
+    input: Entity<SearchInput>,
+    query: String,
+    _subscription: Subscription,
+}
+
+impl PlaylistFind {
+    pub(in crate::app) fn matches(&self, item: &Item) -> bool {
+        find_matches(&self.query, item)
+    }
+
+    pub(in crate::app) fn text(&self, cx: &App) -> String {
+        self.input.read(cx).value().trim().to_owned()
+    }
+
+    pub(in crate::app) fn filtering(&self) -> bool {
+        !self.query.is_empty()
+    }
+}
+
+/// Like the web, a song matches when its title, artists or album contain
+/// the lowercased query.
+fn find_matches(query: &str, item: &Item) -> bool {
+    let Item::Track(track) = item else {
+        return false;
+    };
+    [
+        Some(track.title.as_str()),
+        Some(track.artist.as_str()),
+        track.album.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|text| text.to_lowercase().contains(query))
+}
 
 impl Music {
+    pub(in crate::app) fn open_playlist_find(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(find) = &self.playlist_find {
+            window.focus(&find.input.focus_handle(cx), cx);
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut input = SearchInput::new(cx);
+            input.set_placeholder("Find on this page", cx);
+            input.set_text_size(px(13.33));
+            input
+        });
+        let subscription =
+            cx.subscribe_in(
+                &input,
+                window,
+                |view, input, event, window, cx| match event {
+                    InputEvent::Changed => {
+                        let query = input.read(cx).value().trim().to_lowercase();
+                        if let Some(find) = &mut view.playlist_find {
+                            find.query = query;
+                        }
+                        view.rebuild_rows();
+                        cx.notify();
+                    }
+                    InputEvent::Blur => view.close_playlist_find(window, cx),
+                    InputEvent::Submit => {}
+                },
+            );
+        window.focus(&input.focus_handle(cx), cx);
+        self.playlist_find = Some(PlaylistFind {
+            input,
+            query: String::new(),
+            _subscription: subscription,
+        });
+        self.rebuild_rows();
+        cx.notify();
+    }
+
+    fn close_playlist_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.playlist_find.take().is_some() {
+            self.rebuild_rows();
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// The web's Find in playlist bar: a 28px field with a clear button,
+    /// and Cancel beside it, 20px above the songs.
+    pub(in crate::app) fn playlist_find_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let find = self.playlist_find.as_ref()?;
+        let text = rgb(0xf1f1f1);
+        let clear = find.filtering().then(|| {
+            let input = find.input.clone();
+            div()
+                .id("playlist-find-clear")
+                .keyboard_control(self.theme)
+                .size(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(icon("close", 16., text.into()))
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    input.update(cx, |input, cx| {
+                        input.set_value(String::new(), cx);
+                        cx.emit(InputEvent::Changed);
+                    });
+                    window.focus(&input.focus_handle(cx), cx);
+                }))
+        });
+        Some(
+            div()
+                .h(px(30.))
+                .mb(px(20.))
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(28.))
+                        .pl(px(10.))
+                        .pr(px(2.))
+                        .rounded(px(13.))
+                        .bg(gpui::white().opacity(0.15))
+                        .flex()
+                        .items_center()
+                        .child(div().flex_1().min_w_0().child(find.input.clone()))
+                        .children(clear),
+                )
+                .child(
+                    div()
+                        .id("playlist-find-cancel")
+                        .keyboard_control(self.theme)
+                        .h(px(24.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text)
+                        .cursor_pointer()
+                        .child("Cancel")
+                        .on_click(
+                            cx.listener(|view, _, window, cx| view.close_playlist_find(window, cx)),
+                        ),
+                ),
+        )
+    }
+
     pub(in crate::app) fn page_collection(&self) -> Option<Collection> {
         let Route::Browse(link) = &self.route else {
             return None;
@@ -450,5 +604,28 @@ impl Music {
         }
         // The web lines the button up with the songs' thumbnails, 18px above them.
         Some(div().pl(px(16.)).pb(px(18.)).child(anchor))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_matches;
+    use crate::catalog::{Item, Track};
+
+    #[test]
+    fn find_in_playlist_matches_title_artist_or_album_ignoring_case() {
+        let song = Item::Track(Track {
+            id: "abcdefghijk".into(),
+            title: "Old Time Rock & Roll".into(),
+            artist: "Bob Seger & The Silver Bullet Band".into(),
+            album: Some("Stranger In Town".into()),
+            duration: None,
+            thumbnail: None,
+            details: Default::default(),
+        });
+        for query in ["rock", "seger", "stranger in"] {
+            assert!(find_matches(query, &song), "{query}");
+        }
+        assert!(!find_matches("hurricane", &song));
     }
 }

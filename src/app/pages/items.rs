@@ -895,7 +895,10 @@ impl Music {
             );
         row = row.child(controls.absolute().right_0().top_0().h_full());
         wrap_row(row)
-            .when(style.gap() > 0., |d| d.pb(px(style.gap())))
+            // The web's Find in playlist results sit edge to edge.
+            .when(style.gap() > 0. && self.playlist_find.is_none(), |d| {
+                d.pb(px(style.gap()))
+            })
             .when(artist_table && self.list_rows.windows(2).any(|rows| {
                 matches!(rows, [super::ListRow::Item(current), super::ListRow::Item(_)] if *current == index)
             }), |d| {
