@@ -1,4 +1,5 @@
-use super::{PreparedTarget, ResolvedStream, native, normalization_gain};
+use super::native;
+use super::stream::{PreparedTarget, ResolvedStream, normalization_gain};
 use crate::auth::PlaybackCredentials;
 use crate::os::{ChildOutput, ExitNotice, Group, child_output, exit_notice, private_file};
 use anyhow::{Context, Result, bail, ensure};
@@ -473,7 +474,7 @@ pub(crate) fn find_ytdlp() -> Result<PathBuf> {
 pub(super) mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::player::tests::resolver_target;
+    use crate::player::stream::tests::resolver_target;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
