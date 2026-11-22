@@ -12,8 +12,22 @@ mod search;
 mod suggestions;
 mod sync;
 
+use super::Music;
 use anyhow::{Context as _, Result, ensure};
+use gpui::{Pixels, Window, px};
 use std::{fs, os::unix::fs::MetadataExt, path::PathBuf};
+
+/// How far a collection row's content sits inside its list item: the page inset
+/// when the header scrolls with the rows, past the header column when the
+/// header stands beside them.
+pub(in crate::app) fn row_left(view: &Music, window: &Window) -> Pixels {
+    let layout = view.page_layout(window);
+    px(if view.detail_list.inline_header {
+        layout.inset
+    } else {
+        layout.stacked_columns().1
+    })
+}
 
 pub(in crate::app) fn isolate() -> Result<()> {
     ensure!(

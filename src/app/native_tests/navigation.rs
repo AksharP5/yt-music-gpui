@@ -3041,11 +3041,7 @@ fn dragging_a_playlist_song_moves_its_occurrence_across_loaded_shelves() -> Resu
                     };
                     let source = row(1);
                     let target = row(if partial { 3 } else { 2 });
-                    let inset = if view.detail_list.inline_header {
-                        px(view.page_layout(window).inset)
-                    } else {
-                        px(0.)
-                    };
+                    let inset = super::row_left(view, window);
                     (
                         point(source.left() + inset + px(28.), source.top() + px(34.)),
                         point(target.left() + inset + px(180.), target.top() + px(53.)),
@@ -3207,11 +3203,7 @@ fn playlist_drag_scrolls_to_songs_outside_the_original_viewport() -> Result<()> 
                 let source = list
                     .bounds_for_item(1 + usize::from(view.detail_list.inline_header))
                     .unwrap();
-                let inset = if view.detail_list.inline_header {
-                    px(view.page_layout(window).inset)
-                } else {
-                    px(0.)
-                };
+                let inset = super::row_left(view, window);
                 let viewport = list.viewport_bounds();
                 let edge = point(
                     viewport.left() + inset + px(180.),
