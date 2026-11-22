@@ -31,6 +31,25 @@ pub(super) struct Lookup {
     visitor: Arc<Mutex<Visitor>>,
     homepage: String,
     player: String,
+    prefer_h264: bool,
+}
+
+/// Macs before the M3 decode H.264 but not AV1 in hardware. There H.264 plays
+/// video at a fraction of the CPU, so it ranks above the other codecs.
+#[cfg(target_os = "macos")]
+fn prefer_h264() -> bool {
+    #[link(name = "VideoToolbox", kind = "framework")]
+    unsafe extern "C" {
+        fn VTIsHardwareDecodeSupported(codec: u32) -> u8;
+    }
+    let av1 = u32::from_be_bytes(*b"av01");
+    let h264 = u32::from_be_bytes(*b"avc1");
+    unsafe { VTIsHardwareDecodeSupported(av1) == 0 && VTIsHardwareDecodeSupported(h264) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefer_h264() -> bool {
+    false
 }
 
 impl Lookup {
@@ -46,6 +65,7 @@ impl Lookup {
             visitor: Arc::default(),
             homepage: "https://music.youtube.com/".into(),
             player: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false".into(),
+            prefer_h264: prefer_h264(),
         })
     }
 
@@ -59,7 +79,7 @@ impl Lookup {
         let epoch = self.epoch()?;
         let result = self
             .player_response(video_id, deadline, epoch)
-            .and_then(|player| select(&player, audio, video));
+            .and_then(|player| select(&player, audio, video, self.prefer_h264));
         if result.as_ref().err().is_some_and(|error| {
             Instant::now() >= deadline
                 || error.chain().any(|cause| {
@@ -351,7 +371,7 @@ fn dynamic_range(codec: &str) -> f64 {
 }
 
 impl<'a> Format<'a> {
-    fn parse(raw: &'a Value, duration: Option<f64>) -> Option<Self> {
+    fn parse(raw: &'a Value, duration: Option<f64>, prefer_h264: bool) -> Option<Self> {
         if raw["drmFamilies"]
             .as_array()
             .is_some_and(|drm| !drm.is_empty())
@@ -380,7 +400,13 @@ impl<'a> Format<'a> {
         let mut hdr = f64::NEG_INFINITY;
         for codec in codecs.split(',').map(str::trim) {
             if let Some(rank) = codec_rank(codec, true) {
-                vcodec = Some(rank);
+                // Codec ranks below resolution, frame rate and dynamic range,
+                // so H.264 wins only when it matches the best of those.
+                let h264 = prefer_h264
+                    && ["avc", "h264"]
+                        .iter()
+                        .any(|prefix| codec.starts_with(prefix));
+                vcodec = Some(if h264 { f64::MAX } else { rank });
                 hdr = dynamic_range(codec);
             } else {
                 acodec = Some(codec_rank(codec, false)?);
@@ -541,6 +567,7 @@ pub(super) fn select(
     player: &Value,
     audio: AudioQuality,
     video: Option<VideoQuality>,
+    prefer_h264: bool,
 ) -> Result<Selection> {
     ensure!(
         player["playabilityStatus"]["status"] == "OK",
@@ -555,7 +582,7 @@ pub(super) fn select(
     let mut formats: Vec<_> = ["formats", "adaptiveFormats"]
         .into_iter()
         .flat_map(|field| data[field].as_array().into_iter().flatten())
-        .filter_map(|raw| Format::parse(raw, duration))
+        .filter_map(|raw| Format::parse(raw, duration, prefer_h264))
         .collect();
     formats.sort_by(Format::compare);
     let audio_only: Vec<_> = formats
@@ -655,6 +682,7 @@ pub(super) mod tests {
     /// A lookup that sends its page and player requests to a local server.
     pub(in crate::player) fn lookup_at(base: &str) -> Lookup {
         let mut lookup = Lookup::new().unwrap();
+        lookup.prefer_h264 = false;
         lookup.homepage = format!("{base}/");
         lookup.player = format!("{base}/player");
         lookup
@@ -705,14 +733,17 @@ pub(super) mod tests {
             (AudioQuality::Normal, "251"),
             (AudioQuality::High, "141"),
         ] {
-            assert_eq!(itags(&select(&player, audio, None).unwrap()), [expected]);
+            assert_eq!(
+                itags(&select(&player, audio, None, false).unwrap()),
+                [expected]
+            );
             for (video, expected_video) in VideoQuality::ALL
                 .into_iter()
                 // 480p prefers the HDR VP9.2 format, as yt-dlp does.
                 .zip(["160", "133", "134", "333", "298", "303", "271", "313"])
             {
                 assert_eq!(
-                    itags(&select(&player, audio, Some(video)).unwrap()),
+                    itags(&select(&player, audio, Some(video), false).unwrap()),
                     [expected_video, expected]
                 );
             }
@@ -723,11 +754,26 @@ pub(super) mod tests {
             .unwrap()
             .retain(|format| format["mimeType"].as_str().unwrap().starts_with("video/"));
         for audio in AudioQuality::ALL {
-            assert_eq!(itags(&select(&player, audio, None).unwrap()), ["18"]);
-            assert!(select(&player, audio, Some(VideoQuality::P240)).is_err());
+            assert_eq!(itags(&select(&player, audio, None, false).unwrap()), ["18"]);
+            assert!(select(&player, audio, Some(VideoQuality::P240), false).is_err());
             assert_eq!(
-                itags(&select(&player, audio, Some(VideoQuality::P360)).unwrap()),
+                itags(&select(&player, audio, Some(VideoQuality::P360), false).unwrap()),
                 ["18"]
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_h264_wins_only_at_the_best_resolution_frame_rate_and_range() {
+        let player = fixture();
+        for (video, expected) in VideoQuality::ALL
+            .into_iter()
+            // 480p keeps HDR VP9.2, and above 1080p H.264 has no format.
+            .zip(["160", "133", "134", "333", "298", "299", "271", "313"])
+        {
+            assert_eq!(
+                itags(&select(&player, AudioQuality::Normal, Some(video), true).unwrap()),
+                [expected, "251"]
             );
         }
     }
@@ -752,12 +798,12 @@ pub(super) mod tests {
             (AudioQuality::High, None, -3.),
             (AudioQuality::High, Some(VideoQuality::P720), -3.),
         ] {
-            let selection = select(&player, audio, video).unwrap();
+            let selection = select(&player, audio, video, false).unwrap();
             assert_eq!(selection.gain_db, expected, "{:?}", itags(&selection));
         }
         // The muxed fallback has no loudness of its own.
         player["streamingData"]["adaptiveFormats"] = json!([]);
-        let selection = select(&player, AudioQuality::High, None).unwrap();
+        let selection = select(&player, AudioQuality::High, None, false).unwrap();
         assert_eq!(itags(&selection), ["18"]);
         assert_eq!(selection.gain_db, -3.5);
     }
@@ -773,11 +819,11 @@ pub(super) mod tests {
             format.as_object_mut().unwrap().remove("audioQuality");
         }
         assert_eq!(
-            itags(&select(&player, AudioQuality::Low, None).unwrap()),
+            itags(&select(&player, AudioQuality::Low, None, false).unwrap()),
             ["600"]
         );
         assert_eq!(
-            itags(&select(&player, AudioQuality::Normal, None).unwrap()),
+            itags(&select(&player, AudioQuality::Normal, None, false).unwrap()),
             ["249"]
         );
         let formats = player["streamingData"]["adaptiveFormats"]
@@ -787,11 +833,11 @@ pub(super) mod tests {
             format["averageBitrate"] = json!(200000);
         }
         assert_eq!(
-            itags(&select(&player, AudioQuality::Low, None).unwrap()),
+            itags(&select(&player, AudioQuality::Low, None, false).unwrap()),
             ["139"]
         );
         assert_eq!(
-            itags(&select(&player, AudioQuality::Normal, None).unwrap()),
+            itags(&select(&player, AudioQuality::Normal, None, false).unwrap()),
             ["600"]
         );
         player["streamingData"]["formats"] = json!([]);
@@ -802,7 +848,7 @@ pub(super) mod tests {
             format["signatureCipher"] = json!("s=encrypted&url=https://rr1.googlevideo.com/x");
             format.as_object_mut().unwrap().remove("url");
         }
-        assert!(select(&player, AudioQuality::High, None).is_err());
+        assert!(select(&player, AudioQuality::High, None, false).is_err());
         for url in [
             "https://rr1.googlevideo.com/x?n=challenge",
             "https://evil.example/x",
@@ -811,9 +857,9 @@ pub(super) mod tests {
             let mut format = fixture()["streamingData"]["adaptiveFormats"][0].clone();
             format["url"] = json!(url);
             player["streamingData"]["adaptiveFormats"] = json!([format]);
-            assert!(select(&player, AudioQuality::Low, None).is_err());
+            assert!(select(&player, AudioQuality::Low, None, false).is_err());
         }
-        assert!(select(&json!({}), AudioQuality::High, None).is_err());
+        assert!(select(&json!({}), AudioQuality::High, None, false).is_err());
     }
 
     #[test]
@@ -988,7 +1034,7 @@ pub(super) mod tests {
             [None].into_iter().chain(VideoQuality::ALL.map(Some)).map(move |video| {
                 json!({
                     "selector": video.map_or_else(|| audio.selector().to_owned(), |video| video.selector(audio)),
-                    "itags": select(player,audio,video).ok().map(|selection| itags(&selection))
+                    "itags": select(player, audio, video, false).ok().map(|selection| itags(&selection))
                 })
             })
         }).collect();
@@ -1054,7 +1100,7 @@ print('27 selectors matched')
             compare_ytdlp(&player);
             let mut checked = std::collections::HashSet::new();
             for audio in AudioQuality::ALL {
-                let selection = select(&player, audio, Some(VideoQuality::P1080)).unwrap();
+                let selection = select(&player, audio, Some(VideoQuality::P1080), false).unwrap();
                 eprintln!("{id} {} 1080p: {:?}", audio.label(), itags(&selection));
                 for url in selection.urls {
                     let parsed = reqwest::Url::parse(&url).unwrap();
