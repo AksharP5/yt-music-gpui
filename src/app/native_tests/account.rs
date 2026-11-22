@@ -625,7 +625,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 view.playback_request(PlaybackQuery::Watch { track: Box::new(track("invalid-first")), mode: WatchMode::Issued }, cx);
                 let job = view.pending_playback_jobs.try_recv().unwrap();
                 view.next(false, cx);
-                assert!(view.queue_waiting.is_some());
+                assert!(view.queue_waiting.is_some_and(|intent| !intent.playback.is_paused()), "Next from pause plays the song it reaches");
                 view.playback_result(PlaybackResult::Watch { collection: None, id: job.id, account_revision: job.account_revision, update: QueueUpdate::Adopt, result: Err("Synthetic rejected playlist read".into()), session_rejected: true }, cx);
                 let account::Command::Refresh { operation, .. } = commands.try_recv().unwrap() else { panic!("Issued rejection must retain the advance while refreshing"); };
                 view.account_event(account::Event::Connected { operation, result: Err("Synthetic unavailable refresh".into()), save_session: false }, window, cx);
@@ -637,7 +637,7 @@ fn native_recovery_preserves_intent_and_revokes_cancelled_activation() -> Result
                 let job = view.pending_playback_jobs.try_recv().unwrap();
                 assert!(matches!(job.query, PlaybackQuery::Watch { track, mode: WatchMode::Issued } if track.id == "invalid-first"));
                 assert!(job.session.is_some_and(|session| Arc::ptr_eq(&session, &original)));
-                assert!(view.queue_waiting.is_some() && !view.playback.is_paused());
+                assert!(view.queue_waiting.is_some_and(|intent| intent.playback.is_paused()) && view.playback.is_paused(), "Recovery must keep the pause pressed while it failed");
                 assert!(view.error.is_none() && commands.is_empty());
                 let watch = Watch { current: Some(track("invalid-first")), current_index: Some(0), queue: vec![track("invalid-first"), track("invalid-second")], source: None, lyrics: None, related: None, comments: None, alternatives: None, continuation: None, source_target: None, shuffle: None };
                 view.playback_result(PlaybackResult::Watch { collection: None, id: job.id, account_revision: job.account_revision, update: QueueUpdate::Adopt, result: Ok(Box::new(watch)), session_rejected: false }, cx);
