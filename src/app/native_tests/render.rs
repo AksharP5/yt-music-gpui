@@ -1511,7 +1511,7 @@ async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut Async
 }
 
 async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
-    for (width, left, column) in [(956., 302, 592), (1920., 650, 860)] {
+    for (width, left, column) in [(956., 296, 592), (1920., 644, 860)] {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(1050.)));
