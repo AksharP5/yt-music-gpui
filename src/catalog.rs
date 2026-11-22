@@ -612,6 +612,14 @@ impl Item {
             Self::Navigation(_) => "",
         }
     }
+    /// The line under a card's title. Two-row cards print the service's whole
+    /// subtitle, such as "Fleetwood Mac • 144M views" under a video.
+    pub fn card_subtitle(&self) -> &str {
+        match self {
+            Self::Track(t) => t.details.byline.as_deref().unwrap_or(&t.artist),
+            _ => self.subtitle(),
+        }
+    }
     pub fn thumbnail(&self) -> Option<&str> {
         match self {
             Self::Track(t) => t.thumbnail.as_deref(),
@@ -630,6 +638,8 @@ impl Item {
 
 #[derive(Clone, Debug)]
 pub struct Shelf {
+    /// The small caps line the web prints above some titles, such as "JUST UPDATED".
+    pub strapline: String,
     pub title: String,
     pub items: Vec<Item>,
     pub layout: ShelfLayout,
@@ -1434,6 +1444,7 @@ fn apply_episode_page(page: &mut Page, data: &Value, browse_id: &str) -> Result<
             .description
             .clone();
         page.shelves = vec![Shelf {
+            strapline: String::new(),
             title: String::new(),
             items: vec![Item::Track(track)],
             layout: ShelfLayout::Songs,
@@ -1968,6 +1979,9 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                                 BrowseLink::from_endpoint(&button["navigationEndpoint"]["browseEndpoint"], text(&button["text"]))
                             });
                         shelves.push(Shelf {
+                            // The web upper-cases straplines in CSS.
+                            strapline: text(&shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]["strapline"])
+                                .to_uppercase(),
                             title,
                             items,
                             layout: if key == "musicCardShelfRenderer" {
@@ -2012,6 +2026,7 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
                 }
                 if !rows.is_empty() {
                     shelves.push(Shelf {
+                        strapline: String::new(),
                         title: String::new(),
                         items: std::mem::take(&mut rows),
                         layout: shelf_layout(&items[start..index]),
@@ -2023,6 +2038,7 @@ fn parse_shelves(value: &Value, shelves: &mut Vec<Shelf>) {
             }
             if !rows.is_empty() {
                 shelves.push(Shelf {
+                    strapline: String::new(),
                     title: String::new(),
                     items: rows,
                     layout: shelf_layout(&items[start..]),
@@ -2603,16 +2619,6 @@ fn home_choices(data: &Value) -> Result<Vec<BrowseChoice>> {
         selected_count <= 1,
         "YouTube Music returned conflicting selected Home filters"
     );
-    if let Some(target) = reset {
-        choices.insert(
-            0,
-            BrowseChoice {
-                label: "All".into(),
-                selected: selected_count == 0,
-                target,
-            },
-        );
-    }
     Ok(choices)
 }
 
@@ -2825,6 +2831,7 @@ mod tests {
         let page = |ids: &[usize], partial: bool| {
             let mut page = parse_page(&json!({"contents":[]}), "Playlist").unwrap();
             page.shelves.push(Shelf {
+                strapline: String::new(),
                 title: String::new(),
                 layout: ShelfLayout::Songs,
                 more: None,
@@ -2890,6 +2897,7 @@ mod tests {
         .unwrap();
         track.details.set_video_id = Some("occurrence-0".into());
         page.shelves.push(Shelf {
+            strapline: String::new(),
             title: String::new(),
             layout: ShelfLayout::Songs,
             more: None,
@@ -3127,6 +3135,27 @@ mod tests {
     }
 
     #[test]
+    fn video_cards_keep_their_view_counts() {
+        // An artist page's Videos card as the service returned it on 2026-11-21.
+        let card = json!({"musicTwoRowItemRenderer":{
+            "aspectRatio":"MUSIC_TWO_ROW_ITEM_THUMBNAIL_ASPECT_RATIO_RECTANGLE_16_9",
+            "title":{"runs":[{"text":"Everywhere"}]},
+            "subtitle":{"runs":[
+                {"text":"Fleetwood Mac","navigationEndpoint":{"browseEndpoint":{"browseId":"UCCzULu3prrEaPvM2ZtkJlYQ"}}},
+                {"text":" • "},
+                {"text":"144M views"}
+            ]},
+            "navigationEndpoint":{"watchEndpoint":{"videoId":"YF1R0hc5Q2I"}}
+        }});
+        let item = parse_item(&card).unwrap();
+        assert_eq!(item.card_subtitle(), "Fleetwood Mac • 144M views");
+        let Item::Track(track) = item else {
+            panic!("A video card plays as a track")
+        };
+        assert_eq!(track.artist, "Fleetwood Mac");
+    }
+
+    #[test]
     fn shelf_layouts_keep_responsive_songs_and_wide_video_carousels() {
         let cards = json!({"musicTwoRowItemRenderer":{
             "title":{"simpleText":"Album"},
@@ -3179,6 +3208,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list.shelves[0].layout, ShelfLayout::Songs);
+    }
+
+    #[test]
+    fn home_shelves_keep_their_straplines() {
+        // Headers as the Energize filter returned them on 2026-11-21.
+        let shelf = |header: Value| {
+            json!({"musicCarouselShelfRenderer":{
+                "header":{"musicCarouselShelfBasicHeaderRenderer":header},
+                "contents":[{"musicTwoRowItemRenderer":{"title":{"simpleText":"Mix"},"navigationEndpoint":{"browseEndpoint":{"browseId":"VLRDmix"}}}}]
+            }})
+        };
+        let response = json!({"contents":[
+            shelf(json!({"title":{"runs":[{"text":"Motivation"}]},"strapline":{"runs":[{"text":"Boosting your energy"}]}})),
+            shelf(json!({"title":{"runs":[{"text":"Pop bangers"}]}})),
+        ]});
+        let page = parse_page(&response, "Home").unwrap();
+        assert_eq!(page.shelves[0].strapline, "BOOSTING YOUR ENERGY");
+        assert_eq!(page.shelves[0].title, "Motivation");
+        assert!(page.shelves[1].strapline.is_empty());
     }
 
     #[test]
@@ -3641,12 +3689,14 @@ mod tests {
         };
         page.shelves = vec![
             Shelf {
+                strapline: String::new(),
                 title: "First".into(),
                 items: vec![track("A"), track("B")],
                 layout: ShelfLayout::Songs,
                 more: None,
             },
             Shelf {
+                strapline: String::new(),
                 title: "Second".into(),
                 items: vec![
                     Item::Navigation(BrowseLink::new("FEexplore", "Explore")),
@@ -4813,18 +4863,18 @@ mod tests {
                 .iter()
                 .map(|choice| choice.label.as_str())
                 .collect::<Vec<_>>(),
-            ["All", "Relax", "Focus"]
+            // The web keeps the service's row as is, with no "All" chip.
+            ["Relax", "Focus"]
         );
-        assert!(!choices[0].selected);
-        assert!(choices[1].selected);
+        assert!(choices[0].selected);
+        // The selected chip deselects back to the unfiltered Home.
         assert_eq!(choices[0].target.params.as_deref(), Some("all-filter"));
-        assert_eq!(choices[1].target, choices[0].target);
-        assert_eq!(choices[2].target.params.as_deref(), Some("focus-filter"));
+        assert!(!choices[1].selected);
+        assert_eq!(choices[1].target.params.as_deref(), Some("focus-filter"));
         assert!(choices.iter().all(|choice| choice.target.title == "Home"));
         let reset = home_choices(&home_filter_fixture(false)).unwrap();
-        assert!(reset[0].selected);
-        assert!(!reset[1].selected);
-        assert_eq!(reset[1].target.params.as_deref(), Some("relax-filter"));
+        assert!(reset.iter().all(|choice| !choice.selected));
+        assert_eq!(reset[0].target.params.as_deref(), Some("relax-filter"));
         let parsed = parse_page(&response, "Unscoped parser").unwrap();
         assert!(parsed.chips.is_empty() && parsed.countries.is_empty());
 
@@ -5877,11 +5927,7 @@ mod tests {
     fn live_public_browse_filters() {
         let catalog = Catalog::new().unwrap();
         let home = catalog.home().unwrap();
-        assert!(
-            home.chips
-                .iter()
-                .any(|choice| choice.label == "All" && choice.selected)
-        );
+        assert!(home.chips.iter().all(|choice| !choice.selected));
         let relax = &home
             .chips
             .iter()
@@ -5903,19 +5949,7 @@ mod tests {
             .unwrap()
             .target;
         let reset = catalog.browse(deselect).unwrap();
-        assert!(
-            reset
-                .chips
-                .iter()
-                .any(|choice| choice.label == "All" && choice.selected)
-        );
-        assert!(
-            reset
-                .chips
-                .iter()
-                .filter(|choice| choice.label != "All")
-                .all(|choice| !choice.selected)
-        );
+        assert!(reset.chips.iter().all(|choice| !choice.selected));
         assert_eq!(reset.title, "Home");
 
         let explore = catalog.explore().unwrap();
