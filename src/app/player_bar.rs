@@ -577,11 +577,7 @@ impl Music {
                                     view.drag_to(event.position, cx);
                                 }),
                             )
-                            .child(slider(
-                                (self.library.volume / 100.) as f32,
-                                volume_bounds,
-                                theme,
-                            )),
+                            .child(slider((self.library.volume / 100.) as f32, volume_bounds)),
                     )
                     .child(tinted_control(
                         "mute-toggle",
@@ -596,30 +592,22 @@ impl Music {
                         |view, _, cx| view.toggle_mute(cx),
                     )),
             )
-            .child(
-                tinted_control(
-                    "repeat",
-                    "repeat",
-                    if repeat == Repeat::Off {
-                        rgb(INACTIVE).into()
-                    } else {
-                        theme.text
-                    },
-                    theme,
-                    cx,
-                    |view, _, cx| view.cycle_repeat(cx),
-                )
-                .when(repeat == Repeat::One, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .text_size(px(9.))
-                            .child("1"),
-                    )
-                }),
-            )
+            .child(tinted_control(
+                "repeat",
+                if repeat == Repeat::One {
+                    "repeat-one"
+                } else {
+                    "repeat"
+                },
+                if repeat == Repeat::Off {
+                    rgb(INACTIVE).into()
+                } else {
+                    theme.text
+                },
+                theme,
+                cx,
+                |view, _, cx| view.cycle_repeat(cx),
+            ))
             .child(tinted_control(
                 "shuffle",
                 "shuffle",

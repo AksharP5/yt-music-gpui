@@ -2032,7 +2032,18 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 cx.notify();
             })
             .unwrap();
-        wait_for_presented_frame(window, cx).await;
+        // Up next lays its rows below the header measured on the previous frame, so
+        // wait for the queue to settle after the resize.
+        let mut settled = None;
+        for _ in 0..10 {
+            wait_for_presented_frame(window, cx).await;
+            let bounds = window
+                .update(cx, |music, _, _| music.player_page.queue_bounds.get())
+                .unwrap();
+            if settled.replace(bounds) == Some(bounds) {
+                break;
+            }
+        }
         window
             .update(cx, |music, window, cx| {
                 capture(window, &format!("chrome-queue-{width}-{compact}"));
@@ -2398,7 +2409,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     cx.update_window(window.into(), |_, window, cx| {
                         window.dispatch_event(
                             gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
-                                position: point(window.viewport_size().width * 0.4, px(300.)),
+                                position: point(window.viewport_size().width * 0.54, px(190.)),
                                 pressed_button: None,
                                 modifiers: Default::default(),
                             }),
@@ -2408,12 +2419,13 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     .unwrap();
                     let before = wait_for_quiescence(window, cx).await;
                     let bounds_before = bounds_changes.get();
-                    // A wheel tick over artwork has no scrolling work to do.
+                    // A wheel tick over the artwork has no scrolling work to do; Up next
+                    // below it scrolls with its header.
                     for _ in 0..10 {
                         cx.update_window(window.into(), |_, window, cx| {
                             window.dispatch_event(
                                 gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                                    position: point(window.viewport_size().width * 0.4, px(300.)),
+                                    position: point(window.viewport_size().width * 0.54, px(190.)),
                                     delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-50.))),
                                     modifiers: Default::default(),
                                     touch_phase: gpui::TouchPhase::Moved,

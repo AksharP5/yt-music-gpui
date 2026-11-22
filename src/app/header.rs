@@ -45,7 +45,12 @@ impl Music {
         cx: &Context<Self>,
     ) -> AnyElement {
         let avatar = self.account.is_some().then(|| self.account_avatar(26.));
-        let account_inset = if matches!(self.route, Route::Search(_)) {
+        // Below 936px the web folds the search field into a button, except on the
+        // search page, and opens it as a field over the left of the header.
+        let narrow = width < 936. && !matches!(self.route, Route::Search(_));
+        let account_inset = if narrow {
+            50.
+        } else if matches!(self.route, Route::Search(_)) {
             if width < 936. {
                 50.
             } else if width < 1150. {
@@ -69,9 +74,15 @@ impl Music {
             let layout = pages::PageLayout::new(width, width - guide_width);
             // The web centers this column in the space before its 12px scrollbar.
             guide_width + (width - guide_width - 12. - layout.search_width()) / 2. + 1.
+        } else if narrow {
+            brand_width
         } else if compact && width < 1150. {
             // Below the wide breakpoint, center between the brand and account controls.
             brand_width + ((width - brand_width - 194. - crate::search_box::WIDTH) / 2.).max(0.)
+        } else if width >= 1578. {
+            // The web centers its column, at most 1478px wide, in the window less its
+            // 12px scrollbar, offset by half the guide.
+            (guide_width + inset).max((width - 12. + guide_width - 1478.) / 2.)
         } else {
             guide_width + if width < 1150. { 56. } else { inset }
         };
@@ -130,7 +141,41 @@ impl Music {
                     .flex()
                     .items_center()
                     .gap(px(24.))
-                    .child(div().flex_1().min_w_0().flex().child(self.search.clone()))
+                    .when(!narrow, |header| {
+                        header.child(div().flex_1().min_w_0().flex().child(self.search.clone()))
+                    })
+                    .when(narrow, |header| {
+                        header
+                            .child(div().flex_1())
+                            .when(!self.search_open, |header| {
+                                header.child(
+                                    div()
+                                        .id("search-open")
+                                        .w(px(52.))
+                                        .h(px(40.))
+                                        // The web leaves 40px before the account controls.
+                                        .mr(px(16.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .child(
+                                            div()
+                                                .size(px(32.))
+                                                .rounded_full()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .hover(|button| button.bg(self.theme.raised))
+                                                .child(icon("search", 18., self.theme.text)),
+                                        )
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.open_search(window, cx)
+                                        })),
+                                )
+                            })
+                    })
                     // Signed in, the web keeps History here rather than in the library.
                     .when(
                         avatar.is_some() && !matches!(self.route, Route::Search(_)),
@@ -212,7 +257,41 @@ impl Music {
                         )
                     }),
             )
+            .when(narrow && self.search_open, |header| {
+                header.child(
+                    div()
+                        .absolute()
+                        .left(px(17.))
+                        .top(px((HEADER_HEIGHT - 42.) / 2.))
+                        // The field covers the guide button and logo.
+                        .occlude()
+                        .child(self.search.clone()),
+                )
+            })
             .into_any_element()
+    }
+
+    /// Focus the search field, first opening it from its button in a narrow window.
+    pub(in crate::app) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let narrow = f32::from(window.viewport_size().width) < 936.
+            && !matches!(self.route, Route::Search(_));
+        self.search_open = narrow;
+        self.search.update(cx, |search, cx| {
+            search.set_back(narrow, cx);
+            search.activate(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Fold the narrow window's open search field back into its button.
+    pub(in crate::app) fn close_narrow_search(&mut self, cx: &mut Context<Self>) {
+        if !self.search_open {
+            return;
+        }
+        self.search_open = false;
+        self.search
+            .update(cx, |search, cx| search.set_back(false, cx));
+        cx.notify();
     }
 
     /// The YouTube Music logo, which opens Home.

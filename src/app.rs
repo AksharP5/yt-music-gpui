@@ -115,6 +115,8 @@ pub struct Music {
     sidebar_focus: VirtualListFocus,
     queue_focus: VirtualListFocus,
     search: Entity<SearchBox>,
+    /// Below 936px, whether the search button has opened its field.
+    search_open: bool,
     route: Route,
     page: Page,
     rows: Vec<Item>,
@@ -153,6 +155,7 @@ pub struct Music {
     queue_source: queue_source::Worker,
     queue_waiting: Option<QueueAdvance>,
     autoplay_tracks: VecDeque<Track>,
+    go_chord: interaction::GoChord,
     watch_pending: Option<PlaybackQuery>,
     song_text: song_text::Worker,
     artwork: Artwork,

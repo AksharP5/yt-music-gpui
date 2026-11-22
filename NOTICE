@@ -44,7 +44,8 @@ Source: https://github.com/feathericons/feather
   ("skip-back"), home, more ("more-vertical"),
   mute ("volume-x") and volume ("volume-2").
 
-assets/icons/repeat.svg is adapted from Lucide's "repeat", Copyright Lucide
+assets/icons/repeat.svg and repeat-one.svg are adapted from Lucide's "repeat"
+and "repeat-1", Copyright Lucide
 Icons and Contributors, licensed under the ISC License (LICENSE-LUCIDE).
 Source: https://github.com/lucide-icons/lucide
 
@@ -77,8 +78,8 @@ Source: https://github.com/google/material-design-icons
   These entries replace any earlier source listed above for the same files.
   Also from Material Symbols (Rounded), unmodified at weight 400 and their
   original viewBox: settings ("settings"), help ("help"), logout ("logout"),
-  switch-account ("switch_account"), premium ("smart_display"), policy
-  ("policy") and feedback ("feedback").
+  switch-account ("switch_account"), arrow-back ("arrow_back"), premium
+  ("smart_display"), policy ("policy") and feedback ("feedback").
 
 The rounded voting glyphs in assets/icons/thumb-up.svg, thumb-down.svg and
 thumb-up-filled.svg are from the icons rendered by https://music.youtube.com/.

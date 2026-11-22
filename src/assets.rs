@@ -60,12 +60,18 @@ impl AssetSource for Assets {
             ))),
             "close" => Some(Cow::Borrowed(include_bytes!("../assets/icons/close.svg"))),
             "back" => Some(Cow::Borrowed(include_bytes!("../assets/icons/back.svg"))),
+            "arrow-back" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/arrow-back.svg"
+            ))),
             "forward" => Some(Cow::Borrowed(include_bytes!("../assets/icons/forward.svg"))),
             "external" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/external.svg"
             ))),
             "shuffle" => Some(Cow::Borrowed(include_bytes!("../assets/icons/shuffle.svg"))),
             "repeat" => Some(Cow::Borrowed(include_bytes!("../assets/icons/repeat.svg"))),
+            "repeat-one" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/repeat-one.svg"
+            ))),
             "music" => Some(Cow::Borrowed(include_bytes!("../assets/icons/music.svg"))),
             "explicit" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/explicit.svg"

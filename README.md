@@ -66,29 +66,49 @@ The app copies your browser's YouTube session, so the browser can stay closed af
 
 ## Keyboard shortcuts
 
+Press ? for this list in the app. Escape also closes a dialog, fullscreen or search.
+
+### Playback
+
 | Key | Action |
 | --- | --- |
-| / or Ctrl K | Search |
-| Space or ; | Play or pause |
-| J, Shift N or Ctrl → | Next song |
-| K, Shift P or Ctrl ← | Previous song |
-| → / ← | Seek 5 seconds |
-| L / H or Shift → / Shift ← | Seek 10 seconds |
-| Shift L / Shift H or Ctrl Shift → / ← | Seek 1 second |
-| ↑ / ↓ or = / - | Volume up / down |
-| M | Mute |
-| R | Repeat: off, all, one |
-| S | Shuffle |
-| + | Like the current song |
-| _ | Dislike the current song |
-| Q | Open or close the player page |
-| F | Video fullscreen |
-| Ctrl R | Reload the page |
-| Alt ← or mouse Back | Back |
-| Alt → or mouse Forward | Forward |
-| Escape | Close a dialog, fullscreen, the player page or search |
+| SPACE or ; | Play/Pause |
+| j or SHIFT + n or CTRL + right arrow | Next song |
+| k or SHIFT + p or CTRL + left arrow | Previous song |
+| l or SHIFT + right arrow | Forward 10s |
+| h or SHIFT + left arrow | Back 10s |
+| right or left arrow | Forward or back 5s |
+| SHIFT + l or CTRL + SHIFT + right arrow | Forward 1s |
+| SHIFT + h or CTRL + SHIFT + left arrow | Back 1s |
+| s | Shuffle queue |
+| r | Toggle repeat |
+
+### Navigation
+
+| Key | Action |
+| --- | --- |
+| gh | Go to Home |
+| ge | Go to Explore |
+| gl | Go to Library |
+| g, | Go to Settings |
+| / or CTRL + k | Search |
+| ALT + left arrow or mouse back | Back |
+| ALT + right arrow or mouse forward | Forward |
+
+### General
+
+| Key | Action |
+| --- | --- |
+| = or up arrow | Increase volume |
+| - or down arrow | Decrease volume |
+| m | Toggle mute |
+| q or ESC | Toggle queue/expanded player |
+| f | Toggle full screen |
+| + | Like current song |
+| _ | Dislike current song |
 | ? | Keyboard shortcuts |
-| Ctrl Q | Quit |
+| CTRL + r | Reload |
+| CTRL + q | Quit |
 
 Previous restarts the current song once playback has passed three seconds. In the first three seconds, it only acts when there is an earlier song. The player, keyboard shortcuts, and desktop controls follow the same rule. A desktop seek past the end of a song advances when Next is available. If there’s no next song, both Next and that seek leave the current song playing.
 
