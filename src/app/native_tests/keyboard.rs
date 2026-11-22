@@ -111,7 +111,7 @@ mod focus_return {
             ..Default::default()
         }));
         // The default compact guide keeps the header tab order short.
-        view.sidebar_collapsed = None;
+        view.sidebar_collapsed = false;
         view.sidebar_playlists.clear();
         view.route = Route::Browse(BrowseLink::new("VLdialog", "Dialog playlist"));
         view.page = page(0, false);
@@ -137,7 +137,7 @@ mod focus_return {
     }
 
     fn countries(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
-        view.sidebar_collapsed = None;
+        view.sidebar_collapsed = false;
         view.sidebar_playlists.clear();
         view.route = Route::Browse(BrowseLink::new("FEmusic_charts", "Charts"));
         view.page = page(1, false);
@@ -156,7 +156,7 @@ mod focus_return {
 
     fn songs(view: &mut Music, window: &mut Window, cx: &mut Context<Music>) {
         window.resize(size(px(1280.), px(800.)));
-        view.sidebar_collapsed = Some(false);
+        view.sidebar_collapsed = false;
         view.route = Route::Browse(BrowseLink::new("VLfocus", "Songs"));
         view.page = page(2, false);
         view.library
@@ -580,7 +580,7 @@ fn help_blocks_background_keyboard_clicks_and_restores_focus() -> anyhow::Result
                     }))
                     .unwrap(),
                 ];
-                music.sidebar_collapsed = Some(false);
+                music.sidebar_collapsed = false;
                 cx.notify();
                 music.sidebar_focus.handle(0, cx)
             })

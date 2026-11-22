@@ -276,6 +276,11 @@ impl Music {
             ("f", false) => self.toggle_video_fullscreen(window, cx),
             ("q", false) => self.toggle_player_page(cx),
             ("escape", false) => {
+                if self.guide_drawer {
+                    self.guide_drawer = false;
+                    cx.notify();
+                    return;
+                }
                 if self.settings_menu.is_some() {
                     self.close_settings_menu(window, cx);
                     return;

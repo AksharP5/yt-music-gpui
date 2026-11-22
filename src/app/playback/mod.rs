@@ -908,6 +908,15 @@ impl Music {
                 self.playback = self.playback.with_buffering(buffering);
                 self.sample_listening();
             }
+            PlayerEvent::Buffered { track_id, seconds } if Some(track_id) == self.active_id => {
+                // Whole seconds are a few pixels of the bar; finer updates only cost renders.
+                let previous = self.buffered.replace((track_id, seconds));
+                if previous.is_none_or(|(id, old)| id != track_id || old.floor() != seconds.floor())
+                {
+                    self.player_bar.update(cx, |_, cx| cx.notify());
+                }
+                return;
+            }
             PlayerEvent::StreamExpiring { track_id }
                 if Some(track_id) == self.active_id
                     && matches!(self.playback, Playback::Loaded { paused: true, .. }) =>

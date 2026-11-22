@@ -339,6 +339,7 @@ fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
     check_cache_window(async |window, cx| {
         window
             .update(cx, |music, window, cx| {
+                music.sidebar_collapsed = false;
                 window.resize(size(px(850.), px(560.)));
                 // A narrow window shows the field once its search button opens it.
                 music.search_open = true;
@@ -391,6 +392,7 @@ fn last_search_suggestion_is_clickable_in_a_short_window() -> anyhow::Result<()>
     check_cache_window(async |window, cx| {
         window
             .update(cx, |music, window, cx| {
+                music.sidebar_collapsed = false;
                 window.resize(size(px(850.), px(560.)));
                 // A narrow window shows the field once its search button opens it.
                 music.search_open = true;

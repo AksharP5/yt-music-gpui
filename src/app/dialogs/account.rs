@@ -46,6 +46,7 @@ impl Music {
             .bg(rgb(0x282828))
             .text_color(rgb(0xf1f1f1))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let signed_in = account.is_some();
         if let Some(account) = account {
             let avatar = self.account_avatar(40.);
             body = body
@@ -107,23 +108,57 @@ impl Music {
                         )),
                 );
         }
-        body = body
-            .child(div().py(px(8.)).border_b_1().border_color(separator).child(
-                self.account_action(
-                    "account-settings",
-                    "settings",
-                    "Settings",
-                    cx,
-                    |view, window, cx| view.open_overlay(Overlay::Settings, window, cx),
-                ),
-            ))
-            .child(div().py(px(8.)).child(self.account_action(
-                "account-help",
-                "help",
-                "Help",
-                cx,
-                |_, _, cx| cx.open_url("https://support.google.com/youtubemusic"),
-            )));
+        let settings = self.account_action(
+            "account-settings",
+            "settings",
+            "Settings",
+            cx,
+            |view, window, cx| view.open_overlay(Overlay::Settings, window, cx),
+        );
+        let help = self.account_action("account-help", "help", "Help", cx, |_, _, cx| {
+            cx.open_url("https://support.google.com/youtubemusic")
+        });
+        body = if signed_in {
+            body.child(
+                div()
+                    .py(px(8.))
+                    .border_b_1()
+                    .border_color(separator)
+                    .child(settings),
+            )
+            .child(div().py(px(8.)).child(help))
+        } else {
+            // A guest gets the web's single list. Its links open in the browser;
+            // "Send feedback" reaches this app's issue tracker rather than Google's
+            // in-page form.
+            body.child(
+                div()
+                    .py(px(8.))
+                    .child(self.account_action(
+                        "account-premium",
+                        "premium",
+                        "Get Music Premium",
+                        cx,
+                        |_, _, cx| cx.open_url("https://music.youtube.com/music_premium"),
+                    ))
+                    .child(settings)
+                    .child(self.account_action(
+                        "account-terms",
+                        "policy",
+                        "Terms & privacy policy",
+                        cx,
+                        |_, _, cx| cx.open_url("https://www.youtube.com/t/terms"),
+                    ))
+                    .child(help)
+                    .child(self.account_action(
+                        "account-feedback",
+                        "feedback",
+                        "Send feedback",
+                        cx,
+                        |_, _, cx| cx.open_url("https://github.com/AksharP5/yt-music-gpui/issues"),
+                    )),
+            )
+        };
         div()
             .id("account-focus")
             .absolute()

@@ -65,7 +65,7 @@ use library_actions::is_disliked;
 pub use navigation::HomePrefetch;
 use navigation::*;
 #[cfg(test)]
-use pages::shelves::visible_cards;
+use pages::shelves::{carousel_page, visible_cards};
 use pages::{DetailList, ListRow};
 #[cfg(test)]
 use playback::queue::adopt_watch_queue;
@@ -75,6 +75,9 @@ use player_page::PlayerPage;
 use window::MusicContent;
 
 pub(crate) const HEADER_HEIGHT: f32 = 64.;
+/// The web's breakpoint below which the guide shrinks to its mini form and
+/// opens in full only as a drawer.
+const GUIDE_DRAWER_BELOW: f32 = 936.;
 const CARD_GAP: f32 = 24.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,8 +126,10 @@ pub struct Music {
     shelf_heights: Vec<Option<pages::shelves::ShelfHeight>>,
     list_scroll: UniformListScrollHandle,
     detail_list: DetailList,
-    // None follows the window width until the guide is toggled.
-    sidebar_collapsed: Option<bool>,
+    /// The wide guide's mini state. Below 936px the guide is always mini.
+    sidebar_collapsed: bool,
+    /// Below 936px, the full guide opens as a drawer over the dimmed window.
+    guide_drawer: bool,
     sidebar_playlists: Vec<Collection>,
     sidebar_error: Option<String>,
     sidebar_scroll: UniformListScrollHandle,
@@ -176,6 +181,8 @@ pub struct Music {
     pending_seek: Option<SeekIntent>,
     /// The player's length for the video it measured last, by video ID.
     measured_duration: Option<(String, f64)>,
+    /// How far mpv has downloaded the playback it names, for the seek bar.
+    buffered: Option<(u64, f64)>,
     player_page: PlayerPage,
     overlay: Option<Overlay>,
     settings_section: SettingsSection,
@@ -186,6 +193,7 @@ pub struct Music {
     overlay_button: Option<Bounds<Pixels>>,
     overlay_focus: FocusHandle,
     menu_scroll: ScrollHandle,
+    collection_header_scroll: ScrollHandle,
     picker_focus: VirtualListFocus<crate::playlist_choices::Destination>,
     picker_scroll: UniformListScrollHandle,
     settings_focus: FocusHandle,

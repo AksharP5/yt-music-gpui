@@ -121,35 +121,16 @@ impl Music {
                     .child(
                         button("guide-toggle", "menu", self.theme)
                             .size(px(40.))
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.sidebar_collapsed = Some(!compact);
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                if f32::from(window.viewport_size().width) < GUIDE_DRAWER_BELOW {
+                                    view.guide_drawer = true;
+                                } else {
+                                    view.sidebar_collapsed = !compact;
+                                }
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        div()
-                            .id("brand-home")
-                            .keyboard_control(self.theme)
-                            // The focus shadow supplies the ring without a 1px layout inset.
-                            .border_0()
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .child(
-                                img(|window: &mut Window, cx: &mut App| {
-                                    let scale = window.scale_factor();
-                                    window.use_asset::<crate::assets::HeaderLogo>(
-                                        &size(
-                                            DevicePixels((71. * scale).round() as i32),
-                                            DevicePixels((24. * scale).round() as i32),
-                                        ),
-                                        cx,
-                                    )
-                                })
-                                .w(px(71.))
-                                .h(px(24.)),
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| view.navigate(Route::Home, cx))),
-                    ),
+                    .child(self.brand_home("brand-home", cx)),
             )
             .child(
                 div()
@@ -243,9 +224,11 @@ impl Music {
                                 .child(button("guest-account-menu", "more", self.theme).on_click(
                                     cx.listener(move |view, _, window, cx| {
                                         view.open_overlay(Overlay::Account, window, cx);
+                                        // Like the web, the menu hangs from the button's bottom
+                                        // edge, its right edge level with the icon's.
                                         view.overlay_anchor = Some(point(
-                                            window.viewport_size().width - px(account_inset + 380.),
-                                            px(56.),
+                                            window.viewport_size().width - px(account_inset + 391.),
+                                            px(52.),
                                         ));
                                     }),
                                 ))
@@ -309,6 +292,32 @@ impl Music {
         self.search
             .update(cx, |search, cx| search.set_back(false, cx));
         cx.notify();
+    }
+
+    /// The YouTube Music logo, which opens Home.
+    pub(in crate::app) fn brand_home(&self, id: &'static str, cx: &Context<Self>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .keyboard_control(self.theme)
+            // The focus shadow supplies the ring without a 1px layout inset.
+            .border_0()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .child(
+                img(|window: &mut Window, cx: &mut App| {
+                    let scale = window.scale_factor();
+                    window.use_asset::<crate::assets::HeaderLogo>(
+                        &size(
+                            DevicePixels((71. * scale).round() as i32),
+                            DevicePixels((24. * scale).round() as i32),
+                        ),
+                        cx,
+                    )
+                })
+                .w(px(71.))
+                .h(px(24.)),
+            )
+            .on_click(cx.listener(|view, _, _, cx| view.navigate(Route::Home, cx)))
     }
 
     /// Whether the page has scrolled away from its top, where the web turns
