@@ -520,36 +520,50 @@ pub(in crate::app) fn menu_chip(
         .child(label.into())
         .child(icon("expand-more", 24., theme.text))
 }
-pub(in crate::app) fn slider(
-    ratio: f32,
-    bounds: Rc<Cell<Bounds<Pixels>>>,
-    theme: Theme,
-) -> impl IntoElement {
-    canvas(
-        move |rect, _, _| {
-            bounds.set(rect);
-            rect
-        },
-        move |rect, _, window, _| {
-            let y = rect.top() + rect.size.height / 2. - px(2.);
-            window.paint_quad(fill(
-                Bounds::new(point(rect.left(), y), size(rect.size.width, px(3.))),
-                theme.border,
-            ));
-            window.paint_quad(fill(
-                Bounds::new(point(rect.left(), y), size(rect.size.width * ratio, px(3.))),
-                theme.accent,
-            ));
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(rect.left() + rect.size.width * ratio - px(3.), y - px(1.5)),
-                    size(px(6.), px(6.)),
-                ),
-                theme.text,
-            ));
-        },
+/// The volume slider, drawn as the web's: a 2 px track inset 16 px on each
+/// side of its 100 px box, grey with a white fill, and a 12 px round knob.
+/// `bounds` receives the track, so drags map onto the painted width.
+pub(in crate::app) fn slider(ratio: f32, bounds: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+    div().size_full().px(px(16.)).child(
+        div()
+            .size_full()
+            .relative()
+            .child(
+                canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
+                    .absolute()
+                    .inset_0(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(relative(0.5))
+                    .mt(px(-1.))
+                    .h(px(2.))
+                    .bg(rgb(0x909090))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .w(relative(ratio))
+                            .bg(gpui::white()),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(relative(0.5))
+                    .mt(px(-6.))
+                    .left(relative(ratio))
+                    .ml(px(-6.))
+                    .size(px(12.))
+                    .rounded_full()
+                    .bg(gpui::white()),
+            ),
     )
-    .size_full()
 }
 /// The time the seek bar previews at a fraction of its width. Like the web,
 /// it counts whole elapsed seconds.
