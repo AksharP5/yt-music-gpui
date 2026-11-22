@@ -85,28 +85,17 @@ The tests in `src/app/native_tests/` and the `native_` tests in `src/app/player_
 
 Together these keep the tests away from your library, saved account, keyring and media keys. GPUI's application loop cannot restart within one process, so each test needs its own process and a fresh runtime. The tests set their own volume to 0.
 
-Some tests compare window pixels through X11 and ImageMagick's `import`, so the recipe unsets `WAYLAND_DISPLAY`.
+`bin/test-native` runs them that way, one after another, and keeps going after a failure. It unsets `WAYLAND_DISPLAY`, because some tests compare window pixels through X11 and ImageMagick's `import`, and stops a test that hangs for ten minutes.
 
 ```sh
-for test in $(bin/test -- --ignored --list | sed -n \
-  -e '/^app::native_tests::performance::carousel_render_work_and_height_stay_bounded_while_scrolling: test$/d' \
-  -e '/^app::native_tests::suggestions::suggestions_refresh_cost_with_loaded_playlist: test$/d' \
-  -e '/^app::native_tests::/s/: test$//p' \
-  -e '/^app::player_page::comments::tests::native_/s/: test$//p'); do
-  runtime=$(mktemp -d /tmp/yt-music-native.XXXXXX)
-  mkdir -p "$runtime/data/yt-music-gpui" "$runtime/cache"
-  env -u WAYLAND_DISPLAY \
-    PIPEWIRE_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-    PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse" \
-    XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" XDG_CACHE_HOME="$runtime/cache" \
-    YT_MUSIC_NATIVE_TESTS=1 \
-    dbus-run-session --config-file=bin/private-bus.conf -- bin/test -- --ignored --exact "$test" --nocapture || break
-  # Screenshots from the render checks stay in $runtime for inspection.
-  echo "Native test files: $runtime"
-done
+bin/test-native                    # every native test except the two timing measurements below
+bin/test-native --offline          # also skip the tests that reach YouTube
+bin/test-native app::native_tests::search::tab_reaches_the_clear_button
 ```
 
-To run a single test, replace the loop's list with its name. Remove the runtime directories when you are done.
+Each run's files, including screenshots from the render checks, stay in the `/tmp/yt-music-native.*` directory it prints. Remove them when you are done.
+
+CI runs `bin/test-native --offline` on every pull request in a virtual display. YouTube blocks GitHub's runners, so the tests that play, read or download from YouTube are listed in `bin/test-native` and run only locally. Add a new test to that list if it needs YouTube.
 
 ### Performance checks
 

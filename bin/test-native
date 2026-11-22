@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Runs the native window tests, each in its own process with a fresh private runtime, data and
+# cache directory and a private session bus. Pass test names to run only those, or --offline to
+# skip the tests that reach YouTube. Every test runs even after a failure; the files of each run
+# stay in its runtime directory.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+# Timing measurements, run with --release as CONTRIBUTING describes.
+measurements=(
+  app::native_tests::performance::carousel_render_work_and_height_stay_bounded_while_scrolling
+  app::native_tests::suggestions::suggestions_refresh_cost_with_loaded_playlist
+)
+# These play, read or download from YouTube, which blocks GitHub's runners.
+online=(
+  app::native_tests::playback::fallback_notice_survives_playback_and_shuffle_loads_the_whole_playlist
+  app::native_tests::render::paused_video_stays_visible_under_menus
+  app::native_tests::restart::partial_playlist_continues_after_process_restart
+  app::native_tests::resume::the_last_song_continues_after_process_restart
+  app::player_page::comments::tests::native_comments_read_controls_and_playback_cost
+)
+
+skip=("${measurements[@]}")
+if [[ ${1:-} == --offline ]]; then
+  skip+=("${online[@]}")
+  shift
+fi
+
+if (($#)); then
+  tests=("$@")
+else
+  mapfile -t tests < <(bin/test -- --ignored --list | sed -n \
+    -e '/^app::native_tests::/s/: test$//p' \
+    -e '/^app::player_page::comments::tests::native_/s/: test$//p')
+  for name in "${measurements[@]}" "${online[@]}"; do
+    printf '%s\n' "${tests[@]}" | grep -qxF -- "$name" ||
+      { echo "bin/test-native lists $name, which is not a native test" >&2; exit 1; }
+  done
+  mapfile -t tests < <(printf '%s\n' "${tests[@]}" | grep -vxF -f <(printf '%s\n' "${skip[@]}"))
+fi
+
+failed=()
+for test in "${tests[@]}"; do
+  runtime=$(mktemp -d /tmp/yt-music-native.XXXXXX)
+  mkdir -p "$runtime/data/yt-music-gpui" "$runtime/cache"
+  started=$SECONDS
+  # The display and audio variables keep pointing at the caller's session; some tests compare
+  # window pixels through X11 and ImageMagick's import, so Wayland is unset. A hung test is
+  # stopped after ten minutes.
+  if env -u WAYLAND_DISPLAY \
+    PIPEWIRE_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    PULSE_RUNTIME_PATH="${XDG_RUNTIME_DIR:-}/pulse" \
+    XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" XDG_CACHE_HOME="$runtime/cache" \
+    YT_MUSIC_NATIVE_TESTS=1 \
+    timeout --kill-after=30s 10m \
+    dbus-run-session --config-file=bin/private-bus.conf -- \
+    bin/test -- --ignored --exact "$test" --nocapture; then
+    result=passed
+  else
+    result=FAILED
+    failed+=("$test ($runtime)")
+  fi
+  echo "native test $result in $((SECONDS - started)) s: $test ($runtime)"
+done
+
+echo "${#tests[@]} native tests ran, ${#failed[@]} failed."
+((${#failed[@]} == 0)) || { printf 'FAILED %s\n' "${failed[@]}"; exit 1; }

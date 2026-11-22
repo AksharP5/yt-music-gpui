@@ -95,6 +95,33 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
         run: xvfb-run -a -s "-screen 0 1920x1080x24" bin/check-performance "$BASE_SHA"
 
+  # Opens real windows in a virtual display, rendered with Mesa's software Vulkan. The runner has
+  # no audio server, so playback stays silent.
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Install a virtual display and ImageMagick
+        run: sudo apt-get install -y --no-install-recommends xvfb xauth mesa-vulkan-drivers dbus imagemagick
+      # The player needs yt-dlp to start, even when a test never plays from YouTube.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.x"
+      - name: Install the reviewed yt-dlp
+        run: |
+          version=$(grep -oP 'REVIEWED_VERSION = "\K[0-9.]+(?=")' src/ytdlp_account.py)
+          python -m pip install --quiet "yt-dlp==$version"
+      - run: bin/test --no-run
+      # The tests keep their runtimes in /tmp, and sign-in refuses a runtime that is not in RAM.
+      - name: Keep /tmp in RAM
+        run: sudo mount -t tmpfs -o mode=1777,size=4g tmpfs /tmp
+      - name: Run the native window tests
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" bin/test-native --offline
+
   release-test:
     if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/release-build.yml
