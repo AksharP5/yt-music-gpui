@@ -2842,7 +2842,7 @@ fn playlist_song_menu_moves_the_selected_occurrence_across_shelves() -> Result<(
 
     check_cache_window(async |window, cx| {
         let (commands, submitted) = async_channel::bounded(2);
-        for (offset, destination) in [(5, "occurrence-0"), (6, "occurrence-3")] {
+        for (offset, destination) in [(6, "occurrence-0"), (7, "occurrence-3")] {
             window
                 .update(cx, |view, window, cx| {
                     view.account_commands = commands.clone();

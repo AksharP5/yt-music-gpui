@@ -341,6 +341,12 @@ impl Music {
                         .child(
                             self.menu_button("current-song-menu", cx, move |view, window, cx| {
                                 view.open_track_menu(menu_track.clone(), None, window, cx);
+                                // As on the web, the playing song can be removed from the queue.
+                                let playing = view.library.queue.index;
+                                if let Some(Overlay::Track { queue_index, .. }) = &mut view.overlay
+                                {
+                                    *queue_index = playing;
+                                }
                             })
                             .size(px(36.))
                             .ml(px(13.))
