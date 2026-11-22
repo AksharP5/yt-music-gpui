@@ -203,6 +203,10 @@ impl Render for Music {
             (self.guide_drawer && width < GUIDE_DRAWER_BELOW).then(|| self.guide_drawer(cx));
         let overlay = match &self.overlay {
             Some(Overlay::Account) => Some(self.account_popup(window, cx)),
+            Some(Overlay::SongText { content, .. }) => {
+                let content = content.clone();
+                Some(self.credits_dialog(content.as_ref(), cx))
+            }
             Some(kind) if !kind.in_page() => Some(self.overlay(kind, window, cx)),
             _ => None,
         };
