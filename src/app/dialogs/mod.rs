@@ -537,6 +537,7 @@ impl Music {
             ElementId::Name(name) => match name.as_ref() {
                 "menu-radio" => Some("menu-mix"),
                 "menu-shuffle" => Some("shuffle"),
+                "menu-find" => Some("search"),
                 "collection-play" => Some("play"),
                 "menu-next" => Some("menu-play-next"),
                 "menu-enqueue" => Some("menu-add-queue"),
@@ -858,10 +859,7 @@ impl Music {
                     }
                     SongAction::PlayNext => {
                         self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
-                            view.cancel_queue_drag();
-                            let index = view.library.queue.index.map_or(0, |i| i + 1);
-                            view.library.queue.tracks_mut().insert(index, song.clone());
-                            view.queue_changed(cx);
+                            view.play_next(vec![song.clone()], cx);
                             view.show_toast("Will play next", cx);
                         })
                     }
@@ -1046,50 +1044,138 @@ impl Music {
                 });
             }
         } else if let Overlay::Collection(collection) = kind {
-            for (id, label, query) in [
-                (
+            // An album or public playlist's own header menu lists what the
+            // web's does; its play and save buttons sit beside it.
+            let header = matches!(&self.route, Route::Browse(link) if link.id == collection.id)
+                && (collection.id.starts_with("VL") || collection.id.starts_with("MPRE"))
+                && !self.page.editable;
+            let album = collection.id.starts_with("MPRE");
+            let kind = if album { "Album" } else { "Playlist" };
+            if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Shuffled) {
+                actions.push(self.menu_action(
                     "menu-shuffle",
                     "Shuffle play",
-                    PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
-                ),
-                ("menu-radio", "Start mix", PlaybackQuery::mix(collection)),
-            ] {
-                if let Some(query) = query {
-                    actions.push(self.menu_action(id, label, cx, move |view, _, cx| {
-                        view.start_queue(query.clone(), cx);
-                    }));
-                }
-            }
-            if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Original) {
-                actions.push(self.menu_action(
-                    "collection-play",
-                    "Play",
                     cx,
-                    move |view, _, cx| {
-                        view.start_queue(query.clone(), cx);
+                    move |view, _, cx| view.start_queue(query.clone(), cx),
+                ));
+            }
+            if header && !album {
+                actions.push(self.menu_action(
+                    "menu-find",
+                    "Find in playlist",
+                    cx,
+                    |view, window, cx| view.open_playlist_find(window, cx),
+                ));
+            }
+            if let Some(query) = PlaybackQuery::mix(collection) {
+                actions.push(self.menu_action(
+                    "menu-radio",
+                    "Start mix",
+                    cx,
+                    move |view, _, cx| view.start_queue(query.clone(), cx),
+                ));
+            }
+            if header {
+                let next = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-next",
+                    "Play next",
+                    cx,
+                    move |view, window, cx| {
+                        view.with_collection_tracks(
+                            &next,
+                            window,
+                            cx,
+                            move |view, tracks, _, cx| {
+                                view.play_next(tracks, cx);
+                                view.show_toast(format!("{} will play next", kind), cx);
+                            },
+                        )
+                    },
+                ));
+                let queued = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-enqueue",
+                    "Add to queue",
+                    cx,
+                    move |view, window, cx| {
+                        view.with_collection_tracks(
+                            &queued,
+                            window,
+                            cx,
+                            move |view, tracks, _, cx| {
+                                view.library.queue.tracks_mut().extend(tracks);
+                                view.queue_changed(cx);
+                                view.show_toast(format!("{} added to queue", kind), cx);
+                            },
+                        )
+                    },
+                ));
+                let saved = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-playlist",
+                    "Save to playlist",
+                    cx,
+                    move |view, window, cx| {
+                        if view.account.is_none() {
+                            view.connect_account(window, cx);
+                            return;
+                        }
+                        view.with_collection_tracks(
+                            &saved,
+                            window,
+                            cx,
+                            |view, tracks, window, cx| view.playlist_picker(tracks, window, cx),
+                        )
+                    },
+                ));
+                if album
+                    && let Some(HeaderArtist::Link(artist)) = self
+                        .page
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.artist.clone())
+                {
+                    actions.push(self.menu_action(
+                        "menu-artist",
+                        "Go to artist",
+                        cx,
+                        move |view, _, cx| view.navigate(Route::Browse(artist.clone()), cx),
+                    ));
+                }
+            } else {
+                if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Original)
+                {
+                    actions.push(self.menu_action(
+                        "collection-play",
+                        "Play",
+                        cx,
+                        move |view, _, cx| {
+                            view.start_queue(query.clone(), cx);
+                        },
+                    ));
+                }
+                let saved = self.is_saved(collection);
+                let selected = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-library",
+                    if collection.id.starts_with("UC") {
+                        if saved { "Unsubscribe" } else { "Subscribe" }
+                    } else if saved {
+                        "Remove from library"
+                    } else {
+                        "Save to library"
+                    },
+                    cx,
+                    move |view, window, cx| {
+                        if selected.id.starts_with("UC") && view.account.is_none() {
+                            view.connect_account(window, cx);
+                            return;
+                        }
+                        view.save_collection(selected.clone(), cx);
                     },
                 ));
             }
-            let saved = self.is_saved(collection);
-            let selected = collection.clone();
-            actions.push(self.menu_action(
-                "menu-library",
-                if collection.id.starts_with("UC") {
-                    if saved { "Unsubscribe" } else { "Subscribe" }
-                } else if saved {
-                    "Remove from library"
-                } else {
-                    "Save to library"
-                },
-                cx,
-                move |view, window, cx| {
-                    if selected.id.starts_with("UC") && view.account.is_none() {
-                        view.connect_account(window, cx);
-                        return;
-                    }
-                    view.save_collection(selected.clone(), cx);
-                },
-            ));
             let shared = collection.clone();
             actions.push(
                 self.menu_action("menu-share", "Share", cx, move |view, window, cx| {

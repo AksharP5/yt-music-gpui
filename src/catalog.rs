@@ -1009,6 +1009,22 @@ impl Catalog {
         anyhow::bail!("Playlist saved, but its details have not updated yet. Refresh the playlist.")
     }
 
+    /// Every song of an album or playlist, in its own order, for Play next
+    /// and Add to queue.
+    pub fn collection_tracks(&self, link: &BrowseLink) -> Result<Vec<Track>> {
+        let page = self.browse(link)?;
+        let mut tracks = page.tracks();
+        let mut continuation = page.continuation;
+        while let Some(next) = continuation {
+            let page = self.more(&next)?;
+            let before = tracks.len();
+            tracks.extend(page.tracks());
+            // A page without songs would only repeat the same request.
+            continuation = page.continuation.filter(|_| tracks.len() > before);
+        }
+        Ok(tracks)
+    }
+
     pub fn more(&self, continuation: &Continuation) -> Result<Page> {
         let data = self.request_with_continuation(
             "browse",

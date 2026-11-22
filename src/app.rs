@@ -170,6 +170,8 @@ pub struct Music {
     /// The full-window player page, showing artwork or video beside its tabs.
     player_open: bool,
     sort_focus: FocusHandle,
+    /// A playlist's Find in playlist bar, which filters its loaded rows.
+    playlist_find: Option<pages::PlaylistFind>,
     video_fullscreen: bool,
     video_transparent: bool,
     video_error: Option<String>,

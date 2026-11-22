@@ -9,6 +9,8 @@ mod playlist_order;
 pub(in crate::app) mod search;
 pub(in crate::app) mod shelves;
 
+pub(in crate::app) use collection::PlaylistFind;
+
 use super::*;
 
 pub(super) fn error_summary(error: &str) -> String {
@@ -357,8 +359,11 @@ impl Music {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let playlist_end = self.playlist_rows_end();
-        self.prefetch_page(index.min(playlist_end), playlist_end, 8, cx);
+        // Like the web, Find in playlist searches only the songs already loaded.
+        if self.playlist_find.is_none() {
+            let playlist_end = self.playlist_rows_end();
+            self.prefetch_page(index.min(playlist_end), playlist_end, 8, cx);
+        }
         match self.list_rows[index] {
             ListRow::Featured(index) => {
                 self.featured_result(index, inset, self.page_layout(window).search_width(), cx)
@@ -377,6 +382,26 @@ impl Music {
                 .into_any_element(),
             ListRow::Item(index) => self.row(index, inset, window, cx),
             ListRow::Shelf(index) => self.shelf(index, inset, window, cx),
+            ListRow::EmptyPlaylist if self.playlist_find.is_some() => {
+                let query = self
+                    .playlist_find
+                    .as_ref()
+                    .map(|find| find.text(cx))
+                    .unwrap_or_default();
+                div()
+                    .px(px(inset))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .text_size(px(16.))
+                    .child(format!("No results for \"{query}\""))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .child("Check the spelling, or try different words"),
+                    )
+                    .into_any_element()
+            }
             ListRow::EmptyPlaylist => div()
                 .px(px(inset + 16.))
                 .py(px(24.))
@@ -653,7 +678,10 @@ impl Music {
                             return stacked_row(if index == 0 {
                                 div()
                                     .pt(px(STACKED_TOP))
-                                    .children(view.playlist_sort(cx))
+                                    .children(
+                                        view.playlist_find_bar(cx)
+                                            .or_else(|| view.playlist_sort(cx)),
+                                    )
                                     .child(row)
                                     .into_any_element()
                             } else {
@@ -686,7 +714,13 @@ impl Music {
                                 ));
                             return div()
                                 .child(header)
-                                .children(view.playlist_sort(cx).map(|sort| sort.ml(px(inset))))
+                                .children(
+                                    view.playlist_find_bar(cx)
+                                        .map(|find| find.mx(px(inset)))
+                                        .or_else(|| {
+                                            view.playlist_sort(cx).map(|sort| sort.ml(px(inset)))
+                                        }),
+                                )
                                 .into_any_element();
                         }
                         view.list_row(index - usize::from(inline), inset, window, cx)
