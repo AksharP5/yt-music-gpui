@@ -693,7 +693,7 @@ fn compact_playlist_menu_focus_reveals_the_last_action() -> anyhow::Result<()> {
         };
 
         // The podcast menu has a subtitle above its actions.
-        for (episode, first, last) in [(false, 1, 12), (true, 2, 14)] {
+        for (episode, first, last) in [(false, 1, 13), (true, 2, 15)] {
             window
                 .update(cx, |view, window, cx| {
                     window.resize(size(px(850.), px(560.)));
