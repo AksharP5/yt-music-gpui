@@ -44,7 +44,8 @@ Source: https://github.com/feathericons/feather
   ("skip-back"), home, more ("more-vertical"),
   mute ("volume-x") and volume ("volume-2").
 
-assets/icons/repeat.svg is adapted from Lucide's "repeat", Copyright Lucide
+assets/icons/repeat.svg and repeat-one.svg are adapted from Lucide's "repeat"
+and "repeat-1", Copyright Lucide
 Icons and Contributors, licensed under the ISC License (LICENSE-LUCIDE).
 Source: https://github.com/lucide-icons/lucide
 
