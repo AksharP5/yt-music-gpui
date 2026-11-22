@@ -65,7 +65,7 @@ use library_actions::is_disliked;
 pub use navigation::HomePrefetch;
 use navigation::*;
 #[cfg(test)]
-use pages::shelves::visible_cards;
+use pages::shelves::{carousel_page, visible_cards};
 use pages::{DetailList, ListRow};
 #[cfg(test)]
 use playback::queue::adopt_watch_queue;
@@ -174,6 +174,8 @@ pub struct Music {
     pending_seek: Option<SeekIntent>,
     /// The player's length for the video it measured last, by video ID.
     measured_duration: Option<(String, f64)>,
+    /// How far mpv has downloaded the playback it names, for the seek bar.
+    buffered: Option<(u64, f64)>,
     player_page: PlayerPage,
     overlay: Option<Overlay>,
     settings_section: SettingsSection,
