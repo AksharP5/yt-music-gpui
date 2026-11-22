@@ -12,7 +12,7 @@ sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland lib
 
 On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the packages to install. Sign-in also needs Python 3, xdg-utils and libsecret's `secret-tool`, and saves accounts in a running Secret Service keyring.
 
-On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. The macOS build plays signed-out audio and video; sign-in is Linux-only for now. Media keys and Control Center's Now Playing work on macOS, and CI checks the build on Apple Silicon with macOS 15.
+On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. See [Release](#release) to package it as an app. Source builds use Homebrew's libmpv; the macOS app ships an LGPL libmpv built from source (see [Release](#release)). The macOS build plays signed-out audio and video; sign-in is Linux-only for now. Media keys and Control Center's Now Playing work on macOS, and CI checks the build on Apple Silicon with macOS 15.
 
 On Windows, install Rust with the MSVC toolchain, build with `cargo build --release --locked`, and put `libmpv-2.dll` from mpv's release `libmpv-*-x86_64-w64-mingw32-lgpl.zip` next to the executable or on `PATH`; [the CI setup](.github/actions/setup/action.yml) pins the one CI uses. yt-dlp and Deno come from `PATH`. The Windows build also plays signed-out audio only, and CI checks it on Windows Server 2025.
 
@@ -149,13 +149,13 @@ Never commit cookies, account data or keyring contents.
 
 ## Release
 
-Releases are x86_64 Linux binaries built on Ubuntu 24.04. Merging only runs CI; it never publishes a release or deploys anything. Releases are immutable once published, only repository admins can create or move `v*` tags, and the release build refuses a tag whose commit is not on `main`.
+Releases are x86_64 Linux binaries built on Ubuntu 24.04 and an Apple Silicon macOS app built on GitHub's macOS 15 runner. Merging only runs CI; it never publishes a release or deploys anything. Releases are immutable once published, only repository admins can create or move `v*` tags, and the release build refuses a tag whose commit is not on `main`.
 
 1. Set the release version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`. Merge the reviewed version change.
 2. Tag that commit with `git tag vX.Y.Z`, matching `Cargo.toml`, then `git push origin vX.Y.Z`.
-3. The Release workflow builds with `--locked`, tests the tarball, `.deb` and `.rpm` in Ubuntu, Debian, Fedora and openSUSE containers, and publishes them with their SHA-256 checksums, `install.sh` and a dependency report.
+3. The Release workflow builds with `--locked`, tests the tarball, `.deb` and `.rpm` in Ubuntu, Debian, Fedora and openSUSE containers, builds the macOS `.dmg`, and publishes them with their SHA-256 checksums, `install.sh` and a dependency report.
 
-Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` artifact without creating a release. Check `dependencies.txt` for direct dynamic dependencies and the highest required glibc symbol version.
+Before tagging, run the Release workflow with `workflow_dispatch` on the branch. It uploads the same files as the `linux-x86_64` and `macos-aarch64` artifacts without creating a release. Check `dependencies.txt` for direct dynamic dependencies and the highest required glibc symbol version.
 
 Download the artifact and test the installer without touching an existing installation. Keep the matching `.tar.gz.sha256` beside the tarball:
 
@@ -167,6 +167,27 @@ HOME="$home" XDG_DATA_HOME="$home/data" sh install.sh --uninstall
 rm -r -- "$home"
 ```
 
+To build the macOS app locally, first build the LGPL libmpv it ships. `packaging/macos-libmpv.sh` builds mpv with `-Dgpl=false` and FFmpeg without GPL or nonfree parts, from sources pinned by SHA-256, into one `libmpv.2.dylib` that loads only macOS frameworks, and fails if either is configured otherwise. It takes about 4 minutes on an M1. The build tools come from a throwaway virtual environment:
+
+```sh
+python3 -m venv /tmp/libmpv-tools
+/tmp/libmpv-tools/bin/pip install --require-hashes -r packaging/macos-build-requirements.txt
+PATH="/tmp/libmpv-tools/bin:$PATH" packaging/macos-libmpv.sh target/libmpv
+LIBMPV_PREFIX=$PWD/target/libmpv cargo build --release --locked
+python3 packaging/macos-dmg.py
+```
+
+`packaging/macos-dmg.py` puts that libmpv in the app, adds the pinned yt-dlp, Deno and Python, signs the app ad hoc and writes `dist/yt-music-gpui-X.Y.Z-aarch64-macos.dmg` with its `.sha256`. It fails unless every FFmpeg library in libmpv reports LGPL 2.1 and mpv reports `-Dgpl=false`, and if anything in the app loads a library from outside macOS. The app declares the newest minimum macOS among its binaries. CI builds and tests with the same libmpv, cached until the recipe changes. Test the app with Homebrew unreadable and a scratch home:
+
+```sh
+home=$(mktemp -d)
+mkdir -p "$home/Library/Application Support/yt-music-gpui"
+echo '{"volume":0}' > "$home/Library/Application Support/yt-music-gpui/library.json"
+env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="$(getconf DARWIN_USER_TEMP_DIR)" \
+  sandbox-exec -p '(version 1)(allow default)(deny file-read* (subpath "/opt/homebrew") (subpath "/usr/local"))' \
+  "/path/to/YouTube Music.app/Contents/MacOS/yt-music-gpui"
+```
+
 Container `--version` checks do not prove that graphics, audio or sign-in work, so test playback with the installed binary using the isolated instance recipe above.
 
-`src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256, plus the fallback Deno version, archive SHA-256 and download size. Packaging copies them into `runtime-pins.json`, which the release build and the installer read; nothing else pins these versions. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.
+`src/ytdlp_account.py` holds the reviewed yt-dlp version and zipapp SHA-256, plus the fallback Deno version, archive SHA-256 and download size, and the SHA-256 of the Apple Silicon Deno archive the macOS app bundles. Packaging copies them into `runtime-pins.json`, which the release build and the installer read; nothing else pins these versions. The Python the macOS app runs yt-dlp with is pinned in `packaging/macos-dmg.py`, and libmpv's sources in `packaging/macos-libmpv.sh`. When changing them, verify the official release hashes, run `bin/test-install` and both yt-dlp contracts, and test the zipapp's resident resolver and bundled EJS solver. The app never downloads tools or solver scripts.

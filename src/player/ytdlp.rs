@@ -36,7 +36,7 @@ pub(super) fn write_account_extractor(runtime: &Path) -> Result<PathBuf> {
 pub(super) const REVIEWED_YTDLP: &str = env!("REVIEWED_YTDLP");
 
 pub(super) fn account_playback_supported(ytdlp: &Path) -> bool {
-    Command::new(ytdlp)
+    ytdlp_command(ytdlp)
         .args(["--ignore-config", "--no-plugin-dirs", "--version"])
         .output()
         .is_ok_and(|output| {
@@ -110,6 +110,9 @@ fn send_credentials(input: Arc<ChildStdin>, credentials: &ExtractorCredentials) 
 }
 
 fn python_interpreter(ytdlp: &Path) -> Result<Command> {
+    if let Some(python) = bundled_python(ytdlp) {
+        return Ok(Command::new(python));
+    }
     let mut header = [0; 1024];
     let count = File::open(ytdlp)?.read(&mut header)?;
     let line = header[..count]
@@ -307,7 +310,7 @@ impl StreamPreparation {
     ) -> Result<Self> {
         // Keep signed URLs and any extractor output in anonymous RAM, never disk.
         let output = private_file()?;
-        let mut command = Command::new(ytdlp);
+        let mut command = ytdlp_command(ytdlp);
         extractor_arguments(&mut command, credentials);
         command
             .arg("--format")
@@ -410,14 +413,20 @@ pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
         let uid = unsafe { libc::geteuid() };
         (home.join(".local/share/yt-music-gpui"), home, uid)
     });
-    // Bundled helpers must be root-owned all the way up from /.
-    let root = |directory| Some((directory, PathBuf::from("/"), 0));
-    let candidates = match std::env::current_exe()
-        .ok()
-        .and_then(|exe| bundled_helpers(&exe))
-    {
-        Some(bundled) => [root(bundled), installer],
-        None => [installer, root(PathBuf::from(PACKAGE_HELPERS))],
+    // Package helpers must be root-owned all the way up from /. A macOS app's
+    // need only match its executable: whoever can change them can change the app.
+    let bundled = std::env::current_exe().ok().and_then(|exe| {
+        let (directory, top) = bundled_helpers(&exe)?;
+        let owner = if top == Path::new("/") {
+            0
+        } else {
+            fs::metadata(&exe).ok()?.uid()
+        };
+        Some((directory, top, owner))
+    });
+    let candidates = match bundled {
+        Some(bundled) => [Some(bundled), installer],
+        None => [installer, Some((PACKAGE_HELPERS.into(), "/".into(), 0))],
     };
     candidates
         .into_iter()
@@ -427,15 +436,42 @@ pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
         .map(|(path, ..)| path)
 }
 
-// Where the running executable's own helpers live, by platform layout. On
-// Linux only the package binary has bundled helpers: /usr/bin/yt-music-gpui
-// uses /usr/lib/yt-music-gpui. After a package upgrade replaces the running
-// binary, Linux reports its old path with a " (deleted)" suffix.
-#[cfg(unix)]
-fn bundled_helpers(exe: &Path) -> Option<PathBuf> {
+// Where the running executable's own helpers live, by platform layout, and the
+// directory they are checked up to. On Linux only the package binary has
+// bundled helpers: /usr/bin/yt-music-gpui uses /usr/lib/yt-music-gpui. After a
+// package upgrade replaces the running binary, Linux reports its old path with
+// a " (deleted)" suffix. A macOS app keeps them in its Contents/Resources.
+#[cfg(target_os = "macos")]
+fn bundled_helpers(exe: &Path) -> Option<(PathBuf, PathBuf)> {
+    let contents = exe.parent()?.parent()?;
+    let app = contents.parent()?;
+    (exe.parent()?.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && app.extension()? == "app")
+        .then(|| (contents.join("Resources"), app.to_path_buf()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn bundled_helpers(exe: &Path) -> Option<(PathBuf, PathBuf)> {
     let exe = exe.as_os_str().as_encoded_bytes();
     let exe = exe.strip_suffix(b" (deleted)").unwrap_or(exe);
-    (exe == b"/usr/bin/yt-music-gpui").then(|| PathBuf::from(PACKAGE_HELPERS))
+    (exe == b"/usr/bin/yt-music-gpui").then(|| (PACKAGE_HELPERS.into(), "/".into()))
+}
+
+// macOS has no Python new enough for yt-dlp, so the app bundles one beside its
+// zipapp. Any other yt-dlp runs with the interpreter its shebang names.
+fn bundled_python(ytdlp: &Path) -> Option<PathBuf> {
+    let python = private_tool("python/bin/python3")?;
+    (python.ancestors().nth(3) == ytdlp.parent()).then_some(python)
+}
+
+fn ytdlp_command(ytdlp: &Path) -> Command {
+    let Some(python) = bundled_python(ytdlp) else {
+        return Command::new(ytdlp);
+    };
+    let mut command = Command::new(python);
+    command.arg(ytdlp);
+    command
 }
 
 /// Windows builds bundle no helpers yet, so yt-dlp and Deno come from PATH.
@@ -508,10 +544,10 @@ pub(super) mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn only_the_package_binary_uses_bundled_helpers_even_after_an_upgrade_replaces_it() {
-        let package = Some(PathBuf::from("/usr/lib/yt-music-gpui"));
+        let package = Some(("/usr/lib/yt-music-gpui".into(), "/".into()));
         assert_eq!(
             bundled_helpers(Path::new("/usr/bin/yt-music-gpui")),
             package
@@ -525,6 +561,28 @@ pub(super) mod tests {
             "/home/me/.local/bin/yt-music-gpui",
             "/home/me/yt-music-gpui/target/release/yt-music-gpui",
             "/usr/bin/yt-music-gpui-old",
+        ] {
+            assert_eq!(bundled_helpers(Path::new(exe)), None, "{exe}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_an_app_bundle_uses_its_resources_as_helpers() {
+        assert_eq!(
+            bundled_helpers(Path::new(
+                "/Applications/YouTube Music.app/Contents/MacOS/yt-music-gpui"
+            )),
+            Some((
+                "/Applications/YouTube Music.app/Contents/Resources".into(),
+                "/Applications/YouTube Music.app".into()
+            ))
+        );
+        for exe in [
+            "/usr/bin/yt-music-gpui",
+            "/Users/me/yt-music-gpui/target/release/yt-music-gpui",
+            "/Users/me/Contents/MacOS/yt-music-gpui",
+            "/Applications/YouTube Music.app/Contents/Resources/yt-music-gpui",
         ] {
             assert_eq!(bundled_helpers(Path::new(exe)), None, "{exe}");
         }

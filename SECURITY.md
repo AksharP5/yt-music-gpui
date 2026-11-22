@@ -38,3 +38,11 @@ The packages are not signed. Their `.sha256` files come from the same GitHub Rel
 The app uses the packaged helpers only when each file and every directory up to `/` belongs to root and is not writable by group or others. The packaged app prefers them over installer copies in your home folder; the script-installed app and source builds prefer their own.
 
 Each release build installs the `.deb` in clean Ubuntu 24.04 and Debian 13 containers and the `.rpm` in clean Fedora 43 and openSUSE Tumbleweed containers. It checks that dependencies resolve, the packaged app prefers the bundled helpers over a trusted copy in HOME while a copy outside `/usr/bin` prefers the HOME copy, the app refuses the bundled helpers once their directory is writable by others or owned by another user, yt-dlp accepts the bundled Deno, and removal leaves none of the package's files. It does not test graphics, audio, sign-in or playback.
+
+## macOS app
+
+The `.dmg` comes from the same release workflow, built on GitHub's macOS 15 runner. The app is signed ad hoc, not with an Apple Developer ID, and is not notarized, so macOS asks you to approve it once. Its `.sha256` detects corrupted downloads, not a compromised maintainer account or release. Like every release file, it has a build provenance attestation you can check with `gh attestation verify`, as described under [Release installer](#release-installer).
+
+Its libmpv is built in the release workflow from mpv, FFmpeg, libplacebo, libass, dav1d, FreeType, FriBidi and HarfBuzz sources pinned by SHA-256 in `packaging/macos-libmpv.sh`, and loads only macOS frameworks. `Contents/Resources/licenses/LIBRARIES.txt` lists their versions, licenses and sources. The yt-dlp zipapp and Deno must match the reviewed hashes in `src/ytdlp_account.py`, and the Python that runs yt-dlp must match the hash in `packaging/macos-dmg.py`. All of these update only with a new app release.
+
+The app uses the yt-dlp, Deno and Python in its own `Contents/Resources` only when each file and every directory up to the `.app` belongs to the owner of the app's executable and is not writable by group or others. Anyone who could change them could change the app itself. Otherwise it falls back to a trusted copy in your home folder, then `PATH`.

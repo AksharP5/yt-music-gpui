@@ -1,6 +1,6 @@
 # YouTube Music GPUI
 
-A fast, native YouTube Music client for Linux, built with Rust and GPUI. Audio and video play through libmpv.
+A fast, native YouTube Music client for Linux and macOS, built with Rust and GPUI. Audio and video play through libmpv.
 
 ![Home page with Quick picks and playlist shelves](docs/screenshot.webp)
 
@@ -21,6 +21,8 @@ In three runs per packaged build on Omarchy, median guest playback memory fell f
 This is an independent client using YouTube Music's unofficial API. YouTube changes can break playback or account features.
 
 ## Install
+
+### Linux
 
 Requires x86_64 Linux with glibc 2.39 or newer and a working Vulkan driver: Ubuntu 24.04+, Debian 13+, Fedora, openSUSE Tumbleweed or Arch.
 
@@ -53,6 +55,18 @@ curl -fsSL https://github.com/AksharP5/yt-music-gpui/releases/latest/download/in
 Use either a package or the script, not both. Uninstalling keeps your library, settings and saved account. See [SECURITY.md](SECURITY.md) for what each method checks and trusts.
 
 **Arch, from source:** `packaging/PKGBUILD` builds the latest commit. Copy it anywhere and run `makepkg -si`.
+
+### macOS
+
+Requires a Mac with Apple Silicon and macOS 12 or newer. The app includes everything it needs, so there is nothing else to install.
+
+1. Download `yt-music-gpui-*-aarch64-macos.dmg` from the [latest release](https://github.com/AksharP5/yt-music-gpui/releases/latest), open it and drag **YouTube Music** into **Applications**.
+2. Open the app. The app isn't signed by Apple yet, so macOS blocks the first launch. Choose **Done**.
+3. Open **System Settings**, then **Privacy & Security**. Under Security, choose **Open Anyway** next to "YouTube Music" was blocked, and confirm with your password. On macOS 14 and earlier, Control-click the app in Applications instead, choose **Open**, then **Open** again.
+
+After that it opens normally. To upgrade, replace the app with the one from a newer `.dmg`. To remove it, move it to the Trash. Your library and settings stay in `~/Library/Application Support/yt-music-gpui`.
+
+On macOS you can browse, search and play audio and video signed out, with captions, media keys and Now Playing in Control Center. Sign-in, and with it your library, playlists and history, is coming soon.
 
 ## Sign in
 

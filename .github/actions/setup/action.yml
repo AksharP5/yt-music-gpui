@@ -1,5 +1,5 @@
 name: Set up build
-description: Install the system libraries and Rust toolchain the app builds against.
+description: Install the system libraries and Rust toolchain the app builds against. macOS builds libmpv with ./.github/actions/libmpv-macos.
 inputs:
   cache:
     description: Restore and save the shared Rust build cache.
@@ -35,10 +35,6 @@ runs:
           fetch_packages
         fi
         sudo apt-get install -y --no-install-recommends --no-download "${packages[@]}"
-    - name: Install libmpv
-      if: runner.os == 'macOS'
-      shell: bash
-      run: brew install mpv
     # mpv's own LGPL build, pinned by checksum. The app loads libmpv-2.dll at run time.
     - name: Install libmpv
       if: runner.os == 'Windows'

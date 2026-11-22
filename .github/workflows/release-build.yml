@@ -169,6 +169,46 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
+  # Apple Silicon app with an LGPL libmpv, yt-dlp, Python and Deno bundled.
+  # The build job's tag checks gate publishing it.
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          cache: 'false'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - uses: ./.github/actions/libmpv-macos
+      - run: cargo build --release --locked
+      - name: Build the .app and .dmg
+        run: python packaging/macos-dmg.py dist
+      - name: Check the app finds its own helpers with Homebrew unreadable
+        run: |
+          mount=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" dist/*.dmg
+          trap 'hdiutil detach "$mount"' EXIT
+          app="$mount/YouTube Music.app"
+          deny='(version 1)(allow default)(deny file-read* (subpath "/opt/homebrew") (subpath "/usr/local"))'
+          version=$(env -i HOME="$RUNNER_TEMP" PATH=/usr/bin:/bin sandbox-exec -p "$deny" "$app/Contents/MacOS/yt-music-gpui" --version)
+          echo "$version"
+          grep -qF "yt-dlp: $app/Contents/Resources/yt-dlp" <<< "$version"
+          grep -qF "deno: $app/Contents/Resources/deno" <<< "$version"
+          env -i PATH=/usr/bin:/bin sandbox-exec -p "$deny" \
+            "$app/Contents/Resources/python/bin/python3" "$app/Contents/Resources/yt-dlp" --version
+          codesign --verify --deep --strict "$app"
+          plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: macos-aarch64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
   compatibility:
     needs: build
     runs-on: ubuntu-24.04

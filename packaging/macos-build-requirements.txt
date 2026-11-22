@@ -1,0 +1,11 @@
+# Build tools for packaging/macos-libmpv.sh, installed with:
+#   python3 -m venv venv && venv/bin/pip install --require-hashes -r packaging/macos-build-requirements.txt
+# libplacebo generates its shaders with Jinja2.
+meson==1.9.1 --hash=sha256:f824ab770c041a202f532f69e114c971918ed2daff7ea56583d80642564598d0
+ninja==1.13.0 --hash=sha256:fa2a8bfc62e31b08f83127d1613d10821775a0eb334197154c4d6067b7068ff1
+jinja2==3.1.6 --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+# Apple Silicon wheels for Python 3.13, 3.14 and 3.15.
+markupsafe==3.0.4 \
+    --hash=sha256:73e77980c7207854f00fc4e71fb1626868d5740ab4012623d55c7a99ad122a72 \
+    --hash=sha256:52704c5d36eb6dda8866493decd61111fff86244c9b1ad225ca01b9e91e5970f \
+    --hash=sha256:ae9dcb8fbe244cb82f8a6458b455b927a03685e383d9bacf1ea5ce180b96dc97
