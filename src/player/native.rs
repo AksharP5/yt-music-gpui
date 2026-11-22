@@ -1,4 +1,5 @@
 //! Cookie-free VISIONOS player lookup, reviewed against yt-dlp 2026.08.19.
+use super::stream::normalization_gain;
 use super::{AudioQuality, VideoQuality};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::{Client, RequestBuilder};
@@ -670,7 +671,7 @@ pub(super) fn select(
     };
     let selection = |urls, audio: &Format| Selection {
         urls,
-        gain_db: super::normalization_gain(&player["playerConfig"]["audioConfig"], audio.raw),
+        gain_db: normalization_gain(&player["playerConfig"]["audioConfig"], audio.raw),
         captions: captions(&player["captions"]["playerCaptionsTracklistRenderer"]),
     };
     if let Some(video) = video {
