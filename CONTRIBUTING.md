@@ -12,7 +12,7 @@ sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland lib
 
 On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the packages to install. Sign-in also needs Python 3, xdg-utils and libsecret's `secret-tool`, and saves accounts in a running Secret Service keyring.
 
-On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. The macOS build plays signed-out audio only for now: sign-in, video and media keys are Linux-only, and CI checks the build on Apple Silicon with macOS 15.
+On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. The macOS build plays signed-out audio only for now: sign-in and video are Linux-only. Media keys and Control Center's Now Playing work on macOS, and CI checks the build on Apple Silicon with macOS 15.
 
 On Windows, install Rust with the MSVC toolchain, build with `cargo build --release --locked`, and put `libmpv-2.dll` from mpv's release `libmpv-*-x86_64-w64-mingw32-lgpl.zip` next to the executable or on `PATH`; [the CI setup](.github/actions/setup/action.yml) pins the one CI uses. yt-dlp and Deno come from `PATH`. The Windows build also plays signed-out audio only, and CI checks it on Windows Server 2025.
 
