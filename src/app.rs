@@ -124,6 +124,8 @@ pub struct Music {
     suggestions: Option<suggestions::Suggestions>,
     shelf_scroll: HashMap<usize, ScrollHandle>,
     shelf_heights: Vec<Option<pages::shelves::ShelfHeight>>,
+    /// The artist heading height the hero photo was last sized from.
+    hero_heading: Option<Pixels>,
     list_scroll: UniformListScrollHandle,
     detail_list: DetailList,
     /// The wide guide's mini state. Below 936px the guide is always mini.

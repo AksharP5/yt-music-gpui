@@ -1,7 +1,7 @@
 //! Catalog cards and track/collection rows shared across pages.
 
 use super::super::*;
-use super::PageLayout;
+use super::{PageLayout, Tier};
 use crate::catalog::{ChartMovement, ChartRank};
 
 /// Web row thumbnails dim to this on hover behind the play glyph.
@@ -561,7 +561,12 @@ impl Music {
         let page = self.page_layout(window);
         let text_size = page.text_size();
         let style = if self.route.is_artist() {
-            RowStyle::ArtistTable
+            // Below 936px the web stacks Top songs' columns under the title.
+            if page.tier == Tier::Narrow {
+                RowStyle::ArtistStacked
+            } else {
+                RowStyle::ArtistTable
+            }
         } else if matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"))
             && matches!(item, Item::Track(_))
         {
@@ -658,7 +663,7 @@ impl Music {
                 .byline
                 .clone()
                 .unwrap_or_else(|| joined(&[Some(&track.artist), plays.as_deref()])),
-            (RowStyle::Playlist, Some(track)) => joined(&[
+            (RowStyle::Playlist | RowStyle::ArtistStacked, Some(track)) => joined(&[
                 Some(&track.artist),
                 plays.as_deref(),
                 track.album.as_deref(),
@@ -691,7 +696,7 @@ impl Music {
                 16.
             }))
             .rounded(px(4.))
-            .when(style == RowStyle::ArtistTable, |row| row.rounded_none())
+            .when(style.artist(), |row| row.rounded_none())
             .when(active, |d| d.bg(self.theme.selection))
             .cursor_pointer()
             .on_mouse_down(
@@ -762,7 +767,11 @@ impl Music {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(if style == RowStyle::Search { 4. } else { 8. }))
+                    .gap(px(match style {
+                        RowStyle::Search => 4.,
+                        RowStyle::ArtistStacked => 3.,
+                        _ => 8.,
+                    }))
                     .child(
                         div()
                             .truncate()
@@ -805,7 +814,7 @@ impl Music {
         let liked = self.is_liked(&track);
         let like_track = track.clone();
         let menu_track = track.clone();
-        if !matches!(style, RowStyle::Search | RowStyle::ArtistTable) {
+        if !matches!(style, RowStyle::Search) && !style.artist() {
             let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
                 track
                     .details
@@ -827,7 +836,7 @@ impl Music {
                     .child(duration),
             );
         }
-        let artist_table = style == RowStyle::ArtistTable;
+        let artist_table = style.artist();
         let controls = div()
             .id(("track-controls", index))
             .flex()
@@ -907,16 +916,23 @@ enum RowStyle {
     Playlist,
     /// The artist page's Top songs table.
     ArtistTable,
+    /// Top songs below 936px: artist, plays and album in one line under the title.
+    ArtistStacked,
     /// Library, history, charts and other plain lists.
     List,
 }
 
 impl RowStyle {
+    fn artist(self) -> bool {
+        matches!(self, Self::ArtistTable | Self::ArtistStacked)
+    }
+
     fn height(self) -> f32 {
         match self {
             Self::Search => 80.,
             Self::Album | Self::Playlist => 68.,
             Self::ArtistTable => 48.,
+            Self::ArtistStacked => 56.,
             Self::List => 64.,
         }
     }
@@ -939,7 +955,7 @@ impl RowStyle {
     fn thumbnail(self) -> f32 {
         match self {
             Self::Search => 56.,
-            Self::ArtistTable => 32.,
+            Self::ArtistTable | Self::ArtistStacked => 32.,
             _ => 48.,
         }
     }
