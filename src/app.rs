@@ -167,6 +167,8 @@ pub struct Music {
     player: Option<Player>,
     media_controls: Option<media_controls::MediaControls>,
     seekable: bool,
+    /// The playing track, when its video has captions.
+    captions_track: Option<u64>,
     video: Option<VideoAttachment>,
     /// The full-window player page, showing artwork or video beside its tabs.
     player_open: bool,

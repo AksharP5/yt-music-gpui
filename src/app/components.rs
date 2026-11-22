@@ -375,6 +375,7 @@ pub(in crate::app) fn tinted_button(
         "next" => "Next song",
         "shuffle" => "Shuffle",
         "repeat" => "Cycle repeat: off, all, one",
+        "captions" | "captions-on" => "Captions",
         "heart" => "Like song",
         "heart-filled" => "Remove from liked music",
         "expand" => "Open player page",
