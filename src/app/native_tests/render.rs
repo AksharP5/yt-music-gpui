@@ -728,7 +728,7 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                         .update(cx, |_, window, _| capture(window, "track-controls-focused"))
                         .unwrap();
                     let title = |image: &image::RgbaImage| {
-                        image::imageops::crop_imm(image, 210, 308, 400, 20).to_image()
+                        image::imageops::crop_imm(image, 210, 308, 300, 20).to_image()
                     };
                     let actions = |image: &image::RgbaImage| {
                         image::imageops::crop_imm(image, 675, 310, 110, 40).to_image()
