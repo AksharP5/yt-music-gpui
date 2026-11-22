@@ -8,7 +8,7 @@ use crate::{
         BrowseLink, Catalog, Collection, Continuation, HeaderArtist, Item, Page, PlaylistTarget,
         Rating, Shelf, ShelfLayout, Track, WatchTarget,
     },
-    country_picker::{CountryPicker, CountryPickerEvent},
+    country_picker::{CountryPicker, CountryPickerEvent, PICKER_WIDTH},
     library::{LastPosition, Library, LibraryWriter, Queue, Repeat, Store},
     media_controls,
     player::{

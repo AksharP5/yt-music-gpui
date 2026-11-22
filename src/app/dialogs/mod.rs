@@ -252,19 +252,19 @@ impl Music {
         if self.page.countries.is_empty() {
             return;
         }
-        let picker = cx.new(|cx| CountryPicker::new(self.page.countries.clone(), cx));
+        let picker = cx.new(|cx| {
+            CountryPicker::new(self.page.countries.clone(), self.page.country_divider, cx)
+        });
         self.open_overlay(Overlay::CountryPicker(picker.clone()), window, cx);
         self.overlay_subscription = Some(cx.subscribe_in(
             &picker,
             window,
-            |view, picker, event, window, cx| {
+            |view, picker, CountryPickerEvent::Choose(target), window, cx| {
                 if !matches!(&view.overlay, Some(Overlay::CountryPicker(current)) if current == picker) {
                     return;
                 }
                 view.close_overlay(window, cx);
-                if let CountryPickerEvent::Choose(target) = event {
-                    view.navigate(Route::Browse(target.clone()), cx);
-                }
+                view.navigate(Route::Browse(target.clone()), cx);
             },
         ));
         window.focus(&picker.focus_handle(cx), cx);
@@ -615,7 +615,40 @@ impl Music {
             _ => {}
         }
         if let Overlay::CountryPicker(picker) = kind {
-            return self.backdrop(picker.clone().into_any_element(), cx);
+            // Like the web, the dropdown opens 8px below its button.
+            let position = self.overlay_button.map_or_else(
+                || {
+                    let viewport = window.viewport_size();
+                    point(
+                        (viewport.width - px(PICKER_WIDTH)) / 2.,
+                        viewport.height / 6.,
+                    )
+                },
+                |button| point(button.left(), button.bottom() + px(8.)),
+            );
+            return div()
+                .id("menu-focus")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.close_overlay(window, cx);
+                    }),
+                )
+                .child(
+                    anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            div()
+                                .on_children_prepainted(self.covers_video())
+                                .child(picker.clone()),
+                        ),
+                )
+                .into_any_element();
         }
         if let Overlay::PlaylistForm { form, .. } = kind {
             let mut body = div().flex().flex_col().gap(px(12.)).child(form.clone());

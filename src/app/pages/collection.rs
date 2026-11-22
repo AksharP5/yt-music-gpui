@@ -347,10 +347,20 @@ impl Music {
             )
             .when(play, |heading| heading.child(self.play_all_button(cx)))
             .when_some(country, |heading, country| {
+                let bounds = Rc::new(Cell::new(Bounds::default()));
+                let measured = bounds.clone();
                 heading.child(
-                    menu_chip("chart-country", country, self.theme).on_click(
-                        cx.listener(|view, _, window, cx| view.country_picker(window, cx)),
-                    ),
+                    menu_chip("chart-country", country, self.theme)
+                        .relative()
+                        .child(
+                            canvas(move |rect, _, _| measured.set(rect), |_, _, _, _| {})
+                                .absolute()
+                                .inset_0(),
+                        )
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.country_picker(window, cx);
+                            view.overlay_button = Some(bounds.get());
+                        })),
                 )
             })
     }

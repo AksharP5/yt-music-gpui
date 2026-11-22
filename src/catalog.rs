@@ -834,6 +834,9 @@ pub struct Page {
     pub privacy: Option<String>,
     pub chips: Vec<BrowseChoice>,
     pub countries: Vec<BrowseChoice>,
+    /// How many chart countries come before the menu's divider: the
+    /// selected country and Global, ahead of the rest.
+    pub country_divider: Option<usize>,
     pub search_filters: Vec<crate::search::FilterChip>,
     pub correction: Option<crate::search::Correction>,
     pub library: Option<LibraryFilters>,
@@ -976,7 +979,7 @@ impl Catalog {
                 .and_then(owned_continuation);
         }
         if link.id == "FEmusic_charts" {
-            page.countries = chart_choices(&data, link)?;
+            (page.countries, page.country_divider) = chart_choices(&data, link)?;
         }
         apply_episode_page(&mut page, &data, &link.id)?;
         self.bind_page(page, &data, None)
@@ -2355,6 +2358,7 @@ pub fn parse_page(data: &Value, fallback_title: &str) -> Result<Page> {
             .map(str::to_owned),
         chips: Vec::new(),
         countries: Vec::new(),
+        country_divider: None,
         search_filters: Vec::new(),
         correction: None,
         library: library_filters(data),
@@ -2626,7 +2630,7 @@ fn valid_chart_country(country: &str) -> bool {
     country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
 }
 
-fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>> {
+fn chart_choices(data: &Value, current: &BrowseLink) -> Result<(Vec<BrowseChoice>, Option<usize>)> {
     let mutations = data
         .pointer("/frameworkUpdates/entityBatchUpdate/mutations")
         .and_then(Value::as_array)
@@ -2665,10 +2669,15 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
         .context("YouTube Music did not return chart country choices")?;
     let mut choices = Vec::new();
     let mut countries = HashSet::new();
-    for option in options
-        .iter()
-        .filter_map(|option| option.get("musicMultiSelectMenuItemRenderer"))
-    {
+    let mut divider = None;
+    for option in options {
+        if option.get("musicMenuItemDividerRenderer").is_some() {
+            divider = divider.or((!choices.is_empty()).then_some(choices.len()));
+            continue;
+        }
+        let Some(option) = option.get("musicMultiSelectMenuItemRenderer") else {
+            continue;
+        };
         let parsed = (|| {
             let key = option["formItemEntityKey"].as_str()?;
             let state = states.get(key)?;
@@ -2749,7 +2758,7 @@ fn chart_choices(data: &Value, current: &BrowseLink) -> Result<Vec<BrowseChoice>
             .is_none_or(|country| selected[0].target.chart_country.as_ref() == Some(country)),
         "YouTube Music did not return the requested chart country"
     );
-    Ok(choices)
+    Ok((choices, divider))
 }
 
 pub(crate) fn playlist_metadata_visible(
@@ -3682,6 +3691,7 @@ mod tests {
             privacy: None,
             chips: Vec::new(),
             countries: Vec::new(),
+            country_divider: None,
             search_filters: Vec::new(),
             correction: None,
             library: None,
@@ -4842,6 +4852,7 @@ mod tests {
                     "musicSideAlignedItemRenderer":{"startItems":[{"musicSortFilterButtonRenderer":{
                         "title":{"simpleText":"Misleading display label"},"menu":{"musicMultiSelectMenuRenderer":{"options":[
                             option("United States","us-choice",true), option("Canada","ca-choice",false),
+                            json!({"musicMenuItemDividerRenderer":{"hack":true}}),
                             option("Global","global-choice",false), option("United States","us-choice",true)
                         ]}}
                     }}]}
@@ -4904,8 +4915,13 @@ mod tests {
             ..BrowseLink::new("FEmusic_charts", "Charts")
         };
         let response = chart_filter_fixture();
-        let choices = chart_choices(&response, &current).unwrap();
+        let (choices, divider) = chart_choices(&response, &current).unwrap();
         assert_eq!(choices.len(), 3);
+        assert_eq!(
+            divider,
+            Some(2),
+            "The menu's divider follows the second country"
+        );
         assert!(choices[0].selected);
         assert_eq!(choices[0].label, "United States");
         assert_eq!(choices[0].target.chart_country.as_deref(), Some("US"));
@@ -4929,7 +4945,7 @@ mod tests {
         ] {
             let mut invalid = response.clone();
             *invalid.pointer_mut(&path).unwrap() = value;
-            let choices = chart_choices(&invalid, &current).unwrap();
+            let (choices, _) = chart_choices(&invalid, &current).unwrap();
             assert!(choices.iter().all(|choice| choice.label != "Canada"));
         }
         let mut missing_action = response.clone();
@@ -4942,11 +4958,12 @@ mod tests {
         assert!(
             chart_choices(&missing_action, &current)
                 .unwrap()
+                .0
                 .iter()
                 .all(|choice| choice.label != "Canada")
         );
         let mut malformed_selected = response;
-        for index in [0, 3] {
+        for index in [0, 4] {
             malformed_selected
                 .pointer_mut(&format!(
                     "{option}/{index}/musicMultiSelectMenuItemRenderer"

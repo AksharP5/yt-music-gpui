@@ -366,6 +366,7 @@ impl Music {
                 privacy: None,
                 chips: Vec::new(),
                 countries: Vec::new(),
+                country_divider: None,
                 search_filters: Vec::new(),
                 correction: None,
                 library: None,

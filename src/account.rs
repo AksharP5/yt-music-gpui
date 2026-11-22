@@ -1044,6 +1044,7 @@ mod tests {
             editable: true,
             chips: Vec::new(),
             countries: Vec::new(),
+            country_divider: None,
             playlist_sort: Vec::new(),
             search_filters: Vec::new(),
             correction: None,
