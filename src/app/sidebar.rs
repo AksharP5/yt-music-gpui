@@ -155,18 +155,88 @@ impl Music {
                 compact,
                 cx,
             ));
+        let guest = self.account.is_none();
         if compact {
-            return sidebar.into_any_element();
+            // The web's rail offers Sign in below a divider.
+            return sidebar
+                .when(guest, |sidebar| {
+                    sidebar.child(
+                        div()
+                            .id("guide-sign-in")
+                            .keyboard_control(self.theme)
+                            .mx(px(-8.))
+                            .pt(px(12.))
+                            .pb(px(12.))
+                            .border_t_1()
+                            .border_color(gpui::white().opacity(0.15))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(5.))
+                            .text_size(px(10.))
+                            .line_height(px(16.))
+                            .text_color(self.theme.text)
+                            .cursor_pointer()
+                            .child(icon("sign-in", 24., self.theme.text))
+                            .child("Sign in")
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.connect_account(window, cx)),
+                            ),
+                    )
+                })
+                .into_any_element();
         }
-        sidebar = sidebar
-            .child(
+        sidebar = sidebar.child(
+            div()
+                .h(px(1.))
+                .mx(px(16.))
+                .my(px(24.))
+                .bg(self.theme.border),
+        );
+        // Guests get the web's Sign in prompt where the account's New playlist
+        // button sits; their local likes, history and saved collections follow.
+        sidebar = if guest {
+            sidebar.child(
                 div()
-                    .h(px(1.))
-                    .mx(px(16.))
-                    .my(px(24.))
-                    .bg(self.theme.border),
+                    .ml(px(16.))
+                    .w(px(192.))
+                    .mb(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id("guide-sign-in")
+                            .keyboard_control(self.theme)
+                            .h(px(36.))
+                            .rounded_full()
+                            .bg(gpui::white().opacity(0.1))
+                            .hover(|d| d.bg(gpui::white().opacity(0.2)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .child("Sign in")
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.connect_account(window, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(0x909090))
+                            .child(
+                                "Sign in to create & share playlists, get personalized \
+                                 recommendations, and more.",
+                            ),
+                    ),
             )
-            .child(
+        } else {
+            sidebar.child(
                 div()
                     .id("sidebar-new-playlist")
                     .keyboard_control(self.theme)
@@ -192,7 +262,8 @@ impl Music {
                             view.connect_account(window, cx);
                         }
                     })),
-            );
+            )
+        };
         for (id, title, subtitle, route) in [
             ("liked-nav", "Liked Music", "Auto playlist", Route::Liked),
             ("recent-nav", "History", "Recently played", Route::Recent),
