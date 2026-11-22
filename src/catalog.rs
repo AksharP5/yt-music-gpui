@@ -612,6 +612,14 @@ impl Item {
             Self::Navigation(_) => "",
         }
     }
+    /// The line under a card's title. Two-row cards print the service's whole
+    /// subtitle, such as "Fleetwood Mac • 144M views" under a video.
+    pub fn card_subtitle(&self) -> &str {
+        match self {
+            Self::Track(t) => t.details.byline.as_deref().unwrap_or(&t.artist),
+            _ => self.subtitle(),
+        }
+    }
     pub fn thumbnail(&self) -> Option<&str> {
         match self {
             Self::Track(t) => t.thumbnail.as_deref(),
@@ -3124,6 +3132,27 @@ mod tests {
         ] {
             assert!(PlaylistTarget::from_navigation(&navigation).is_none());
         }
+    }
+
+    #[test]
+    fn video_cards_keep_their_view_counts() {
+        // An artist page's Videos card as the service returned it on 2026-11-21.
+        let card = json!({"musicTwoRowItemRenderer":{
+            "aspectRatio":"MUSIC_TWO_ROW_ITEM_THUMBNAIL_ASPECT_RATIO_RECTANGLE_16_9",
+            "title":{"runs":[{"text":"Everywhere"}]},
+            "subtitle":{"runs":[
+                {"text":"Fleetwood Mac","navigationEndpoint":{"browseEndpoint":{"browseId":"UCCzULu3prrEaPvM2ZtkJlYQ"}}},
+                {"text":" • "},
+                {"text":"144M views"}
+            ]},
+            "navigationEndpoint":{"watchEndpoint":{"videoId":"YF1R0hc5Q2I"}}
+        }});
+        let item = parse_item(&card).unwrap();
+        assert_eq!(item.card_subtitle(), "Fleetwood Mac • 144M views");
+        let Item::Track(track) = item else {
+            panic!("A video card plays as a track")
+        };
+        assert_eq!(track.artist, "Fleetwood Mac");
     }
 
     #[test]
