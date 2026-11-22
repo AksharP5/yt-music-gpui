@@ -375,7 +375,7 @@ impl State {
 impl Music {
     #[cfg(test)]
     #[cfg(unix)]
-    pub(in crate::app) fn seed_comments_for_render(&mut self) {
+    pub(in crate::app) fn seed_comments_for_render(&mut self, guest: bool) {
         let mut page = crate::comments::parse_page(
             &serde_json::from_str(include_str!("../../fixtures/comments/initial.json")).unwrap(),
             None,
@@ -384,6 +384,13 @@ impl Music {
         page.continuation = None;
         for thread in &mut page.comments {
             thread.comment.avatar = None;
+        }
+        if guest {
+            if let Some(prompt) = &mut page.sign_in {
+                prompt.avatar = None;
+            }
+        } else {
+            page.sign_in = None;
         }
         self.player_page.comments = State::new();
         self.player_page.comments.track = self.library.queue.current().unwrap().id.clone();
@@ -1512,7 +1519,7 @@ mod tests {
                     // Exercise read-only controls against deterministic content without any writes.
                     window.update(cx, |music, window, cx| {
                         music.stop_playback(cx);
-                        music.seed_comments_for_render();
+                        music.seed_comments_for_render(true);
                         let state = &mut music.player_page.comments;
                         let original = state.entries[0].thread.comment.text.clone();
                         for (text, width, long) in [

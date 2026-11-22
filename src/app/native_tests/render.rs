@@ -2469,7 +2469,9 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     window
                         .update(cx, |music, window, cx| {
                             if tab == PlayerTab::Comments {
-                                music.seed_comments_for_render();
+                                // Without the guest's comment field, Tab reaches the first
+                                // comment's controls without scrolling this short window.
+                                music.seed_comments_for_render(false);
                             }
                             music.select_player_tab(tab, cx);
                             // Earlier Tab presses can leave a focus ring in the page body.
