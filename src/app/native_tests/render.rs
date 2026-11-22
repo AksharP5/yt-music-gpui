@@ -2008,6 +2008,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 alternatives: None,
                 continuation: None,
                 source_target: None,
+                chips: Vec::new(),
                 shuffle: None,
             });
             music.select_player_tab(PlayerTab::UpNext, cx);
@@ -2274,6 +2275,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                                 PlayerEvent::Started {
                                     track_id: 42,
                                     paused: false,
+                                    captions: false,
                                 },
                                 cx,
                             );

@@ -46,6 +46,7 @@ pub(in crate::app) struct ChipRow {
     id: ElementId,
     style: StyleRefinement,
     chips: Vec<Stateful<Div>>,
+    handles: Option<Vec<FocusHandle>>,
 }
 
 pub(in crate::app) fn chip_row(id: impl Into<ElementId>) -> ChipRow {
@@ -53,6 +54,7 @@ pub(in crate::app) fn chip_row(id: impl Into<ElementId>) -> ChipRow {
         id: id.into(),
         style: StyleRefinement::default(),
         chips: Vec::new(),
+        handles: None,
     }
 }
 
@@ -75,12 +77,21 @@ impl ChipRow {
         self.chips.extend(chips);
         self
     }
+
+    /// Chips inside a virtual list take their keyboard stops from it.
+    pub(in crate::app) fn focus_handles(mut self, handles: Vec<FocusHandle>) -> Self {
+        self.handles = Some(handles);
+        self
+    }
 }
 
 impl RenderOnce for ChipRow {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus = window.use_keyed_state(self.id.clone(), cx, |_, _| ChipRowFocus::default());
         let (scroll, chips) = focus.update(cx, |focus, cx| {
+            if let Some(handles) = self.handles {
+                focus.controls = handles;
+            }
             focus.controls.truncate(self.chips.len());
             let chips = self
                 .chips
@@ -244,7 +255,8 @@ impl Music {
         } else {
             self.library.saved.len()
         };
-        let queue_count = (self.library.queue.tracks.len() + self.autoplay_tracks.len()) * 2;
+        let up_next = self.up_next_layout();
+        let queue_count = up_next.stops();
         let advanced = self
             .sidebar_focus
             .advance(reverse, sidebar_count, window, cx)
@@ -278,11 +290,9 @@ impl Music {
                 index = if reverse { queue_count - 1 } else { 0 };
                 self.queue_focus.focus(index, window, cx);
             }
-            let row = index / 2;
-            let row = row + usize::from(row >= self.library.queue.tracks.len());
             self.player_page
                 .queue_scroll
-                .scroll_to_item(row, ScrollStrategy::Nearest);
+                .scroll_to_item(up_next.stop_row(index), ScrollStrategy::Nearest);
             cx.notify();
         }
     }
@@ -375,6 +385,7 @@ pub(in crate::app) fn tinted_button(
         "next" => "Next song",
         "shuffle" => "Shuffle",
         "repeat" => "Cycle repeat: off, all, one",
+        "captions" | "captions-on" => "Captions",
         "heart" => "Like song",
         "heart-filled" => "Remove from liked music",
         "expand" => "Open player page",

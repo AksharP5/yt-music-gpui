@@ -32,6 +32,8 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
             "restore-issued",
             "save-radio",
             "restore-radio",
+            "save-chip",
+            "restore-chip",
             "save-search",
             "restore-search",
             "save-autoplay",
@@ -59,6 +61,8 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
                 | "restore-issued"
                 | "save-radio"
                 | "restore-radio"
+                | "save-chip"
+                | "restore-chip"
                 | "save-search"
                 | "restore-search"
                 | "save-autoplay"
@@ -89,7 +93,9 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
                 super::render::wait_for_presented_frame(window, cx).await;
                 let path = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").context("private data directory")?).join("yt-music-gpui/library.json");
                 let autoplay = phase.ends_with("-search") || phase.ends_with("-autoplay");
-                let radio = phase.ends_with("-radio");
+                // A chip phase starts a radio and filters it to Popular before saving.
+                let chip = phase.ends_with("-chip");
+                let radio = phase.ends_with("-radio") || chip;
                 if phase.starts_with("save-") {
                     let issued = phase.ends_with("-issued");
                     let (page, watch, seed) = cx.background_executor().spawn(async move {
@@ -133,20 +139,31 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
                     })?;
                     let deadline = Instant::now() + Duration::from_secs(45);
                     let mut advanced = false;
+                    let mut filtered = false;
                     loop {
                         let (playing, ready, cached_count, index) = window.update(cx, |music, _, _| (
                             music.position > 0. && matches!(music.playback, Playback::Loaded { .. }),
                             music.watch_pending.is_none() && music.library.queue.playing_from.is_some() && (autoplay || music.library.queue.source.is_some()),
                             music.library.queue.tracks.len(), music.library.queue.index,
                         ))?;
+                        if playing && ready && chip && !filtered {
+                            window.update(cx, |music, _, cx| -> Result<()> {
+                                let popular = music.library.queue.chips.iter().position(|chip| chip.label == "Popular").context("The radio must offer a Popular filter")?;
+                                music.select_queue_chip(crate::app::ChipSection::Queue, popular, cx);
+                                Ok(())
+                            })??;
+                            filtered = true;
+                            continue;
+                        }
+                        let filtered_saved = !chip || window.update(cx, |music, _, _| !music.radio_loading && music.library.queue.chips.iter().any(|chip| chip.selected && chip.label == "Popular"))?;
                         if playing && ready && phase == "save-autoplay" && !advanced {
                             cx.update_window(window.into(), |_, window, cx| window.dispatch_keystroke(gpui::Keystroke::parse("ctrl-right").unwrap(), cx))?;
                             advanced = true;
                             continue;
                         }
                         let saved = std::fs::read(&path).ok().and_then(|data| serde_json::from_slice::<Library>(&data).ok()).is_some_and(|library| library.queue.tracks.len() == cached_count && library.volume == 0. && (autoplay || library.queue.source.is_some()));
-                        if playing && ready && saved && (phase != "save-autoplay" || index == Some(1)) {
-                            ensure!(!radio || cached_count == 50, "Radio fixture must reach its real 50-track cached boundary");
+                        if playing && ready && saved && filtered_saved && (phase != "save-autoplay" || index == Some(1)) {
+                            ensure!(phase != "save-radio" || cached_count == 50, "Radio fixture must reach its real 50-track cached boundary");
                             ensure!(!autoplay || cached_count == if advanced { 2 } else { 1 }, "Single-song/autoplay fixture must retain only played tracks");
                             println!("RESTART_SAVED phase={phase} cached={cached_count} playing=true source_persisted={} pid={}", !autoplay, std::process::id());
                             break;
@@ -161,6 +178,8 @@ fn partial_playlist_continues_after_process_restart() -> Result<()> {
                         ensure!(cached_count > 0 && music.library.queue.incomplete != autoplay, "Restart did not restore the expected queue completeness");
                         ensure!(!phase.ends_with("-browse") || cached_count == 100, "Browse restart must restore exactly 100 cached tracks");
                         ensure!(!radio || music.library.repeat == Repeat::All, "Radio must continue with Repeat All enabled");
+                        let selected = music.library.queue.chips.iter().find(|chip| chip.selected).map(|chip| chip.label.as_str());
+                        ensure!(!radio || selected == Some(if chip { "Popular" } else { "All" }), "Restart must restore the mix's filters with the chosen one selected: {selected:?}");
                         ensure!(!music.queue_source.can_continue(), "The source must stay lazy on startup");
                         music.library.queue.select(cached_count - 1);
                         music.play_current(cx);

@@ -80,6 +80,8 @@ Source: https://github.com/google/material-design-icons
   original viewBox: settings ("settings"), help ("help"), logout ("logout"),
   switch-account ("switch_account"), arrow-back ("arrow_back"), premium
   ("smart_display"), policy ("policy") and feedback ("feedback").
+  Scaled to the web's glyph size: captions (outlined "closed_caption") and
+  captions-on (filled "closed_caption").
 
 The rounded voting glyphs in assets/icons/thumb-up.svg, thumb-down.svg and
 thumb-up-filled.svg are from the icons rendered by https://music.youtube.com/.

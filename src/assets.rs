@@ -68,6 +68,12 @@ impl AssetSource for Assets {
                 "../assets/icons/external.svg"
             ))),
             "shuffle" => Some(Cow::Borrowed(include_bytes!("../assets/icons/shuffle.svg"))),
+            "captions" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/captions.svg"
+            ))),
+            "captions-on" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/captions-on.svg"
+            ))),
             "repeat" => Some(Cow::Borrowed(include_bytes!("../assets/icons/repeat.svg"))),
             "repeat-one" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/repeat-one.svg"

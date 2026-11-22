@@ -50,13 +50,14 @@ def remember_player_scripts(ydl):
     EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
 
 
-def report_loudness(ydl):
-    """Return a function that reports the loudness YouTube sent for the last
-    request's selected audio format, so the player can level volume the way
-    YouTube Music does. yt-dlp drops these player response fields.
+def report_player_response(ydl):
+    """Return a function that reports what the player needs from the last
+    request's player responses, which yt-dlp drops: the loudness YouTube sent
+    for the selected audio format, so the player can level volume the way
+    YouTube Music does, and the caption tracks, which the player validates.
 
-    The returned function also forgets the request, and returns None when the
-    fields are missing or this yt-dlp version extracts differently.
+    The returned function also forgets the request. Each field is None when
+    it is missing or this yt-dlp version extracts differently.
     """
     import math
     from urllib.parse import parse_qs, urlsplit
@@ -65,8 +66,8 @@ def report_loudness(ydl):
         from yt_dlp.extractor.youtube import YoutubeIE
         extract_player_responses = YoutubeIE._extract_player_responses
     except (ImportError, AttributeError):
-        # Another yt-dlp layout only loses levelling, never the warm resolver.
-        return lambda: None
+        # Another yt-dlp layout only loses levelling and captions, never the warm resolver.
+        return lambda: {'loudness': None, 'captions': None}
 
     responses, selected = [], []
     process_info = ydl.process_info
@@ -109,12 +110,32 @@ def report_loudness(ydl):
                         }
         except Exception:
             pass
+        return None
+
+    def captions():
+        try:
+            for response in responses:
+                renderer = (response.get('captions') or {}).get('playerCaptionsTracklistRenderer') or {}
+                if not renderer.get('captionTracks'):
+                    continue
+                return {
+                    'captionTracks': [{name: track.get(name) for name in ('baseUrl', 'languageCode', 'kind')}
+                                      for track in renderer['captionTracks']],
+                    'audioTracks': [{'defaultCaptionTrackIndex': track.get('defaultCaptionTrackIndex')}
+                                    for track in renderer.get('audioTracks') or []][:1],
+                }
+        except Exception:
+            pass
+        return None
+
+    def details():
+        try:
+            return {'loudness': loudness(), 'captions': captions()}
         finally:
             responses.clear()
             selected.clear()
-        return None
 
-    return loudness
+    return details
 
 
 protocol = sys.stdout
@@ -124,7 +145,7 @@ with contextlib.redirect_stdout(output):
     from yt_dlp.globals import plugin_dirs
     from yt_dlp.plugins import load_all_plugins
 
-    def extract(ydl, loudness, request):
+    def extract(ydl, player_response, request):
         output.seek(0)
         output.truncate()
         ydl.params['format'] = request['format']
@@ -140,8 +161,8 @@ with contextlib.redirect_stdout(output):
             # Extractor diagnostics can contain cookies and signed URLs.
             urls = None
         # Always called, so one request's responses never reach the next.
-        levels = loudness()
-        return {'urls': urls, 'loudness': levels} if urls else {'urls': None}
+        details = player_response()
+        return {'urls': urls, **details} if urls else {'urls': None}
 
     parsed = yt_dlp.parse_options(sys.argv[1:])
     # Match the CLI initialization order.
@@ -149,7 +170,7 @@ with contextlib.redirect_stdout(output):
     load_all_plugins()
     with yt_dlp.YoutubeDL(parsed.ydl_opts) as ydl:
         remember_player_scripts(ydl)
-        loudness = report_loudness(ydl)
+        player_response = report_player_response(ydl)
         if parsed.ydl_opts['allowed_extractors'] == ['^ytmusicaccount$']:
             if (set(ydl._ies) != {'YtMusicAccount'}
                     or ydl.get_info_extractor('YtMusicAccount').IE_NAME != 'ytmusicaccount'):
@@ -161,7 +182,7 @@ with contextlib.redirect_stdout(output):
         for line in sys.stdin:
             try:
                 request = json.loads(line)
-                response = extract(ydl, loudness, request)
+                response = extract(ydl, player_response, request)
             except Exception:
                 response = {'urls': None}
             protocol.write(json.dumps(response) + '\n')

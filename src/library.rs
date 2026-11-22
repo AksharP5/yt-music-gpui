@@ -48,6 +48,8 @@ pub struct Library {
     pub quality: AudioQuality,
     pub video: bool,
     pub video_quality: VideoQuality,
+    /// Whether captions show over videos that have them, as the web's CC button sets.
+    pub captions: bool,
 }
 
 impl Default for Library {
@@ -67,6 +69,7 @@ impl Default for Library {
             quality: AudioQuality::default(),
             video: false,
             video_quality: VideoQuality::default(),
+            captions: false,
         }
     }
 }
@@ -127,6 +130,9 @@ pub struct Queue {
     pub(crate) source: Option<crate::queue_source::SavedSource>,
     #[serde(skip)]
     pub(crate) source_id: Option<Arc<()>>,
+    /// The mix's filters. Choosing one replaces the songs after the current one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) chips: Vec<crate::watch::QueueChip>,
 }
 
 impl Queue {
@@ -142,6 +148,25 @@ impl Queue {
         self.collection = None;
         self.source_id = None;
         self.source = None;
+        self.chips.clear();
+    }
+
+    /// Keep the songs up to the current one and play `upcoming` after it, as
+    /// a mix's filter does on the web.
+    pub(crate) fn replace_upcoming(&mut self, upcoming: Vec<Track>) {
+        let kept = self.index.map_or(0, |index| index + 1);
+        let tracks = self.tracks_mut();
+        tracks.truncate(kept);
+        let mut seen: std::collections::HashSet<_> =
+            tracks.iter().map(|track| track.id.clone()).collect();
+        tracks.extend(
+            upcoming
+                .into_iter()
+                .filter(|track| seen.insert(track.id.clone())),
+        );
+        if self.shuffled {
+            self.shuffle_remaining();
+        }
     }
     /// Editing detaches from any immutable library snapshot held by the writer.
     pub(crate) fn tracks_mut(&mut self) -> &mut Vec<Track> {
@@ -374,6 +399,7 @@ struct Preferences {
     quality: AudioQuality,
     video: bool,
     video_quality: VideoQuality,
+    captions: bool,
 }
 
 impl From<&Library> for Preferences {
@@ -387,6 +413,7 @@ impl From<&Library> for Preferences {
             quality: library.quality,
             video: library.video,
             video_quality: library.video_quality,
+            captions: library.captions,
         }
     }
 }
@@ -401,6 +428,7 @@ impl Preferences {
         library.quality = self.quality;
         library.video = self.video;
         library.video_quality = self.video_quality;
+        library.captions = self.captions;
     }
 }
 
@@ -1016,6 +1044,16 @@ mod tests {
         assert_eq!(q.current().unwrap().id, "c");
         assert!(q.remove(0));
         assert!(q.current().is_none());
+    }
+
+    #[test]
+    fn a_mix_filter_keeps_played_songs_and_replaces_everything_after_the_current_one() {
+        let mut queue = Queue::default();
+        queue.replace(vec![track("a"), track("b"), track("added"), track("c")], 1);
+        queue.replace_upcoming(vec![track("a"), track("x"), track("b"), track("y")]);
+        let ids: Vec<_> = queue.tracks.iter().map(|track| track.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "x", "y"]);
+        assert_eq!(queue.current().unwrap().id, "b");
     }
 
     #[test]

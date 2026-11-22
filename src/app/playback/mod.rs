@@ -40,6 +40,14 @@ impl PlaybackQuery {
         )
     }
 }
+/// Where a mix's filters sit in Up next and which songs they replace: above a
+/// mix's queue, or above the autoplay songs of a song played on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ChipSection {
+    Queue,
+    Autoplay,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum QueueUpdate {
     Preserve,
@@ -814,7 +822,12 @@ impl Music {
                 self.seekable = false;
                 self.playback = Playback::Stopped;
             }
-            PlayerEvent::Started { track_id, paused } if Some(track_id) == self.active_id => {
+            PlayerEvent::Started {
+                track_id,
+                paused,
+                captions,
+            } if Some(track_id) == self.active_id => {
+                self.captions_track = captions.then_some(track_id);
                 self.playback = Playback::Loaded {
                     paused,
                     buffering: false,

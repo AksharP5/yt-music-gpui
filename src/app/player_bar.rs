@@ -173,6 +173,19 @@ impl Music {
         self.notify_playback(cx);
     }
 
+    pub(in crate::app) fn toggle_captions(&mut self, cx: &mut Context<Self>) {
+        self.library.captions = !self.library.captions;
+        let captions = self.library.captions;
+        self.player_command(|player| player.set_captions(captions));
+        self.save_preferences();
+        self.notify_playback(cx);
+    }
+
+    /// The web shows its CC button only for a video with caption tracks.
+    fn has_captions(&self) -> bool {
+        self.library.video && self.captions_track.is_some() && self.captions_track == self.active_id
+    }
+
     pub(in crate::app) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
         if self.library.effective_volume() == 0. {
             self.library.muted = false;
@@ -198,6 +211,7 @@ impl Music {
     ) -> AnyElement {
         let compact = width < 1120.;
         let theme = self.theme;
+        let captions_width = if self.has_captions() { 48. } else { 0. };
         let current = self.library.queue.current().cloned();
         let seek_position = self.seek_drag_position();
         // A drag previews its time above the bar; the time beside the
@@ -463,7 +477,7 @@ impl Music {
                     )
                     .child(
                         div()
-                            .w(px(if compact { 241. } else { 280. }))
+                            .w(px(if compact { 241. } else { 280. + captions_width }))
                             .relative()
                             .flex_shrink_0()
                             .flex()
@@ -510,7 +524,7 @@ impl Music {
                                         .id("expanded-player-controls")
                                         .absolute()
                                         .right(px(36.))
-                                        .w(px(260.))
+                                        .w(px(260. + captions_width))
                                         .h(px(36.))
                                         .px(px(12.))
                                         .bg(theme.panel)
@@ -552,8 +566,9 @@ impl Music {
         let volume_bounds = self.volume_bounds.clone();
         let adjusting_volume = self.drag == Some(Drag::Volume);
         let repeat = self.library.repeat;
+        let captions = self.has_captions();
         div()
-            .w(px(236.))
+            .w(px(if captions { 284. } else { 236. }))
             .h(px(36.))
             .flex_shrink_0()
             .flex()
@@ -598,6 +613,20 @@ impl Music {
                         |view, _, cx| view.toggle_mute(cx),
                     )),
             )
+            .when(captions, |controls| {
+                controls.child(tinted_control(
+                    "captions",
+                    if self.library.captions {
+                        "captions-on"
+                    } else {
+                        "captions"
+                    },
+                    rgb(INACTIVE),
+                    theme,
+                    cx,
+                    |view, _, cx| view.toggle_captions(cx),
+                ))
+            })
             .child(tinted_control(
                 "repeat",
                 if repeat == Repeat::One {
