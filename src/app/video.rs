@@ -79,9 +79,8 @@ impl Music {
                 let active = view.active_id;
                 let playback = view.playback;
                 view.video_click = Some(cx.spawn(async move |view, cx| {
-                    // GPUI's Linux backends recognize double-clicks within 400 ms.
                     cx.background_executor()
-                        .timer(Duration::from_millis(400))
+                        .timer(double_click_interval())
                         .await;
                     let _ = view.update(cx, |view, cx| {
                         if view.player_open
@@ -168,4 +167,19 @@ impl Music {
         }
         viewport
     }
+}
+
+/// How long a click on the video waits to see whether it starts a double-click.
+fn double_click_interval() -> Duration {
+    // The user's setting, which AppKit counts double-clicks with.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(interval) =
+            Duration::try_from_secs_f64(objc2_app_kit::NSEvent::doubleClickInterval())
+        {
+            return interval;
+        }
+    }
+    // GPUI's Linux backends recognize double-clicks within 400 ms.
+    Duration::from_millis(400)
 }

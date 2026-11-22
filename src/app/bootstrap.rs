@@ -100,6 +100,7 @@ impl Music {
                 .then_some(library.video_quality),
             volume: library.effective_volume(),
             speed: library.speed,
+            captions: library.captions,
             ..Default::default()
         }) {
             Ok(p) => (Some(p), error),
@@ -409,6 +410,7 @@ impl Music {
             queue_source,
             queue_waiting: None,
             autoplay_tracks: VecDeque::new(),
+            autoplay_chips: Vec::new(),
             go_chord: Default::default(),
             watch_pending: None,
             song_text,
@@ -418,6 +420,7 @@ impl Music {
             player,
             media_controls,
             seekable: false,
+            captions_track: None,
             video,
             player_open: false,
             sort_focus: cx.focus_handle().tab_index(0).tab_stop(true),

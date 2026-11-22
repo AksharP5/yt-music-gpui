@@ -1,12 +1,13 @@
 use crate::{
     auth::Session,
     catalog::{
-        Catalog, PODCAST_EPISODE, PlaybackActions, PlaylistTarget, Track, duration,
+        Catalog, PODCAST_EPISODE, PlaybackActions, PlaylistTarget, Track, WatchTarget, duration,
         episode_context, episode_header, text, thumbnail, track_details, valid_service_params,
         valid_video_id, wide_thumbnail,
     },
 };
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -24,6 +25,35 @@ pub struct Watch {
     pub continuation: Option<WatchContinuation>,
     pub source_target: Option<crate::catalog::WatchTarget>,
     pub(crate) shuffle: Option<QueueShuffle>,
+    /// A mix's filters (All, Popular, Discover, moods…), shown in Up next.
+    pub chips: Vec<QueueChip>,
+}
+
+/// One of a mix's filters. Choosing it reloads the mix from the playing song.
+/// It holds only public request fields, so a saved queue keeps its filters.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueChip {
+    pub label: String,
+    pub target: WatchTarget,
+    pub selected: bool,
+}
+
+impl QueueChip {
+    fn parse(chip: &Value) -> Option<Self> {
+        let chip = chip.get("chipCloudChipRenderer")?;
+        let endpoint = chip
+            .pointer("/navigationEndpoint/queueUpdateCommand/fetchContentsCommand/watchEndpoint")?;
+        let target = WatchTarget::try_from(endpoint.clone()).ok()?;
+        // The request adds the playing song, so a filter names only its mix.
+        if !target.is_generated() || target.video_id().is_some() {
+            return None;
+        }
+        Some(Self {
+            label: Some(text(&chip["text"])).filter(|label| !label.trim().is_empty())?,
+            target,
+            selected: chip["isSelected"] == true,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -148,6 +178,26 @@ impl Catalog {
         let request = watch_request(track, mode)?;
         let response = self.request("next", request.clone())?;
         parse_watch(&response, track, request, self.session.clone(), mode)
+    }
+
+    /// The mix a chip filters to, continuing from `current` as on the web.
+    pub fn watch_chip(&self, chip: &QueueChip, current: &Track) -> Result<Watch> {
+        ensure!(
+            valid_video_id(&current.id),
+            "This song has an invalid YouTube Music ID"
+        );
+        let mut request = chip.target.body();
+        request["videoId"] = json!(current.id);
+        request["enablePersistentPlaylistPanel"] = json!(true);
+        request["isAudioOnly"] = json!(true);
+        let response = self.request("next", request.clone())?;
+        parse_watch(
+            &response,
+            current,
+            request,
+            self.session.clone(),
+            WatchMode::Issued,
+        )
     }
 
     pub fn watch_more(&self, continuation: &WatchContinuation) -> Result<WatchPage> {
@@ -361,6 +411,16 @@ fn parse_watch(
         alternatives,
         shuffle: QueueShuffle::parse(panel),
         continuation: watch_continuation(panel, request, session),
+        chips: tabs
+            .iter()
+            .find_map(|tab| {
+                tab.pointer("/tabRenderer/content/musicQueueRenderer/subHeaderChipCloud/chipCloudRenderer/chips")
+            })
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(QueueChip::parse)
+            .collect(),
     })
 }
 
@@ -858,6 +918,61 @@ mod tests {
             "primaryRenderer":primary,
             "counterpart":[{"counterpartRenderer":counterpart}]
         }})
+    }
+
+    #[test]
+    fn mix_filters_keep_their_mix_and_drop_chips_tied_to_another_song() {
+        let chip = |label: &str, endpoint: Value, selected: bool| {
+            json!({"chipCloudChipRenderer":{
+                "text":{"runs":[{"text":label}]},
+                "isSelected":selected,
+                "navigationEndpoint":{"queueUpdateCommand":{
+                    "queueUpdateSection":"QUEUE_UPDATE_SECTION_QUEUE",
+                    "fetchContentsCommand":{"watchEndpoint":endpoint}
+                }}
+            }})
+        };
+        let mut response = watch_response(json!([row("abcdefghijk", true)]));
+        response["contents"]["singleColumnMusicWatchNextResultsRenderer"]["tabbedRenderer"]["watchNextTabbedResultsRenderer"]
+            ["tabs"][1]["tabRenderer"]["content"]["musicQueueRenderer"]["subHeaderChipCloud"] = json!({"chipCloudRenderer":{"chips":[
+            chip("All", json!({"playlistId":"RDAMVMabcdefghijk","index":0}), true),
+            chip("Popular", json!({"playlistId":"RDATpYabcdefghijk","params":"ggU4Q2hK%3D"}), false),
+            chip("Another song", json!({"videoId":"zyxwvutsrqp","playlistId":"RDATzz"}), false),
+            chip("A playlist", json!({"playlistId":"PLsomething"}), false),
+            chip("", json!({"playlistId":"RDATiXabcdefghijk"}), false),
+        ]}});
+        let watch = parse_watch(
+            &response,
+            &track("abcdefghijk"),
+            json!({"videoId":"abcdefghijk"}),
+            None,
+            WatchMode::Details,
+        )
+        .unwrap();
+        let chips: Vec<_> = watch
+            .chips
+            .iter()
+            .map(|chip| (chip.label.as_str(), chip.selected, chip.target.body()))
+            .collect();
+        assert_eq!(
+            chips,
+            [
+                (
+                    "All",
+                    true,
+                    json!({"playlistId":"RDAMVMabcdefghijk","index":0})
+                ),
+                (
+                    "Popular",
+                    false,
+                    json!({"playlistId":"RDATpYabcdefghijk","params":"ggU4Q2hK%3D"})
+                ),
+            ]
+        );
+        // A saved queue keeps its filters.
+        let saved: Vec<QueueChip> =
+            serde_json::from_value(serde_json::to_value(&watch.chips).unwrap()).unwrap();
+        assert_eq!(saved[1].target, watch.chips[1].target);
     }
 
     #[test]
@@ -1481,6 +1596,21 @@ mod tests {
         let second = catalog.watch_more(&first.continuation.unwrap()).unwrap();
         assert!(!second.queue.is_empty());
         assert!(second.queue.iter().all(|track| valid_video_id(&track.id)));
+    }
+
+    #[test]
+    #[ignore = "uses the public YouTube Music radio and its filters without an account"]
+    fn live_public_mix_filter_continues_from_the_playing_song() {
+        let catalog = Catalog::new().unwrap();
+        let radio = catalog
+            .watch(&track("dQw4w9WgXcQ"), WatchMode::Radio)
+            .unwrap();
+        assert!(radio.chips.first().is_some_and(|chip| chip.selected));
+        let playing = radio.queue[3].clone();
+        let chip = radio.chips.iter().find(|chip| !chip.selected).unwrap();
+        let filtered = catalog.watch_chip(chip, &playing).unwrap();
+        assert_eq!(filtered.current.map(|track| track.id), Some(playing.id));
+        assert!(filtered.queue.len() > 5 && filtered.continuation.is_some());
     }
 
     #[test]
