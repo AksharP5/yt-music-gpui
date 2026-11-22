@@ -518,7 +518,8 @@ pub(super) mod tests {
     use crate::os::IpcStream;
     #[cfg(unix)]
     use crate::player::{
-        command_channel, find_ytdlp, wait_for_player_input,
+        actor::wait_for_player_input,
+        command_channel, find_ytdlp,
         ytdlp::{
             tests::{alive, signed_in, synthetic_account, synthetic_credentials},
             write_account_extractor,
