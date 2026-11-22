@@ -4,6 +4,8 @@ use super::*;
 
 /// A 56 px row plus its 1 px divider, as on music.youtube.com.
 const ROW_HEIGHT: f32 = 57.;
+/// The width the web's always-shown scrollbar takes from the rows.
+const SCROLLBAR_GUTTER: f32 = 15.;
 
 /// A queue row being dragged from `from`, previewed at `to` until it is dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,12 +39,156 @@ impl Music {
         let autoplay = self.autoplay_tracks.len();
         let rows = queued + if autoplay > 0 { autoplay + 1 } else { 0 };
         let bounds = self.player_page.queue_bounds.clone();
+        // Playing from, Save and Autoplay scroll with the rows on the web, so the
+        // list reserves their height, measured on the last frame, as top padding.
+        let header = self.player_page.queue_header.get();
         let theme = self.theme;
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        // The rows' area before scrolling, below the header and beside the gutter.
+                        canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
+                            .absolute()
+                            .top(header)
+                            .left_0()
+                            .right(px(SCROLLBAR_GUTTER))
+                            .bottom_0(),
+                    )
+                    .child(
+                        uniform_list(
+                            "up-next",
+                            rows,
+                            cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
+                                // music.youtube.com enlarges row text at its large breakpoint.
+                                let text = if window.viewport_size().width >= px(1364.) {
+                                    16.
+                                } else {
+                                    14.
+                                };
+                                let queued = view.library.queue.tracks.len();
+                                view.queue_focus.retain(range.clone(), window, |index| {
+                                    let row = index / 2;
+                                    row + usize::from(row >= queued)
+                                });
+                                range
+                                    .map(|row| {
+                                        let element = view.up_next_list_row(row, text, cx);
+                                        if row > 0 {
+                                            return element;
+                                        }
+                                        // The header hangs above the first row, in the list's
+                                        // top padding, so it scrolls with the rows and keeps
+                                        // its place before them in Tab order.
+                                        div()
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom_full()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .child(view.up_next_header(cx)),
+                                            )
+                                            .child(element)
+                                            .into_any_element()
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .track_scroll(&self.player_page.queue_scroll)
+                        .pt(header)
+                        .pr(px(SCROLLBAR_GUTTER))
+                        .size_full(),
+                    ),
+            )
+            .when_some(
+                self.queue_source
+                    .error()
+                    .filter(|_| self.account_operation.is_none())
+                    .map(str::to_owned),
+                |panel, error| {
+                    panel.child(
+                        div()
+                            .px(px(8.))
+                            .py(px(12.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .text_size(px(14.))
+                            .text_color(theme.muted)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .child(pages::error_summary(&error)),
+                            )
+                            .child(
+                                div()
+                                    .id("retry-queue")
+                                    .keyboard_control(theme)
+                                    .flex_shrink_0()
+                                    .px(px(12.))
+                                    .py(px(8.))
+                                    .text_size(px(14.))
+                                    .text_color(theme.text)
+                                    .cursor_pointer()
+                                    .child("Retry")
+                                    .on_click(cx.listener(|view, _, _, cx| view.retry_queue(cx))),
+                            ),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn up_next_list_row(&mut self, row: usize, text: f32, cx: &mut Context<Self>) -> AnyElement {
+        match self.up_next_row(row) {
+            UpNextRow::Queued(row) => self.queue_row(row, text, cx),
+            UpNextRow::AutoplayLabel => div()
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .text_size(px(text))
+                .text_color(self.theme.muted)
+                .child("Autoplay is on")
+                .into_any_element(),
+            UpNextRow::Autoplay(index) => self.autoplay_row(index, text, cx),
+        }
+    }
+
+    fn up_next_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let measured = self.player_page.queue_header.clone();
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(
+                // The subtitle wraps in narrow panels; a new height lays the rows out again.
+                canvas(
+                    move |rect, window, _| {
+                        if measured.replace(rect.size.height) != rect.size.height {
+                            // A refresh while drawing is dropped, so ask for the next frame.
+                            window.on_next_frame(|window, _| window.refresh());
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(
                 div()
                     .pt(px(16.))
@@ -103,95 +249,6 @@ impl Music {
                     ),
             )
             .child(self.autoplay_switch(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
-                            .absolute()
-                            .size_full(),
-                    )
-                    .child(
-                        uniform_list(
-                            "up-next",
-                            rows,
-                            cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
-                                // music.youtube.com enlarges row text at its large breakpoint.
-                                let text = if window.viewport_size().width >= px(1364.) {
-                                    16.
-                                } else {
-                                    14.
-                                };
-                                let queued = view.library.queue.tracks.len();
-                                view.queue_focus.retain(range.clone(), window, |index| {
-                                    let row = index / 2;
-                                    row + usize::from(row >= queued)
-                                });
-                                range
-                                    .map(|row| match view.up_next_row(row) {
-                                        UpNextRow::Queued(row) => view.queue_row(row, text, cx),
-                                        UpNextRow::AutoplayLabel => div()
-                                            .w_full()
-                                            .h(px(ROW_HEIGHT))
-                                            .px(px(12.))
-                                            .flex()
-                                            .items_center()
-                                            .text_size(px(text))
-                                            .text_color(view.theme.muted)
-                                            .child("Autoplay is on")
-                                            .into_any_element(),
-                                        UpNextRow::Autoplay(index) => {
-                                            view.autoplay_row(index, text, cx)
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                            }),
-                        )
-                        .track_scroll(&self.player_page.queue_scroll)
-                        .size_full(),
-                    ),
-            )
-            .when_some(
-                self.queue_source
-                    .error()
-                    .filter(|_| self.account_operation.is_none())
-                    .map(str::to_owned),
-                |panel, error| {
-                    panel.child(
-                        div()
-                            .px(px(8.))
-                            .py(px(12.))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .text_size(px(14.))
-                            .text_color(theme.muted)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .whitespace_normal()
-                                    .child(pages::error_summary(&error)),
-                            )
-                            .child(
-                                div()
-                                    .id("retry-queue")
-                                    .keyboard_control(theme)
-                                    .flex_shrink_0()
-                                    .px(px(12.))
-                                    .py(px(8.))
-                                    .text_size(px(14.))
-                                    .text_color(theme.text)
-                                    .cursor_pointer()
-                                    .child("Retry")
-                                    .on_click(cx.listener(|view, _, _, cx| view.retry_queue(cx))),
-                            ),
-                    )
-                },
-            )
             .into_any_element()
     }
 
@@ -218,7 +275,7 @@ impl Music {
             .px(px(8.))
             .flex()
             .items_center()
-            .gap(px(16.))
+            .gap(px(4.))
             .cursor_pointer()
             .child(
                 div()
@@ -246,7 +303,7 @@ impl Music {
                 div()
                     .w(px(36.))
                     .h(px(14.))
-                    .mr(px(12.))
+                    .mr(px(11.))
                     .relative()
                     .rounded_full()
                     .bg(if on {
