@@ -64,6 +64,14 @@ fn mouse(window: WindowHandle<Music>, cx: &mut AsyncApp, x: f32, y: f32, down: b
     .unwrap();
 }
 
+/// Open search the way the narrow header's search button does.
+async fn open_search(window: WindowHandle<Music>, cx: &mut AsyncApp) {
+    window
+        .update(cx, |music, window, cx| music.open_search(window, cx))
+        .unwrap();
+    wait_for_presented_frame(window, cx).await;
+}
+
 fn searched(window: WindowHandle<Music>, cx: &mut AsyncApp) -> String {
     window
         .update(cx, |music, _, _| match &music.route {
@@ -341,15 +349,12 @@ fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
             .update(cx, |music, window, cx| {
                 music.sidebar_collapsed = false;
                 window.resize(size(px(850.), px(560.)));
-                // A narrow window shows the field once its search button opens it.
-                music.search_open = true;
-                music
-                    .search
-                    .update(cx, |search, cx| search.set_back(true, cx));
                 cx.notify();
             })
             .unwrap();
         wait_for_presented_frame(window, cx).await;
+        // A narrow window shows the field once its search button opens it.
+        open_search(window, cx).await;
         type_with_suggestions(window, cx).await;
 
         let click = |cx: &mut AsyncApp, x: f32| {
@@ -370,15 +375,9 @@ fn search_suggestions_fit_the_narrow_field() -> anyhow::Result<()> {
             "Clicking outside must not select a suggestion"
         );
 
-        // Leaving the field folded it back into its button.
-        window
-            .update(cx, |music, _, cx| {
-                music.search_open = true;
-                music
-                    .search
-                    .update(cx, |search, cx| search.set_back(true, cx));
-            })
-            .unwrap();
+        // Clicking outside folds the field, but only once the window has focus, which
+        // a test window never takes. Open it again as a user would.
+        open_search(window, cx).await;
         type_with_suggestions(window, cx).await;
         click(cx, 400.);
         wait_for_presented_frame(window, cx).await;
@@ -394,11 +393,6 @@ fn last_search_suggestion_is_clickable_in_a_short_window() -> anyhow::Result<()>
             .update(cx, |music, window, cx| {
                 music.sidebar_collapsed = false;
                 window.resize(size(px(850.), px(560.)));
-                // A narrow window shows the field once its search button opens it.
-                music.search_open = true;
-                music
-                    .search
-                    .update(cx, |search, cx| search.set_back(true, cx));
                 cx.notify();
             })
             .unwrap();
@@ -408,9 +402,10 @@ fn last_search_suggestion_is_clickable_in_a_short_window() -> anyhow::Result<()>
             .collect::<Vec<_>>();
         let suggestions = suggestions.iter().map(String::as_str).collect::<Vec<_>>();
         for by_keyboard in [true, false] {
+            // Each pass opens the field again, since leaving for a result folds it.
+            open_search(window, cx).await;
             window
-                .update(cx, |music, window, cx| {
-                    window.focus(&music.search.focus_handle(cx), cx);
+                .update(cx, |music, _, cx| {
                     music.search.update(cx, |search, cx| {
                         search.set_query("typed query".into(), cx);
                         search.show_suggestions(&suggestions, cx);
