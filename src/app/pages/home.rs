@@ -24,29 +24,20 @@ impl Music {
                     .mt(px(above))
                     .mb(px(below))
                     .flex_shrink_0()
-                    .children(
-                        self.page
-                            .chips
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, choice)| choice.label != "All" || !choice.selected)
-                            .map(|(index, choice)| {
-                                let target = choice.target.clone();
-                                let selected = choice.selected;
-                                filter_chip(
-                                    ("home-filter", index),
-                                    choice.label.clone(),
-                                    selected,
-                                    self.theme,
-                                )
-                                .when(!selected, |chip| chip.bg(gpui::white().opacity(0.1)))
-                                .on_click(cx.listener(
-                                    move |view, _, _, cx| {
-                                        view.navigate(Route::Browse(target.clone()), cx)
-                                    },
-                                ))
-                            }),
-                    ),
+                    .children(self.page.chips.iter().enumerate().map(|(index, choice)| {
+                        let target = choice.target.clone();
+                        let selected = choice.selected;
+                        filter_chip(
+                            ("home-filter", index),
+                            choice.label.clone(),
+                            selected,
+                            self.theme,
+                        )
+                        .when(!selected, |chip| chip.bg(gpui::white().opacity(0.1)))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.navigate(Route::Browse(target.clone()), cx)
+                        }))
+                    })),
             );
         } else if home {
             let above = if matches!(self.route, Route::Explore) && layout.window >= 1800. {
