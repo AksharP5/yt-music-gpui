@@ -246,9 +246,11 @@ impl Music {
                         .into_any_element(),
                 });
             }
+            // Roboto sets about 8% wider than the web's YouTube Sans, so the
+            // title gets that much more room to wrap at the same words.
             heading = heading.child(
                 div()
-                    .w(relative(1.04))
+                    .w(relative(1.08))
                     .text_size(px(layout.heading_size().min(28.)))
                     .line_height(relative(1.2))
                     .font_weight(FontWeight::BOLD)

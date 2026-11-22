@@ -668,6 +668,13 @@ impl Music {
                 plays.as_deref(),
                 track.album.as_deref(),
             ]),
+            // Album rows inherit the album's artist, which the web shows only
+            // when the row names its own, as on compilations.
+            (RowStyle::Album, Some(track)) => track
+                .details
+                .byline
+                .clone()
+                .unwrap_or_else(|| plays.clone().unwrap_or_default()),
             (_, Some(track)) => joined(&[Some(&track.artist), plays.as_deref()]),
             _ => item.subtitle().to_owned(),
         };
@@ -814,86 +821,113 @@ impl Music {
         let liked = self.is_liked(&track);
         let like_track = track.clone();
         let menu_track = track.clone();
-        if !matches!(style, RowStyle::Search) && !style.artist() {
-            let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
-                track
-                    .details
-                    .episode
-                    .as_ref()
-                    .map(|episode| episode.duration_text.clone())
-                    .unwrap_or_default()
-            });
-            // The hover controls cover this slot and the end of long text,
-            // without taking space from the title while the row is idle.
-            row = row.child(
+        let artist_table = style.artist();
+        let like = button(
+            ("like", index),
+            if liked { "thumb-up-filled" } else { "thumb-up" },
+            self.theme,
+        )
+        .size(px(36.))
+        .on_click(cx.listener(move |view, _, _, cx| {
+            cx.stop_propagation();
+            view.toggle_like(&like_track, cx);
+        }));
+        let menu = self
+            .menu_button(("track-menu", index), cx, move |view, window, cx| {
+                view.open_track_menu(menu_track.clone(), Some(index), window, cx);
+            })
+            .size(px(36.));
+        if artist_table {
+            // The table leaves the controls their own space at the row's end.
+            let controls = div()
+                .id(("track-controls", index))
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .pr(px(8.))
+                .bg(if active {
+                    self.theme.selection
+                } else {
+                    self.theme.bg
+                })
+                .opacity(if keyboard_controls { 1. } else { 0. })
+                .group_hover("music-row", |style| style.opacity(1.))
+                .child(like)
+                .child(menu);
+            row = row.child(controls.absolute().right_0().top_0().h_full());
+        } else {
+            let duration = (style != RowStyle::Search).then(|| {
+                let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
+                    track
+                        .details
+                        .episode
+                        .as_ref()
+                        .map(|episode| episode.duration_text.clone())
+                        .unwrap_or_default()
+                });
                 div()
-                    .w(px(54.))
-                    .flex_shrink_0()
+                    .w(px(58.))
                     .flex()
                     .justify_end()
                     .text_size(px(text_size))
                     .text_color(self.theme.muted)
-                    .child(duration),
+                    .when(keyboard_controls, |slot| slot.invisible())
+                    .group_hover("music-row", |style| style.invisible())
+                    .child(duration)
+            });
+            let dislike = button(("dislike", index), "thumb-down", self.theme)
+                .size(px(36.))
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    if view.account.is_none() {
+                        view.connect_account(window, cx);
+                        return;
+                    }
+                    let disliked = is_disliked(&view.ratings, &track);
+                    view.mutate(
+                        Mutation::RateSong {
+                            track: track.clone(),
+                            rating: if disliked {
+                                Rating::Indifferent
+                            } else {
+                                Rating::Dislike
+                            },
+                        },
+                        cx,
+                    );
+                }));
+            // Like the web, a hovered row shortens its text to make room for
+            // the controls and hides the duration, so the page's backdrop
+            // shows around them. The slot collapses rather than hiding, since
+            // a hidden element skips painting its children.
+            const CONTROLS_WIDTH: f32 = 126.5;
+            let controls = div()
+                .id(("track-controls", index))
+                .h(px(36.))
+                .overflow_hidden()
+                .w(px(if keyboard_controls {
+                    CONTROLS_WIDTH
+                } else {
+                    0.
+                }))
+                .group_hover("music-row", |style| style.w(px(CONTROLS_WIDTH)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(like)
+                        .child(dislike.ml(px(2.5)))
+                        .child(menu.ml(px(16.))),
+                );
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(controls)
+                    .children(duration),
             );
         }
-        let artist_table = style.artist();
-        let controls = div()
-            .id(("track-controls", index))
-            .flex()
-            .items_center()
-            .gap(px(2.))
-            .pr(px(8.))
-            .bg(if active {
-                self.theme.selection
-            } else {
-                self.theme.bg
-            })
-            .opacity(if keyboard_controls { 1. } else { 0. })
-            .group_hover("music-row", |style| style.opacity(1.))
-            .child(
-                button(
-                    ("like", index),
-                    if liked { "thumb-up-filled" } else { "thumb-up" },
-                    self.theme,
-                )
-                .size(px(36.))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    cx.stop_propagation();
-                    view.toggle_like(&like_track, cx);
-                })),
-            )
-            .when(!artist_table, |d| {
-                d.child(
-                    button(("dislike", index), "thumb-down", self.theme)
-                        .size(px(36.))
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            cx.stop_propagation();
-                            if view.account.is_none() {
-                                view.connect_account(window, cx);
-                                return;
-                            }
-                            let disliked = is_disliked(&view.ratings, &track);
-                            view.mutate(
-                                Mutation::RateSong {
-                                    track: track.clone(),
-                                    rating: if disliked {
-                                        Rating::Indifferent
-                                    } else {
-                                        Rating::Dislike
-                                    },
-                                },
-                                cx,
-                            );
-                        })),
-                )
-            })
-            .child(
-                self.menu_button(("track-menu", index), cx, move |view, window, cx| {
-                    view.open_track_menu(menu_track.clone(), Some(index), window, cx);
-                })
-                .size(px(36.)),
-            );
-        row = row.child(controls.absolute().right_0().top_0().h_full());
         wrap_row(row)
             // The web's Find in playlist results sit edge to edge.
             .when(style.gap() > 0. && self.playlist_find.is_none(), |d| {

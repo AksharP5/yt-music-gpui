@@ -836,8 +836,11 @@ impl Music {
                                 .absolute()
                                 .top_0()
                                 .bottom_0()
-                                .left(px(header_left))
-                                .w(px(header_width))
+                                // Half the gap to the rows on each side, so
+                                // a title wider than the column is not cut off.
+                                .left(px(header_left - 20.))
+                                .w(px(header_width + 40.))
+                                .px(px(20.))
                                 .pt(px(STACKED_TOP))
                                 .overflow_y_scroll()
                                 .track_scroll(&self.collection_header_scroll)
