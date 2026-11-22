@@ -100,6 +100,10 @@ impl WatchTarget {
             }
         }
     }
+    pub(crate) fn video_id(&self) -> Option<&str> {
+        self.video_id.as_deref()
+    }
+
     pub fn is_single_video(&self) -> bool {
         self.playlist_id.is_none() && self.params.is_none() && self.index.is_none()
     }

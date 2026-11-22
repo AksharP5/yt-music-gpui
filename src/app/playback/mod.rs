@@ -40,6 +40,14 @@ impl PlaybackQuery {
         )
     }
 }
+/// Where a mix's filters sit in Up next and which songs they replace: above a
+/// mix's queue, or above the autoplay songs of a song played on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ChipSection {
+    Queue,
+    Autoplay,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum QueueUpdate {
     Preserve,

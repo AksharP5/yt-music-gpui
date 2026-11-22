@@ -22,7 +22,7 @@ use crate::{
     song_text::{self, Content as SongText, Query as TextQuery},
     theme::Theme,
     track_state,
-    watch::{MediaPair, Watch, WatchContinuation, WatchMode, WatchPage},
+    watch::{MediaPair, QueueChip, Watch, WatchContinuation, WatchMode, WatchPage},
 };
 use gpui::{prelude::*, *};
 use std::{
@@ -158,6 +158,8 @@ pub struct Music {
     queue_source: queue_source::Worker,
     queue_waiting: Option<QueueAdvance>,
     autoplay_tracks: VecDeque<Track>,
+    /// Filters for the autoplay songs of a song played on its own.
+    autoplay_chips: Vec<QueueChip>,
     go_chord: interaction::GoChord,
     watch_pending: Option<PlaybackQuery>,
     song_text: song_text::Worker,

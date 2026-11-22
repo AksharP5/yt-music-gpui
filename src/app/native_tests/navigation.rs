@@ -2753,6 +2753,7 @@ fn clicking_a_queued_row_plays_it_and_dragging_reorders() -> Result<()> {
                         alternatives: None,
                         continuation: None,
                         source_target: None,
+                        chips: Vec::new(),
                         shuffle: None,
                     })),
                     session_rejected: false,

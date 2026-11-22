@@ -127,6 +127,7 @@ impl Music {
         self.autoplay_seeded = false;
         self.autoplay_waiting = None;
         self.autoplay_tracks.clear();
+        self.autoplay_chips.clear();
     }
 
     pub(in crate::app) fn extend_autoplay(&mut self, cx: &mut Context<Self>) {
@@ -161,6 +162,7 @@ impl Music {
             return;
         }
         self.autoplay_seeded = true;
+        self.autoplay_chips = watch.chips.clone();
         if let Some(current) = watch.current_index {
             append_recommendations(
                 &self.library.queue,
@@ -569,6 +571,116 @@ impl Music {
         self.library.queue.tracks_mut().push(track);
         self.library.queue.select(selected);
         self.play_current(cx);
+    }
+
+    /// Reload a mix through one of its filters, from the playing song. A mix in
+    /// the queue replaces the songs after the current one, as on the web, and a
+    /// song played on its own replaces its autoplay songs.
+    pub(in crate::app) fn select_queue_chip(
+        &mut self,
+        section: ChipSection,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let chips = match section {
+            ChipSection::Queue => &self.library.queue.chips,
+            ChipSection::Autoplay => &self.autoplay_chips,
+        };
+        let Some(chip) = chips.get(index).filter(|chip| !chip.selected).cloned() else {
+            return;
+        };
+        let Some(current) = self.library.queue.current().cloned() else {
+            return;
+        };
+        // A newer radio request or a reset makes this answer stale.
+        let id = self.radio_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.radio_loading = true;
+        let session = self.account.as_ref().map(|account| account.session.clone());
+        let request_session = session.clone();
+        let load = cx.background_executor().spawn(async move {
+            Catalog::new().and_then(|catalog| {
+                catalog
+                    .for_session(request_session)
+                    .watch_chip(&chip, &current)
+            })
+        });
+        cx.spawn(async move |view, cx| {
+            let result = load.await;
+            view.update(cx, |view, cx| {
+                view.queue_chip_loaded(section, index, id, session, result, cx)
+            })
+        })
+        .detach();
+        self.notify_playback(cx);
+    }
+
+    fn queue_chip_loaded(
+        &mut self,
+        section: ChipSection,
+        index: usize,
+        id: u64,
+        session: Option<Arc<Session>>,
+        result: anyhow::Result<Watch>,
+        cx: &mut Context<Self>,
+    ) {
+        if id != self.radio_generation.load(Ordering::Relaxed) {
+            return;
+        }
+        self.radio_loading = false;
+        let current = self.library.queue.current().map(|track| track.id.clone());
+        let same_account = match (&session, &self.account) {
+            (None, None) => true,
+            (Some(requested), Some(account)) => Arc::ptr_eq(requested, &account.session),
+            _ => false,
+        };
+        let watch = match result {
+            Ok(watch)
+                if same_account
+                    && watch.current.as_ref().map(|track| &track.id) == current.as_ref() =>
+            {
+                watch
+            }
+            Ok(_) => {
+                self.resume_autoplay(cx);
+                self.notify_playback(cx);
+                return;
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not load this mix: {error:#}"));
+                self.resume_autoplay(cx);
+                self.notify_playback(cx);
+                return;
+            }
+        };
+        let upcoming = watch
+            .current_index
+            .map_or(&[][..], |current| &watch.queue[current + 1..]);
+        match section {
+            ChipSection::Queue => {
+                self.cancel_queue_drag();
+                self.library.queue.replace_upcoming(upcoming.to_vec());
+                self.queue_source
+                    .attach_watch(&mut self.library.queue, &watch, session);
+                for (position, chip) in self.library.queue.chips.iter_mut().enumerate() {
+                    chip.selected = position == index;
+                }
+                self.queue_changed(cx);
+            }
+            ChipSection::Autoplay => {
+                self.autoplay_tracks.clear();
+                append_recommendations(
+                    &self.library.queue,
+                    &mut self.autoplay_tracks,
+                    upcoming.iter().cloned(),
+                );
+                self.radio = watch.continuation.clone();
+                for (position, chip) in self.autoplay_chips.iter_mut().enumerate() {
+                    chip.selected = position == index;
+                }
+                self.resume_autoplay(cx);
+                self.notify_playback(cx);
+            }
+        }
     }
 
     pub(in crate::app) fn clear_queue(&mut self, cx: &mut Context<Self>) {
@@ -980,6 +1092,7 @@ pub(in crate::app) fn adopt_watch_queue(
         .ok_or("YouTube Music did not include the requested song in its playback queue")?;
     queue.replace(watch.queue.clone(), index);
     queue.playing_from = watch.source.clone();
+    queue.chips = watch.chips.clone();
     Ok(true)
 }
 
