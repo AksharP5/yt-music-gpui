@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::{fs, os::unix::fs::PermissionsExt};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver},
@@ -153,14 +153,11 @@ pub(super) fn run(
     let mut account_supported = options
         .check_account_at_startup
         .then(|| account_playback_supported(ytdlp));
-    let mut supports_account =
-        || *account_supported.get_or_insert_with(|| account_playback_supported(ytdlp));
-    let mut account_warned = false;
     let mut account_notice = None;
-    let mut credentials = account_credentials(
+    let credentials = account_credentials(
         options.credentials.take(),
-        &mut supports_account,
-        account_warned,
+        || *account_supported.get_or_insert_with(|| account_playback_supported(ytdlp)),
+        false,
         &mut account_notice,
     )
     .map(|source| ExtractorCredentials {
@@ -169,7 +166,6 @@ pub(super) fn run(
     });
     // Destroy the core before removing the private runtime.
     let core = MpvCore::new(&options, &socket_path)?;
-    // Cancel/reap the resolver before credentials or the core can drop.
     let native = lookup.map(|lookup| NativeResolver::new(lookup, wake.clone()));
     let mut resolver = StreamResolver::new(ytdlp, credentials.as_ref(), native);
     if options
@@ -178,13 +174,6 @@ pub(super) fn run(
     {
         resolver.warm_up(credentials.as_ref());
     }
-    let mut pending_play: Option<PendingPlay> = None;
-    let mut next_target: Option<PreparedTarget> = None;
-    let mut prepared: Option<(PreparedTarget, ResolvedStream)> = None;
-    // The paused song and when its stream must be refreshed, once per pause.
-    let mut paused_stream: Option<(u64, Option<SystemTime>)> = None;
-    // Every actor exit frees the renderer before destroying the core.
-    let mut video: Option<AttachedVideo> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket = loop {
         match IpcStream::connect(&socket_path) {
@@ -197,11 +186,6 @@ pub(super) fn run(
         }
     };
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let mut state = PlaybackState {
-        captions_enabled: options.captions,
-        ..PlaybackState::default()
-    };
-    let mut pending = Vec::new();
     // UI and MPRIS own volume. Delayed mpv acknowledgments must not
     // replace the retained level with an earlier mute's zero.
     for (id, name) in [
@@ -223,298 +207,420 @@ pub(super) fn run(
         json!(["observe_property", 0, "seekable"]),
         None,
     )?;
+    let mut actor = Actor {
+        pending: Vec::new(),
+        state: PlaybackState {
+            captions_enabled: options.captions,
+            ..PlaybackState::default()
+        },
+        socket,
+        video: None,
+        paused_stream: None,
+        prepared: None,
+        next_target: None,
+        pending_play: None,
+        resolver,
+        core,
+        credentials,
+        account_supported,
+        account_warned: false,
+        account_notice,
+        plugin_dir,
+        wake,
+        events,
+        ytdlp,
+    };
     let mut buffer = [0_u8; 16384];
     loop {
         loop {
             match commands.try_recv() {
-                Ok(PlayerCommand::Prepare(target)) => {
-                    if target.as_ref().is_some_and(|target| {
-                        prepared.as_ref().is_some_and(|(current, stream)| {
-                            current.track_id == target.track_id && stream.matches(&target.key)
-                        })
-                    }) {
-                        continue;
-                    }
-                    next_target = target.map(|mut target| {
-                        target.lane = target.key.lane(true, credentials.is_some());
-                        target
-                    });
-                    prepared = None;
-                    state.discard_upcoming();
-                    write_command(&mut socket, json!(["playlist-clear"]), None)?;
-                    // A queue render can prepare the following song while Play is
-                    // resolving. Interactive playback keeps the single request slot.
-                    if pending_play.is_none() {
-                        if let Some(target) = next_target.clone() {
-                            let _ = resolver.start(target, credentials.as_ref());
-                        } else {
-                            resolver.cancel();
-                        }
-                    }
-                }
+                Ok(PlayerCommand::Prepare(target)) => actor.prepare(target)?,
                 Ok(PlayerCommand::Play {
                     track_id,
                     url,
                     title,
                     options,
-                }) => {
-                    let key = StreamKey {
-                        url: url.clone(),
-                        quality: options.quality,
-                        video: options.video,
-                    };
-                    // A reload that skips the fast lookup must not get its stream back.
-                    // Any other play of the prepared song, such as resuming the restored
-                    // song partway in, loads the prepared stream under its own ID.
-                    let resolved = prepared.take().filter(|(target, stream)| {
-                        stream.matches(&key)
-                            && (target.track_id == track_id || !options.full_lookup)
-                    });
-                    // mpv moves to an appended entry only from a file it is playing.
-                    // An idle player, as at startup, loads the prepared stream instead.
-                    let prefetched = resolved
-                        .as_ref()
-                        .is_some_and(|(target, _)| target.track_id == track_id)
-                        && state.file_active
-                        && state.entries.values().any(|entry| *entry == track_id);
-                    next_target = None;
-                    pending_play = None;
-                    let already_restarted = state.restarted && state.current == Some(track_id);
-                    state.invalidate_seeks();
-                    state.restarted = already_restarted;
-                    state.desired = Some(track_id);
-                    state.paused = options.paused;
-                    state.pause_target = Some(options.paused);
-                    // Adoption must refresh metadata even if file-loaded preceded Play.
-                    state.pause_after_load = true;
-                    state.upcoming = None;
-                    if prefetched {
-                        resolver.cancel();
-                        if state.current != Some(track_id) {
-                            state.loaded = false;
-                            state.pause_after_load = true;
-                            // mpv may have reached this last prepared entry before
-                            // its start-file event reaches us. Weak leaves it playing.
-                            write_command(&mut socket, json!(["playlist-next", "weak"]), None)?;
-                        } else if state.loaded {
-                            // EOF may have transitioned before the UI consumed Ended.
-                            let _ = events.send_blocking(PlayerEvent::Started {
-                                track_id,
-                                paused: options.paused,
-                                captions: state.captions.contains_key(&track_id),
-                            });
-                        }
-                        state.pause_revision += 1;
-                        write_pause(&mut socket, options.paused, state.pause_revision)?;
-                    } else {
-                        state.loaded = false;
-                        #[cfg(test)]
-                        if Path::new(&url).is_absolute() {
-                            resolver.cancel();
-                            write_command(
-                                &mut socket,
-                                load_command(&url, &title, 0., options),
-                                Some(json!(track_id)),
-                            )?;
-                            continue;
-                        }
-                        write_command(&mut socket, json!(["stop"]), None)?;
-                        // The append acknowledgement can still be queued when the
-                        // user clicks Next. Reuse its resolved URL in that case.
-                        if let Some((_, stream)) = resolved {
-                            resolver.cancel();
-                            state.load_captions(track_id, &stream);
-                            write_command(
-                                &mut socket,
-                                load_command(&stream.url, &title, stream.gain_db, options),
-                                Some(json!(track_id)),
-                            )?;
-                            continue;
-                        }
-                        let target = PreparedTarget {
-                            lane: if options.full_lookup {
-                                ResolverLane::Full
-                            } else {
-                                key.lane(false, credentials.is_some())
-                            },
-                            key,
-                            track_id,
-                        };
-                        pending_play = Some(PendingPlay {
-                            target: target.clone(),
-                            title,
-                            options,
-                        });
-                        if resolver.start(target, credentials.as_ref()).is_err() {
-                            pending_play = None;
-                            stream_error(track_id, events);
-                        }
-                    }
-                }
+                }) => actor.play(track_id, url, title, options)?,
                 Ok(PlayerCommand::Pause(paused)) => {
+                    let state = &mut actor.state;
                     state.pause_revision += 1;
                     state.pause_target = Some(paused);
                     state.paused = paused;
                     state.pause_after_load = !state.loaded;
-                    write_pause(&mut socket, paused, state.pause_revision)?;
+                    write_pause(&mut actor.socket, paused, state.pause_revision)?;
                 }
                 Ok(PlayerCommand::Captions(enabled)) => {
-                    state.captions_enabled = enabled;
-                    state.apply_captions(&mut socket)?;
+                    actor.state.captions_enabled = enabled;
+                    actor.state.apply_captions(&mut actor.socket)?;
                 }
-                Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
-                Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
+                Ok(PlayerCommand::Seek(request)) => actor.state.queue_seek(request, events),
+                Ok(PlayerCommand::Json(command)) => {
+                    write_command(&mut actor.socket, command, None)?
+                }
                 Ok(PlayerCommand::Credentials { next, reply }) => {
-                    // Reap even an idle resolver: it holds the old account in memory.
-                    resolver.stop();
-                    pending_play = None;
-                    next_target = None;
-                    prepared = None;
-                    state.upcoming = None;
-                    let next = account_credentials(
-                        next,
-                        &mut supports_account,
-                        account_warned,
-                        &mut account_notice,
-                    );
-                    state.invalidate_seeks();
-                    state.desired = None;
-                    state.loaded = false;
-                    let result = replace_playback_credentials(
-                        &mut socket,
-                        &mut pending,
-                        &mut credentials,
-                        next,
-                        &plugin_dir,
-                        &mut state,
-                        events,
-                    );
-                    if result.is_ok() {
-                        let native = resolver.native.take();
-                        if let Some(native) = &native {
-                            native.lookup.reset();
-                        }
-                        resolver = StreamResolver::new(ytdlp, credentials.as_ref(), native);
-                    }
-                    let _ = reply.send_blocking(
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| format!("{error:#}")),
-                    );
-                    result?;
+                    actor.replace_credentials(next, reply)?
                 }
-                Ok(PlayerCommand::AttachVideo { video: next }) => {
-                    let result: Result<()> = (|| {
-                        ensure!(video.is_none(), "A video surface is already attached");
-                        next.start(core.0.as_ptr(), wake)?;
-                        let attached = AttachedVideo {
-                            video: next,
-                            ready: false,
-                        };
-                        video = Some(attached);
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        let _ = events.send_blocking(PlayerEvent::VideoError {
-                            message: format!("{error:#}"),
-                        });
-                    }
-                    let _ = events.send_blocking(PlayerEvent::VideoChanged);
+                Ok(PlayerCommand::AttachVideo { video }) => actor.attach_video(video),
+                Ok(PlayerCommand::DetachVideo { video, reply }) => {
+                    actor.detach_video(&video, reply)
                 }
-                Ok(PlayerCommand::DetachVideo {
-                    video: current,
-                    reply,
-                }) => {
-                    if video
-                        .as_ref()
-                        .is_some_and(|video| Arc::ptr_eq(&video.video, &current))
-                    {
-                        let result = request(
-                            &mut socket,
-                            &mut pending,
-                            json!(["set_property", "vid", "no"]),
-                            |value| state.message(value, events),
-                        );
-                        video.take();
-                        if result.is_err() {
-                            let _ = events.send_blocking(PlayerEvent::VideoError {
-                                message: "Could not disable the video track".into(),
-                            });
-                        }
-                    }
-                    let _ = reply.send_blocking(());
-                }
-                Ok(PlayerCommand::Stop) => {
-                    resolver.cancel();
-                    pending_play = None;
-                    next_target = None;
-                    prepared = None;
-                    state.upcoming = None;
-                    state.invalidate_seeks();
-                    state.desired = None;
-                    state.loaded = false;
-                    write_command(&mut socket, json!(["stop"]), None)?;
-                }
+                Ok(PlayerCommand::Stop) => actor.stop()?,
                 Ok(PlayerCommand::Quit) | Err(mpsc::TryRecvError::Disconnected) => {
-                    resolver.stop();
-                    let _ = write_command(&mut socket, json!(["quit"]), None);
+                    actor.resolver.stop();
+                    let _ = write_command(&mut actor.socket, json!(["quit"]), None);
                     return Ok(());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        resolver.retain(
-            pending_play.as_ref().map(|play| &play.target),
-            next_target.as_ref(),
-        );
-        if let Some((target, result)) = resolver.finish(
-            pending_play.as_ref().map(|play| &play.target),
-            credentials.as_ref(),
-        ) {
-            if let Some(play) = pending_play.take_if(|play| {
-                play.target.track_id == target.track_id && play.target.key == target.key
-            }) {
-                match result {
-                    Ok(stream) => {
-                        let options = PlayOptions {
-                            paused: state.paused,
-                            ..play.options
-                        };
-                        state.load_captions(target.track_id, &stream);
-                        write_command(
-                            &mut socket,
-                            load_command(&stream.url, &play.title, stream.gain_db, options),
-                            Some(json!(target.track_id)),
-                        )?;
-                        if let Some(target) = next_target.clone()
-                            && !prepared.as_ref().is_some_and(|(current, stream)| {
-                                current.track_id == target.track_id && stream.matches(&target.key)
-                            })
-                        {
-                            let _ = resolver.start(target, credentials.as_ref());
-                        }
-                    }
-                    Err(_) => {
-                        next_target = None;
-                        stream_error(target.track_id, events);
-                    }
-                }
-            } else if next_target
-                .as_ref()
-                .is_some_and(|next| next.track_id == target.track_id && next.key == target.key)
-                && let Ok(stream) = result
-            {
-                prepared = Some((target, stream));
+        actor.load_resolved()?;
+        actor.append_prepared()?;
+        actor.refresh_expired_preparation()?;
+        actor.enable_video();
+        actor.deliver_account_notice();
+        actor.state.write_seek(&mut actor.socket)?;
+        ensure!(!actor.core.is_shutdown(), "mpv stopped unexpectedly");
+        actor.watch_paused_stream();
+        let deadline = actor
+            .resolver
+            .deadline()
+            .into_iter()
+            .chain(actor.expiry())
+            .min();
+        if actor.pending.contains(&b'\n')
+            || wait_for_player_input(&actor.socket, wake, actor.resolver.fd(), deadline)?
+        {
+            actor.state.read_messages(
+                &mut actor.socket,
+                &mut actor.pending,
+                &mut buffer,
+                events,
+            )?;
+        }
+    }
+}
+
+/// What the actor loop keeps between iterations. Fields drop in declaration
+/// order: the renderer before the resolver, and the resolver, which may hold
+/// the account in a running extractor, before the core and the credentials.
+struct Actor<'a> {
+    pending: Vec<u8>,
+    state: PlaybackState,
+    socket: IpcStream,
+    // Every actor exit frees the renderer before destroying the core.
+    video: Option<AttachedVideo>,
+    // The paused song and when its stream must be refreshed, once per pause.
+    paused_stream: Option<(u64, Option<SystemTime>)>,
+    prepared: Option<(PreparedTarget, ResolvedStream)>,
+    next_target: Option<PreparedTarget>,
+    pending_play: Option<PendingPlay>,
+    // Cancel/reap the resolver before credentials or the core can drop.
+    resolver: StreamResolver,
+    core: MpvCore,
+    credentials: Option<ExtractorCredentials>,
+    account_supported: Option<bool>,
+    account_warned: bool,
+    account_notice: Option<String>,
+    plugin_dir: PathBuf,
+    wake: &'a Arc<Waker>,
+    events: &'a async_channel::Sender<PlayerEvent>,
+    ytdlp: &'a Path,
+}
+
+impl Actor<'_> {
+    fn prepare(&mut self, target: Option<PreparedTarget>) -> Result<()> {
+        if target.as_ref().is_some_and(|target| {
+            self.prepared.as_ref().is_some_and(|(current, stream)| {
+                current.track_id == target.track_id && stream.matches(&target.key)
+            })
+        }) {
+            return Ok(());
+        }
+        self.next_target = target.map(|mut target| {
+            target.lane = target.key.lane(true, self.credentials.is_some());
+            target
+        });
+        self.prepared = None;
+        self.state.discard_upcoming();
+        write_command(&mut self.socket, json!(["playlist-clear"]), None)?;
+        // A queue render can prepare the following song while Play is
+        // resolving. Interactive playback keeps the single request slot.
+        if self.pending_play.is_none() {
+            if let Some(target) = self.next_target.clone() {
+                let _ = self.resolver.start(target, self.credentials.as_ref());
+            } else {
+                self.resolver.cancel();
             }
         }
+        Ok(())
+    }
+
+    fn play(
+        &mut self,
+        track_id: u64,
+        url: String,
+        title: String,
+        options: PlayOptions,
+    ) -> Result<()> {
+        let state = &mut self.state;
+        let key = StreamKey {
+            url: url.clone(),
+            quality: options.quality,
+            video: options.video,
+        };
+        // A reload that skips the fast lookup must not get its stream back.
+        // Any other play of the prepared song, such as resuming the restored
+        // song partway in, loads the prepared stream under its own ID.
+        let resolved = self.prepared.take().filter(|(target, stream)| {
+            stream.matches(&key) && (target.track_id == track_id || !options.full_lookup)
+        });
+        // mpv moves to an appended entry only from a file it is playing.
+        // An idle player, as at startup, loads the prepared stream instead.
+        let prefetched = resolved
+            .as_ref()
+            .is_some_and(|(target, _)| target.track_id == track_id)
+            && state.file_active
+            && state.entries.values().any(|entry| *entry == track_id);
+        self.next_target = None;
+        self.pending_play = None;
+        let already_restarted = state.restarted && state.current == Some(track_id);
+        state.invalidate_seeks();
+        state.restarted = already_restarted;
+        state.desired = Some(track_id);
+        state.paused = options.paused;
+        state.pause_target = Some(options.paused);
+        // Adoption must refresh metadata even if file-loaded preceded Play.
+        state.pause_after_load = true;
+        state.upcoming = None;
+        if prefetched {
+            self.resolver.cancel();
+            if state.current != Some(track_id) {
+                state.loaded = false;
+                state.pause_after_load = true;
+                // mpv may have reached this last prepared entry before
+                // its start-file event reaches us. Weak leaves it playing.
+                write_command(&mut self.socket, json!(["playlist-next", "weak"]), None)?;
+            } else if state.loaded {
+                // EOF may have transitioned before the UI consumed Ended.
+                let _ = self.events.send_blocking(PlayerEvent::Started {
+                    track_id,
+                    paused: options.paused,
+                    captions: state.captions.contains_key(&track_id),
+                });
+            }
+            state.pause_revision += 1;
+            return write_pause(&mut self.socket, options.paused, state.pause_revision);
+        }
+        state.loaded = false;
+        #[cfg(test)]
+        if Path::new(&url).is_absolute() {
+            self.resolver.cancel();
+            return write_command(
+                &mut self.socket,
+                load_command(&url, &title, 0., options),
+                Some(json!(track_id)),
+            );
+        }
+        write_command(&mut self.socket, json!(["stop"]), None)?;
+        // The append acknowledgement can still be queued when the
+        // user clicks Next. Reuse its resolved URL in that case.
+        if let Some((_, stream)) = resolved {
+            self.resolver.cancel();
+            state.load_captions(track_id, &stream);
+            return write_command(
+                &mut self.socket,
+                load_command(&stream.url, &title, stream.gain_db, options),
+                Some(json!(track_id)),
+            );
+        }
+        let target = PreparedTarget {
+            lane: if options.full_lookup {
+                ResolverLane::Full
+            } else {
+                key.lane(false, self.credentials.is_some())
+            },
+            key,
+            track_id,
+        };
+        self.pending_play = Some(PendingPlay {
+            target: target.clone(),
+            title,
+            options,
+        });
+        if self
+            .resolver
+            .start(target, self.credentials.as_ref())
+            .is_err()
+        {
+            self.pending_play = None;
+            stream_error(track_id, self.events);
+        }
+        Ok(())
+    }
+
+    fn replace_credentials(
+        &mut self,
+        next: Option<PlaybackCredentials>,
+        reply: async_channel::Sender<Result<(), String>>,
+    ) -> Result<()> {
+        // Reap even an idle resolver: it holds the old account in memory.
+        self.resolver.stop();
+        self.pending_play = None;
+        self.next_target = None;
+        self.prepared = None;
+        self.state.upcoming = None;
+        let ytdlp = self.ytdlp;
+        let next = account_credentials(
+            next,
+            || {
+                *self
+                    .account_supported
+                    .get_or_insert_with(|| account_playback_supported(ytdlp))
+            },
+            self.account_warned,
+            &mut self.account_notice,
+        );
+        self.state.invalidate_seeks();
+        self.state.desired = None;
+        self.state.loaded = false;
+        let result = replace_playback_credentials(
+            &mut self.socket,
+            &mut self.pending,
+            &mut self.credentials,
+            next,
+            &self.plugin_dir,
+            &mut self.state,
+            self.events,
+        );
+        if result.is_ok() {
+            let native = self.resolver.native.take();
+            if let Some(native) = &native {
+                native.lookup.reset();
+            }
+            self.resolver = StreamResolver::new(self.ytdlp, self.credentials.as_ref(), native);
+        }
+        let _ = reply.send_blocking(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}")),
+        );
+        result
+    }
+
+    fn attach_video(&mut self, next: Arc<NativeVideo>) {
+        let result: Result<()> = (|| {
+            ensure!(self.video.is_none(), "A video surface is already attached");
+            next.start(self.core.0.as_ptr(), self.wake)?;
+            let attached = AttachedVideo {
+                video: next,
+                ready: false,
+            };
+            self.video = Some(attached);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = self.events.send_blocking(PlayerEvent::VideoError {
+                message: format!("{error:#}"),
+            });
+        }
+        let _ = self.events.send_blocking(PlayerEvent::VideoChanged);
+    }
+
+    fn detach_video(&mut self, current: &Arc<NativeVideo>, reply: async_channel::Sender<()>) {
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|video| Arc::ptr_eq(&video.video, current))
+        {
+            let result = request(
+                &mut self.socket,
+                &mut self.pending,
+                json!(["set_property", "vid", "no"]),
+                |value| self.state.message(value, self.events),
+            );
+            self.video.take();
+            if result.is_err() {
+                let _ = self.events.send_blocking(PlayerEvent::VideoError {
+                    message: "Could not disable the video track".into(),
+                });
+            }
+        }
+        let _ = reply.send_blocking(());
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.resolver.cancel();
+        self.pending_play = None;
+        self.next_target = None;
+        self.prepared = None;
+        self.state.upcoming = None;
+        self.state.invalidate_seeks();
+        self.state.desired = None;
+        self.state.loaded = false;
+        write_command(&mut self.socket, json!(["stop"]), None)
+    }
+
+    /// Load a resolved click, or keep a resolved preparation for appending.
+    fn load_resolved(&mut self) -> Result<()> {
+        self.resolver.retain(
+            self.pending_play.as_ref().map(|play| &play.target),
+            self.next_target.as_ref(),
+        );
+        let Some((target, result)) = self.resolver.finish(
+            self.pending_play.as_ref().map(|play| &play.target),
+            self.credentials.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        if let Some(play) = self.pending_play.take_if(|play| {
+            play.target.track_id == target.track_id && play.target.key == target.key
+        }) {
+            match result {
+                Ok(stream) => {
+                    let options = PlayOptions {
+                        paused: self.state.paused,
+                        ..play.options
+                    };
+                    self.state.load_captions(target.track_id, &stream);
+                    write_command(
+                        &mut self.socket,
+                        load_command(&stream.url, &play.title, stream.gain_db, options),
+                        Some(json!(target.track_id)),
+                    )?;
+                    if let Some(target) = self.next_target.clone()
+                        && !self.prepared.as_ref().is_some_and(|(current, stream)| {
+                            current.track_id == target.track_id && stream.matches(&target.key)
+                        })
+                    {
+                        let _ = self.resolver.start(target, self.credentials.as_ref());
+                    }
+                }
+                Err(_) => {
+                    self.next_target = None;
+                    stream_error(target.track_id, self.events);
+                }
+            }
+        } else if self
+            .next_target
+            .as_ref()
+            .is_some_and(|next| next.track_id == target.track_id && next.key == target.key)
+            && let Ok(stream) = result
+        {
+            self.prepared = Some((target, stream));
+        }
+        Ok(())
+    }
+
+    /// Append the prepared song to mpv's playlist, so it can play on at the end.
+    fn append_prepared(&mut self) -> Result<()> {
         // A full preparation can finish while a native click is resolving. Hold
         // it until that click loads, so append cannot replace its pending load.
-        if pending_play.is_none()
-            && let Some((target, stream)) = &prepared
-            && state.upcoming != Some(target.track_id)
+        if self.pending_play.is_none()
+            && let Some((target, stream)) = &self.prepared
+            && self.state.upcoming != Some(target.track_id)
             // After a natural transition the prepared song is already playing.
-            && state.current != Some(target.track_id)
+            && self.state.current != Some(target.track_id)
         {
             let mut command = load_command(
                 &stream.url,
@@ -527,82 +633,100 @@ pub(super) fn run(
                 },
             );
             command["flags"] = json!("append");
-            state.upcoming = Some(target.track_id);
-            state.load_captions(target.track_id, stream);
+            self.state.upcoming = Some(target.track_id);
+            self.state.load_captions(target.track_id, stream);
             write_command(
-                &mut socket,
+                &mut self.socket,
                 command,
                 Some(json!(format!("prepare:{}", target.track_id))),
             )?;
             #[cfg(test)]
-            let _ = events.send_blocking(PlayerEvent::Prepared {
+            let _ = self.events.send_blocking(PlayerEvent::Prepared {
                 video_id: stream.key.url.rsplit_once("v=").unwrap().1.to_owned(),
             });
         }
-        if let Some((target, _)) = prepared.take_if(|(target, stream)| {
-            state.current != Some(target.track_id) && SystemTime::now() >= stream.expires
+        Ok(())
+    }
+
+    fn refresh_expired_preparation(&mut self) -> Result<()> {
+        if let Some((target, _)) = self.prepared.take_if(|(target, stream)| {
+            self.state.current != Some(target.track_id) && SystemTime::now() >= stream.expires
         }) {
-            state.discard_upcoming();
-            write_command(&mut socket, json!(["playlist-clear"]), None)?;
-            let _ = resolver.start(target, credentials.as_ref());
+            self.state.discard_upcoming();
+            write_command(&mut self.socket, json!(["playlist-clear"]), None)?;
+            let _ = self.resolver.start(target, self.credentials.as_ref());
         }
-        if let Some(attached) = &mut video {
-            let result = attached.video.ready_for_player().and_then(|ready| {
-                if ready && !attached.ready {
-                    // A native lookup can load video before EGL/libmpv finishes
-                    // starting. Enabling it sooner leaves mpv with no renderer.
-                    request(
-                        &mut socket,
-                        &mut pending,
-                        json!(["set_property", "vid", "auto"]),
-                        |value| state.message(value, events),
-                    )
-                    .map_err(|_| anyhow::anyhow!("Could not enable the video track"))?;
-                    attached.ready = true;
-                    let _ = events.send_blocking(PlayerEvent::VideoChanged);
-                }
-                Ok(())
-            });
-            if let Err(error) = result {
-                let _ = request(
-                    &mut socket,
-                    &mut pending,
-                    json!(["set_property", "vid", "no"]),
-                    |value| state.message(value, events),
-                );
-                video.take();
-                let _ = events.send_blocking(PlayerEvent::VideoError {
-                    message: error.to_string(),
-                });
-                let _ = events.send_blocking(PlayerEvent::VideoChanged);
+        Ok(())
+    }
+
+    /// Enable mpv's video track once the attached renderer is ready, or
+    /// detach a renderer that failed.
+    fn enable_video(&mut self) {
+        let Some(attached) = &mut self.video else {
+            return;
+        };
+        let result = attached.video.ready_for_player().and_then(|ready| {
+            if ready && !attached.ready {
+                // A native lookup can load video before EGL/libmpv finishes
+                // starting. Enabling it sooner leaves mpv with no renderer.
+                request(
+                    &mut self.socket,
+                    &mut self.pending,
+                    json!(["set_property", "vid", "auto"]),
+                    |value| self.state.message(value, self.events),
+                )
+                .map_err(|_| anyhow::anyhow!("Could not enable the video track"))?;
+                attached.ready = true;
+                let _ = self.events.send_blocking(PlayerEvent::VideoChanged);
             }
+            Ok(())
+        });
+        if let Err(error) = result {
+            let _ = request(
+                &mut self.socket,
+                &mut self.pending,
+                json!(["set_property", "vid", "no"]),
+                |value| self.state.message(value, self.events),
+            );
+            self.video.take();
+            let _ = self.events.send_blocking(PlayerEvent::VideoError {
+                message: error.to_string(),
+            });
+            let _ = self.events.send_blocking(PlayerEvent::VideoChanged);
         }
-        if state.loaded
-            && state.current == state.desired
-            && let Some(message) = account_notice.take()
+    }
+
+    fn deliver_account_notice(&mut self) {
+        if self.state.loaded
+            && self.state.current == self.state.desired
+            && let Some(message) = self.account_notice.take()
         {
             // Activation and stream replacement clear transient UI notices.
             // Deliver this after Started, once guest playback is actually ready.
-            account_warned = true;
-            let _ = events.send_blocking(PlayerEvent::Notice(message));
+            self.account_warned = true;
+            let _ = self.events.send_blocking(PlayerEvent::Notice(message));
         }
-        let _ = &credentials;
-        state.write_seek(&mut socket)?;
-        ensure!(!core.is_shutdown(), "mpv stopped unexpectedly");
-        // mpv reconnects a dropped stream with the same URL, which fails once
-        // the URL expires, and the song then ends where its buffer runs out.
-        // A paused song can outlive its URL, so before that ask the app to
-        // reload it, still paused, at the same position.
+    }
+
+    /// mpv reconnects a dropped stream with the same URL, which fails once
+    /// the URL expires, and the song then ends where its buffer runs out.
+    /// A paused song can outlive its URL, so before that ask the app to
+    /// reload it, still paused, at the same position.
+    fn watch_paused_stream(&mut self) {
+        let state = &self.state;
         let paused_track = state.current.filter(|id| {
-            state.paused && state.loaded && state.desired == Some(*id) && pending_play.is_none()
+            state.paused
+                && state.loaded
+                && state.desired == Some(*id)
+                && self.pending_play.is_none()
         });
-        if paused_track != paused_stream.map(|(id, _)| id) {
-            paused_stream = paused_track.map(|id| {
+        if paused_track != self.paused_stream.map(|(id, _)| id) {
+            self.paused_stream = paused_track.map(|id| {
                 let path = request(
-                    &mut socket,
-                    &mut pending,
+                    &mut self.socket,
+                    &mut self.pending,
                     json!(["get_property", "path"]),
-                    |value| state.message(value, events),
+                    |value| self.state.message(value, self.events),
                 );
                 let refresh = path
                     .ok()
@@ -612,29 +736,35 @@ pub(super) fn run(
                 (id, refresh)
             });
         }
-        if let Some((track_id, Some(refresh))) = paused_stream
+        if let Some((track_id, Some(refresh))) = self.paused_stream
             && SystemTime::now() >= refresh
         {
-            paused_stream = Some((track_id, None));
+            self.paused_stream = Some((track_id, None));
             let buffered_to_end = request(
-                &mut socket,
-                &mut pending,
+                &mut self.socket,
+                &mut self.pending,
                 json!(["get_property", "demuxer-cache-state"]),
-                |value| state.message(value, events),
+                |value| self.state.message(value, self.events),
             )
             .is_ok_and(|cache| cache["eof"] == true);
             if !buffered_to_end {
-                let _ = events.send_blocking(PlayerEvent::StreamExpiring { track_id });
+                let _ = self
+                    .events
+                    .send_blocking(PlayerEvent::StreamExpiring { track_id });
             }
         }
-        // Expiry is wall-clock time, which a monotonic wait doesn't follow across
-        // clock changes or suspend, so recheck it at least once a minute.
-        let expiry = prepared
+    }
+
+    /// When a prepared or paused stream next needs a fresh URL. Expiry is
+    /// wall-clock time, which a monotonic wait doesn't follow across clock
+    /// changes or suspend, so recheck it at least once a minute.
+    fn expiry(&self) -> Option<Instant> {
+        self.prepared
             .as_ref()
-            .filter(|(target, _)| state.current != Some(target.track_id))
+            .filter(|(target, _)| self.state.current != Some(target.track_id))
             .map(|(_, stream)| stream.expires)
             .into_iter()
-            .chain(paused_stream.and_then(|(_, refresh)| refresh))
+            .chain(self.paused_stream.and_then(|(_, refresh)| refresh))
             .min()
             .map(|expires| {
                 Instant::now()
@@ -642,13 +772,7 @@ pub(super) fn run(
                         .duration_since(SystemTime::now())
                         .unwrap_or_default()
                         .min(Duration::from_secs(60))
-            });
-        let deadline = resolver.deadline().into_iter().chain(expiry).min();
-        if pending.contains(&b'\n')
-            || wait_for_player_input(&socket, wake, resolver.fd(), deadline)?
-        {
-            state.read_messages(&mut socket, &mut pending, &mut buffer, events)?;
-        }
+            })
     }
 }
 
