@@ -570,6 +570,16 @@ impl Music {
                 .into_any_element();
         }
         let (header_width, list_width, cover) = layout.collection_columns();
+        // Stacked pages scroll from anywhere in the page, like the web's document: the
+        // list spans the page and its rows start past the header column.
+        let header_left = ((available - header_width - 40. - list_width) / 2. + 8.).max(0.);
+        let rows_left = header_left + header_width + 40.;
+        let stacked_row = move |row: AnyElement| {
+            div()
+                .pl(px(rows_left))
+                .child(div().w(px(list_width)).child(row))
+                .into_any_element()
+        };
         let heading = (collection && stacked).then(|| self.page_heading(cover, layout, cx));
         if self.rows.is_empty()
             && !collection
@@ -605,11 +615,15 @@ impl Music {
             let list = if empty_stacked {
                 div()
                     .flex_1()
-                    .px(px(24.))
-                    .pt(px(STACKED_TOP + 32.))
-                    .pb(px(32.))
-                    .text_color(self.theme.muted)
-                    .child("No songs here yet.")
+                    .child(stacked_row(
+                        div()
+                            .px(px(24.))
+                            .pt(px(STACKED_TOP + 32.))
+                            .pb(px(32.))
+                            .text_color(self.theme.muted)
+                            .child("No songs here yet.")
+                            .into_any_element(),
+                    ))
                     .into_any_element()
             } else if collection {
                 self.detail_list.set_inline_header(!stacked);
@@ -628,7 +642,7 @@ impl Music {
                         // above them scrolls with the first row.
                         if stacked {
                             let row = view.list_row(index, 0., window, cx);
-                            return if index == 0 {
+                            return stacked_row(if index == 0 {
                                 div()
                                     .pt(px(STACKED_TOP))
                                     .children(view.playlist_sort(cx))
@@ -636,7 +650,7 @@ impl Music {
                                     .into_any_element()
                             } else {
                                 row
-                            };
+                            });
                         }
                         if inline && index == 0 {
                             let cover = if layout.tier >= Tier::Medium {
@@ -763,27 +777,31 @@ impl Music {
                 .into_any_element()
             };
             content = if stacked {
+                // A header taller than the window scrolls on its own; otherwise the
+                // wheel over it reaches the list beneath.
+                let header_overflows = self.collection_header_scroll.max_offset().y > px(0.);
                 content.child(
                     div()
                         .flex_1()
                         .min_h_0()
                         .w_full()
-                        .pl(px(((available - header_width - 40. - list_width) / 2.
-                            + 8.)
-                            .max(0.)))
+                        .relative()
                         .flex()
-                        .gap(px(40.))
+                        .child(list)
                         .child(
                             div()
                                 .id("collection-header")
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(header_left))
                                 .w(px(header_width))
-                                .h_full()
-                                .flex_shrink_0()
                                 .pt(px(STACKED_TOP))
                                 .overflow_y_scroll()
+                                .track_scroll(&self.collection_header_scroll)
+                                .when(header_overflows, |header| header.occlude())
                                 .children(heading),
-                        )
-                        .child(div().w(px(list_width)).h_full().flex().child(list)),
+                        ),
                 )
             } else {
                 content

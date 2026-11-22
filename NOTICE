@@ -76,8 +76,9 @@ Source: https://github.com/google/material-design-icons
   badge outline with a scaled "music_note".
   These entries replace any earlier source listed above for the same files.
   Also from Material Symbols (Rounded), unmodified at weight 400 and their
-  original viewBox: settings ("settings"), help ("help"), logout ("logout")
-  and switch-account ("switch_account").
+  original viewBox: settings ("settings"), help ("help"), logout ("logout"),
+  switch-account ("switch_account"), premium ("smart_display"), policy
+  ("policy") and feedback ("feedback").
 
 The rounded voting glyphs in assets/icons/thumb-up.svg, thumb-down.svg and
 thumb-up-filled.svg are from the icons rendered by https://music.youtube.com/.
