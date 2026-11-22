@@ -15,18 +15,28 @@ fn main() {
     println!("cargo:rustc-env=REVIEWED_YTDLP={version}");
     println!("cargo:rerun-if-changed=src/ytdlp_account.py");
     let target = std::env::var("CARGO_CFG_TARGET_OS");
-    // Video is Linux-only so far. player.rs binds to libmpv-2.dll at run time
-    // on Windows, so it needs no import library.
+    // Windows has no video yet. player.rs binds to libmpv-2.dll at run time
+    // there, so it needs no import library.
     if target.as_deref() == Ok("windows") {
         return;
     }
     if target.as_deref() == Ok("macos") {
-        // Video is Linux-only so far. Apple Silicon Homebrew keeps libmpv outside
-        // the linker's default search path.
+        // Apple Silicon Homebrew keeps libmpv outside the compiler's and
+        // linker's default search paths.
         let homebrew = std::env::var("HOMEBREW_PREFIX").unwrap_or("/opt/homebrew".into());
+        cc::Build::new()
+            .file("native/video_macos.m")
+            .include(format!("{homebrew}/include"))
+            .flag("-fno-objc-arc")
+            .warnings(true)
+            .compile("native_video");
         println!("cargo:rustc-link-search=native={homebrew}/lib");
         println!("cargo:rustc-link-lib=mpv");
+        for framework in ["AppKit", "QuartzCore", "IOSurface", "OpenGL"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
         println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
+        println!("cargo:rerun-if-changed=native/video_macos.m");
         return;
     }
     cc::Build::new()

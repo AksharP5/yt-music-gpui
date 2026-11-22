@@ -2,17 +2,30 @@ use crate::os::Waker;
 use anyhow::{Context, Result, ensure};
 use gpui::{Bounds, Pixels, Window};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+#[cfg(target_os = "linux")]
+use std::ffi::c_ulong;
 use std::{
-    ffi::{c_ulong, c_void},
+    ffi::c_void,
     os::fd::{AsFd, AsRawFd},
     ptr::NonNull,
     sync::{Mutex, PoisonError, TryLockError},
 };
 
+// native/video.c on Linux, native/video_macos.m on macOS.
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn video_initialize() -> i32;
     fn video_create(display: *mut c_void, parent: *mut c_void) -> *mut c_void;
     fn video_create_x11(parent: c_ulong) -> *mut c_void;
+    fn video_set_cutouts(video: *mut c_void, rects: *const i32, count: i32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn video_create(app_view: *mut c_void) -> *mut c_void;
+}
+
+unsafe extern "C" {
     fn video_start(video: *mut c_void, core: *mut c_void, wake: i32) -> i32;
     fn video_resize(
         video: *mut c_void,
@@ -23,7 +36,6 @@ unsafe extern "C" {
         pixel_width: i32,
         pixel_height: i32,
     ) -> i32;
-    fn video_set_cutouts(video: *mut c_void, rects: *const i32, count: i32) -> i32;
     fn video_status(video: *mut c_void) -> i32;
     fn video_stop(video: *mut c_void);
     fn video_destroy(video: *mut c_void);
@@ -32,15 +44,38 @@ unsafe extern "C" {
 pub const SUPPORTED: bool = true;
 
 /// `VIDEO_CUTOUTS` in native/video.c.
+#[cfg(target_os = "linux")]
 const CUTOUTS: usize = 4;
 
 /// Call before GPUI or libmpv starts: hardware decoders can also use Xlib.
+#[cfg(target_os = "linux")]
 pub fn initialize() -> Result<()> {
     ensure!(
         unsafe { video_initialize() } != 0,
         "Could not initialize native video threading"
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn initialize() -> Result<()> {
+    Ok(())
+}
+
+/// Where the platform puts the video, which decides how it is positioned.
+#[derive(Clone, Copy)]
+enum Placement {
+    /// A subsurface below the window, positioned in logical pixels.
+    #[cfg(target_os = "linux")]
+    Wayland,
+    /// A child window above the app, positioned in physical pixels.
+    #[cfg(target_os = "linux")]
+    X11,
+    /// A view below the app's view, positioned in physical pixels rounded
+    /// outward, so it covers every pixel of the hole the transparent window
+    /// leaves. The app draws over any overlap.
+    #[cfg(target_os = "macos")]
+    AppKit,
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,7 +89,7 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn new(bounds: Bounds<Pixels>, scale: f32, x11: bool) -> Result<Self> {
+    fn new(bounds: Bounds<Pixels>, scale: f32, placement: Placement) -> Result<Self> {
         let x = f32::from(bounds.origin.x);
         let y = f32::from(bounds.origin.y);
         let width = f32::from(bounds.size.width);
@@ -68,9 +103,22 @@ impl Geometry {
                 && scale > 0.,
             "Invalid video bounds"
         );
-        // Wayland positions logical pixels; X11 positions physical pixels.
-        let coordinates = if x11 { scale } else { 1. };
-        let edges = [x, y, x + width, y + height].map(|edge| (edge * coordinates).round());
+        let (coordinates, buffer_scale) = match placement {
+            #[cfg(target_os = "linux")]
+            Placement::Wayland => (1., scale),
+            #[cfg(target_os = "linux")]
+            Placement::X11 => (scale, 1.),
+            #[cfg(target_os = "macos")]
+            Placement::AppKit => (scale, 1.),
+        };
+        let [left, top, right, bottom] =
+            [x, y, x + width, y + height].map(|edge| edge * coordinates);
+        let edges = match placement {
+            #[cfg(target_os = "linux")]
+            Placement::Wayland | Placement::X11 => [left, top, right, bottom].map(f32::round),
+            #[cfg(target_os = "macos")]
+            Placement::AppKit => [left.floor(), top.floor(), right.ceil(), bottom.ceil()],
+        };
         ensure!(
             edges.iter().all(|edge| edge.is_finite()
                 && *edge >= i32::MIN as f32
@@ -85,7 +133,6 @@ impl Geometry {
         let height = bottom
             .checked_sub(top)
             .context("Video bounds are too large")?;
-        let buffer_scale = if x11 { 1. } else { scale };
         let pixels = [width, height].map(|value| (value as f32 * buffer_scale).round().max(1.));
         ensure!(
             pixels
@@ -106,7 +153,7 @@ impl Geometry {
 
 pub(crate) struct NativeVideo {
     handle: Mutex<Option<NonNull<c_void>>>,
-    x11: bool,
+    placement: Placement,
 }
 
 // All calls into this handle are serialized. Only start/stop cross to the actor;
@@ -118,21 +165,28 @@ impl NativeVideo {
     pub(crate) fn new(bounds: Bounds<Pixels>, window: &Window) -> Result<Self> {
         let display = HasDisplayHandle::display_handle(window)?.as_raw();
         let handle = HasWindowHandle::window_handle(window)?.as_raw();
-        let (handle, x11) = match (display, handle) {
+        let (handle, placement) = match (display, handle) {
+            #[cfg(target_os = "linux")]
             (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(handle)) => (
                 unsafe { video_create(display.display.as_ptr(), handle.surface.as_ptr()) },
-                false,
+                Placement::Wayland,
             ),
+            #[cfg(target_os = "linux")]
             (RawDisplayHandle::Xcb(_), RawWindowHandle::Xcb(handle)) => (
                 unsafe { video_create_x11(handle.window.get().into()) },
-                true,
+                Placement::X11,
             ),
-            _ => anyhow::bail!("Native video requires Wayland or X11"),
+            #[cfg(target_os = "macos")]
+            (RawDisplayHandle::AppKit(_), RawWindowHandle::AppKit(handle)) => (
+                unsafe { video_create(handle.ns_view.as_ptr()) },
+                Placement::AppKit,
+            ),
+            _ => anyhow::bail!("Native video requires Wayland, X11 or macOS"),
         };
         let handle = NonNull::new(handle).context("Could not create the native video surface")?;
         let video = Self {
             handle: Mutex::new(Some(handle)),
-            x11,
+            placement,
         };
         video.set_bounds(bounds, window.scale_factor())?;
         Ok(video)
@@ -180,7 +234,7 @@ impl NativeVideo {
     }
 
     pub(crate) fn set_bounds(&self, bounds: Bounds<Pixels>, scale: f32) -> Result<()> {
-        let geometry = Geometry::new(bounds, scale, self.x11)?;
+        let geometry = Geometry::new(bounds, scale, self.placement)?;
         let handle = match self.handle.try_lock() {
             Ok(handle) => handle,
             Err(TryLockError::WouldBlock) => return Ok(()),
@@ -205,15 +259,19 @@ impl NativeVideo {
     }
 
     /// X11 draws the video window above the app, so it leaves out the given window
-    /// rectangles, where dialogs and menus cover the video. Wayland places the video
-    /// below the window, where they already draw over it.
+    /// rectangles, where dialogs and menus cover the video. Wayland and macOS place
+    /// the video below the window, where they already draw over it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_cutouts(&self, _: &[Bounds<Pixels>], _: f32) {}
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_cutouts(&self, cutouts: &[Bounds<Pixels>], scale: f32) {
-        if !self.x11 {
+        if !matches!(self.placement, Placement::X11) {
             return;
         }
         let rects: Vec<i32> = cutouts
             .iter()
-            .filter_map(|bounds| Geometry::new(*bounds, scale, true).ok())
+            .filter_map(|bounds| Geometry::new(*bounds, scale, Placement::X11).ok())
             .take(CUTOUTS)
             .flat_map(|cutout| [cutout.x, cutout.y, cutout.width, cutout.height])
             .collect();
@@ -254,20 +312,33 @@ mod tests {
     use super::*;
     use gpui::{point, px, size};
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn framebuffer_uses_current_fractional_scale() {
         let bounds = Bounds::new(point(px(190.), px(64.)), size(px(853.), px(499.)));
-        let geometry = Geometry::new(bounds, 1.25, false).unwrap();
+        let geometry = Geometry::new(bounds, 1.25, Placement::Wayland).unwrap();
         assert_eq!((geometry.width, geometry.height), (853, 499));
         assert_eq!((geometry.pixel_width, geometry.pixel_height), (1066, 624));
-        let changed = Geometry::new(bounds, 1.5, false).unwrap();
+        let changed = Geometry::new(bounds, 1.5, Placement::Wayland).unwrap();
         assert_eq!((changed.pixel_width, changed.pixel_height), (1280, 749));
-        let x11 = Geometry::new(bounds, 1.25, true).unwrap();
+        let x11 = Geometry::new(bounds, 1.25, Placement::X11).unwrap();
         assert_eq!((x11.x, x11.y), (238, 80));
         assert_eq!((x11.pixel_width, x11.pixel_height), (1066, 624));
         let fractional = Bounds::new(point(px(0.3), px(0.3)), size(px(10.2), px(10.2)));
-        let x11 = Geometry::new(fractional, 1.5, true).unwrap();
+        let x11 = Geometry::new(fractional, 1.5, Placement::X11).unwrap();
         assert_eq!((x11.x, x11.pixel_width), (0, 16));
-        assert!(Geometry::new(bounds, f32::NAN, false).is_err());
+        assert!(Geometry::new(bounds, f32::NAN, Placement::Wayland).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn view_covers_every_pixel_of_a_fractional_hole() {
+        let bounds = Bounds::new(point(px(100.25), px(40.75)), size(px(200.5), px(100.3)));
+        let geometry = Geometry::new(bounds, 2., Placement::AppKit).unwrap();
+        // The hole spans pixels 200.5 to 601.5 and 81.5 to 282.1.
+        assert_eq!((geometry.x, geometry.y), (200, 81));
+        assert_eq!((geometry.width, geometry.height), (402, 202));
+        assert_eq!((geometry.pixel_width, geometry.pixel_height), (402, 202));
+        assert!(Geometry::new(bounds, f32::NAN, Placement::AppKit).is_err());
     }
 }

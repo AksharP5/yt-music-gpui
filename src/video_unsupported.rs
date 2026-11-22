@@ -1,4 +1,4 @@
-//! Only Linux has a native video renderer so far, so elsewhere the app plays audio only.
+//! Windows has no native video renderer yet, so there the app plays audio only.
 //! A `NativeVideo` cannot exist, which leaves every video path unreachable.
 
 use crate::os::Waker;
