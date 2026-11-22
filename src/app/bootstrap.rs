@@ -422,6 +422,7 @@ impl Music {
             player_open: false,
             sort_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             playlist_find: None,
+            selected_songs: Vec::new(),
             video_fullscreen: false,
             video_transparent: false,
             video_error: None,

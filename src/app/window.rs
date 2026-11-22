@@ -237,6 +237,7 @@ impl Render for Music {
                 .occlude()
                 .child(overlay)
         });
+        let selection = self.selection_bar(player_height, width, cx);
         let toast = self
             .toast
             .as_ref()
@@ -277,6 +278,7 @@ impl Render for Music {
             .child(content)
             .children(player)
             .children(drawer)
+            .children(selection)
             .children(overlay)
             .children(toast)
     }

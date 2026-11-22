@@ -685,6 +685,10 @@ impl Music {
         let focus = focus.read(cx);
         let keyboard_controls =
             window.last_input_was_keyboard() && focus.contains_focused(window, cx);
+        // Album and playlist songs can be selected, like the web's.
+        let selectable = matches!(style, RowStyle::Album | RowStyle::Playlist);
+        let selected = selectable && track.is_some_and(|track| self.is_selected(track));
+        let selecting = selectable && !self.selected_songs.is_empty();
         let mut row = div()
             .id(("song", index))
             .track_focus(focus)
@@ -705,6 +709,9 @@ impl Music {
             .rounded(px(4.))
             .when(style.artist(), |row| row.rounded_none())
             .when(active, |d| d.bg(self.theme.selection))
+            .when(selected, |d| {
+                d.rounded(px(8.)).bg(gpui::white().opacity(0.2))
+            })
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Right,
@@ -865,15 +872,48 @@ impl Music {
                         .map(|episode| episode.duration_text.clone())
                         .unwrap_or_default()
                 });
+                // The checkbox takes the duration's place on hover and
+                // while any song is selected.
+                let checkbox = selectable.then(|| {
+                    let song = track.clone();
+                    div()
+                        .id(("select-song", index))
+                        .keyboard_control(self.theme)
+                        .absolute()
+                        .top_0()
+                        .right(px(2.))
+                        .size(px(24.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .when(!selecting && !keyboard_controls, |checkbox| {
+                            checkbox
+                                .invisible()
+                                .group_hover("music-row", |style| style.visible())
+                        })
+                        .child(self.checkbox(selected))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.toggle_selected(&song, cx);
+                        }))
+                });
                 div()
+                    .relative()
                     .w(px(58.))
+                    .h(px(24.))
                     .flex()
+                    .items_center()
                     .justify_end()
                     .text_size(px(text_size))
                     .text_color(self.theme.muted)
-                    .when(keyboard_controls, |slot| slot.invisible())
-                    .group_hover("music-row", |style| style.invisible())
-                    .child(duration)
+                    .child(
+                        div()
+                            .when(keyboard_controls || selecting, |text| text.invisible())
+                            .group_hover("music-row", |style| style.invisible())
+                            .child(duration),
+                    )
+                    .children(checkbox)
             });
             let dislike = button(("dislike", index), "thumb-down", self.theme)
                 .size(px(36.))
