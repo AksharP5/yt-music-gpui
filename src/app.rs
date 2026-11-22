@@ -75,6 +75,9 @@ use player_page::PlayerPage;
 use window::MusicContent;
 
 pub(crate) const HEADER_HEIGHT: f32 = 64.;
+/// The web's breakpoint below which the guide shrinks to its mini form and
+/// opens in full only as a drawer.
+const GUIDE_DRAWER_BELOW: f32 = 936.;
 const CARD_GAP: f32 = 24.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,8 +124,10 @@ pub struct Music {
     shelf_heights: Vec<Option<pages::shelves::ShelfHeight>>,
     list_scroll: UniformListScrollHandle,
     detail_list: DetailList,
-    // None follows the window width until the guide is toggled.
-    sidebar_collapsed: Option<bool>,
+    /// The wide guide's mini state. Below 936px the guide is always mini.
+    sidebar_collapsed: bool,
+    /// Below 936px, the full guide opens as a drawer over the dimmed window.
+    guide_drawer: bool,
     sidebar_playlists: Vec<Collection>,
     sidebar_error: Option<String>,
     sidebar_scroll: UniformListScrollHandle,

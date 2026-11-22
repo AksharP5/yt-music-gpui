@@ -1209,7 +1209,7 @@ async fn scrolled_artist_survives_tab(
         .update(cx, |music, window, cx| {
             window.resize(size(px(1280.), px(900.)));
             let sidebar = music.sidebar_collapsed;
-            music.sidebar_collapsed = Some(false);
+            music.sidebar_collapsed = false;
             for shelf in &mut music.page.shelves[1..] {
                 let Item::Collection(album) = &mut shelf.items[0] else {
                     panic!()
@@ -1514,7 +1514,7 @@ async fn search_song_rows(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(1050.)));
-                music.sidebar_collapsed = None;
+                music.sidebar_collapsed = false;
                 music.account = None;
                 music.catalog_requests = crate::app::CatalogRequests::new();
                 music.player_open = false;
@@ -1591,7 +1591,7 @@ async fn responsive_search(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     ] {
         window.update(cx, |music, window, cx| {
             window.resize(size(px(width), px(900.)));
-            music.sidebar_collapsed = Some(compact);
+            music.sidebar_collapsed = compact;
             music.account = None;
             music.catalog_requests = crate::app::CatalogRequests::new();
             music.player_open = false;
@@ -1648,7 +1648,7 @@ async fn responsive_explore(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(900.)));
-                music.sidebar_collapsed = None;
+                music.sidebar_collapsed = false;
                 music.player_open = false;
                 music.route = Route::Explore;
                 music.page = crate::app::sync::tests::page(6, false);
@@ -1696,7 +1696,7 @@ async fn home_background(window: WindowHandle<Music>, cx: &mut AsyncApp) {
     window
         .update(cx, |music, window, cx| {
             window.resize(size(px(1280.), px(800.)));
-            music.sidebar_collapsed = None;
+            music.sidebar_collapsed = false;
             music.account = None;
             music.catalog_requests = crate::app::CatalogRequests::new();
             music.player_open = false;
@@ -1824,7 +1824,7 @@ async fn guide_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 window
                     .update(cx, |music, window, cx| {
                         window.resize(size(px(width), px(1050.)));
-                        music.sidebar_collapsed = None;
+                        music.sidebar_collapsed = false;
                         music.catalog_requests = crate::app::CatalogRequests::new();
                         music.player_open = false;
                         music.library.queue = Default::default();
@@ -2026,7 +2026,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
         window
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(800.)));
-                music.sidebar_collapsed = Some(compact);
+                music.sidebar_collapsed = compact;
                 music.player_open = true;
                 music.player_page.hovered_row = None;
                 cx.notify();
@@ -2135,7 +2135,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
             .update(cx, |music, window, cx| {
                 window.resize(size(px(width), px(800.)));
                 music.player_open = false;
-                music.sidebar_collapsed = Some(compact);
+                music.sidebar_collapsed = compact;
                 music
                     .detail_list
                     .state
@@ -2786,7 +2786,7 @@ fn stacked_playlist_back_stays_above_a_retained_page_error() -> anyhow::Result<(
         let crop = window
             .update(cx, |view, window, cx| {
                 window.resize(size(px(1280.), px(800.)));
-                view.sidebar_collapsed = Some(false);
+                view.sidebar_collapsed = false;
                 view.navigate(Route::Browse(BrowseLink::new("VLPLlayout", "Playlist")), cx);
                 view.catalog_requests.cancel(CatalogTarget::Page);
                 let mut page = crate::app::sync::tests::page(4, false);
