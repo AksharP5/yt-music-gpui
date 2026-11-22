@@ -465,6 +465,7 @@ impl Music {
     }
 
     pub(in crate::app) fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.close_narrow_search(cx);
         // Like the web's drawer, the guide closes once it has taken you somewhere.
         self.guide_drawer = false;
         // A guest's Liked Music is the local list of liked songs.

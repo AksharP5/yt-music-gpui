@@ -50,6 +50,8 @@ pub(in crate::app) struct PlayerPage {
     related_focus: Vec<Vec<FocusHandle>>,
     pub(in crate::app) queue_scroll: UniformListScrollHandle,
     pub(in crate::app) queue_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Up next's Playing from and Autoplay header, measured on the last frame.
+    pub(in crate::app) queue_header: Rc<Cell<Pixels>>,
     pub(in crate::app) reorder: Option<Reorder>,
     pub(in crate::app) hovered_row: Option<usize>,
     /// The pointer while reordering Up next, kept for edge auto-scroll between moves.
@@ -99,6 +101,7 @@ impl PlayerPage {
             related_focus: Vec::new(),
             queue_scroll: UniformListScrollHandle::new(),
             queue_bounds: Rc::new(Cell::new(Bounds::default())),
+            queue_header: Rc::new(Cell::new(px(132.))),
             reorder: None,
             hovered_row: None,
             drag_pointer: Point::default(),
