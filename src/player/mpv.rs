@@ -491,139 +491,18 @@ impl PlaybackState {
     }
 
     pub(super) fn message(&mut self, value: Value, events: &async_channel::Sender<PlayerEvent>) {
-        if let Some(track_id) = value["request_id"]
+        if let Some((kind, id)) = value["request_id"]
             .as_str()
-            .and_then(|id| id.strip_prefix("prepare:"))
-            .and_then(|id| id.parse::<u64>().ok())
+            .and_then(|id| id.split_once(':'))
+            && let Ok(id) = id.parse::<u64>()
+            && self.tagged_reply(kind, id, &value, events)
         {
-            if self.upcoming == Some(track_id)
-                && let Some(entry) = value
-                    .pointer("/data/playlist_entry_id")
-                    .and_then(Value::as_u64)
-            {
-                self.entries.insert(entry, track_id);
-            }
             return;
         }
-        if let Some(track_id) = value["request_id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix("loaded-seekable:"))
-            .and_then(|id| id.parse::<u64>().ok())
+        if let Some(id) = value["request_id"].as_u64().filter(|id| *id > 0)
+            && self.numbered_reply(id, &value, events)
         {
-            if self.loaded && self.current == Some(track_id) && self.desired == Some(track_id) {
-                self.seekable =
-                    value["error"] == "success" && value["data"].as_bool().unwrap_or(false);
-                let _ = events.send_blocking(PlayerEvent::Seekable {
-                    track_id,
-                    seekable: self.seekable,
-                });
-            }
             return;
-        }
-        if let Some(track_id) = value["request_id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix("loaded-duration:"))
-            .and_then(|id| id.parse::<u64>().ok())
-        {
-            if self.loaded
-                && self.current == Some(track_id)
-                && self.desired == Some(track_id)
-                && value["error"] == "success"
-                && let Some(seconds) = value["data"].as_f64().filter(|seconds| seconds.is_finite())
-            {
-                let _ = events.send_blocking(PlayerEvent::Duration { track_id, seconds });
-            }
-            return;
-        }
-        if let Some(revision) = value["request_id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix("seekable:"))
-            .and_then(|revision| revision.parse::<u64>().ok())
-        {
-            if let Some(mut seek) = self.seek.take_if(|seek| {
-                seek.request.revision == revision && seek.phase == SeekPhase::Seekability
-            }) {
-                if value["error"] == "success" && value["data"] == true {
-                    seek.phase = SeekPhase::Command;
-                    self.seek = Some(seek);
-                } else {
-                    // mpv accepts a seek before demuxing it, and emits no completion if it cannot seek.
-                    Self::seek_finished(
-                        seek.request,
-                        Err("This stream does not support seeking.".into()),
-                        events,
-                    );
-                }
-            }
-            return;
-        }
-        if let Some(revision) = value["request_id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix("seek-position:"))
-            .and_then(|revision| revision.parse::<u64>().ok())
-        {
-            if value["error"] != "success"
-                && let Some(seek) = self.seek.take_if(|seek| {
-                    seek.request.revision == revision && seek.phase == SeekPhase::Position
-                })
-            {
-                Self::seek_finished(
-                    seek.request,
-                    Err("mpv could not observe the seek position.".into()),
-                    events,
-                );
-            }
-            return;
-        }
-        if let Some(revision) = value["request_id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix("pause:"))
-            .and_then(|revision| revision.parse::<u64>().ok())
-        {
-            if revision == self.pause_revision
-                && self.loaded
-                && !self.pause_after_load
-                && value["error"] == "success"
-                && let Some(paused) = value["data"].as_bool()
-                && self.pause_target.is_some()
-            {
-                self.pause_target = None;
-                self.paused = paused;
-                if let Some(track_id) = self.current.filter(|id| Some(*id) == self.desired) {
-                    let _ = events.send_blocking(PlayerEvent::Paused { track_id, paused });
-                }
-            }
-            return;
-        }
-        if let Some(id) = value["request_id"].as_u64().filter(|id| *id > 0) {
-            if let Some(mut seek) = self
-                .seek
-                .take_if(|seek| seek.request.revision == id && seek.phase == SeekPhase::Acceptance)
-            {
-                if value["error"] == "success" {
-                    seek.phase = SeekPhase::Start;
-                    self.seek = Some(seek);
-                } else {
-                    Self::seek_finished(
-                        seek.request,
-                        Err("mpv could not seek in this track.".into()),
-                        events,
-                    );
-                }
-                return;
-            }
-            if let Some(entry) = value
-                .pointer("/data/playlist_entry_id")
-                .and_then(Value::as_u64)
-            {
-                self.entries.insert(entry, id);
-            } else if value["error"].as_str() != Some("success") && self.desired == Some(id) {
-                let _ = events.send_blocking(PlayerEvent::Error {
-                    track_id: Some(id),
-                    message: "mpv could not load this track. Try another track or update yt-dlp."
-                        .into(),
-                });
-            }
         }
         match value["event"].as_str() {
             Some("seek") if self.loaded && self.current == self.desired => {
@@ -701,90 +580,218 @@ impl PlaybackState {
                     self.loaded = false;
                 }
             }
-            Some("property-change") => {
-                if value["name"] == "time-pos"
-                    && value["id"].as_u64() == Some(self.position_observer.max(1))
-                    && let Some(seek) = self.seek.take_if(|seek| seek.phase == SeekPhase::Position)
+            Some("property-change") => self.property_change(&value, events),
+            _ => {}
+        }
+    }
+
+    /// The reply to a request this player tagged `kind:id`. Returns false for
+    /// a tag it never sends.
+    fn tagged_reply(
+        &mut self,
+        kind: &str,
+        id: u64,
+        value: &Value,
+        events: &async_channel::Sender<PlayerEvent>,
+    ) -> bool {
+        match (kind, id) {
+            ("prepare", track_id) => {
+                if self.upcoming == Some(track_id)
+                    && let Some(entry) = value
+                        .pointer("/data/playlist_entry_id")
+                        .and_then(Value::as_u64)
                 {
-                    // observe_property guarantees an initial notification, even for a no-op seek.
-                    let result = value["data"]
-                        .as_f64()
-                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
-                        .ok_or_else(|| "mpv could not confirm the seek position.".into());
-                    Self::seek_finished(seek.request, result, events);
-                    return;
-                }
-                if value["name"] == "speed" {
-                    if let Some(speed) = value["data"]
-                        .as_f64()
-                        .and_then(|value| PlaybackSpeed::try_from(value).ok())
-                    {
-                        let _ = events.send_blocking(PlayerEvent::Speed(speed));
-                    }
-                    return;
-                }
-                if value["name"] == "seekable"
-                    && self.current.is_some()
-                    && self.current == self.desired
-                {
-                    self.seekable = value["data"].as_bool().unwrap_or(false);
-                }
-                if value["name"] == "pause"
-                    && self.current.is_some()
-                    && self.current == self.desired
-                    && let Some(paused) = value["data"].as_bool()
-                {
-                    if self.pause_target.is_some_and(|target| target != paused) {
-                        return;
-                    }
-                    self.paused = paused;
-                }
-                let Some(track_id) = self
-                    .current
-                    .filter(|id| self.loaded && Some(*id) == self.desired)
-                else {
-                    return;
-                };
-                let event = match value["name"].as_str() {
-                    Some("time-pos")
-                        if self.seek.is_none()
-                            && self.next_seek.is_none()
-                            && value["id"].as_u64() == Some(self.position_observer.max(1)) =>
-                    {
-                        value["data"]
-                            .as_f64()
-                            .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
-                            .map(|seconds| PlayerEvent::Position { track_id, seconds })
-                    }
-                    Some("duration") => value["data"]
-                        .as_f64()
-                        .map(|seconds| PlayerEvent::Duration { track_id, seconds }),
-                    Some("seekable") => Some(PlayerEvent::Seekable {
-                        track_id,
-                        seekable: self.seekable,
-                    }),
-                    Some("pause") => value["data"]
-                        .as_bool()
-                        .map(|paused| PlayerEvent::Paused { track_id, paused }),
-                    Some("paused-for-cache") => {
-                        value["data"]
-                            .as_bool()
-                            .map(|buffering| PlayerEvent::Buffering {
-                                track_id,
-                                buffering,
-                            })
-                    }
-                    Some("demuxer-cache-time") => value["data"]
-                        .as_f64()
-                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
-                        .map(|seconds| PlayerEvent::Buffered { track_id, seconds }),
-                    _ => None,
-                };
-                if let Some(event) = event {
-                    let _ = events.send_blocking(event);
+                    self.entries.insert(entry, track_id);
                 }
             }
-            _ => {}
+            ("loaded-seekable", track_id) => {
+                if self.loaded && self.current == Some(track_id) && self.desired == Some(track_id) {
+                    self.seekable =
+                        value["error"] == "success" && value["data"].as_bool().unwrap_or(false);
+                    let _ = events.send_blocking(PlayerEvent::Seekable {
+                        track_id,
+                        seekable: self.seekable,
+                    });
+                }
+            }
+            ("loaded-duration", track_id) => {
+                if self.loaded
+                    && self.current == Some(track_id)
+                    && self.desired == Some(track_id)
+                    && value["error"] == "success"
+                    && let Some(seconds) =
+                        value["data"].as_f64().filter(|seconds| seconds.is_finite())
+                {
+                    let _ = events.send_blocking(PlayerEvent::Duration { track_id, seconds });
+                }
+            }
+            ("seekable", revision) => {
+                if let Some(mut seek) = self.seek.take_if(|seek| {
+                    seek.request.revision == revision && seek.phase == SeekPhase::Seekability
+                }) {
+                    if value["error"] == "success" && value["data"] == true {
+                        seek.phase = SeekPhase::Command;
+                        self.seek = Some(seek);
+                    } else {
+                        // mpv accepts a seek before demuxing it, and emits no completion if it cannot seek.
+                        Self::seek_finished(
+                            seek.request,
+                            Err("This stream does not support seeking.".into()),
+                            events,
+                        );
+                    }
+                }
+            }
+            ("seek-position", revision) => {
+                if value["error"] != "success"
+                    && let Some(seek) = self.seek.take_if(|seek| {
+                        seek.request.revision == revision && seek.phase == SeekPhase::Position
+                    })
+                {
+                    Self::seek_finished(
+                        seek.request,
+                        Err("mpv could not observe the seek position.".into()),
+                        events,
+                    );
+                }
+            }
+            ("pause", revision) => {
+                if revision == self.pause_revision
+                    && self.loaded
+                    && !self.pause_after_load
+                    && value["error"] == "success"
+                    && let Some(paused) = value["data"].as_bool()
+                    && self.pause_target.is_some()
+                {
+                    self.pause_target = None;
+                    self.paused = paused;
+                    if let Some(track_id) = self.current.filter(|id| Some(*id) == self.desired) {
+                        let _ = events.send_blocking(PlayerEvent::Paused { track_id, paused });
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The reply to a load, tagged with its track ID, or a seek, tagged with
+    /// its revision. Returns true when it was the seek's.
+    fn numbered_reply(
+        &mut self,
+        id: u64,
+        value: &Value,
+        events: &async_channel::Sender<PlayerEvent>,
+    ) -> bool {
+        if let Some(mut seek) = self
+            .seek
+            .take_if(|seek| seek.request.revision == id && seek.phase == SeekPhase::Acceptance)
+        {
+            if value["error"] == "success" {
+                seek.phase = SeekPhase::Start;
+                self.seek = Some(seek);
+            } else {
+                Self::seek_finished(
+                    seek.request,
+                    Err("mpv could not seek in this track.".into()),
+                    events,
+                );
+            }
+            return true;
+        }
+        if let Some(entry) = value
+            .pointer("/data/playlist_entry_id")
+            .and_then(Value::as_u64)
+        {
+            self.entries.insert(entry, id);
+        } else if value["error"].as_str() != Some("success") && self.desired == Some(id) {
+            let _ = events.send_blocking(PlayerEvent::Error {
+                track_id: Some(id),
+                message: "mpv could not load this track. Try another track or update yt-dlp."
+                    .into(),
+            });
+        }
+        false
+    }
+
+    fn property_change(&mut self, value: &Value, events: &async_channel::Sender<PlayerEvent>) {
+        if value["name"] == "time-pos"
+            && value["id"].as_u64() == Some(self.position_observer.max(1))
+            && let Some(seek) = self.seek.take_if(|seek| seek.phase == SeekPhase::Position)
+        {
+            // observe_property guarantees an initial notification, even for a no-op seek.
+            let result = value["data"]
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
+                .ok_or_else(|| "mpv could not confirm the seek position.".into());
+            Self::seek_finished(seek.request, result, events);
+            return;
+        }
+        if value["name"] == "speed" {
+            if let Some(speed) = value["data"]
+                .as_f64()
+                .and_then(|value| PlaybackSpeed::try_from(value).ok())
+            {
+                let _ = events.send_blocking(PlayerEvent::Speed(speed));
+            }
+            return;
+        }
+        if value["name"] == "seekable" && self.current.is_some() && self.current == self.desired {
+            self.seekable = value["data"].as_bool().unwrap_or(false);
+        }
+        if value["name"] == "pause"
+            && self.current.is_some()
+            && self.current == self.desired
+            && let Some(paused) = value["data"].as_bool()
+        {
+            if self.pause_target.is_some_and(|target| target != paused) {
+                return;
+            }
+            self.paused = paused;
+        }
+        let Some(track_id) = self
+            .current
+            .filter(|id| self.loaded && Some(*id) == self.desired)
+        else {
+            return;
+        };
+        let event = match value["name"].as_str() {
+            Some("time-pos")
+                if self.seek.is_none()
+                    && self.next_seek.is_none()
+                    && value["id"].as_u64() == Some(self.position_observer.max(1)) =>
+            {
+                value["data"]
+                    .as_f64()
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
+                    .map(|seconds| PlayerEvent::Position { track_id, seconds })
+            }
+            Some("duration") => value["data"]
+                .as_f64()
+                .map(|seconds| PlayerEvent::Duration { track_id, seconds }),
+            Some("seekable") => Some(PlayerEvent::Seekable {
+                track_id,
+                seekable: self.seekable,
+            }),
+            Some("pause") => value["data"]
+                .as_bool()
+                .map(|paused| PlayerEvent::Paused { track_id, paused }),
+            Some("paused-for-cache") => {
+                value["data"]
+                    .as_bool()
+                    .map(|buffering| PlayerEvent::Buffering {
+                        track_id,
+                        buffering,
+                    })
+            }
+            Some("demuxer-cache-time") => value["data"]
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
+                .map(|seconds| PlayerEvent::Buffered { track_id, seconds }),
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = events.send_blocking(event);
         }
     }
 }
