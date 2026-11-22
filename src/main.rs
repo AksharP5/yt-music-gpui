@@ -26,7 +26,7 @@ mod shutdown;
 mod song_text;
 mod theme;
 mod track_state;
-#[cfg_attr(not(target_os = "linux"), path = "video_unsupported.rs")]
+#[cfg_attr(windows, path = "video_unsupported.rs")]
 mod video;
 mod watch;
 
