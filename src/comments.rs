@@ -38,9 +38,17 @@ pub struct Sort {
     pub continuation: Continuation,
 }
 
+/// The web's "Add a comment" entry when it asks the viewer to sign in first.
+#[derive(Clone, Debug)]
+pub struct SignInPrompt {
+    pub placeholder: String,
+    pub avatar: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Page {
     pub count: Option<String>,
+    pub sign_in: Option<SignInPrompt>,
     pub sorts: Vec<Sort>,
     pub comments: Vec<Thread>,
     pub continuation: Option<Continuation>,
@@ -159,6 +167,16 @@ fn parse_items(
             let count = text(&header["countText"]);
             if !count.is_empty() {
                 page.count = Some(count);
+            }
+            let simplebox = &header["createRenderer"]["commentSimpleboxRenderer"];
+            if simplebox
+                .pointer("/prepareAccountEndpoint/signInEndpoint")
+                .is_some()
+            {
+                page.sign_in = Some(SignInPrompt {
+                    placeholder: text(&simplebox["placeholderText"]),
+                    avatar: thumbnail(&simplebox["authorThumbnail"]),
+                });
             }
             for sort in header
                 .pointer("/sortMenu/sortFilterSubMenuRenderer/subMenuItems")
@@ -342,6 +360,20 @@ mod tests {
         assert_eq!(page.sorts[1].label, "Newest");
         assert_eq!(page.sorts[1].continuation.token(), "new-sort");
         assert!(page.sorts[0].selected);
+        let prompt = page.sign_in.unwrap();
+        assert_eq!(prompt.placeholder, "Add a comment...");
+        assert!(prompt.avatar.unwrap().contains("default-user"));
+    }
+
+    #[test]
+    fn only_a_sign_in_entry_becomes_a_prompt() {
+        let mut signed_in = fixture("initial");
+        let simplebox = signed_in
+            .pointer_mut("/onResponseReceivedEndpoints/0/reloadContinuationItemsCommand/continuationItems/0/commentsHeaderRenderer/createRenderer/commentSimpleboxRenderer")
+            .unwrap();
+        simplebox["prepareAccountEndpoint"] = Value::Null;
+        simplebox["submitButton"] = json!({"buttonRenderer": {}});
+        assert!(parse_page(&signed_in, None).unwrap().sign_in.is_none());
     }
 
     #[test]
@@ -414,6 +446,10 @@ mod tests {
             .expect("comments tab");
         let first = catalog.comments(&token).unwrap();
         assert!(!first.comments.is_empty());
+        assert!(
+            first.sign_in.is_some(),
+            "Guests are asked to sign in to comment"
+        );
         let more = catalog
             .comments(first.continuation.as_ref().unwrap())
             .unwrap();
