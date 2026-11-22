@@ -2,33 +2,94 @@
 
 use super::*;
 
-/// The `?` dialog and the README table both list these, in this order.
-pub(in crate::app) const SHORTCUTS: &[(&str, &str)] = &[
-    ("/ or Ctrl K", "Search"),
-    ("Space or ;", "Play or pause"),
-    ("J, Shift N or Ctrl →", "Next song"),
-    ("K, Shift P or Ctrl ←", "Previous song"),
-    ("→ / ←", "Seek 5 seconds"),
-    ("L / H or Shift → / Shift ←", "Seek 10 seconds"),
-    ("Shift L / Shift H or Ctrl Shift → / ←", "Seek 1 second"),
-    ("↑ / ↓ or = / -", "Volume up / down"),
-    ("M", "Mute"),
-    ("R", "Repeat: off, all, one"),
-    ("S", "Shuffle"),
-    ("+", "Like the current song"),
-    ("_", "Dislike the current song"),
-    ("Q", "Open or close the player page"),
-    ("F", "Video fullscreen"),
-    ("Ctrl R", "Reload the page"),
-    ("Alt ← or mouse Back", "Back"),
-    ("Alt → or mouse Forward", "Forward"),
+/// The `?` sheet's sections, worded as music.youtube.com's, with the app's
+/// extra keys added to their rows. The README lists the same tables.
+pub(in crate::app) const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
-        "Escape",
-        "Close a dialog, fullscreen, the player page or search",
+        "Playback",
+        &[
+            ("Play/Pause", "SPACE or ;"),
+            ("Next song", "j or SHIFT + n or CTRL + right arrow"),
+            ("Previous song", "k or SHIFT + p or CTRL + left arrow"),
+            ("Forward 10s", "l or SHIFT + right arrow"),
+            ("Back 10s", "h or SHIFT + left arrow"),
+            ("Forward or back 5s", "right or left arrow"),
+            ("Forward 1s", "SHIFT + l or CTRL + SHIFT + right arrow"),
+            ("Back 1s", "SHIFT + h or CTRL + SHIFT + left arrow"),
+            ("Shuffle queue", "s"),
+            ("Toggle repeat", "r"),
+        ],
     ),
-    ("?", "Keyboard shortcuts"),
-    ("Ctrl Q", "Quit"),
+    (
+        "Navigation",
+        &[
+            ("Go to Home", "gh"),
+            ("Go to Explore", "ge"),
+            ("Go to Library", "gl"),
+            ("Go to Settings", "g,"),
+            ("Search", "/ or CTRL + k"),
+            ("Back", "ALT + left arrow or mouse back"),
+            ("Forward", "ALT + right arrow or mouse forward"),
+        ],
+    ),
+    (
+        "General",
+        &[
+            ("Increase volume", "= or up arrow"),
+            ("Decrease volume", "- or down arrow"),
+            ("Toggle mute", "m"),
+            ("Toggle queue/expanded player", "q or ESC"),
+            ("Toggle full screen", "f"),
+            ("Like current song", "+"),
+            ("Dislike current song", "_"),
+            ("Keyboard shortcuts", "?"),
+            ("Reload", "CTRL + r"),
+            ("Quit", "CTRL + q"),
+        ],
+    ),
 ];
+
+/// Where the web's two-key shortcuts go: G, then H, E, L or comma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum GoTo {
+    Home,
+    Explore,
+    Library,
+    Settings,
+}
+
+/// The pending G of a two-key shortcut. As on the web, the second key must
+/// follow within about 1.5 s; any other key, or a late one, acts on its own,
+/// so a bare H or L still seeks.
+#[derive(Default)]
+pub(in crate::app) struct GoChord(Option<Instant>);
+
+impl GoChord {
+    const TIMEOUT: Duration = Duration::from_millis(1500);
+
+    /// `None` lets the key act as usual. `Some(None)` means G started a chord.
+    fn press(&mut self, key: &str, now: Instant) -> Option<Option<GoTo>> {
+        let pending = self
+            .0
+            .take()
+            .is_some_and(|pressed| now.saturating_duration_since(pressed) < Self::TIMEOUT);
+        let target = match key {
+            "h" => Some(GoTo::Home),
+            "e" => Some(GoTo::Explore),
+            "l" => Some(GoTo::Library),
+            "," => Some(GoTo::Settings),
+            _ => None,
+        };
+        if pending && target.is_some() {
+            return Some(target);
+        }
+        if key == "g" {
+            self.0 = Some(now);
+            return Some(None);
+        }
+        None
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub(in crate::app) enum Drag {
@@ -238,6 +299,16 @@ impl Music {
             }
             return;
         }
+        if !shift && let Some(go) = self.go_chord.press(key, Instant::now()) {
+            match go {
+                Some(GoTo::Home) => self.navigate(Route::Home, cx),
+                Some(GoTo::Explore) => self.navigate(Route::Explore, cx),
+                Some(GoTo::Library) => self.navigate(Route::Saved, cx),
+                Some(GoTo::Settings) => self.open_overlay(Overlay::Settings, window, cx),
+                None => {}
+            }
+            return;
+        }
         // Linux reports Shift+= as "+" and Shift+/ as "?" without Shift; other
         // platforms may keep the base key and the modifier.
         match (key, shift) {
@@ -310,16 +381,46 @@ impl Music {
 
 #[cfg(test)]
 mod tests {
+    use super::{GoChord, GoTo};
+    use std::time::{Duration, Instant};
+
     #[test]
-    fn readme_table_matches_the_help_dialog() {
-        let rows: String = super::SHORTCUTS
-            .iter()
-            .map(|(key, action)| format!("| {key} | {action} |\n"))
-            .collect();
-        let table = format!("| Key | Action |\n| --- | --- |\n{rows}\n");
-        assert!(
-            include_str!("../../README.md").contains(&table),
-            "Update the README shortcut table to:\n{table}"
-        );
+    fn readme_tables_match_the_shortcut_sheet() {
+        for (section, rows) in super::SHORTCUTS {
+            let rows: String = rows
+                .iter()
+                .map(|(action, keys)| format!("| {keys} | {action} |\n"))
+                .collect();
+            let table = format!("### {section}\n\n| Key | Action |\n| --- | --- |\n{rows}\n");
+            assert!(
+                include_str!("../../README.md").contains(&table),
+                "Update the README shortcut table to:\n{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn g_then_a_key_navigates_only_within_the_webs_window() {
+        let start = Instant::now();
+        let mut chord = GoChord::default();
+        assert_eq!(chord.press("h", start), None, "a bare H still seeks");
+        for (key, target) in [
+            ("h", GoTo::Home),
+            ("e", GoTo::Explore),
+            ("l", GoTo::Library),
+            (",", GoTo::Settings),
+        ] {
+            assert_eq!(chord.press("g", start), Some(None));
+            let soon = start + Duration::from_millis(1400);
+            assert_eq!(chord.press(key, soon), Some(Some(target)));
+            assert_eq!(chord.press(key, soon), None, "the chord is used up");
+        }
+        // The web dropped a G held for 1.6 s before L.
+        assert_eq!(chord.press("g", start), Some(None));
+        assert_eq!(chord.press("l", start + Duration::from_millis(1600)), None);
+        // Any other key cancels the chord and acts on its own.
+        assert_eq!(chord.press("g", start), Some(None));
+        assert_eq!(chord.press("j", start), None);
+        assert_eq!(chord.press("h", start), None);
     }
 }
