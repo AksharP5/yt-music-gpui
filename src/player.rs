@@ -1,4 +1,8 @@
-use crate::auth::{PlaybackCredentials, private_runtime};
+use crate::auth::PlaybackCredentials;
+#[cfg(not(target_os = "macos"))]
+use crate::auth::private_runtime;
+#[cfg(target_os = "macos")]
+use crate::auth::validate_private_runtime;
 use crate::os::{
     AsWaitable, ChildOutput, ExitNotice, Group, IpcStream, Waitable, Waker, child_output,
     exit_notice, ipc_path, private_file, wait_readable,
@@ -2008,6 +2012,17 @@ fn run(
     ytdlp: &Path,
     lookup: Option<native::Lookup>,
 ) -> Result<()> {
+    // mpv cannot bind a control socket path longer than 102 bytes on macOS,
+    // and $TMPDIR can be far longer. /tmp is short and shared, so the folder
+    // created there is checked to be ours alone before anything goes in it.
+    #[cfg(target_os = "macos")]
+    let runtime = {
+        let runtime = playback_runtime(Path::new("/tmp"))?;
+        validate_private_runtime(runtime.path())
+            .context("Could not create a private playback directory in /tmp")?;
+        runtime
+    };
+    #[cfg(not(target_os = "macos"))]
     let runtime = playback_runtime(&private_runtime()?)?;
     let socket_path = ipc_path(runtime.path())?;
     let plugin_dir = write_account_extractor(runtime.path())?;

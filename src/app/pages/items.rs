@@ -1,7 +1,7 @@
 //! Catalog cards and track/collection rows shared across pages.
 
 use super::super::*;
-use super::PageLayout;
+use super::{PageLayout, Tier};
 use crate::catalog::{ChartMovement, ChartRank};
 
 /// Web row thumbnails dim to this on hover behind the play glyph.
@@ -330,7 +330,10 @@ impl Music {
         } else {
             2
         };
-        let subtitle = item.subtitle().to_owned();
+        let subtitle = item.card_subtitle().to_owned();
+        // Video cards keep a play glyph in the middle, as on the web, rather
+        // than revealing the hover play button.
+        let video = layout == ShelfLayout::Videos && matches!(item, Item::Track(_));
         let explicit = match &item {
             Item::Track(track) => track.details.explicit,
             Item::Collection(collection) => collection.details.explicit,
@@ -424,7 +427,17 @@ impl Music {
                 })),
             });
         }
-        if playable || !artist {
+        if video {
+            art = art.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("play", 48., self.theme.text)),
+            );
+        } else if playable || !artist {
             art = art.child(hover);
         }
         div()
@@ -548,7 +561,12 @@ impl Music {
         let page = self.page_layout(window);
         let text_size = page.text_size();
         let style = if self.route.is_artist() {
-            RowStyle::ArtistTable
+            // Below 936px the web stacks Top songs' columns under the title.
+            if page.tier == Tier::Narrow {
+                RowStyle::ArtistStacked
+            } else {
+                RowStyle::ArtistTable
+            }
         } else if matches!(&self.route, Route::Browse(link) if link.id.starts_with("MPRE"))
             && matches!(item, Item::Track(_))
         {
@@ -645,11 +663,18 @@ impl Music {
                 .byline
                 .clone()
                 .unwrap_or_else(|| joined(&[Some(&track.artist), plays.as_deref()])),
-            (RowStyle::Playlist, Some(track)) => joined(&[
+            (RowStyle::Playlist | RowStyle::ArtistStacked, Some(track)) => joined(&[
                 Some(&track.artist),
                 plays.as_deref(),
                 track.album.as_deref(),
             ]),
+            // Album rows inherit the album's artist, which the web shows only
+            // when the row names its own, as on compilations.
+            (RowStyle::Album, Some(track)) => track
+                .details
+                .byline
+                .clone()
+                .unwrap_or_else(|| plays.clone().unwrap_or_default()),
             (_, Some(track)) => joined(&[Some(&track.artist), plays.as_deref()]),
             _ => item.subtitle().to_owned(),
         };
@@ -660,6 +685,10 @@ impl Music {
         let focus = focus.read(cx);
         let keyboard_controls =
             window.last_input_was_keyboard() && focus.contains_focused(window, cx);
+        // Album and playlist songs can be selected, like the web's.
+        let selectable = matches!(style, RowStyle::Album | RowStyle::Playlist);
+        let selected = selectable && track.is_some_and(|track| self.is_selected(track));
+        let selecting = selectable && !self.selected_songs.is_empty();
         let mut row = div()
             .id(("song", index))
             .track_focus(focus)
@@ -678,8 +707,11 @@ impl Music {
                 16.
             }))
             .rounded(px(4.))
-            .when(style == RowStyle::ArtistTable, |row| row.rounded_none())
+            .when(style.artist(), |row| row.rounded_none())
             .when(active, |d| d.bg(self.theme.selection))
+            .when(selected, |d| {
+                d.rounded(px(8.)).bg(gpui::white().opacity(0.2))
+            })
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Right,
@@ -749,7 +781,11 @@ impl Music {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(if style == RowStyle::Search { 4. } else { 8. }))
+                    .gap(px(match style {
+                        RowStyle::Search => 4.,
+                        RowStyle::ArtistStacked => 3.,
+                        _ => 8.,
+                    }))
                     .child(
                         div()
                             .truncate()
@@ -792,88 +828,151 @@ impl Music {
         let liked = self.is_liked(&track);
         let like_track = track.clone();
         let menu_track = track.clone();
-        if !matches!(style, RowStyle::Search | RowStyle::ArtistTable) {
-            let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
-                track
-                    .details
-                    .episode
-                    .as_ref()
-                    .map(|episode| episode.duration_text.clone())
-                    .unwrap_or_default()
-            });
-            // The hover controls cover this slot and the end of long text,
-            // without taking space from the title while the row is idle.
-            row = row.child(
+        let artist_table = style.artist();
+        let like = button(
+            ("like", index),
+            if liked { "thumb-up-filled" } else { "thumb-up" },
+            self.theme,
+        )
+        .size(px(36.))
+        .on_click(cx.listener(move |view, _, _, cx| {
+            cx.stop_propagation();
+            view.toggle_like(&like_track, cx);
+        }));
+        let menu = self
+            .menu_button(("track-menu", index), cx, move |view, window, cx| {
+                view.open_track_menu(menu_track.clone(), Some(index), window, cx);
+            })
+            .size(px(36.));
+        if artist_table {
+            // The table leaves the controls their own space at the row's end.
+            let controls = div()
+                .id(("track-controls", index))
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .pr(px(8.))
+                .bg(if active {
+                    self.theme.selection
+                } else {
+                    self.theme.bg
+                })
+                .opacity(if keyboard_controls { 1. } else { 0. })
+                .group_hover("music-row", |style| style.opacity(1.))
+                .child(like)
+                .child(menu);
+            row = row.child(controls.absolute().right_0().top_0().h_full());
+        } else {
+            let duration = (style != RowStyle::Search).then(|| {
+                let duration = track.duration.map(|s| clock(s as f64)).unwrap_or_else(|| {
+                    track
+                        .details
+                        .episode
+                        .as_ref()
+                        .map(|episode| episode.duration_text.clone())
+                        .unwrap_or_default()
+                });
+                // The checkbox takes the duration's place on hover and
+                // while any song is selected.
+                let checkbox = selectable.then(|| {
+                    let song = track.clone();
+                    div()
+                        .id(("select-song", index))
+                        .keyboard_control(self.theme)
+                        .absolute()
+                        .top_0()
+                        .right(px(2.))
+                        .size(px(24.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .when(!selecting && !keyboard_controls, |checkbox| {
+                            checkbox
+                                .invisible()
+                                .group_hover("music-row", |style| style.visible())
+                        })
+                        .child(self.checkbox(selected))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.toggle_selected(&song, cx);
+                        }))
+                });
                 div()
-                    .w(px(54.))
-                    .flex_shrink_0()
+                    .relative()
+                    .w(px(58.))
+                    .h(px(24.))
                     .flex()
+                    .items_center()
                     .justify_end()
                     .text_size(px(text_size))
                     .text_color(self.theme.muted)
-                    .child(duration),
+                    .child(
+                        div()
+                            .when(keyboard_controls || selecting, |text| text.invisible())
+                            .group_hover("music-row", |style| style.invisible())
+                            .child(duration),
+                    )
+                    .children(checkbox)
+            });
+            let dislike = button(("dislike", index), "thumb-down", self.theme)
+                .size(px(36.))
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    cx.stop_propagation();
+                    if view.account.is_none() {
+                        view.connect_account(window, cx);
+                        return;
+                    }
+                    let disliked = is_disliked(&view.ratings, &track);
+                    view.mutate(
+                        Mutation::RateSong {
+                            track: track.clone(),
+                            rating: if disliked {
+                                Rating::Indifferent
+                            } else {
+                                Rating::Dislike
+                            },
+                        },
+                        cx,
+                    );
+                }));
+            // Like the web, a hovered row shortens its text to make room for
+            // the controls and hides the duration, so the page's backdrop
+            // shows around them. The slot collapses rather than hiding, since
+            // a hidden element skips painting its children.
+            const CONTROLS_WIDTH: f32 = 126.5;
+            let controls = div()
+                .id(("track-controls", index))
+                .h(px(36.))
+                .overflow_hidden()
+                .w(px(if keyboard_controls {
+                    CONTROLS_WIDTH
+                } else {
+                    0.
+                }))
+                .group_hover("music-row", |style| style.w(px(CONTROLS_WIDTH)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(like)
+                        .child(dislike.ml(px(2.5)))
+                        .child(menu.ml(px(16.))),
+                );
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(controls)
+                    .children(duration),
             );
         }
-        let artist_table = style == RowStyle::ArtistTable;
-        let controls = div()
-            .id(("track-controls", index))
-            .flex()
-            .items_center()
-            .gap(px(2.))
-            .pr(px(8.))
-            .bg(if active {
-                self.theme.selection
-            } else {
-                self.theme.bg
-            })
-            .opacity(if keyboard_controls { 1. } else { 0. })
-            .group_hover("music-row", |style| style.opacity(1.))
-            .child(
-                button(
-                    ("like", index),
-                    if liked { "thumb-up-filled" } else { "thumb-up" },
-                    self.theme,
-                )
-                .size(px(36.))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    cx.stop_propagation();
-                    view.toggle_like(&like_track, cx);
-                })),
-            )
-            .when(!artist_table, |d| {
-                d.child(
-                    button(("dislike", index), "thumb-down", self.theme)
-                        .size(px(36.))
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            cx.stop_propagation();
-                            if view.account.is_none() {
-                                view.connect_account(window, cx);
-                                return;
-                            }
-                            let disliked = is_disliked(&view.ratings, &track);
-                            view.mutate(
-                                Mutation::RateSong {
-                                    track: track.clone(),
-                                    rating: if disliked {
-                                        Rating::Indifferent
-                                    } else {
-                                        Rating::Dislike
-                                    },
-                                },
-                                cx,
-                            );
-                        })),
-                )
-            })
-            .child(
-                self.menu_button(("track-menu", index), cx, move |view, window, cx| {
-                    view.open_track_menu(menu_track.clone(), Some(index), window, cx);
-                })
-                .size(px(36.)),
-            );
-        row = row.child(controls.absolute().right_0().top_0().h_full());
         wrap_row(row)
-            .when(style.gap() > 0., |d| d.pb(px(style.gap())))
+            // The web's Find in playlist results sit edge to edge.
+            .when(style.gap() > 0. && self.playlist_find.is_none(), |d| {
+                d.pb(px(style.gap()))
+            })
             .when(artist_table && self.list_rows.windows(2).any(|rows| {
                 matches!(rows, [super::ListRow::Item(current), super::ListRow::Item(_)] if *current == index)
             }), |d| {
@@ -894,16 +993,23 @@ enum RowStyle {
     Playlist,
     /// The artist page's Top songs table.
     ArtistTable,
+    /// Top songs below 936px: artist, plays and album in one line under the title.
+    ArtistStacked,
     /// Library, history, charts and other plain lists.
     List,
 }
 
 impl RowStyle {
+    fn artist(self) -> bool {
+        matches!(self, Self::ArtistTable | Self::ArtistStacked)
+    }
+
     fn height(self) -> f32 {
         match self {
             Self::Search => 80.,
             Self::Album | Self::Playlist => 68.,
             Self::ArtistTable => 48.,
+            Self::ArtistStacked => 56.,
             Self::List => 64.,
         }
     }
@@ -926,7 +1032,7 @@ impl RowStyle {
     fn thumbnail(self) -> f32 {
         match self {
             Self::Search => 56.,
-            Self::ArtistTable => 32.,
+            Self::ArtistTable | Self::ArtistStacked => 32.,
             _ => 48.,
         }
     }

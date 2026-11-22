@@ -1024,6 +1024,7 @@ mod tests {
             description: "Updated description".into(),
             privacy: Some("PRIVATE".into()),
             shelves: vec![crate::catalog::Shelf {
+                strapline: String::new(),
                 layout: crate::catalog::ShelfLayout::Songs,
                 title: "Songs".into(),
                 more: None,
@@ -1043,6 +1044,7 @@ mod tests {
             editable: true,
             chips: Vec::new(),
             countries: Vec::new(),
+            country_divider: None,
             playlist_sort: Vec::new(),
             search_filters: Vec::new(),
             correction: None,

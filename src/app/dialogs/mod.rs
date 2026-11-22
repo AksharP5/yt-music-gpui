@@ -32,6 +32,8 @@ pub(in crate::app) enum Overlay {
         queue_index: Option<usize>,
     },
     Collection(Collection),
+    /// The selection toolbar's More actions menu.
+    Selection,
     PlaylistPicker {
         /// One song from its menu, or the whole queue from Up next's Save.
         tracks: Vec<Track>,
@@ -82,6 +84,7 @@ impl Overlay {
             self,
             Self::Track { .. }
                 | Self::Collection(_)
+                | Self::Selection
                 | Self::Account
                 | Self::LibrarySort
                 | Self::PlaylistSort
@@ -252,19 +255,19 @@ impl Music {
         if self.page.countries.is_empty() {
             return;
         }
-        let picker = cx.new(|cx| CountryPicker::new(self.page.countries.clone(), cx));
+        let picker = cx.new(|cx| {
+            CountryPicker::new(self.page.countries.clone(), self.page.country_divider, cx)
+        });
         self.open_overlay(Overlay::CountryPicker(picker.clone()), window, cx);
         self.overlay_subscription = Some(cx.subscribe_in(
             &picker,
             window,
-            |view, picker, event, window, cx| {
+            |view, picker, CountryPickerEvent::Choose(target), window, cx| {
                 if !matches!(&view.overlay, Some(Overlay::CountryPicker(current)) if current == picker) {
                     return;
                 }
                 view.close_overlay(window, cx);
-                if let CountryPickerEvent::Choose(target) = event {
-                    view.navigate(Route::Browse(target.clone()), cx);
-                }
+                view.navigate(Route::Browse(target.clone()), cx);
             },
         ));
         window.focus(&picker.focus_handle(cx), cx);
@@ -383,7 +386,7 @@ impl Music {
                         .is_some_and(|episode| !episode.subtitle.is_empty()),
                 ),
             ),
-            Some(Overlay::Collection(_)) => Some(1),
+            Some(Overlay::Collection(_) | Overlay::Selection) => Some(1),
             _ => None,
         };
         if let Some(preamble) = menu_preamble {
@@ -431,6 +434,7 @@ impl Music {
             overlay,
             Overlay::Track { .. }
                 | Overlay::Collection(_)
+                | Overlay::Selection
                 | Overlay::LibrarySort
                 | Overlay::PlaylistSort
         );
@@ -537,6 +541,7 @@ impl Music {
             ElementId::Name(name) => match name.as_ref() {
                 "menu-radio" => Some("menu-mix"),
                 "menu-shuffle" => Some("shuffle"),
+                "menu-find" => Some("search"),
                 "collection-play" => Some("play"),
                 "menu-next" => Some("menu-play-next"),
                 "menu-enqueue" => Some("menu-add-queue"),
@@ -615,7 +620,40 @@ impl Music {
             _ => {}
         }
         if let Overlay::CountryPicker(picker) = kind {
-            return self.backdrop(picker.clone().into_any_element(), cx);
+            // Like the web, the dropdown opens 8px below its button.
+            let position = self.overlay_button.map_or_else(
+                || {
+                    let viewport = window.viewport_size();
+                    point(
+                        (viewport.width - px(PICKER_WIDTH)) / 2.,
+                        viewport.height / 6.,
+                    )
+                },
+                |button| point(button.left(), button.bottom() + px(8.)),
+            );
+            return div()
+                .id("menu-focus")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.close_overlay(window, cx);
+                    }),
+                )
+                .child(
+                    anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            div()
+                                .on_children_prepainted(self.covers_video())
+                                .child(picker.clone()),
+                        ),
+                )
+                .into_any_element();
         }
         if let Overlay::PlaylistForm { form, .. } = kind {
             let mut body = div().flex().flex_col().gap(px(12.)).child(form.clone());
@@ -650,7 +688,10 @@ impl Music {
                     .mb(px(24.))
                     .gap(px(12.))
                     .when(
-                        matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)),
+                        matches!(
+                            kind,
+                            Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Selection
+                        ),
                         |d| d.h(px(0.)).mb(px(0.)).overflow_hidden(),
                     )
                     .child(
@@ -679,6 +720,7 @@ impl Music {
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::NoKeyring(_) => "No keyring found".into(),
                                 Overlay::PlaylistForm { .. }
+                                | Overlay::Selection
                                 | Overlay::CountryPicker(_)
                                 | Overlay::LibrarySort
                                 | Overlay::PlaylistSort
@@ -688,7 +730,12 @@ impl Music {
                     .child(
                         button("close-overlay", "close", self.theme)
                             .when(
-                                matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)),
+                                matches!(
+                                    kind,
+                                    Overlay::Track { .. }
+                                        | Overlay::Collection(_)
+                                        | Overlay::Selection
+                                ),
                                 |button| button.tab_stop(false),
                             )
                             .on_click(
@@ -858,10 +905,7 @@ impl Music {
                     }
                     SongAction::PlayNext => {
                         self.menu_action("menu-next", "Play next", cx, move |view, _, cx| {
-                            view.cancel_queue_drag();
-                            let index = view.library.queue.index.map_or(0, |i| i + 1);
-                            view.library.queue.tracks_mut().insert(index, song.clone());
-                            view.queue_changed(cx);
+                            view.play_next(vec![song.clone()], cx);
                             view.show_toast("Will play next", cx);
                         })
                     }
@@ -1046,56 +1090,146 @@ impl Music {
                 });
             }
         } else if let Overlay::Collection(collection) = kind {
-            for (id, label, query) in [
-                (
+            // An album or public playlist's own header menu lists what the
+            // web's does; its play and save buttons sit beside it.
+            let header = matches!(&self.route, Route::Browse(link) if link.id == collection.id)
+                && (collection.id.starts_with("VL") || collection.id.starts_with("MPRE"))
+                && !self.page.editable;
+            let album = collection.id.starts_with("MPRE");
+            let kind = if album { "Album" } else { "Playlist" };
+            if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Shuffled) {
+                actions.push(self.menu_action(
                     "menu-shuffle",
                     "Shuffle play",
-                    PlaybackQuery::collection(collection, PlaybackOrder::Shuffled),
-                ),
-                ("menu-radio", "Start mix", PlaybackQuery::mix(collection)),
-            ] {
-                if let Some(query) = query {
-                    actions.push(self.menu_action(id, label, cx, move |view, _, cx| {
-                        view.start_queue(query.clone(), cx);
-                    }));
-                }
-            }
-            if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Original) {
-                actions.push(self.menu_action(
-                    "collection-play",
-                    "Play",
                     cx,
-                    move |view, _, cx| {
-                        view.start_queue(query.clone(), cx);
+                    move |view, _, cx| view.start_queue(query.clone(), cx),
+                ));
+            }
+            if header && !album {
+                actions.push(self.menu_action(
+                    "menu-find",
+                    "Find in playlist",
+                    cx,
+                    |view, window, cx| view.open_playlist_find(window, cx),
+                ));
+            }
+            if let Some(query) = PlaybackQuery::mix(collection) {
+                actions.push(self.menu_action(
+                    "menu-radio",
+                    "Start mix",
+                    cx,
+                    move |view, _, cx| view.start_queue(query.clone(), cx),
+                ));
+            }
+            if header {
+                let next = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-next",
+                    "Play next",
+                    cx,
+                    move |view, window, cx| {
+                        view.with_collection_tracks(
+                            &next,
+                            window,
+                            cx,
+                            move |view, tracks, _, cx| {
+                                view.play_next(tracks, cx);
+                                view.show_toast(format!("{} will play next", kind), cx);
+                            },
+                        )
+                    },
+                ));
+                let queued = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-enqueue",
+                    "Add to queue",
+                    cx,
+                    move |view, window, cx| {
+                        view.with_collection_tracks(
+                            &queued,
+                            window,
+                            cx,
+                            move |view, tracks, _, cx| {
+                                view.library.queue.tracks_mut().extend(tracks);
+                                view.queue_changed(cx);
+                                view.show_toast(format!("{} added to queue", kind), cx);
+                            },
+                        )
+                    },
+                ));
+                let saved = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-playlist",
+                    "Save to playlist",
+                    cx,
+                    move |view, window, cx| {
+                        if view.account.is_none() {
+                            view.connect_account(window, cx);
+                            return;
+                        }
+                        view.with_collection_tracks(
+                            &saved,
+                            window,
+                            cx,
+                            |view, tracks, window, cx| view.playlist_picker(tracks, window, cx),
+                        )
+                    },
+                ));
+                if album
+                    && let Some(HeaderArtist::Link(artist)) = self
+                        .page
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.artist.clone())
+                {
+                    actions.push(self.menu_action(
+                        "menu-artist",
+                        "Go to artist",
+                        cx,
+                        move |view, _, cx| view.navigate(Route::Browse(artist.clone()), cx),
+                    ));
+                }
+            } else {
+                if let Some(query) = PlaybackQuery::collection(collection, PlaybackOrder::Original)
+                {
+                    actions.push(self.menu_action(
+                        "collection-play",
+                        "Play",
+                        cx,
+                        move |view, _, cx| {
+                            view.start_queue(query.clone(), cx);
+                        },
+                    ));
+                }
+                let saved = self.is_saved(collection);
+                let selected = collection.clone();
+                actions.push(self.menu_action(
+                    "menu-library",
+                    if collection.id.starts_with("UC") {
+                        if saved { "Unsubscribe" } else { "Subscribe" }
+                    } else if saved {
+                        "Remove from library"
+                    } else {
+                        "Save to library"
+                    },
+                    cx,
+                    move |view, window, cx| {
+                        if selected.id.starts_with("UC") && view.account.is_none() {
+                            view.connect_account(window, cx);
+                            return;
+                        }
+                        view.save_collection(selected.clone(), cx);
                     },
                 ));
             }
-            let saved = self.is_saved(collection);
-            let selected = collection.clone();
-            actions.push(self.menu_action(
-                "menu-library",
-                if collection.id.starts_with("UC") {
-                    if saved { "Unsubscribe" } else { "Subscribe" }
-                } else if saved {
-                    "Remove from library"
-                } else {
-                    "Save to library"
-                },
-                cx,
-                move |view, window, cx| {
-                    if selected.id.starts_with("UC") && view.account.is_none() {
-                        view.connect_account(window, cx);
-                        return;
-                    }
-                    view.save_collection(selected.clone(), cx);
-                },
-            ));
             let shared = collection.clone();
             actions.push(
                 self.menu_action("menu-share", "Share", cx, move |view, window, cx| {
                     view.share_collection(&shared, window, cx)
                 }),
             );
+        } else if matches!(kind, Overlay::Selection) {
+            actions.extend(self.selection_actions(cx));
         } else if let Overlay::AlreadyAdded {
             id,
             video_ids,
@@ -1211,7 +1345,10 @@ impl Music {
                 );
             }
         }
-        if matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)) {
+        if matches!(
+            kind,
+            Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Selection
+        ) {
             let viewport = window.viewport_size();
             let menu = size(
                 px(MENU_WIDTH),

@@ -1,239 +1,169 @@
 use crate::{
     catalog::{BrowseChoice, BrowseLink},
-    input::{InputEvent, SearchInput},
     theme::Theme,
 };
 use gpui::{prelude::*, *};
 
 pub enum CountryPickerEvent {
     Choose(BrowseLink),
-    Cancel,
 }
 
+/// The web's chart country dropdown, measured from music.youtube.com: 307px
+/// wide, a "Select a country" heading, then 48px rows with a check on the
+/// current country and a divider after the pinned ones. Up, Down and Enter
+/// choose from the keyboard; Escape closes it through the app's overlays.
 pub struct CountryPicker {
-    input: Entity<SearchInput>,
     choices: Vec<BrowseChoice>,
-    filtered: Vec<usize>,
-    highlighted: Option<usize>,
-    scroll: UniformListScrollHandle,
+    /// How many countries sit above the divider.
+    divider: Option<usize>,
+    highlighted: usize,
+    focus: FocusHandle,
+    scroll: ScrollHandle,
     theme: Theme,
-    _subscription: Subscription,
 }
+
+pub const PICKER_WIDTH: f32 = 307.;
+const ROW: f32 = 48.;
+/// The web's list, padding included, before it scrolls.
+const LIST_HEIGHT: f32 = 438.;
 
 impl EventEmitter<CountryPickerEvent> for CountryPicker {}
 
 impl CountryPicker {
-    pub fn new(choices: Vec<BrowseChoice>, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            let mut input = SearchInput::new(cx);
-            input.set_placeholder("Search countries", cx);
-            input
-        });
-        let subscription = cx.subscribe(&input, |picker, _, event, cx| match event {
-            InputEvent::Changed => {
-                let query = picker.input.read(cx).value().trim().to_lowercase();
-                picker.filtered = picker
-                    .choices
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, choice)| choice.label.to_lowercase().contains(&query))
-                    .map(|(index, _)| index)
-                    .collect();
-                picker.highlighted = (!picker.filtered.is_empty()).then_some(0);
-                picker.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            }
-            InputEvent::Submit => {
-                if let Some(index) = picker.highlighted {
-                    picker.choose(index, cx);
-                }
-            }
-            InputEvent::Blur => cx.emit(CountryPickerEvent::Cancel),
-        });
+    pub fn new(choices: Vec<BrowseChoice>, divider: Option<usize>, cx: &mut Context<Self>) -> Self {
         let highlighted = choices
             .iter()
             .position(|choice| choice.selected)
-            .or_else(|| (!choices.is_empty()).then_some(0));
-        let scroll = UniformListScrollHandle::new();
-        if let Some(index) = highlighted {
-            scroll.scroll_to_item(index, ScrollStrategy::Center);
-        }
+            .unwrap_or(0);
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_item(highlighted);
         Self {
-            input,
-            filtered: (0..choices.len()).collect(),
             choices,
+            divider,
             highlighted,
+            focus: cx.focus_handle(),
             scroll,
             theme: Theme::load(),
-            _subscription: subscription,
         }
     }
 
     fn choose(&self, index: usize, cx: &mut Context<Self>) {
-        if let Some(choice) = self.filtered.get(index).and_then(|i| self.choices.get(*i)) {
+        if let Some(choice) = self.choices.get(index) {
             cx.emit(CountryPickerEvent::Choose(choice.target.clone()));
         }
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.modifiers.modified() {
+        if event.keystroke.modifiers.modified() || self.choices.is_empty() {
             return;
         }
-        if !self.filtered.is_empty() {
-            let next = match event.keystroke.key.as_str() {
-                "down" => Some(
-                    self.highlighted
-                        .map_or(0, |index| (index + 1).min(self.filtered.len() - 1)),
-                ),
-                "up" => Some(self.highlighted.unwrap_or(0).saturating_sub(1)),
-                _ => None,
-            };
-            if let Some(index) = next {
-                self.highlighted = Some(index);
-                self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
-                window.focus(&self.input.focus_handle(cx), cx);
-                cx.notify();
+        let last = self.choices.len() - 1;
+        self.highlighted = match event.keystroke.key.as_str() {
+            "down" => (self.highlighted + 1).min(last),
+            "up" => self.highlighted.saturating_sub(1),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                self.choose(self.highlighted, cx);
                 cx.stop_propagation();
+                return;
             }
-        }
+            _ => return,
+        };
+        self.scroll.scroll_to_item(self.highlighted);
+        window.focus(&self.focus, cx);
+        cx.stop_propagation();
+        cx.notify();
     }
 }
 
 impl Focusable for CountryPicker {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.focus_handle(cx)
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 
 impl Render for CountryPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let line = gpui::white().opacity(0.1);
+        let rows = self.choices.iter().enumerate().map(|(index, choice)| {
+            let row = div()
+                .id(("country", index))
+                .tab_index(0)
+                .h(px(ROW))
+                .pl(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .focus_visible(|style| style.border_color(theme.text))
+                .when(self.highlighted == index, |row| row.bg(line))
+                .hover(|row| row.bg(line))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .size(px(40.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(choice.selected, |column| {
+                            column.child(svg().path("check").size(px(24.)).text_color(theme.text))
+                        }),
+                )
+                .child(choice.label.clone())
+                .on_key_down(
+                    cx.listener(move |picker, event: &KeyDownEvent, window, cx| {
+                        if matches!(
+                            event.keystroke.key.as_str(),
+                            "up" | "down" | "home" | "end" | "enter"
+                        ) {
+                            picker.highlighted = index;
+                            picker.key_down(event, window, cx);
+                        }
+                    }),
+                )
+                .on_click(cx.listener(move |picker, _, _, cx| picker.choose(index, cx)));
+            div()
+                .child(row)
+                .when(self.divider == Some(index + 1), |slot| {
+                    slot.child(div().mx(px(16.)).w(px(260.)).h(px(1.)).bg(line))
+                })
+        });
         div()
             .id("country-picker")
-            .w(px(480.))
-            .max_w_full()
-            .max_h(relative(0.9))
-            .p(px(28.))
-            .rounded(px(12.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.panel)
-            .text_color(theme.text)
-            .text_size(px(14.))
-            .flex()
-            .flex_col()
-            .gap(px(20.))
+            .track_focus(&self.focus)
             .key_context("CountryPicker")
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
+            .w(px(PICKER_WIDTH))
+            .rounded(px(2.))
+            .border_1()
+            .border_color(line)
+            .bg(rgb(0x212121))
+            .text_color(theme.text)
+            .text_size(px(14.))
+            .shadow_lg()
             .child(
                 div()
+                    .h(px(64.))
+                    .pl(px(28.))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(23.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Chart country"),
-                    )
-                    .child(
-                        div()
-                            .id("close-country-picker")
-                            .tab_index(0)
-                            .border_1()
-                            .border_color(gpui::transparent_black())
-                            .focus_visible(|style| style.border_color(theme.text))
-                            .p(px(6.))
-                            .cursor_pointer()
-                            .child(svg().path("close").size(px(20.)).text_color(theme.muted))
-                            .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(CountryPickerEvent::Cancel)),
-                            ),
-                    ),
+                    .border_b_1()
+                    .border_color(line)
+                    .child("Select a country"),
             )
             .child(
                 div()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .bg(theme.bg)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(px(6.))
-                    .child(self.input.clone()),
+                    .id("country-choices")
+                    .max_h(px(LIST_HEIGHT))
+                    .py(px(8.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(rows),
             )
-            .when(self.filtered.is_empty(), |body| {
-                body.child(
-                    div()
-                        .py(px(20.))
-                        .text_color(theme.muted)
-                        .child("No countries found"),
-                )
-            })
-            .when(!self.filtered.is_empty(), |body| {
-                body.child(
-                    uniform_list(
-                        "country-choices",
-                        self.filtered.len(),
-                        cx.processor(|picker, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|index| {
-                                    let choice = &picker.choices[picker.filtered[index]];
-                                    div()
-                                        .id(("country", index))
-                                        .tab_index(0)
-                                        .border_1()
-                                        .border_color(gpui::transparent_black())
-                                        .focus_visible(|style| {
-                                            style.border_color(picker.theme.text)
-                                        })
-                                        .w_full()
-                                        .h(px(44.))
-                                        .px(px(12.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .when(picker.highlighted == Some(index), |row| {
-                                            row.bg(picker.theme.selection)
-                                        })
-                                        .hover(|row| row.bg(picker.theme.raised))
-                                        .cursor_pointer()
-                                        .child(choice.label.clone())
-                                        .when(choice.selected, |row| {
-                                            row.child(
-                                                div()
-                                                    .text_size(px(12.))
-                                                    .text_color(picker.theme.muted)
-                                                    .child("Current"),
-                                            )
-                                        })
-                                        .on_key_down(cx.listener(
-                                            move |picker, event: &KeyDownEvent, window, cx| {
-                                                if event.keystroke.modifiers.modified()
-                                                    || !matches!(
-                                                        event.keystroke.key.as_str(),
-                                                        "up" | "down"
-                                                    )
-                                                {
-                                                    return;
-                                                }
-                                                picker.highlighted = Some(index);
-                                                picker.key_down(event, window, cx);
-                                            },
-                                        ))
-                                        .on_click(cx.listener(move |picker, _, _, cx| {
-                                            picker.choose(index, cx)
-                                        }))
-                                })
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .w_full()
-                    .h(px((self.filtered.len() as f32 * 44.).min(352.)))
-                    .min_h_0()
-                    .track_scroll(&self.scroll),
-                )
-            })
     }
 }

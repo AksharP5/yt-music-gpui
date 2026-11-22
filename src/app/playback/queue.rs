@@ -852,6 +852,41 @@ impl Music {
         self.show_toast("Added to queue", cx);
     }
 
+    /// Insert songs after the current one, as Play next does.
+    pub(in crate::app) fn play_next(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
+        self.cancel_queue_drag();
+        let index = self.library.queue.index.map_or(0, |i| i + 1);
+        self.library.queue.tracks_mut().splice(index..index, tracks);
+        self.queue_changed(cx);
+    }
+
+    /// Load every song of an album or playlist, as the web does before
+    /// Play next, Add to queue or Save to playlist, then act on them.
+    pub(in crate::app) fn with_collection_tracks(
+        &mut self,
+        collection: &Collection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Vec<Track>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let link = BrowseLink::new(collection.id.clone(), collection.title.clone());
+        let session = self.account.as_ref().map(|account| account.session.clone());
+        let load = cx.background_executor().spawn(async move {
+            Catalog::new().and_then(|catalog| catalog.for_session(session).collection_tracks(&link))
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let tracks = load.await;
+            view.update_in(cx, |view, window, cx| match tracks {
+                Ok(tracks) => then(view, tracks, window, cx),
+                Err(error) => {
+                    view.error = Some(pages::error_summary(&format!("{error:#}")));
+                    cx.notify();
+                }
+            })
+        })
+        .detach();
+    }
+
     pub(in crate::app) fn queue_changed(&mut self, cx: &mut Context<Self>) {
         if let Some(intent) = self.queue_waiting.take() {
             self.advance_queue(intent, cx);

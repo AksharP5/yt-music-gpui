@@ -461,6 +461,7 @@ pub(super) fn patch_page(page: &mut Page, route: &Route, mutation: &Mutation) {
     {
         if page.shelves.is_empty() {
             page.shelves.push(Shelf {
+                strapline: String::new(),
                 title: String::new(),
                 layout: ShelfLayout::Songs,
                 more: None,
@@ -569,6 +570,7 @@ fn append_added(page: &mut Page, route: &Route, id: &str, sources: &[Track]) -> 
     };
     if page.shelves.is_empty() {
         page.shelves.push(Shelf {
+            strapline: String::new(),
             title: String::new(),
             layout: ShelfLayout::Songs,
             more: None,
@@ -1387,7 +1389,7 @@ pub(super) mod tests {
 
     pub(in crate::app) fn page(count: usize, continuation: bool) -> Page {
         let mut page = crate::catalog::parse_page(&json!({"contents":[],"nextContinuationData":if continuation { json!({"continuation":"next"}) } else { serde_json::Value::Null }}), "Playlist").unwrap();
-        page.shelves.push(Shelf { title: "Songs".into(), layout: ShelfLayout::Songs, more: None, items:(0..count).map(|index| {
+        page.shelves.push(Shelf { strapline: String::new(), title: "Songs".into(), layout: ShelfLayout::Songs, more: None, items:(0..count).map(|index| {
             let mut track: Track = serde_json::from_value(json!({"id":format!("{index:011}"),"title":format!("Song {}",index+1),"artist":"Synthetic artist"})).unwrap();
             track.details.set_video_id = Some(format!("occurrence-{index}")); Item::Track(track)
         }).collect() });

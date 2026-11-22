@@ -8,7 +8,7 @@ use crate::{
         BrowseLink, Catalog, Collection, Continuation, HeaderArtist, Item, Page, PlaylistTarget,
         Rating, Shelf, ShelfLayout, Track, WatchTarget,
     },
-    country_picker::{CountryPicker, CountryPickerEvent},
+    country_picker::{CountryPicker, CountryPickerEvent, PICKER_WIDTH},
     library::{LastPosition, Library, LibraryWriter, Queue, Repeat, Store},
     media_controls,
     player::{
@@ -50,6 +50,7 @@ mod playback;
 mod player_bar;
 mod player_page;
 mod queue_panel;
+mod selection;
 mod sidebar;
 mod suggestions;
 mod sync;
@@ -124,6 +125,8 @@ pub struct Music {
     suggestions: Option<suggestions::Suggestions>,
     shelf_scroll: HashMap<usize, ScrollHandle>,
     shelf_heights: Vec<Option<pages::shelves::ShelfHeight>>,
+    /// The artist heading height the hero photo was last sized from.
+    hero_heading: Option<Pixels>,
     list_scroll: UniformListScrollHandle,
     detail_list: DetailList,
     /// The wide guide's mini state. Below 936px the guide is always mini.
@@ -168,6 +171,10 @@ pub struct Music {
     /// The full-window player page, showing artwork or video beside its tabs.
     player_open: bool,
     sort_focus: FocusHandle,
+    /// A playlist's Find in playlist bar, which filters its loaded rows.
+    playlist_find: Option<pages::PlaylistFind>,
+    /// Album and playlist songs ticked for the selection toolbar, in the order chosen.
+    selected_songs: Vec<Track>,
     video_fullscreen: bool,
     video_transparent: bool,
     video_error: Option<String>,
