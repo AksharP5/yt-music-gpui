@@ -261,10 +261,16 @@ def no_network(*args, **kwargs):
 
 yt_dlp.YoutubeDL.urlopen = no_network
 YoutubeIE._real_initialize = lambda self: None
-# Only the first request sees a player response, so loudness must not carry over.
+# Only the first request sees a player response, so loudness and captions must not carry over.
 YoutubeIE._extract_player_responses = lambda self, *args, **kwargs: ([{
     'streamingData': {'adaptiveFormats': [{'itag': 251, 'loudnessDb': 2.5}]},
     'playerConfig': {'audioConfig': {'loudnessDb': float('nan'), 'loudnessTargetLkfs': -14}},
+}, {
+    'captions': {'playerCaptionsTracklistRenderer': {
+        'captionTracks': [{'baseUrl': 'https://www.youtube.com/api/timedtext?lang=en', 'languageCode': 'en',
+                           'name': {'runs': [{'text': 'English'}]}}],
+        'audioTracks': [{'captionTrackIndices': [0], 'defaultCaptionTrackIndex': 0}],
+    }},
 }], None)
 
 def extract(self, url):
@@ -322,10 +328,13 @@ exec(sys.argv.pop(1))
         self.assertEqual([json.loads(line) for line in stdout.splitlines()], [
             {'ready': True},
             {'urls': ['https://rr1.googlevideo.com/audio?itag=251&call=1'],
-             'loudness': {'audioConfig': {'loudnessTargetLkfs': -14.0}, 'format': {'loudnessDb': 2.5}}},
+             'loudness': {'audioConfig': {'loudnessTargetLkfs': -14.0}, 'format': {'loudnessDb': 2.5}},
+             'captions': {'captionTracks': [{'baseUrl': 'https://www.youtube.com/api/timedtext?lang=en',
+                                             'languageCode': 'en', 'kind': None}],
+                          'audioTracks': [{'defaultCaptionTrackIndex': 0}]}},
             {'urls': None}, {'urls': None},
             {'urls': ['https://rr1.googlevideo.com/video', 'https://rr1.googlevideo.com/audio?itag=251&call=4'],
-             'loudness': None},
+             'loudness': None, 'captions': None},
         ])
         self.assertNotIn('INVENTED_COOKIE', stdout)
         self.assertNotIn('other||account', stdout)

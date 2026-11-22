@@ -814,7 +814,12 @@ impl Music {
                 self.seekable = false;
                 self.playback = Playback::Stopped;
             }
-            PlayerEvent::Started { track_id, paused } if Some(track_id) == self.active_id => {
+            PlayerEvent::Started {
+                track_id,
+                paused,
+                captions,
+            } if Some(track_id) == self.active_id => {
+                self.captions_track = captions.then_some(track_id);
                 self.playback = Playback::Loaded {
                     paused,
                     buffering: false,

@@ -2274,6 +2274,7 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                                 PlayerEvent::Started {
                                     track_id: 42,
                                     paused: false,
+                                    captions: false,
                                 },
                                 cx,
                             );

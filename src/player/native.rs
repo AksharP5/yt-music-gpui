@@ -535,6 +535,56 @@ impl<'a> Format<'a> {
 pub(super) struct Selection {
     pub(super) urls: Vec<String>,
     pub(super) gain_db: f64,
+    pub(super) captions: Option<String>,
+}
+
+/// The caption track the web turns on for an English viewer: English
+/// captions, then English auto-generated ones, then the video's default
+/// track, then the first one. `renderer` is the player response's
+/// `playerCaptionsTracklistRenderer`.
+pub(super) fn captions(renderer: &Value) -> Option<String> {
+    let tracks = renderer["captionTracks"].as_array()?;
+    let english = |track: &&Value| {
+        track["languageCode"]
+            .as_str()
+            .is_some_and(|code| code == "en" || code.starts_with("en-"))
+    };
+    let default = renderer["audioTracks"][0]["defaultCaptionTrackIndex"]
+        .as_u64()
+        .and_then(|index| tracks.get(usize::try_from(index).ok()?));
+    tracks
+        .iter()
+        .find(|track| english(track) && track["kind"] != "asr")
+        .or_else(|| tracks.iter().find(english))
+        .or(default)
+        .or(tracks.first())
+        .and_then(|track| caption_url(track["baseUrl"].as_str()?))
+}
+
+/// mpv fetches captions itself, so only YouTube's timedtext endpoint is
+/// accepted, asked for WebVTT, which mpv can read.
+fn caption_url(url: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(url).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("www.youtube.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/api/timedtext"
+    {
+        return None;
+    }
+    let query: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| name != "fmt")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    url.set_fragment(None);
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(query)
+        .append_pair("fmt", "vtt");
+    Some(url.into())
 }
 
 pub(super) fn select(
@@ -594,6 +644,7 @@ pub(super) fn select(
     let selection = |urls, audio: &Format| Selection {
         urls,
         gain_db: super::normalization_gain(&player["playerConfig"]["audioConfig"], audio.raw),
+        captions: captions(&player["captions"]["playerCaptionsTracklistRenderer"]),
     };
     if let Some(video) = video {
         if let Some(video) = formats.iter().rev().find(|format| {
@@ -730,6 +781,81 @@ pub(super) mod tests {
                 ["18"]
             );
         }
+    }
+
+    #[test]
+    fn captions_prefer_english_then_the_default_track_and_stay_on_timedtext() {
+        let base = "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&expire=1795349646&signature=AB.CD&key=yt8";
+        let track = |language: &str, kind: Option<&str>| {
+            json!({
+                "baseUrl": format!("{base}&lang={language}{}", kind.map_or(String::new(), |kind| format!("&kind={kind}"))),
+                "languageCode": language,
+                "kind": kind,
+            })
+        };
+        let renderer = |tracks: Vec<Value>, default: u64| json!({"captionTracks": tracks, "audioTracks": [{"defaultCaptionTrackIndex": default}]});
+        let vtt = |language: &str, kind: &str| format!("{base}&lang={language}{kind}&fmt=vtt");
+        for (tracks, default, expected) in [
+            // Shaped like dQw4w9WgXcQ's response: the manual English track wins.
+            (
+                vec![
+                    track("de-DE", None),
+                    track("en", Some("asr")),
+                    track("en", None),
+                ],
+                0,
+                Some(vtt("en", "")),
+            ),
+            (
+                vec![track("ja", None), track("en-GB", Some("asr"))],
+                0,
+                Some(vtt("en-GB", "&kind=asr")),
+            ),
+            (
+                vec![track("ko", Some("asr")), track("ja", None)],
+                1,
+                Some(vtt("ja", "")),
+            ),
+            (
+                vec![track("ko", Some("asr"))],
+                7,
+                Some(vtt("ko", "&kind=asr")),
+            ),
+            (vec![], 0, None),
+        ] {
+            assert_eq!(captions(&renderer(tracks, default)), expected);
+        }
+        assert_eq!(captions(&Value::Null), None);
+
+        // A requested format is replaced, so mpv always gets WebVTT.
+        assert_eq!(
+            caption_url(&format!("{base}&fmt=srv3#top")),
+            Some(format!("{base}&fmt=vtt"))
+        );
+        // mpv fetches the URL itself, so nothing but YouTube's timedtext endpoint passes.
+        for url in [
+            "http://www.youtube.com/api/timedtext?v=x",
+            "https://www.youtube.com.evil.example/api/timedtext?v=x",
+            "https://youtube.com/api/timedtext?v=x",
+            "https://rr1.googlevideo.com/api/timedtext?v=x",
+            "https://www.youtube.com:8443/api/timedtext?v=x",
+            "https://user@www.youtube.com/api/timedtext?v=x",
+            "https://www.youtube.com/redirect?q=https://evil.example/",
+            "file:///etc/passwd",
+            "edl://%10%https://evil.ex",
+            "timedtext",
+        ] {
+            assert_eq!(caption_url(url), None, "{url}");
+        }
+        let mut player = fixture();
+        player["captions"]["playerCaptionsTracklistRenderer"] =
+            renderer(vec![track("en", None)], 0);
+        assert_eq!(
+            select(&player, AudioQuality::Normal, Some(VideoQuality::P720))
+                .unwrap()
+                .captions,
+            Some(vtt("en", ""))
+        );
     }
 
     #[test]

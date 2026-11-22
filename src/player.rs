@@ -205,6 +205,7 @@ pub struct PlayerOptions {
     pub volume: f64,
     pub speed: PlaybackSpeed,
     pub audio_output: Option<String>,
+    pub captions: bool,
 }
 
 impl Default for PlayerOptions {
@@ -216,6 +217,7 @@ impl Default for PlayerOptions {
             volume: 60.,
             speed: PlaybackSpeed::default(),
             audio_output: None,
+            captions: false,
         }
     }
 }
@@ -225,6 +227,8 @@ pub enum PlayerEvent {
     Started {
         track_id: u64,
         paused: bool,
+        /// Whether the loaded video has captions to show.
+        captions: bool,
     },
     Position {
         track_id: u64,
@@ -292,6 +296,7 @@ enum PlayerCommand {
         options: PlayOptions,
     },
     Pause(bool),
+    Captions(bool),
     Seek(SeekRequest),
     Json(Value),
     Credentials {
@@ -564,6 +569,9 @@ impl Player {
             bail!("Invalid volume.");
         }
         self.command(json!(["set_property", "volume", percent.clamp(0., 100.)]))
+    }
+    pub fn set_captions(&self, enabled: bool) -> Result<()> {
+        self.send(PlayerCommand::Captions(enabled))
     }
     pub fn set_speed(&self, speed: PlaybackSpeed) -> Result<()> {
         self.command(json!(["set_property", "speed", f64::from(speed)]))
@@ -868,13 +876,24 @@ impl MpvCore {
             c"load-select",
             c"load-stats-overlay",
         ] {
-            let result =
-                unsafe { mpv_set_option_string(core.0.as_ptr(), name.as_ptr(), c"no".as_ptr()) };
-            ensure!(
-                result >= 0 || result == MPV_ERROR_OPTION_NOT_FOUND,
-                "Could not set mpv startup option {} ({result})",
-                name.to_string_lossy()
-            );
+            core.set_optional(name, c"no")?;
+        }
+        // Captions as the web draws them over video: white Roboto on a 75%
+        // black box per line, 2% above the bottom, sized to 16/360 of the
+        // player's height (mpv sizes at a 720-pixel-high window). mpv 0.38
+        // renamed sub-border-color, so older releases keep their own box color.
+        for (name, value) in [
+            (c"sub-font", c"Roboto"),
+            (c"sub-font-size", c"38"),
+            (c"sub-color", c"#FFFFFF"),
+            (c"sub-border-style", c"opaque-box"),
+            (c"sub-outline-color", c"#BF080808"),
+            (c"sub-border-color", c"#BF080808"),
+            (c"sub-outline-size", c"2"),
+            (c"sub-shadow-offset", c"0"),
+            (c"sub-margin-y", c"14"),
+        ] {
+            core.set_optional(name, value)?;
         }
         core.set_option(c"volume", &options.volume.clamp(0., 100.).to_string())?;
         core.set_option(c"speed", &f64::from(options.speed).to_string())?;
@@ -892,6 +911,18 @@ impl MpvCore {
             "Could not initialize mpv"
         );
         Ok(core)
+    }
+
+    /// Set an option that older mpv releases may not have.
+    fn set_optional(&self, name: &CStr, value: &CStr) -> Result<()> {
+        let result =
+            unsafe { mpv_set_option_string(self.0.as_ptr(), name.as_ptr(), value.as_ptr()) };
+        ensure!(
+            result >= 0 || result == MPV_ERROR_OPTION_NOT_FOUND,
+            "Could not set mpv startup option {} ({result})",
+            name.to_string_lossy()
+        );
+        Ok(())
     }
 
     fn set_option(&self, name: &CStr, value: &str) -> Result<()> {
@@ -1151,6 +1182,8 @@ struct ResolvedStream {
     url: String,
     gain_db: f64,
     expires: SystemTime,
+    /// A validated timedtext URL. Only video streams keep one: captions draw over the video.
+    captions: Option<String>,
 }
 
 impl ResolvedStream {
@@ -1206,7 +1239,19 @@ impl ResolvedStream {
             url,
             gain_db,
             expires,
+            captions: None,
         })
+    }
+
+    fn select(key: StreamKey, selection: native::Selection) -> Result<Self> {
+        let captions = key.video.and(selection.captions);
+        let stream = Self::parse(
+            key,
+            selection.urls.join("\n").as_bytes(),
+            selection.gain_db,
+            SystemTime::now(),
+        )?;
+        Ok(Self { captions, ..stream })
     }
 
     fn matches(&self, key: &StreamKey) -> bool {
@@ -1348,6 +1393,9 @@ enum ResolverResponse {
         // The selected audio format's loudness fields, see ytdlp_resolver.py.
         #[serde(default)]
         loudness: Value,
+        // The player response's caption tracks, see ytdlp_resolver.py.
+        #[serde(default)]
+        captions: Value,
     },
 }
 
@@ -1435,10 +1483,18 @@ impl WarmResolver {
                         self.ready = true;
                         self.flush()?;
                     }
-                    ResolverResponse::Stream { urls, loudness } if self.ready => {
+                    ResolverResponse::Stream {
+                        urls,
+                        loudness,
+                        captions,
+                    } if self.ready => {
                         let gain_db =
                             normalization_gain(&loudness["audioConfig"], &loudness["format"]);
-                        return Ok(Some(urls.map(|urls| native::Selection { urls, gain_db })));
+                        return Ok(Some(urls.map(|urls| native::Selection {
+                            urls,
+                            gain_db,
+                            captions: native::captions(&captions),
+                        })));
                     }
                     _ => bail!("Invalid resolver response"),
                 }
@@ -1451,7 +1507,11 @@ impl WarmResolver {
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error.into()),
                 }
-                ensure!(self.bytes.len() <= 32 * 1024, "Oversized resolver response");
+                // Caption tracks for every language a video offers can reach tens of kilobytes.
+                ensure!(
+                    self.bytes.len() <= 1024 * 1024,
+                    "Oversized resolver response"
+                );
             }
         }
     }
@@ -1515,12 +1575,7 @@ impl NativeResolver {
                         .find_map(|(name, value)| (name == "v").then(|| value.into_owned()))
                         .context("Missing video ID")?;
                     let selection = lookup.lookup(&id, key.quality, key.video)?;
-                    ResolvedStream::parse(
-                        key,
-                        selection.urls.join("\n").as_bytes(),
-                        selection.gain_db,
-                        SystemTime::now(),
-                    )
+                    ResolvedStream::select(key, selection)
                 })();
                 if sender.send((generation, result)).is_ok() {
                     wake.wake();
@@ -1760,14 +1815,7 @@ impl StreamResolver {
                 Ok(Some(urls)) => {
                     if let Some(target) = &self.target {
                         result = Some(urls.context("Could not resolve the stream").and_then(
-                            |selection| {
-                                ResolvedStream::parse(
-                                    target.key.clone(),
-                                    selection.urls.join("\n").as_bytes(),
-                                    selection.gain_db,
-                                    SystemTime::now(),
-                                )
-                            },
+                            |selection| ResolvedStream::select(target.key.clone(), selection),
                         ));
                     }
                 }
@@ -2073,7 +2121,10 @@ fn run(
         }
     };
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let mut state = PlaybackState::default();
+    let mut state = PlaybackState {
+        captions_enabled: options.captions,
+        ..PlaybackState::default()
+    };
     let mut pending = Vec::new();
     // UI and MPRIS own volume. Delayed mpv acknowledgments must not
     // replace the retained level with an earlier mute's zero.
@@ -2174,6 +2225,7 @@ fn run(
                             let _ = events.send_blocking(PlayerEvent::Started {
                                 track_id,
                                 paused: options.paused,
+                                captions: state.captions.contains_key(&track_id),
                             });
                         }
                         state.pause_revision += 1;
@@ -2195,6 +2247,7 @@ fn run(
                         // user clicks Next. Reuse its resolved URL in that case.
                         if let Some((_, stream)) = resolved {
                             resolver.cancel();
+                            state.load_captions(track_id, &stream);
                             write_command(
                                 &mut socket,
                                 load_command(&stream.url, &title, stream.gain_db, options),
@@ -2228,6 +2281,10 @@ fn run(
                     state.paused = paused;
                     state.pause_after_load = !state.loaded;
                     write_pause(&mut socket, paused, state.pause_revision)?;
+                }
+                Ok(PlayerCommand::Captions(enabled)) => {
+                    state.captions_enabled = enabled;
+                    state.apply_captions(&mut socket)?;
                 }
                 Ok(PlayerCommand::Seek(request)) => state.queue_seek(request, events),
                 Ok(PlayerCommand::Json(command)) => write_command(&mut socket, command, None)?,
@@ -2348,6 +2405,7 @@ fn run(
                             paused: state.paused,
                             ..play.options
                         };
+                        state.load_captions(target.track_id, &stream);
                         write_command(
                             &mut socket,
                             load_command(&stream.url, &play.title, stream.gain_db, options),
@@ -2394,6 +2452,7 @@ fn run(
             );
             command["flags"] = json!("append");
             state.upcoming = Some(target.track_id);
+            state.load_captions(target.track_id, stream);
             write_command(
                 &mut socket,
                 command,
@@ -2565,6 +2624,11 @@ struct PlaybackState {
     seek: Option<ActiveSeek>,
     next_seek: Option<SeekRequest>,
     position_observer: u64,
+    /// Caption URLs of the loaded and upcoming tracks, by track ID.
+    captions: HashMap<u64, String>,
+    captions_enabled: bool,
+    /// Whether the loaded file has its caption track. mpv drops it with the file.
+    captions_added: bool,
 }
 
 impl PlaybackState {
@@ -2613,6 +2677,8 @@ impl PlaybackState {
                         self.pause_revision += 1;
                         write_pause(socket, paused, self.pause_revision)?;
                     }
+                    self.captions_added = false;
+                    self.apply_captions(socket)?;
                 }
                 self.write_seek(socket)?;
             }
@@ -2622,6 +2688,34 @@ impl PlaybackState {
             "mpv returned an oversized response."
         );
         Ok(())
+    }
+
+    /// Remember the captions of a stream mpv is about to load as `track_id`.
+    fn load_captions(&mut self, track_id: u64, stream: &ResolvedStream) {
+        let keep = [self.current, self.desired, self.upcoming];
+        self.captions
+            .retain(|id, _| *id != track_id && keep.contains(&Some(*id)));
+        if let Some(url) = &stream.captions {
+            self.captions.insert(track_id, url.clone());
+        }
+    }
+
+    /// Show or hide captions on the loaded file. mpv fetches the track the
+    /// first time they show, so a video watched without them never loads it.
+    fn apply_captions(&mut self, socket: &mut IpcStream) -> Result<()> {
+        if self.captions_enabled
+            && !self.captions_added
+            && self.loaded
+            && let Some(url) = self.current.and_then(|id| self.captions.get(&id))
+        {
+            write_command(socket, json!(["sub-add", url, "select"]), None)?;
+            self.captions_added = true;
+        }
+        write_command(
+            socket,
+            json!(["set_property", "sub-visibility", self.captions_enabled]),
+            None,
+        )
     }
 
     fn discard_upcoming(&mut self) {
@@ -2896,6 +2990,7 @@ impl PlaybackState {
                 let _ = events.send_blocking(PlayerEvent::Started {
                     track_id,
                     paused: self.paused,
+                    captions: self.captions.contains_key(&track_id),
                 });
                 if self.seekable {
                     let _ = events.send_blocking(PlayerEvent::Seekable {
@@ -5077,7 +5172,7 @@ YtMusicAccountIE._real_extract = extract
             state.message(json!({"event":"file-loaded"}), &events);
             assert!(matches!(
                 received.try_recv(),
-                Ok(PlayerEvent::Started { track_id: 1, paused }) if paused == expected
+                Ok(PlayerEvent::Started { track_id: 1, paused, .. }) if paused == expected
             ));
         }
     }
@@ -5916,6 +6011,85 @@ os.kill(os.getpid(), signal.SIGSTOP)
     }
 
     #[test]
+    fn captions_load_with_their_video_only_once_shown() {
+        let (events, received) = async_channel::unbounded();
+        let (mut socket, mut mpv) = IpcStream::pair().unwrap();
+        mpv.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let captions = "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=vtt";
+        let stream = ResolvedStream {
+            key: StreamKey {
+                url: "https://music.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                quality: AudioQuality::Normal,
+                video: Some(VideoQuality::P720),
+            },
+            url: "https://rr1.googlevideo.com/video".into(),
+            gain_db: 0.,
+            expires: SystemTime::now() + Duration::from_secs(60),
+            captions: Some(captions.into()),
+        };
+        let mut state = PlaybackState {
+            desired: Some(2),
+            pause_after_load: true,
+            entries: HashMap::from([(5, 2)]),
+            ..Default::default()
+        };
+        state.load_captions(2, &stream);
+        let mut pending =
+            b"{\"event\":\"start-file\",\"playlist_entry_id\":5}\n{\"event\":\"file-loaded\"}\n"
+                .to_vec();
+        state
+            .read_messages(&mut socket, &mut pending, &mut [0; 1024], &events)
+            .unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(PlayerEvent::Started {
+                track_id: 2,
+                captions: true,
+                ..
+            })
+        ));
+        // Every command written so far; the read times out once they run out.
+        let mut commands = || {
+            let (mut bytes, mut chunk) = (Vec::new(), [0; 4096]);
+            while let Ok(count @ 1..) = mpv.read(&mut chunk) {
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<Value>(line).unwrap()["command"].clone())
+                .collect::<Vec<_>>()
+        };
+        let sent = commands();
+        // Captions are off: nothing is fetched, only hidden.
+        assert!(
+            !sent.iter().any(|command| command[0] == "sub-add"),
+            "{sent:?}"
+        );
+        assert_eq!(
+            sent.last(),
+            Some(&json!(["set_property", "sub-visibility", false]))
+        );
+
+        state.captions_enabled = true;
+        state.apply_captions(&mut socket).unwrap();
+        state.captions_enabled = false;
+        state.apply_captions(&mut socket).unwrap();
+        state.captions_enabled = true;
+        state.apply_captions(&mut socket).unwrap();
+        assert_eq!(
+            commands(),
+            [
+                json!(["sub-add", captions, "select"]),
+                json!(["set_property", "sub-visibility", true]),
+                json!(["set_property", "sub-visibility", false]),
+                json!(["set_property", "sub-visibility", true]),
+            ]
+        );
+    }
+
+    #[test]
     fn adopting_a_loaded_stream_refreshes_duration_and_seekability() {
         let (events, received) = async_channel::unbounded();
         let (mut socket, mut mpv) = IpcStream::pair().unwrap();
@@ -5989,7 +6163,8 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 rx.try_recv(),
                 Ok(PlayerEvent::Started {
                     track_id: 2,
-                    paused: false
+                    paused: false,
+                    ..
                 })
             ));
             state.message(
@@ -6701,7 +6876,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             }
         };
         wait_for(
-            &|event| matches!(event, PlayerEvent::Started { track_id: id, paused: true } if *id == track_id),
+            &|event| matches!(event, PlayerEvent::Started { track_id: id, paused: true, .. } if *id == track_id),
         );
         player
             .prepare_next(Some("abcdefghijk"), PlayOptions::default())
@@ -6761,7 +6936,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             panic!("mpv did not complete the synthetic seek boundary");
         };
         wait_for(
-            &|event| matches!(event,PlayerEvent::Started{track_id:id,paused:true} if *id == track_id),
+            &|event| matches!(event,PlayerEvent::Started{track_id:id,paused:true,..} if *id == track_id),
         );
         player.seek(track_id, 10.).unwrap();
         let revision = player.seek(track_id, 50.).unwrap();
@@ -6818,6 +6993,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                     PlayerEvent::Started {
                         track_id,
                         paused: false,
+                        ..
                     } if track_id == id => started = true,
                     PlayerEvent::Position { track_id, seconds }
                         if track_id == id && seconds > 1. =>
@@ -6883,7 +7059,9 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 Some(event) => {
                     println!("{event:?}");
                     match event {
-                        PlayerEvent::Started { track_id, paused } if track_id == replacement => {
+                        PlayerEvent::Started {
+                            track_id, paused, ..
+                        } if track_id == replacement => {
                             assert!(paused, "quality reload must retain pause");
                             resumed_paused = true;
                         }

@@ -48,6 +48,8 @@ pub struct Library {
     pub quality: AudioQuality,
     pub video: bool,
     pub video_quality: VideoQuality,
+    /// Whether captions show over videos that have them, as the web's CC button sets.
+    pub captions: bool,
 }
 
 impl Default for Library {
@@ -67,6 +69,7 @@ impl Default for Library {
             quality: AudioQuality::default(),
             video: false,
             video_quality: VideoQuality::default(),
+            captions: false,
         }
     }
 }
@@ -374,6 +377,7 @@ struct Preferences {
     quality: AudioQuality,
     video: bool,
     video_quality: VideoQuality,
+    captions: bool,
 }
 
 impl From<&Library> for Preferences {
@@ -387,6 +391,7 @@ impl From<&Library> for Preferences {
             quality: library.quality,
             video: library.video,
             video_quality: library.video_quality,
+            captions: library.captions,
         }
     }
 }
@@ -401,6 +406,7 @@ impl Preferences {
         library.quality = self.quality;
         library.video = self.video;
         library.video_quality = self.video_quality;
+        library.captions = self.captions;
     }
 }
 
