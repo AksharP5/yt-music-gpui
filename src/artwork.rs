@@ -420,9 +420,18 @@ fn load_source(
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&key);
     }
+    let bytes = download(client, parsed)?;
+    let image = decode(bytes.clone(), resolution, still)?;
+    disk.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .write(&key, &bytes);
+    Ok(image)
+}
+
+fn download(client: &reqwest::blocking::Client, url: reqwest::Url) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     client
-        .get(parsed)
+        .get(url)
         .send()?
         .error_for_status()?
         .take(DOWNLOAD_BYTES + 1)
@@ -431,11 +440,31 @@ fn load_source(
         bytes.len() as u64 <= DOWNLOAD_BYTES,
         "Artwork response is too large"
     );
-    let image = decode(bytes.clone(), resolution, still)?;
-    disk.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .write(&key, &bytes);
-    Ok(image)
+    Ok(bytes)
+}
+
+/// The encoded art at `url`, sized to cover a `side` pixel square, for system
+/// surfaces that decode it themselves.
+#[cfg(target_os = "macos")]
+pub(crate) fn download_square(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    side: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut failure = anyhow::anyhow!("Artwork has no source");
+    for source in sources(
+        url,
+        Resolution::Cover {
+            width: side,
+            height: side,
+        },
+    ) {
+        match artwork_url(&source).and_then(|url| download(client, url)) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
 }
 
 struct DiskEntry {
