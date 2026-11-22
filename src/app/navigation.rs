@@ -783,6 +783,7 @@ impl Music {
             header: None,
             background: None,
             shelves: vec![Shelf {
+                strapline: String::new(),
                 layout: ShelfLayout::Cards,
                 title: String::new(),
                 more: None,

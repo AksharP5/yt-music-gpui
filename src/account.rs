@@ -1024,6 +1024,7 @@ mod tests {
             description: "Updated description".into(),
             privacy: Some("PRIVATE".into()),
             shelves: vec![crate::catalog::Shelf {
+                strapline: String::new(),
                 layout: crate::catalog::ShelfLayout::Songs,
                 title: "Songs".into(),
                 more: None,
