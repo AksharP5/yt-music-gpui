@@ -47,13 +47,11 @@ impl MpvCore {
         for (name, value) in [
             (c"terminal", "no"),
             (c"config", "no"),
-            (c"load-scripts", "no"),
             (c"idle", "yes"),
             (c"vid", "no"),
             (c"vo", "libmpv"),
             (c"hwdec", "auto-safe"),
             (c"audio-display", "no"),
-            (c"osc", "no"),
             (c"input-default-bindings", "no"),
             (c"input-vo-keyboard", "no"),
             (c"network-timeout", "20"),
@@ -63,14 +61,17 @@ impl MpvCore {
             (c"demuxer-max-bytes", "32MiB"),
             (c"demuxer-max-back-bytes", "8MiB"),
             (c"audio-client-name", "YouTube Music"),
-            (c"ytdl", "no"),
         ] {
             core.set_option(name, value)?;
         }
         // mpv also starts a Lua VM for each built-in script. This player is
         // controlled only over IPC, so none of them has any use. Older mpv
-        // releases lack some of these scripts, and so their switches.
+        // releases lack some of these scripts, and so their switches; an mpv
+        // built without scripting, like the macOS app's, lacks all of them.
         for name in [
+            c"load-scripts",
+            c"osc",
+            c"ytdl",
             c"load-auto-profiles",
             c"load-commands",
             c"load-console",
@@ -227,7 +228,6 @@ pub(super) fn load_command(url: &str, title: &str, gain_db: f64, options: PlayOp
     // options; positional ones work with only one side of that change.
     json!({"name": "loadfile", "url": url, "flags": "replace", "options": {
         "force-media-title": title,
-        "ytdl": "no",
         "start": options.start.to_string(),
         "pause": if options.paused { "yes" } else { "no" },
         // A file-local option: it applies to this entry only, including when

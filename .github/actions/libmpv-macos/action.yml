@@ -1,0 +1,22 @@
+name: Build the LGPL libmpv
+description: Restore or build the LGPL libmpv the macOS app ships, and link the app against it.
+runs:
+  using: composite
+  steps:
+    # Keyed on the recipe, so it rebuilds only when a pin or option changes.
+    # Tags and main read only caches saved on main; pull requests save their own.
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: target/libmpv
+        key: libmpv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/macos-libmpv.sh', 'packaging/macos-build-requirements.txt') }}
+    - name: Build libmpv
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        command -v pkg-config || brew install pkgconf
+        python3 -m venv "$RUNNER_TEMP/build-tools"
+        "$RUNNER_TEMP/build-tools/bin/pip" install --quiet --require-hashes -r packaging/macos-build-requirements.txt
+        PATH="$RUNNER_TEMP/build-tools/bin:$PATH" packaging/macos-libmpv.sh target/libmpv
+    - shell: bash
+      run: echo "LIBMPV_PREFIX=$PWD/target/libmpv" >> "$GITHUB_ENV"

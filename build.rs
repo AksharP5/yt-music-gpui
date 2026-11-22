@@ -22,20 +22,24 @@ fn main() {
     }
     if target.as_deref() == Ok("macos") {
         // Apple Silicon Homebrew keeps libmpv outside the compiler's and
-        // linker's default search paths.
-        let homebrew = std::env::var("HOMEBREW_PREFIX").unwrap_or("/opt/homebrew".into());
+        // linker's default search paths. Release builds link the LGPL libmpv
+        // that packaging/macos-libmpv.sh builds instead.
+        let prefix = std::env::var("LIBMPV_PREFIX")
+            .or_else(|_| std::env::var("HOMEBREW_PREFIX"))
+            .unwrap_or("/opt/homebrew".into());
         cc::Build::new()
             .file("native/video_macos.m")
-            .include(format!("{homebrew}/include"))
+            .include(format!("{prefix}/include"))
             .flag("-fno-objc-arc")
             .warnings(true)
             .compile("native_video");
-        println!("cargo:rustc-link-search=native={homebrew}/lib");
+        println!("cargo:rustc-link-search=native={prefix}/lib");
         println!("cargo:rustc-link-lib=mpv");
         for framework in ["AppKit", "QuartzCore", "IOSurface", "OpenGL"] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
         println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
+        println!("cargo:rerun-if-env-changed=LIBMPV_PREFIX");
         println!("cargo:rerun-if-changed=native/video_macos.m");
         return;
     }

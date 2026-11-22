@@ -1085,12 +1085,10 @@ mod tests {
         assert_eq!(command["flags"], "replace");
         assert_eq!(command["options"]["start"], "32.5");
         assert_eq!(command["options"]["pause"], "yes");
-        assert_eq!(command["options"]["ytdl"], "no");
         assert_eq!(command["options"]["volume-gain"], "-2.29");
         let defaults = load_command("unused", "Track", 0., PlayOptions::default());
         assert_eq!(defaults["options"]["start"], "0");
         assert_eq!(defaults["options"]["pause"], "no");
-        assert_eq!(defaults["options"]["ytdl"], "no");
         let video = load_command(
             "unused",
             "Track",
@@ -1100,7 +1098,6 @@ mod tests {
                 ..options
             },
         );
-        assert_eq!(video["options"]["ytdl"], "no");
         assert_eq!(video["options"]["start"], "32.5");
         assert_eq!(video["options"]["pause"], "yes");
     }

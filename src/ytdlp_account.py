@@ -23,6 +23,8 @@ REVIEWED_SHA256 = "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d
 DENO_VERSION = "2.9.8"
 DENO_SHA256 = "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609"
 DENO_SIZE = 41963064
+# deno-aarch64-apple-darwin.zip, bundled in the macOS app.
+DENO_MACOS_SHA256 = "9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e"
 
 # The cookie jar is capped at 128 KiB when the app reads it from the browser.
 _MAX_CREDENTIALS = 256 * 1024
