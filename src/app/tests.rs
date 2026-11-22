@@ -1,7 +1,7 @@
 use super::{
     CatalogRequests, CatalogTarget, DetailList, Playback, Query, QueueUpdate,
-    acknowledge_song_change, adopt_watch_queue, apply_track_details, playlist_move_targets,
-    visible_cards,
+    acknowledge_song_change, adopt_watch_queue, apply_track_details, carousel_page,
+    playlist_move_targets, visible_cards,
 };
 use crate::{
     account::Mutation,
@@ -207,6 +207,16 @@ fn carousel_only_renders_nearby_cards_and_clamps_after_a_shorter_refresh() {
     assert_eq!(visible_cards(100, 100000., 612., 204.), 96..100);
     assert_eq!(visible_cards(2, 100000., 612., 204.), 0..2);
     assert_eq!(visible_cards(0, 0., 612., 204.), 0..0);
+}
+
+#[test]
+fn carousel_buttons_move_a_whole_page_of_cards() {
+    // The web's 1280px Explore shelf: five 146.4px cards with 24px gaps in 828px.
+    assert_eq!(carousel_page(828., 146.4, 24.), 5. * 170.4);
+    // At 900px four 180px cards fit in the 828px bleed, even with a fifth partly shown.
+    assert_eq!(carousel_page(828., 180., 16.), 4. * 196.);
+    // A card wider than the shelf still moves one card.
+    assert_eq!(carousel_page(300., 436., 16.), 452.);
 }
 
 #[test]
@@ -499,6 +509,14 @@ fn displayed_durations_round_partial_seconds_up_like_the_web() {
         (-1., "0:00"),
     ] {
         assert_eq!(super::clock(seconds), expected);
+    }
+}
+
+#[test]
+fn the_seek_preview_counts_whole_seconds_under_the_pointer() {
+    // Hover times music.youtube.com showed across Levitating's 230.121 s video.
+    for (at, expected) in [(0.0874, "0:20"), (0.5874, "2:15"), (0.9824, "3:46")] {
+        assert_eq!(super::seek_label(at, 230.121), expected);
     }
 }
 
