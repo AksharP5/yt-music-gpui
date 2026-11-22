@@ -376,6 +376,7 @@ impl Music {
             suggestions: None,
             shelf_scroll: HashMap::new(),
             shelf_heights: Vec::new(),
+            hero_heading: None,
             #[cfg(test)]
             shelf_render_times: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
