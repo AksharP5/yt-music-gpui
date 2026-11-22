@@ -1,8 +1,10 @@
 //! Overlay state, menus/dialogs, and picker/form lifecycle.
 
 pub(in crate::app) mod account;
+pub(in crate::app) mod credits;
 pub(in crate::app) mod settings;
 pub(in crate::app) mod share;
+pub(in crate::app) mod shortcuts;
 mod song_menu;
 
 use super::*;
@@ -50,9 +52,9 @@ pub(in crate::app) enum Overlay {
     },
     /// Sign-in worked, but no keyring can save it.
     NoKeyring(Arc<Session>),
+    /// A song's credits, drawn by `credits_dialog`.
     SongText {
         id: u64,
-        title: String,
         content: Option<Result<SongText, String>>,
     },
     /// The library's Sort by menu, drawn in the page under its button.
@@ -510,30 +512,14 @@ impl Music {
     pub(in crate::app) fn show_song_text(
         &mut self,
         query: TextQuery,
-        title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let label = match &query {
-            TextQuery::Lyrics(_) => "Lyrics",
-            TextQuery::Credits(_) => "Credits",
-            TextQuery::Related(_) => "Related",
-            TextQuery::Comments(_) => "Comments",
-        };
-        let title = format!("{label} · {title}");
         let session = self.account.as_ref().map(|account| account.session.clone());
         // Closing an overlay cancels song text, so close before this load starts.
         self.close_overlay(window, cx);
         match self.song_text.load(query, session) {
-            Ok(id) => self.open_overlay(
-                Overlay::SongText {
-                    id,
-                    title,
-                    content: None,
-                },
-                window,
-                cx,
-            ),
+            Ok(id) => self.open_overlay(Overlay::SongText { id, content: None }, window, cx),
             Err(error) => self.error = Some(format!("{error:#}")),
         }
         cx.notify();
@@ -625,6 +611,7 @@ impl Music {
                 return self.playlist_picker_dialog(window, cx);
             }
             Overlay::Share(share) => return self.share_dialog(share, cx),
+            Overlay::Help => return self.shortcuts_dialog(cx),
             _ => {}
         }
         if let Overlay::CountryPicker(picker) = kind {
@@ -674,12 +661,13 @@ impl Music {
                             .text_size(px(23.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(match kind {
-                                Overlay::Help => "Keyboard shortcuts".to_owned(),
-                                Overlay::Settings
+                                Overlay::Help
+                                | Overlay::Settings
                                 | Overlay::Account
                                 | Overlay::SignIn
                                 | Overlay::PlaylistPicker { .. }
-                                | Overlay::Share(_) => {
+                                | Overlay::Share(_)
+                                | Overlay::SongText { .. } => {
                                     // Rendered by their own dialogs above.
                                     String::new()
                                 }
@@ -690,7 +678,6 @@ impl Music {
                                 Overlay::AlreadyAdded { .. } => "Already added".into(),
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::NoKeyring(_) => "No keyring found".into(),
-                                Overlay::SongText { title, .. } => title.clone(),
                                 Overlay::PlaylistForm { .. }
                                 | Overlay::CountryPicker(_)
                                 | Overlay::LibrarySort
@@ -711,19 +698,7 @@ impl Music {
             );
         let mut actions = Vec::new();
         let mut menu_extra = 0.;
-        if matches!(kind, Overlay::Help) {
-            for &(key, action) in super::interaction::SHORTCUTS {
-                body = body.child(
-                    div()
-                        .py(px(9.))
-                        .flex()
-                        .justify_between()
-                        .text_size(px(14.))
-                        .child(action)
-                        .child(div().text_color(self.theme.muted).child(key)),
-                );
-            }
-        } else if let Overlay::Description { title, text } = kind {
+        if let Overlay::Description { title, text } = kind {
             body = body
                 .child(
                     div()
@@ -1054,18 +1029,12 @@ impl Music {
                     }
                     SongAction::Credits => {
                         let id = track.credits_id().unwrap_or_default();
-                        let title = track.title.clone();
                         self.menu_action(
                             "menu-credits",
                             "View song credits",
                             cx,
                             move |view, window, cx| {
-                                view.show_song_text(
-                                    TextQuery::Credits(id.clone()),
-                                    &title,
-                                    window,
-                                    cx,
-                                )
+                                view.show_song_text(TextQuery::Credits(id.clone()), window, cx)
                             },
                         )
                     }
@@ -1127,38 +1096,6 @@ impl Music {
                     view.share_collection(&shared, window, cx)
                 }),
             );
-        } else if let Overlay::SongText { content, .. } = kind {
-            match content {
-                None => body = body.child(div().text_color(self.theme.muted).child("Loading…")),
-                Some(Err(error)) => {
-                    body = body.child(div().text_color(self.theme.muted).child(error.clone()))
-                }
-                Some(Ok(SongText::Lyrics(lyrics))) => {
-                    body = body.child(div().text_size(px(17.)).child(lyrics.text.clone()))
-                }
-                Some(Ok(SongText::Related(_) | SongText::Comments(_))) => {}
-                Some(Ok(SongText::Credits(credits))) => {
-                    for section in credits {
-                        body = body.child(
-                            div()
-                                .mb(px(22.))
-                                .child(
-                                    div()
-                                        .text_size(px(16.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(section.title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .mt(px(8.))
-                                        .text_size(px(14.))
-                                        .text_color(self.theme.muted)
-                                        .child(section.names.clone()),
-                                ),
-                        );
-                    }
-                }
-            }
         } else if let Overlay::AlreadyAdded {
             id,
             video_ids,

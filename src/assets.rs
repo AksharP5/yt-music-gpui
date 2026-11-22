@@ -69,6 +69,9 @@ impl AssetSource for Assets {
             ))),
             "shuffle" => Some(Cow::Borrowed(include_bytes!("../assets/icons/shuffle.svg"))),
             "repeat" => Some(Cow::Borrowed(include_bytes!("../assets/icons/repeat.svg"))),
+            "repeat-one" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/repeat-one.svg"
+            ))),
             "music" => Some(Cow::Borrowed(include_bytes!("../assets/icons/music.svg"))),
             "explicit" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/explicit.svg"

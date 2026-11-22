@@ -2,7 +2,7 @@
 
 use crate::{
     auth::{self, Session},
-    catalog::{BrowseLink, Catalog, Page, text},
+    catalog::{BrowseLink, Catalog, Page, text, thumbnail},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -34,10 +34,28 @@ pub struct CreditSection {
     pub names: String,
 }
 
+/// A song's credits dialog, as YouTube Music sends it: its title ("Song
+/// credits"), the song it is about, and the roles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Credits {
+    pub title: String,
+    pub song: Option<CreditedSong>,
+    pub sections: Vec<CreditSection>,
+}
+
+/// The cover, title, artist and "Song • 2020" line above the credits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditedSong {
+    pub title: String,
+    pub artist: String,
+    pub detail: String,
+    pub thumbnail: Option<String>,
+}
+
 #[derive(Clone)]
 pub enum Content {
     Lyrics(Lyrics),
-    Credits(Vec<CreditSection>),
+    Credits(Credits),
     Related(Box<Page>),
     Comments(Box<crate::comments::Page>),
 }
@@ -167,7 +185,7 @@ impl Catalog {
         parse_lyrics(&response)
     }
 
-    pub fn credits(&self, browse_id: &str) -> Result<Vec<CreditSection>> {
+    pub fn credits(&self, browse_id: &str) -> Result<Credits> {
         ensure!(
             browse_id.starts_with("MPTC")
                 && browse_id.len() > 4
@@ -204,16 +222,18 @@ fn parse_lyrics(response: &Value) -> Result<Lyrics> {
     })
 }
 
-fn parse_credits(response: &Value) -> Result<Vec<CreditSection>> {
-    let sections = response
+fn parse_credits(response: &Value) -> Result<Credits> {
+    let dialog = response
         .get("onResponseReceivedActions")
         .and_then(Value::as_array)
         .and_then(|actions| {
             actions.iter().find_map(|action| {
-                action.pointer("/openPopupAction/popup/dismissableDialogRenderer/sections")
+                action.pointer("/openPopupAction/popup/dismissableDialogRenderer")
             })
         })
-        .and_then(Value::as_array)
+        .context("Credits are not available for this song")?;
+    let sections = dialog["sections"]
+        .as_array()
         .context("Credits are not available for this song")?;
     let mut credits = Vec::new();
     for section in sections {
@@ -230,7 +250,28 @@ fn parse_credits(response: &Value) -> Result<Vec<CreditSection>> {
         !credits.is_empty(),
         "Credits are not available for this song"
     );
-    Ok(credits)
+    let title = dialog["title"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| text(&dialog["title"]));
+    let song = dialog
+        .pointer("/metadata/musicMultiRowListItemRenderer")
+        .map(|song| CreditedSong {
+            title: text(&song["title"]),
+            artist: text(&song["subtitle"]),
+            detail: text(&song["secondTitle"]),
+            thumbnail: thumbnail(&song["thumbnail"]),
+        })
+        .filter(|song| !song.title.trim().is_empty());
+    Ok(Credits {
+        title: if title.trim().is_empty() {
+            "Song credits".into()
+        } else {
+            title
+        },
+        song,
+        sections: credits,
+    })
 }
 
 #[cfg(test)]
@@ -239,9 +280,17 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     #[test]
-    fn credits_keep_localized_roles_names_and_newlines_in_server_order() {
+    fn credits_keep_the_song_header_and_localized_roles_in_server_order() {
         let response = json!({"onResponseReceivedActions":[{}, {"openPopupAction":{"popup":{
-            "dismissableDialogRenderer":{"sections":[
+            "dismissableDialogRenderer":{"title":"Song credits",
+                "metadata":{"musicMultiRowListItemRenderer":{
+                    "thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[
+                        {"url":"https://example.com/w60","width":60,"height":60},
+                        {"url":"https://example.com/w226","width":226,"height":226}]}}},
+                    "title":{"runs":[{"text":"Future Nostalgia"}]},
+                    "subtitle":{"runs":[{"text":"Dua Lipa"}]},
+                    "secondTitle":{"runs":[{"text":"Song"},{"text":" • "},{"text":"2020"}]}}},
+                "sections":[
                 {"dismissableDialogContentSectionRenderer":{"title":{"simpleText":"Performed by"},
                     "subtitle":{"runs":[{"text":"First artist"},{"text":"\n"},{"text":"Second artist"}]}}},
                 {"dismissableDialogContentSectionRenderer":{"title":{"simpleText":"Piano"},
@@ -251,16 +300,25 @@ mod tests {
         }}}]});
         assert_eq!(
             parse_credits(&response).unwrap(),
-            [
-                CreditSection {
-                    title: "Performed by".into(),
-                    names: "First artist\nSecond artist".into()
-                },
-                CreditSection {
-                    title: "Piano".into(),
-                    names: "Another performer".into()
-                },
-            ]
+            Credits {
+                title: "Song credits".into(),
+                song: Some(CreditedSong {
+                    title: "Future Nostalgia".into(),
+                    artist: "Dua Lipa".into(),
+                    detail: "Song • 2020".into(),
+                    thumbnail: Some("https://example.com/w226".into()),
+                }),
+                sections: vec![
+                    CreditSection {
+                        title: "Performed by".into(),
+                        names: "First artist\nSecond artist".into()
+                    },
+                    CreditSection {
+                        title: "Piano".into(),
+                        names: "Another performer".into()
+                    },
+                ],
+            }
         );
         assert!(parse_credits(&json!({})).is_err());
         let catalog = Catalog::new().unwrap();
@@ -335,7 +393,7 @@ mod tests {
     fn live_public_credits() {
         let catalog = Catalog::new().unwrap();
         let credits = catalog.credits("MPTCiKLU7z_xdYQ").unwrap();
-        assert!(!credits.is_empty());
+        assert!(!credits.sections.is_empty() && credits.song.is_some());
         let page = catalog
             .search_filtered(
                 "Coldplay Yellow",
@@ -350,6 +408,6 @@ mod tests {
         let id = track
             .credits_id()
             .expect("a valid song must have a credits endpoint");
-        assert!(!catalog.credits(&id).unwrap().is_empty());
+        assert!(!catalog.credits(&id).unwrap().sections.is_empty());
     }
 }
