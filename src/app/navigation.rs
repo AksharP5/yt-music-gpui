@@ -496,6 +496,7 @@ impl Music {
             });
         }
         self.clear_suggestions();
+        self.playlist_find = None;
         if self.route != route {
             self.forward.clear();
             let state = self.take_navigation_state();
@@ -726,6 +727,16 @@ impl Music {
                 self.list_rows.extend(items.into_iter().map(ListRow::Item));
             }
         }
+        if let Some(find) = self.playlist_find.as_ref().filter(|find| find.filtering()) {
+            self.list_rows = (0..self.rows.len())
+                .filter(|&index| find.matches(&self.rows[index]))
+                .map(ListRow::Item)
+                .collect();
+            if self.list_rows.is_empty() {
+                self.list_rows.push(ListRow::EmptyPlaylist);
+            }
+            return 0;
+        }
         self.append_suggestion_rows();
         start
     }
@@ -826,6 +837,7 @@ impl Music {
         let Some(state) = state else { return };
         self.focus_after_navigation(cx);
         self.clear_suggestions();
+        self.playlist_find = None;
         let previous = self.take_navigation_state();
         match direction {
             NavigationDirection::Back => self.forward.push(previous),
