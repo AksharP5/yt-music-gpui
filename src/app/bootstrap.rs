@@ -410,6 +410,7 @@ impl Music {
             queue_source,
             queue_waiting: None,
             autoplay_tracks: VecDeque::new(),
+            autoplay_chips: Vec::new(),
             go_chord: Default::default(),
             watch_pending: None,
             song_text,

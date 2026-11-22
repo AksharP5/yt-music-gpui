@@ -101,6 +101,7 @@ fn artist_source(mix: bool, paired: bool) -> CollectionPlayback {
             alternatives: None,
             continuation: None,
             source_target: None,
+            chips: Vec::new(),
             shuffle: Some(QueueShuffle {
                 shuffled: false,
                 actions: Arc::new(PlaybackActions {
@@ -1106,6 +1107,7 @@ fn collection_shuffle_toggles_pending_requests_and_ignores_stale_results() -> Re
                 alternatives: None,
                 continuation: None,
                 source_target: None,
+                chips: Vec::new(),
                 shuffle: None,
             }
         };

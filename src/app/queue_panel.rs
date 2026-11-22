@@ -30,14 +30,78 @@ impl Reorder {
 enum UpNextRow {
     Queued(usize),
     AutoplayLabel,
+    AutoplayChips,
     Autoplay(usize),
 }
 
+/// Up next's rows: the queued songs, then, while autoplay has songs or
+/// filters, its label, its filters and its songs. Keyboard stops follow the
+/// same order: each song's row and menu, and each filter.
+#[derive(Clone, Copy)]
+pub(in crate::app) struct UpNextLayout {
+    queued: usize,
+    chips: usize,
+    autoplay: usize,
+}
+
+impl UpNextLayout {
+    fn chip_rows(self) -> usize {
+        usize::from(self.chips > 0)
+    }
+
+    fn rows(self) -> usize {
+        let autoplay = if self.autoplay > 0 || self.chips > 0 {
+            1 + self.chip_rows() + self.autoplay
+        } else {
+            0
+        };
+        self.queued + autoplay
+    }
+
+    fn row(self, row: usize) -> UpNextRow {
+        match row.checked_sub(self.queued) {
+            None => UpNextRow::Queued(row),
+            Some(0) => UpNextRow::AutoplayLabel,
+            Some(1) if self.chips > 0 => UpNextRow::AutoplayChips,
+            Some(after) => UpNextRow::Autoplay(after - 1 - self.chip_rows()),
+        }
+    }
+
+    pub(in crate::app) fn stops(self) -> usize {
+        (self.queued + self.autoplay) * 2 + self.chips
+    }
+
+    /// The row that holds a keyboard stop.
+    pub(in crate::app) fn stop_row(self, stop: usize) -> usize {
+        let Some(after) = stop.checked_sub(self.queued * 2) else {
+            return stop / 2;
+        };
+        if after < self.chips {
+            return self.queued + 1;
+        }
+        self.queued + 1 + self.chip_rows() + (after - self.chips) / 2
+    }
+
+    fn chip_stop(self, chip: usize) -> usize {
+        self.queued * 2 + chip
+    }
+
+    fn autoplay_stop(self, index: usize) -> usize {
+        self.queued * 2 + self.chips + index * 2
+    }
+}
+
 impl Music {
+    pub(in crate::app) fn up_next_layout(&self) -> UpNextLayout {
+        UpNextLayout {
+            queued: self.library.queue.tracks.len(),
+            chips: self.autoplay_chips.len(),
+            autoplay: self.autoplay_tracks.len(),
+        }
+    }
+
     pub(in crate::app) fn up_next(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let queued = self.library.queue.tracks.len();
-        let autoplay = self.autoplay_tracks.len();
-        let rows = queued + if autoplay > 0 { autoplay + 1 } else { 0 };
+        let rows = self.up_next_layout().rows();
         let bounds = self.player_page.queue_bounds.clone();
         // Playing from, Save and Autoplay scroll with the rows on the web, so the
         // list reserves their height, measured on the last frame, as top padding.
@@ -73,11 +137,9 @@ impl Music {
                                 } else {
                                     14.
                                 };
-                                let queued = view.library.queue.tracks.len();
-                                view.queue_focus.retain(range.clone(), window, |index| {
-                                    let row = index / 2;
-                                    row + usize::from(row >= queued)
-                                });
+                                let layout = view.up_next_layout();
+                                view.queue_focus
+                                    .retain(range.clone(), window, |stop| layout.stop_row(stop));
                                 range
                                     .map(|row| {
                                         let element = view.up_next_list_row(row, text, cx);
@@ -152,18 +214,35 @@ impl Music {
     }
 
     fn up_next_list_row(&mut self, row: usize, text: f32, cx: &mut Context<Self>) -> AnyElement {
-        match self.up_next_row(row) {
+        let layout = self.up_next_layout();
+        match layout.row(row) {
             UpNextRow::Queued(row) => self.queue_row(row, text, cx),
+            // The web spaces the label and filters further apart than a row;
+            // these two rows place them as it does, 22 px shorter overall.
             UpNextRow::AutoplayLabel => div()
                 .w_full()
                 .h(px(ROW_HEIGHT))
                 .px(px(12.))
-                .flex()
-                .items_center()
+                .pt(px(22.))
                 .text_size(px(text))
+                .line_height(px(20.))
                 .text_color(self.theme.muted)
                 .child("Autoplay is on")
                 .into_any_element(),
+            UpNextRow::AutoplayChips => {
+                let stops = (0..self.autoplay_chips.len())
+                    .map(|chip| self.queue_focus.handle(layout.chip_stop(chip), cx))
+                    .collect();
+                div()
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .pt(px(14.))
+                    .child(
+                        self.queue_chips(ChipSection::Autoplay, cx)
+                            .focus_handles(stops),
+                    )
+                    .into_any_element()
+            }
             UpNextRow::Autoplay(index) => self.autoplay_row(index, text, cx),
         }
     }
@@ -248,17 +327,39 @@ impl Music {
                             })),
                     ),
             )
-            .child(self.autoplay_switch(cx))
+            // A mix plays on without autoplay, so the web shows its filters instead.
+            .map(|header| {
+                if self.library.queue.chips.is_empty() {
+                    header.child(self.autoplay_switch(cx))
+                } else {
+                    // The web's 83 px chip cloud: 18 px above the chips and 33 px
+                    // below, which include its horizontal scrollbar. The chip
+                    // row's own focus-ring room adds 8 px below.
+                    header.child(
+                        div()
+                            .pt(px(18.))
+                            .pb(px(25.))
+                            .child(self.queue_chips(ChipSection::Queue, cx)),
+                    )
+                }
+            })
             .into_any_element()
     }
 
-    fn up_next_row(&self, row: usize) -> UpNextRow {
-        let queued = self.library.queue.tracks.len();
-        match row.checked_sub(queued) {
-            None => UpNextRow::Queued(row),
-            Some(0) => UpNextRow::AutoplayLabel,
-            Some(index) => UpNextRow::Autoplay(index - 1),
-        }
+    /// A mix's filters, as the web's 32 px chips.
+    fn queue_chips(&self, section: ChipSection, cx: &mut Context<Self>) -> ChipRow {
+        let (id, chips) = match section {
+            ChipSection::Queue => ("queue-chip", &self.library.queue.chips),
+            ChipSection::Autoplay => ("autoplay-chip", &self.autoplay_chips),
+        };
+        chip_row(id).children(chips.iter().enumerate().map(|(index, chip)| {
+            filter_chip((id, index), chip.label.clone(), chip.selected, self.theme)
+                .h(px(32.))
+                .when(!chip.selected, |chip| chip.bg(gpui::white().opacity(0.1)))
+                .on_click(
+                    cx.listener(move |view, _, _, cx| view.select_queue_chip(section, index, cx)),
+                )
+        }))
     }
 
     fn autoplay_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -432,9 +533,9 @@ impl Music {
         let Some(track) = self.autoplay_tracks.get(index).cloned() else {
             return div().h(px(ROW_HEIGHT)).into_any_element();
         };
-        let row = self.library.queue.tracks.len() + index;
-        let row_focus = self.queue_focus.handle(row * 2, cx);
-        let menu_focus = self.queue_focus.handle(row * 2 + 1, cx);
+        let stop = self.up_next_layout().autoplay_stop(index);
+        let row_focus = self.queue_focus.handle(stop, cx);
+        let menu_focus = self.queue_focus.handle(stop + 1, cx);
         let menu_track = track.clone();
         let menu = self.row_menu(
             ("autoplay-menu", index),
@@ -727,8 +828,28 @@ impl Music {
 
 #[cfg(test)]
 mod tests {
-    use super::Reorder;
+    use super::{Reorder, UpNextLayout, UpNextRow};
     use crate::{catalog::Track, library::Queue};
+
+    #[test]
+    fn keyboard_stops_reach_autoplay_filters_between_the_queue_and_its_songs() {
+        let layout = UpNextLayout {
+            queued: 2,
+            chips: 3,
+            autoplay: 2,
+        };
+        assert_eq!(layout.rows(), 2 + 1 + 1 + 2);
+        assert!(matches!(layout.row(3), UpNextRow::AutoplayChips));
+        assert!(matches!(layout.row(4), UpNextRow::Autoplay(0)));
+        assert_eq!(layout.stops(), 2 * 2 + 3 + 2 * 2);
+        // Each queued row and menu, the three filters, then each autoplay row and menu.
+        let rows: Vec<_> = (0..layout.stops())
+            .map(|stop| layout.stop_row(stop))
+            .collect();
+        assert_eq!(rows, [0, 0, 1, 1, 3, 3, 3, 4, 4, 5, 5]);
+        assert_eq!(layout.chip_stop(0), 4);
+        assert_eq!(layout.autoplay_stop(1), 9);
+    }
 
     #[test]
     fn dragged_rows_preview_exactly_the_order_they_drop_into() {

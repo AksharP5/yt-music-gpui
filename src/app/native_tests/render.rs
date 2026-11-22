@@ -2008,6 +2008,7 @@ async fn player_chrome(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 alternatives: None,
                 continuation: None,
                 source_target: None,
+                chips: Vec::new(),
                 shuffle: None,
             });
             music.select_player_tab(PlayerTab::UpNext, cx);

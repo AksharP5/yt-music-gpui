@@ -132,6 +132,7 @@ fn issued_queue_adoption_preserves_manual_edits_and_the_selected_occurrence() {
     let next = track("lmnopqrstuv");
     let watch = Watch {
         source_target: None,
+        chips: Vec::new(),
         shuffle: None,
         current: Some(seed.clone()),
         current_index: Some(1),
