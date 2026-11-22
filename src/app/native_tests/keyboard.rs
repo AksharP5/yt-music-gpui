@@ -120,6 +120,7 @@ mod focus_return {
         view.page.editable = true;
         view.page.privacy = Some("PRIVATE".into());
         view.page.shelves = vec![Shelf {
+            strapline: String::new(),
             title: String::new(),
             items: vec![Item::Track(track)],
             layout: ShelfLayout::Songs,

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 fn cards(count: usize) -> Shelf {
     Shelf {
+        strapline: String::new(),
         title: "Albums".into(),
         layout: ShelfLayout::Cards,
         more: None,

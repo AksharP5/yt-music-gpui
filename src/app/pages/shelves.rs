@@ -118,6 +118,7 @@ impl Music {
         if shelf.layout == ShelfLayout::Grid {
             return self.grid_shelf(index, inset, window, cx);
         }
+        let strapline = shelf.strapline.clone();
         let title = shelf.title.clone();
         let more = shelf.more.clone();
         let layout = shelf.layout;
@@ -291,7 +292,7 @@ impl Music {
             .gap(px(16.))
             .child(
                 div()
-                    .h(px(header_height))
+                    .min_h(px(header_height))
                     .flex()
                     .items_end()
                     .justify_between()
@@ -300,11 +301,27 @@ impl Music {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(px(heading_size))
-                            .line_height(relative(1.2))
-                            .font_weight(FontWeight::BOLD)
-                            .child(title),
+                            .when(!strapline.is_empty(), |heading| {
+                                let size = page.text_size();
+                                heading.child(
+                                    div()
+                                        .mb(px(2.))
+                                        .truncate()
+                                        .text_size(px(size))
+                                        // Chrome's normal line box for Roboto at 14 and 16px.
+                                        .line_height(px(if size >= 16. { 19. } else { 16. }))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(strapline),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(heading_size))
+                                    .line_height(relative(1.2))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(title),
+                            ),
                     )
                     .child(
                         div()

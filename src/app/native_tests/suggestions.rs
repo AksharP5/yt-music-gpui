@@ -273,6 +273,7 @@ fn related_playlist_cards_open_the_rendered_collection() -> Result<()> {
                     let read = view.catalog_requests.pending.try_recv().unwrap();
                     let mut suggestions = batch(view, "Suggestion");
                     suggestions.related = Some(vec![Shelf {
+                        strapline: String::new(),
                         title: "Related playlists".into(),
                         layout: ShelfLayout::Cards,
                         more: None,
