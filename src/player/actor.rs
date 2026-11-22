@@ -27,7 +27,6 @@ use std::{
         Arc,
         mpsc::{self, Receiver},
     },
-    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -174,39 +173,7 @@ pub(super) fn run(
     {
         resolver.warm_up(credentials.as_ref());
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut socket = loop {
-        match IpcStream::connect(&socket_path) {
-            Ok(socket) => break socket,
-            Err(_) if Instant::now() < deadline => {
-                ensure!(!core.is_shutdown(), "mpv exited during startup");
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error).context("mpv did not open its control socket"),
-        }
-    };
-    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-    // UI and MPRIS own volume. Delayed mpv acknowledgments must not
-    // replace the retained level with an earlier mute's zero.
-    for (id, name) in [
-        "time-pos",
-        "duration",
-        "pause",
-        "paused-for-cache",
-        "speed",
-        "demuxer-cache-time",
-    ]
-    .iter()
-    .enumerate()
-    {
-        write_command(&mut socket, json!(["observe_property", id + 1, name]), None)?;
-    }
-    // Position observers use 1 + 6n; reserve zero for seekability.
-    write_command(
-        &mut socket,
-        json!(["observe_property", 0, "seekable"]),
-        None,
-    )?;
+    let socket = core.connect(&socket_path)?;
     let mut actor = Actor {
         pending: Vec::new(),
         state: PlaybackState {
@@ -794,9 +761,12 @@ mod tests {
         mpv::tests::socket_message,
         ytdlp::tests::{signed_in, synthetic_credentials},
     };
-    use std::io::{Read, Write};
     #[cfg(unix)]
     use std::os::fd::{AsFd, AsRawFd};
+    use std::{
+        io::{Read, Write},
+        thread,
+    };
 
     #[cfg(unix)]
     #[test]

@@ -10,6 +10,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::atomic::{AtomicI64, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -137,6 +138,44 @@ impl MpvCore {
             name.to_string_lossy()
         );
         Ok(())
+    }
+
+    /// Open mpv's control socket and observe the properties the player reports.
+    pub(super) fn connect(&self, socket_path: &Path) -> Result<IpcStream> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            match IpcStream::connect(socket_path) {
+                Ok(socket) => break socket,
+                Err(_) if Instant::now() < deadline => {
+                    ensure!(!self.is_shutdown(), "mpv exited during startup");
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error).context("mpv did not open its control socket"),
+            }
+        };
+        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // UI and MPRIS own volume. Delayed mpv acknowledgments must not
+        // replace the retained level with an earlier mute's zero.
+        for (id, name) in [
+            "time-pos",
+            "duration",
+            "pause",
+            "paused-for-cache",
+            "speed",
+            "demuxer-cache-time",
+        ]
+        .iter()
+        .enumerate()
+        {
+            write_command(&mut socket, json!(["observe_property", id + 1, name]), None)?;
+        }
+        // Position observers use 1 + 6n; reserve zero for seekability.
+        write_command(
+            &mut socket,
+            json!(["observe_property", 0, "seekable"]),
+            None,
+        )?;
+        Ok(socket)
     }
 
     pub(super) fn is_shutdown(&self) -> bool {
@@ -803,7 +842,7 @@ pub(super) mod tests {
         AudioQuality, VideoQuality,
         stream::{ResolvedStream, StreamKey},
     };
-    use std::{thread, time::SystemTime};
+    use std::time::SystemTime;
 
     #[test]
     fn preparing_another_song_during_adoption_keeps_start_and_position_events() {
