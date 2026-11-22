@@ -146,6 +146,10 @@ pub(in crate::app) enum Tier {
     Huge,
 }
 
+/// The web keeps this strip of the window's right edge for its page scrollbar,
+/// beside the page and the header alike.
+pub(in crate::app) const SCROLLBAR_WIDTH: f32 = 12.;
+
 /// The centered content column every browse page shares, and the type and
 /// card sizes the web derives from it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -165,19 +169,20 @@ impl PageLayout {
             width if width < 1578. => Tier::Large,
             _ => Tier::Huge,
         };
+        // The page stops at the scrollbar, and its margins are equal within it.
+        let page = available - SCROLLBAR_WIDTH;
         let column = if tier >= Tier::Wide {
-            (available - 212.).min(1478.)
+            (page - 200.).min(1478.)
         } else if window < 616. {
-            available - 32.
+            page - 32.
         } else {
-            // 112px page margins plus the web's 12px scrollbar reservation.
-            available - 124.
+            page - 112.
         }
         .max(0.);
         Self {
             window,
             tier,
-            inset: (available - column) / 2.,
+            inset: (page - column) / 2.,
             column,
         }
     }
@@ -251,6 +256,11 @@ impl PageLayout {
         let header_left =
             ((self.column + 2. * self.inset - header - 40. - tracks) / 2. + 8.).max(0.);
         (header_left, header_left + header + 40.)
+    }
+
+    /// Left margin of the centered search column.
+    pub(in crate::app) fn search_inset(self) -> f32 {
+        (self.column + 2. * self.inset - self.search_width()) / 2.
     }
 
     /// The web narrows search results to a centered column.
@@ -462,7 +472,7 @@ impl Music {
         let layout = PageLayout::new(window, available);
         let search = matches!(self.route, Route::Search(_));
         let inset = if search {
-            (available - layout.search_width()) / 2.
+            layout.search_inset()
         } else {
             layout.inset
         };
@@ -480,6 +490,7 @@ impl Music {
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .pr(px(SCROLLBAR_WIDTH))
             .relative()
             .flex()
             .flex_col();

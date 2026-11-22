@@ -39,7 +39,6 @@ impl Music {
 
     pub(in crate::app) fn header(
         &mut self,
-        inset: f32,
         compact: bool,
         width: f32,
         cx: &Context<Self>,
@@ -47,44 +46,35 @@ impl Music {
         let avatar = self.account.is_some().then(|| self.account_avatar(26.));
         // Below 936px the web folds the search field into a button, except on the
         // search page, and opens it as a field over the left of the header.
-        let narrow = width < 936. && !matches!(self.route, Route::Search(_));
-        let account_inset = if narrow {
-            50.
-        } else if matches!(self.route, Route::Search(_)) {
-            if width < 936. {
+        let search = matches!(self.route, Route::Search(_));
+        let narrow = width < 936. && !search;
+        // The web's account controls keep this padding inside a header that,
+        // like the page, stops at the scrollbar.
+        let account_inset = pages::SCROLLBAR_WIDTH
+            + if width < 936. {
                 50.
-            } else if width < 1150. {
-                24.
-            } else {
+            } else if search {
                 68.
-            }
-        } else if width < 1150. && !compact {
-            if avatar.is_some() { 66. } else { 47. }
-        } else {
-            100.
-        };
+            } else {
+                100.
+            };
         let scrolled = self.page_scrolled();
         let guide_width = if compact { 72. } else { 240. };
+        let layout = pages::PageLayout::new(width, width - guide_width);
         let brand_width = if compact && width < 1150. {
             148.
         } else {
             guide_width
         };
-        let search_left = if matches!(self.route, Route::Search(_)) {
-            let layout = pages::PageLayout::new(width, width - guide_width);
-            // The web centers this column in the space before its 12px scrollbar.
-            guide_width + (width - guide_width - 12. - layout.search_width()) / 2. + 1.
+        let search_left = if search {
+            guide_width + layout.search_inset() + 1.
         } else if narrow {
             brand_width
         } else if compact && width < 1150. {
             // Below the wide breakpoint, center between the brand and account controls.
             brand_width + ((width - brand_width - 194. - crate::search_box::WIDTH) / 2.).max(0.)
-        } else if width >= 1578. {
-            // The web centers its column, at most 1478px wide, in the window less its
-            // 12px scrollbar, offset by half the guide.
-            (guide_width + inset).max((width - 12. + guide_width - 1478.) / 2.)
         } else {
-            guide_width + if width < 1150. { 56. } else { inset }
+            guide_width + layout.inset
         };
         // Only an expanded, unscrolled guide has its own header background.
         div()
@@ -177,17 +167,14 @@ impl Music {
                             })
                     })
                     // Signed in, the web keeps History here rather than in the library.
-                    .when(
-                        avatar.is_some() && !matches!(self.route, Route::Search(_)),
-                        |header| {
-                            header.child(button("history-nav", "history", self.theme).on_click(
-                                cx.listener(|view, _, window, cx| {
-                                    window.focus(&view.focus, cx);
-                                    view.navigate(Route::Recent, cx);
-                                }),
-                            ))
-                        },
-                    )
+                    .when(avatar.is_some() && !search, |header| {
+                        header.child(button("history-nav", "history", self.theme).on_click(
+                            cx.listener(|view, _, window, cx| {
+                                window.focus(&view.focus, cx);
+                                view.navigate(Route::Recent, cx);
+                            }),
+                        ))
+                    })
                     .when_some(avatar, |header, avatar| {
                         header.child(
                             div()
@@ -200,16 +187,10 @@ impl Music {
                                 .justify_center()
                                 .cursor_pointer()
                                 .child(avatar)
-                                .on_click(cx.listener(|view, _, window, cx| {
+                                .on_click(cx.listener(move |view, _, window, cx| {
                                     view.open_overlay(Overlay::Account, window, cx);
                                     view.overlay_anchor = Some(point(
-                                        window.viewport_size().width
-                                            - px(if matches!(view.route, Route::Search(_)) {
-                                                68.
-                                            } else {
-                                                100.
-                                            })
-                                            - px(300.),
+                                        window.viewport_size().width - px(account_inset + 300.),
                                         px(56.),
                                     ));
                                 })),
