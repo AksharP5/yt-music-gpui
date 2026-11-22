@@ -1846,12 +1846,17 @@ pub(crate) fn track_details(row: &Value, runs: &[&Value], video_id: &str) -> Tra
         .into_iter()
         .flatten()
     {
-        if let Some(id) = item
+        let link = item
             .pointer("/menuNavigationItemRenderer/navigationEndpoint/browseEndpoint/browseId")
-            .and_then(Value::as_str)
-            .filter(|id| id.starts_with("MPTC"))
-        {
+            .and_then(Value::as_str);
+        if let Some(id) = link.filter(|id| id.starts_with("MPTC")) {
             details.credits_id = Some(id.to_owned());
+        }
+        // Search rows name the album only in their menu's Go to album.
+        if details.album_id.is_none()
+            && let Some(id) = link.filter(|id| id.starts_with("MPRE"))
+        {
+            details.album_id = Some(id.to_owned());
         }
         let Some(menu) = item
             .get("toggleMenuServiceItemRenderer")
@@ -5451,6 +5456,18 @@ mod tests {
         let details = track_details(&row, &[], "abcdefghijk");
         assert_eq!(details.add_library.as_deref(), Some("add-song"));
         assert_eq!(details.remove_library.as_deref(), Some("remove-song"));
+    }
+
+    #[test]
+    fn a_search_rows_album_comes_from_its_go_to_album_action() {
+        let row = json!({"menu":{"menuRenderer":{"items":[
+            {"menuNavigationItemRenderer":{"text":{"runs":[{"text":"Go to album"}]},
+                "navigationEndpoint":{"browseEndpoint":{"browseId":"MPREb_stay"}}}},
+            {"menuNavigationItemRenderer":{"text":{"runs":[{"text":"Go to artist"}]},
+                "navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}}}
+        ]}}});
+        let details = track_details(&row, &[], "kTJczUoc26U");
+        assert_eq!(details.album_id.as_deref(), Some("MPREb_stay"));
     }
 
     #[test]

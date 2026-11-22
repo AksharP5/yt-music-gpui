@@ -1,7 +1,8 @@
 //! Desktop media controls: the app publishes now-playing state and receives
 //! commands from media keys and the desktop. Each platform serves them its own
-//! way; Linux uses MPRIS over D-Bus. macOS has no backend yet, so only
-//! Linux reads the published state.
+//! way: Linux uses MPRIS over D-Bus, and macOS uses Now Playing, which serves
+//! the transport and seeking but not volume, rate, repeat or shuffle. Windows
+//! has no backend yet.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use crate::{catalog::Track, library::Repeat, player::PlaybackSpeed};
@@ -17,7 +18,12 @@ mod mpris;
 #[cfg(target_os = "linux")]
 use mpris::serve;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+mod now_playing;
+#[cfg(target_os = "macos")]
+use now_playing::serve;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn serve(
     _: Arc<Mutex<Published>>,
     _: async_channel::Sender<Event>,
@@ -235,6 +241,9 @@ impl MediaControls {
             .unwrap_or_else(PoisonError::into_inner);
         let old = &published.state;
         let properties_changed = !old.same_properties(&state);
+        // macOS extrapolates the position itself, so it must hear when the clock
+        // stops or starts.
+        let clock_changed = cfg!(target_os = "macos") && old.advancing != state.advancing;
         if old.position != state.position
             || old.advancing != state.advancing
             || old.playback != state.playback
@@ -245,7 +254,7 @@ impl MediaControls {
         }
         published.state = state;
         drop(published);
-        if properties_changed {
+        if properties_changed || clock_changed {
             let _ = self.wake.try_send(());
         }
     }
@@ -348,6 +357,27 @@ mod tests {
         assert_eq!(
             published.position_at(published.sampled_at + Duration::from_secs(60)),
             60_000_000
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn now_playing_hears_when_the_clock_stops_and_starts() {
+        let (controls, _, updates) = MediaControls::unserved();
+        let mut state = playing();
+        controls.publish(state.clone());
+        updates.try_recv().unwrap();
+        state.advancing = false;
+        controls.publish(state.clone());
+        assert!(
+            updates.try_recv().is_ok(),
+            "buffering must stop the system clock"
+        );
+        state.advancing = true;
+        controls.publish(state);
+        assert!(
+            updates.try_recv().is_ok(),
+            "resuming must restart the system clock"
         );
     }
 }

@@ -1946,6 +1946,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "core-graphics 0.24.0",
+ "core-text",
  "derive_more",
  "dispatch2",
  "etagere",
@@ -1961,14 +1962,17 @@ dependencies = [
  "metal",
  "objc2 0.6.5",
  "objc2-core-foundation",
+ "objc2-core-text",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "objc2-security",
  "parking_lot",
+ "pathfinder_geometry",
  "smallvec",
  "thiserror 2.0.21",
+ "zed-font-kit",
 ]
 
 [[package]]
@@ -3482,6 +3486,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-text"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "objc2-core-video"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3535,6 +3549,20 @@ dependencies = [
  "bitflags 2.13.2",
  "objc2 0.6.5",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-media-player"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85f2a98483f6e76313cb85a5a185eaa3cda86a177b13a8852d56cbd0085bf635"
+dependencies = [
+ "bitflags 2.13.2",
+ "block2 0.6.2",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -6842,12 +6870,18 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
+ "block2 0.6.2",
  "cc",
  "getrandom 0.4.3",
  "gpui-pre",
  "gpui-pre-platform",
  "image",
  "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-media-player",
  "raw-window-handle",
  "reqwest",
  "serde",
