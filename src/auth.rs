@@ -747,7 +747,7 @@ pub(crate) fn private_runtime() -> Result<PathBuf> {
     Ok(runtime)
 }
 
-fn validate_private_runtime(runtime: &Path) -> Result<()> {
+pub(crate) fn validate_private_runtime(runtime: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(runtime)?;
     ensure!(
         runtime.is_absolute() && metadata.is_dir(),

@@ -37,7 +37,7 @@ A clicked song uses a native, cookie-free player request (`src/player/native.rs`
 
 Account playback uses an extractor (`src/ytdlp_account.py`) reviewed against one yt-dlp release, pinned in that file. With any other yt-dlp version, the app falls back to guest streams and says so. A weekly CI job tests each new yt-dlp release so the pin can be bumped. The app hands the account to the extractor as one JSON line on its stdin. Credentials never appear in an argument, an environment variable or a file.
 
-Playback sockets and the extractor live in a private directory under `$XDG_RUNTIME_DIR` (`$TMPDIR` on macOS, `%LOCALAPPDATA%\yt-music-gpui\runtime` on Windows), removed on normal shutdown, SIGTERM and SIGINT. The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json` (`%LOCALAPPDATA%\yt-music-gpui\library.json` on Windows).
+Playback sockets and the extractor live in a private directory under `$XDG_RUNTIME_DIR` (`/tmp` on macOS, where `$TMPDIR` can be too long for a socket path; `%LOCALAPPDATA%\yt-music-gpui\runtime` on Windows), removed on normal shutdown, SIGTERM and SIGINT. The queue, preferences and guest library live in `${XDG_DATA_HOME:-~/.local/share}/yt-music-gpui/library.json` (`%LOCALAPPDATA%\yt-music-gpui\library.json` on Windows).
 
 ### Profiling a packaged build
 
