@@ -314,7 +314,8 @@ fn related_playlist_cards_open_the_rendered_collection() -> Result<()> {
                         let row =
                             view.list_rows.len() - 1 + usize::from(view.detail_list.inline_header);
                         let bounds = view.detail_list.state.bounds_for_item(row).unwrap();
-                        assert!(carousel.bounds().size.width <= bounds.size.width + px(8.));
+                        let width = bounds.size.width - super::row_left(view, window);
+                        assert!(carousel.bounds().size.width <= width + px(8.));
                         assert!(carousel.max_offset().x > px(40.));
                         carousel.set_offset(point(px(-40.), px(0.)));
                         view.refresh_suggestions(cx);
@@ -356,7 +357,7 @@ fn related_playlist_cards_open_the_rendered_collection() -> Result<()> {
                 super::render::wait_for_presented_frame(window, cx).await;
             }
             let target = window
-                .update(cx, |view, _, _| {
+                .update(cx, |view, window, _| {
                     let row = view
                         .list_rows
                         .iter()
@@ -364,7 +365,8 @@ fn related_playlist_cards_open_the_rendered_collection() -> Result<()> {
                         .unwrap()
                         + usize::from(view.detail_list.inline_header);
                     let bounds = view.detail_list.state.bounds_for_item(row).unwrap();
-                    point(bounds.left() + px(24.), bounds.top() + px(110.))
+                    let left = bounds.left() + super::row_left(view, window);
+                    point(left + px(24.), bounds.top() + px(110.))
                 })
                 .unwrap();
             cx.update_window(window.into(), |_, window, cx| {

@@ -242,6 +242,15 @@ impl PageLayout {
         )
     }
 
+    /// Left edges of a stacked collection page's header column and of its rows,
+    /// which sit side by side, centered in the page.
+    pub(in crate::app) fn stacked_columns(self) -> (f32, f32) {
+        let (header, tracks, _) = self.collection_columns();
+        let header_left =
+            ((self.column + 2. * self.inset - header - 40. - tracks) / 2. + 8.).max(0.);
+        (header_left, header_left + header + 40.)
+    }
+
     /// The web narrows search results to a centered column.
     pub(in crate::app) fn search_width(self) -> f32 {
         match self.tier {
@@ -572,8 +581,7 @@ impl Music {
         let (header_width, list_width, cover) = layout.collection_columns();
         // Stacked pages scroll from anywhere in the page, like the web's document: the
         // list spans the page and its rows start past the header column.
-        let header_left = ((available - header_width - 40. - list_width) / 2. + 8.).max(0.);
-        let rows_left = header_left + header_width + 40.;
+        let (header_left, rows_left) = layout.stacked_columns();
         let stacked_row = move |row: AnyElement| {
             div()
                 .pl(px(rows_left))
