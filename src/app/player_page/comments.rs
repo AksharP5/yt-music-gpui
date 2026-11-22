@@ -1,7 +1,7 @@
 //! Comments UI. Only the song-details worker can perform its read continuations.
 
 use super::*;
-use crate::comments::{Page, Sort, Thread};
+use crate::comments::{Page, SignInPrompt, Sort, Thread};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Load {
@@ -15,7 +15,9 @@ enum Load {
 enum Control {
     Sort,
     SortOption(usize),
+    SignIn,
     Read(usize),
+    Reply(usize),
     Toggle(usize),
     More,
     Replies(usize),
@@ -67,6 +69,7 @@ pub(super) struct State {
     loaded: bool,
     retry: Option<(Load, Continuation)>,
     count: String,
+    sign_in: Option<SignInPrompt>,
     sorts: Vec<Sort>,
     sort_bounds: Rc<Cell<Bounds<Pixels>>>,
     entries: Vec<Entry>,
@@ -93,6 +96,7 @@ impl State {
             loaded: false,
             retry: None,
             count: "Comments".into(),
+            sign_in: None,
             sorts: Vec::new(),
             sort_bounds: Rc::new(Cell::new(Bounds::default())),
             entries: Vec::new(),
@@ -151,6 +155,9 @@ impl State {
                     if entry.long {
                         self.controls.push((row, Control::Read(index)));
                     }
+                    if self.sign_in.is_some() {
+                        self.controls.push((row, Control::Reply(index)));
+                    }
                     if !entry.replies_open
                         && (entry.thread.replies.is_some() || !entry.replies.is_empty())
                     {
@@ -163,8 +170,10 @@ impl State {
             }
         }
         self.focus.retain(|control, _| {
-            matches!(control, Control::Sort | Control::SortOption(_))
-                || self.controls.iter().any(|(_, wanted)| wanted == control)
+            matches!(
+                control,
+                Control::Sort | Control::SortOption(_) | Control::SignIn
+            ) || self.controls.iter().any(|(_, wanted)| wanted == control)
         });
         let top = self.list.logical_scroll_top();
         self.list.reset(self.rows.len());
@@ -331,6 +340,9 @@ impl State {
             }
             if let Some(count) = page.count {
                 self.count = count;
+            }
+            if page.sign_in.is_some() {
+                self.sign_in = page.sign_in;
             }
             if !page.sorts.is_empty() {
                 self.sorts = page.sorts;
@@ -536,6 +548,7 @@ impl Music {
             return related_message(message.into(), self.theme);
         }
         let count = state.count.clone();
+        let sign_in = state.sign_in.clone();
         let sorts = state
             .sorts
             .iter()
@@ -571,6 +584,34 @@ impl Music {
                     .handle(Control::SortOption(*index), cx)
             })
             .collect::<Vec<_>>();
+        // Like the web, a guest's comment field asks them to sign in.
+        let sign_in = sign_in.map(|prompt| {
+            let focus = self.player_page.comments.handle(Control::SignIn, cx);
+            div()
+                .id("comment-sign-in")
+                .track_focus(&focus)
+                .keyboard_control(self.theme)
+                // The web's field stops 16px short of a list that keeps 12px for its scrollbar.
+                .mr(px(28.))
+                .mb(px(32.))
+                .flex()
+                .gap(px(12.))
+                .cursor_text()
+                .child(self.art(prompt.avatar.as_deref(), 24., ArtworkShape::Circle))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pb(px(4.))
+                        .border_b_1()
+                        .border_color(gpui::white().opacity(0.2))
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .text_color(rgb(0xaaaaaa))
+                        .child(prompt.placeholder),
+                )
+                .on_click(cx.listener(|view, _, window, cx| view.connect_account(window, cx)))
+        });
         div()
             .relative()
             .id("comments-tab")
@@ -581,7 +622,7 @@ impl Music {
             .child(
                 div()
                     .pt(px(24.))
-                    .pb(px(32.))
+                    .pb(px(if sign_in.is_some() { 24. } else { 32. }))
                     .flex()
                     .items_center()
                     .gap(px(32.))
@@ -624,6 +665,7 @@ impl Music {
                         )
                     }),
             )
+            .children(sign_in)
             .when(menu, |body| {
                 body.child(
                     deferred(
@@ -983,6 +1025,12 @@ impl Music {
         let long = entry.long;
         let read_focus = long.then(|| self.player_page.comments.handle(Control::Read(index), cx));
         let toggle = (has_replies && !open).then(|| self.comment_reply_toggle(index, cx));
+        let reply_focus = self
+            .player_page
+            .comments
+            .sign_in
+            .is_some()
+            .then(|| self.player_page.comments.handle(Control::Reply(index), cx));
         let guides = self.comment_guides(index, Guide::Comment);
         let art = self.art(
             comment.avatar.as_deref(),
@@ -1068,7 +1116,8 @@ impl Music {
                                 })),
                         )
                     })
-                    // Reaction icons are deliberately plain elements, with no focus or write actions.
+                    // Reaction icons are deliberately plain elements, with no focus or write
+                    // actions. Reply only asks a guest to sign in, as the web's does.
                     .child(
                         div()
                             .mt(px(4.))
@@ -1104,7 +1153,28 @@ impl Music {
                                 "thumb-down",
                                 16.,
                                 rgb(0xf1f1f1).into(),
-                            ))),
+                            )))
+                            .when_some(reply_focus, |bar, focus| {
+                                bar.child(
+                                    div()
+                                        .id(("comment-reply", index))
+                                        .track_focus(&focus)
+                                        .keyboard_control(self.theme)
+                                        .ml(px(16.))
+                                        .h(px(32.))
+                                        .px(px(12.))
+                                        .rounded(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(gpui::white().opacity(0.1)))
+                                        .child("Reply")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.connect_account(window, cx)
+                                        })),
+                                )
+                            }),
                     )
                     .when_some(toggle, |body, toggle| {
                         body.child(div().h(px(48.)).pt(px(12.)).child(toggle))
@@ -1341,6 +1411,9 @@ mod tests {
                             println!("COMMENTS_PROFILE tab={tab:?} {}", String::from_utf8_lossy(&output.stdout));
                         }
                     }
+                    window.update(cx, |music, _, _| {
+                        assert!(music.player_page.comments.sign_in.is_some(), "Guests must see the sign-in comment entry");
+                    })?;
                     let sample = window.update(cx, |music, _, _| {
                         music.player_page.comments.roots.iter().copied()
                             .find(|index| music.player_page.comments.entries[*index].thread.comment.author == "@bdr8823")
@@ -1477,6 +1550,11 @@ mod tests {
                     window.update(cx, |music, _, _| assert!(music.player_page.comments.entries[0].expanded))?;
                     key(window, cx, "enter").await;
                     window.update(cx, |music, _, _| assert!(!music.player_page.comments.entries[0].expanded))?;
+                    // A guest's Reply sits between Read more and the replies toggle, as on the web.
+                    key(window, cx, "tab").await;
+                    window.update(cx, |music, window, _| {
+                        assert!(music.player_page.comments.focus[&Control::Reply(0)].is_focused(window));
+                    })?;
                     key(window, cx, "tab").await;
                     window.update(cx, |music, window, _| {
                         assert!(music.player_page.comments.focus[&Control::Toggle(0)].is_focused(window));
@@ -1526,6 +1604,10 @@ mod tests {
                         let state = &music.player_page.comments;
                         assert!(state.focus[&Control::Read(300)].is_focused(window));
                         assert!(state.rendered.contains(&300), "Focused comment must enter the rendered list");
+                    })?;
+                    key(window, cx, "tab").await;
+                    window.update(cx, |music, window, _| {
+                        assert!(music.player_page.comments.focus[&Control::Reply(300)].is_focused(window));
                     })?;
                     key(window, cx, "tab").await;
                     window.update(cx, |music, window, _| {
