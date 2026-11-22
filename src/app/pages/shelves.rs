@@ -56,7 +56,7 @@ fn measure_shelf_height(shelf: &Shelf, size: ShelfSize, window: &Window) -> f32 
             };
             let title = text_height(item.title(), size.width, FontWeight::MEDIUM, 2);
             let subtitle = text_height(
-                item.subtitle(),
+                item.card_subtitle(),
                 size.width - if explicit { 20. } else { 0. },
                 FontWeight::NORMAL,
                 size.subtitle_lines,

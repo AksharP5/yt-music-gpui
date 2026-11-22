@@ -330,7 +330,10 @@ impl Music {
         } else {
             2
         };
-        let subtitle = item.subtitle().to_owned();
+        let subtitle = item.card_subtitle().to_owned();
+        // Video cards keep a play glyph in the middle, as on the web, rather
+        // than revealing the hover play button.
+        let video = layout == ShelfLayout::Videos && matches!(item, Item::Track(_));
         let explicit = match &item {
             Item::Track(track) => track.details.explicit,
             Item::Collection(collection) => collection.details.explicit,
@@ -424,7 +427,17 @@ impl Music {
                 })),
             });
         }
-        if playable || !artist {
+        if video {
+            art = art.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("play", 48., self.theme.text)),
+            );
+        } else if playable || !artist {
             art = art.child(hover);
         }
         div()
