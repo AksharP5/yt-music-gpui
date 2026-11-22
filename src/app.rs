@@ -155,6 +155,7 @@ pub struct Music {
     queue_source: queue_source::Worker,
     queue_waiting: Option<QueueAdvance>,
     autoplay_tracks: VecDeque<Track>,
+    go_chord: interaction::GoChord,
     watch_pending: Option<PlaybackQuery>,
     song_text: song_text::Worker,
     artwork: Artwork,
