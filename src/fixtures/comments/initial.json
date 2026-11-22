@@ -6,6 +6,35 @@
         "continuationItems": [
           {
             "commentsHeaderRenderer": {
+              "createRenderer": {
+                "commentSimpleboxRenderer": {
+                  "authorThumbnail": {
+                    "thumbnails": [
+                      {
+                        "url": "https://yt3.ggpht.com/a/default-user=s48-c-k-c0x00ffffff-no-rj",
+                        "width": 48,
+                        "height": 48
+                      }
+                    ]
+                  },
+                  "placeholderText": {
+                    "runs": [
+                      {
+                        "text": "Add a comment..."
+                      }
+                    ]
+                  },
+                  "prepareAccountEndpoint": {
+                    "signInEndpoint": {
+                      "nextEndpoint": {
+                        "watchEndpoint": {
+                          "videoId": "video-id"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
               "countText": {
                 "runs": [
                   {

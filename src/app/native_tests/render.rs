@@ -134,8 +134,9 @@ async fn keyboard_survives_replacement_and_scrolls_lists(
         .unwrap();
     wait_for_presented_frame(window, cx).await;
     // At this narrow width: four header tab stops, three primary navigation
-    // controls, then the card. Both carousel arrows are disabled for one card.
-    for _ in 0..8 {
+    // controls, the guest's Sign in, then the card. Both carousel arrows are
+    // disabled for one card.
+    for _ in 0..9 {
         key(window, cx, "tab").await;
     }
     window
@@ -712,9 +713,10 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                         .unwrap();
                 }
             }
-            // Four header controls, three sidebar controls, three playlist
-            // actions, then the row, its two artists, its album and row actions.
-            for step in 0..if reverse { 14 } else { 12 + index } {
+            // Four header controls, three sidebar controls, the guest's Sign in,
+            // three playlist actions, then the row, its two artists, its album
+            // and row actions.
+            for step in 0..if reverse { 15 } else { 13 + index } {
                 key(window, cx, "tab").await;
                 if idle.is_some() && step == 3 {
                     window
@@ -722,7 +724,7 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                         .unwrap();
                 }
                 if let Some(idle) = &idle
-                    && step == 10
+                    && step == 11
                 {
                     let focused = window
                         .update(cx, |_, window, _| capture(window, "track-controls-focused"))
@@ -2469,7 +2471,9 @@ fn position_samples_only_render_the_player_bar() -> Result<()> {
                     window
                         .update(cx, |music, window, cx| {
                             if tab == PlayerTab::Comments {
-                                music.seed_comments_for_render();
+                                // Without the guest's comment field, Tab reaches the first
+                                // comment's controls without scrolling this short window.
+                                music.seed_comments_for_render(false);
                             }
                             music.select_player_tab(tab, cx);
                             // Earlier Tab presses can leave a focus ring in the page body.

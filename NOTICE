@@ -89,3 +89,6 @@ Copyright Google LLC. thumb-down-filled.svg rotates the filled thumb-up glyph.
 These replace the earlier Material Symbols source listed for those four files.
 The back.svg and forward.svg chevrons are project-drawn, sized to the web's
 8x12px carousel glyphs.
+
+assets/icons/sign-in.svg is the guide's sign-in glyph rendered by
+https://music.youtube.com/. Copyright Google LLC.
