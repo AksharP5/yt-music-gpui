@@ -728,7 +728,7 @@ async fn inline_links_follow_row_order(window: WindowHandle<Music>, cx: &mut Asy
                         .update(cx, |_, window, _| capture(window, "track-controls-focused"))
                         .unwrap();
                     let title = |image: &image::RgbaImage| {
-                        image::imageops::crop_imm(image, 210, 308, 400, 20).to_image()
+                        image::imageops::crop_imm(image, 210, 308, 300, 20).to_image()
                     };
                     let actions = |image: &image::RgbaImage| {
                         image::imageops::crop_imm(image, 675, 310, 110, 40).to_image()
@@ -1012,6 +1012,7 @@ async fn scrolled_artist_survives_tab(
             });
             for title in ["Albums", "Singles & EPs", "Videos"] {
                 music.page.shelves.push(Shelf {
+                    strapline: String::new(),
                     title: title.into(),
                     layout: ShelfLayout::Cards,
                     more: None,
@@ -1436,7 +1437,7 @@ async fn home_chips_and_narrow_error(window: WindowHandle<Music>, cx: &mut Async
         music.route = crate::app::Route::Home;
         music.catalog_requests.cancel(CatalogTarget::Page);
         music.page = crate::catalog::parse_home(&response, "Home").unwrap();
-        assert_eq!(music.page.chips.len(), 3);
+        assert_eq!(music.page.chips.len(), 2);
         music.page.shelves = crate::app::sync::tests::page(1, false).shelves;
         music.rebuild_rows();
         music.detail_list.state.scroll_to(gpui::ListOffset::default());
@@ -1655,6 +1656,7 @@ async fn responsive_explore(window: WindowHandle<Music>, cx: &mut AsyncApp) {
                 music.page.shelves.insert(
                     0,
                     Shelf {
+                        strapline: String::new(),
                         title: String::new(),
                         items: [
                             ("FEmusic_new_releases", "New releases"),

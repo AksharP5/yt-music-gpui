@@ -14,7 +14,11 @@ impl Music {
         let (Some(header), Route::Browse(link)) = (self.page.header.clone(), &self.route) else {
             return div().into_any_element();
         };
-        let (_, top) = hero_lines(self.page_layout(window).tier);
+        let tier = self.page_layout(window).tier;
+        let (_, top) = hero_lines(tier);
+        // Below 936px the web hides the description and stacks a wide
+        // Subscribe above Shuffle and Mix.
+        let narrow = tier == Tier::Narrow;
         let artist = Collection {
             id: link.id.clone(),
             title: self.page.title.clone(),
@@ -32,12 +36,7 @@ impl Music {
             cx,
             |_, _| false,
         );
-        let mut actions = div()
-            .mt(px(24.))
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(px(8.));
+        let mut actions = div().flex().items_center().flex_wrap().gap(px(8.));
         for (id, label, glyph, query) in [
             (
                 "artist-shuffle",
@@ -53,7 +52,7 @@ impl Music {
                         .id(id)
                         .keyboard_control(self.theme)
                         .w(px(136.))
-                        .h(px(36.))
+                        .h(px(40.))
                         .rounded_full()
                         .bg(rgb(0xf1f1f1))
                         .hover(|style| style.bg(rgb(0xd9d9d9)))
@@ -72,6 +71,7 @@ impl Music {
                 );
             }
         }
+        let mut subscription = None;
         if let Some(subscribed) = header.subscribed {
             let label = if header.subscription_label.is_empty() {
                 if subscribed {
@@ -89,55 +89,89 @@ impl Music {
                 format!("{label} {}", header.subscriber_count)
             };
             let accent: Hsla = rgb(0xff5577).into();
-            actions = actions.child(
-                div()
-                    .id("artist-subscribe")
-                    .keyboard_control(self.theme)
-                    .h(px(36.))
-                    .px(px(16.))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(if subscribed { self.theme.muted } else { accent })
-                    .text_color(if subscribed { self.theme.muted } else { accent })
-                    .font_weight(FontWeight::MEDIUM)
-                    .hover(|style| style.bg(gpui::white().opacity(0.1)))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .child(label)
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        window.focus(&view.focus, cx);
-                        if view.account.is_none() {
-                            view.connect_account(window, cx);
-                            return;
-                        }
-                        let Route::Browse(link) = &view.route else {
-                            return;
-                        };
-                        let collection = Collection {
-                            id: link.id.clone(),
-                            title: view.page.title.clone(),
-                            subtitle: String::new(),
-                            thumbnail: None,
-                            details: Default::default(),
-                        };
-                        view.mutate(
-                            Mutation::CollectionLibrary {
-                                collection,
-                                save: !subscribed,
-                            },
-                            cx,
-                        );
-                    })),
-            );
+            let subscribe = div()
+                .id("artist-subscribe")
+                .keyboard_control(self.theme)
+                .h(px(40.))
+                .px(px(15.))
+                .rounded_full()
+                .border_1()
+                .border_color(if subscribed { self.theme.muted } else { accent })
+                .text_color(if subscribed { self.theme.muted } else { accent })
+                .font_weight(FontWeight::MEDIUM)
+                .hover(|style| style.bg(gpui::white().opacity(0.1)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    window.focus(&view.focus, cx);
+                    if view.account.is_none() {
+                        view.connect_account(window, cx);
+                        return;
+                    }
+                    let Route::Browse(link) = &view.route else {
+                        return;
+                    };
+                    let collection = Collection {
+                        id: link.id.clone(),
+                        title: view.page.title.clone(),
+                        subtitle: String::new(),
+                        thumbnail: None,
+                        details: Default::default(),
+                    };
+                    view.mutate(
+                        Mutation::CollectionLibrary {
+                            collection,
+                            save: !subscribed,
+                        },
+                        cx,
+                    );
+                }));
+            subscription = Some(subscribe);
         }
-        actions = actions.child(
-            self.menu_button("artist-menu", cx, move |view, window, cx| {
-                view.open_collection_menu(artist.clone(), window, cx);
-            }),
-        );
+        let menu = self.menu_button("artist-menu", cx, move |view, window, cx| {
+            view.open_collection_menu(artist.clone(), window, cx);
+        });
+        // Shuffle and Mix are 136px with 8px after each, and the narrow
+        // Subscribe spans both.
+        let actions = match subscription {
+            Some(subscribe) if narrow => div()
+                .mt(px(16.))
+                .flex()
+                .flex_col()
+                .child(subscribe.w(px(288.)).mb(px(18.)))
+                .child(actions.child(menu)),
+            Some(subscribe) => div()
+                .mt(px(24.))
+                .child(actions.child(subscribe).child(menu)),
+            None => div()
+                .mt(px(if narrow { 16. } else { 24. }))
+                .child(actions.child(menu)),
+        };
         let open = *expanded.read(cx);
+        // The photo behind this heading is sized from the height the list
+        // measured for it last frame. When a resize or a loaded description
+        // changes that height, draw once more so the photo follows.
+        let drawn = self.hero_heading;
+        let music = cx.entity().downgrade();
+        let measure = canvas(
+            move |bounds, window, _| {
+                if drawn.is_some_and(|drawn| (drawn - bounds.size.height).abs() > px(0.5)) {
+                    let music = music.clone();
+                    window.on_next_frame(move |_, cx| {
+                        let _ = music.update(cx, |_, cx| cx.notify());
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
         div()
+            .relative()
+            .child(measure)
             .w_full()
             .px(px(inset))
             .pt(px(top))
@@ -161,7 +195,7 @@ impl Music {
                         .child(header.subtitle),
                 )
             })
-            .when(!self.page.description.is_empty(), |d| {
+            .when(!narrow && !self.page.description.is_empty(), |d| {
                 d.child(
                     div()
                         .mt(px(16.))
@@ -315,8 +349,10 @@ impl Music {
             return None;
         }
         // The hero spans the header and the artist heading in list row 0.
+        let heading = self.detail_list.state.bounds_for_item(0);
+        self.hero_heading = heading.map(|heading| heading.size.height);
         let url = self.page.header.as_ref()?.thumbnail.clone()?;
-        let Some(heading) = self.detail_list.state.bounds_for_item(0) else {
+        let Some(heading) = heading else {
             // Cached artwork has no completion event to redraw the content
             // after the new list measures its heading in this frame.
             if self.detail_list.state.logical_scroll_top().item_ix == 0 {

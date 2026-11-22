@@ -1074,6 +1074,7 @@ mod tests {
         }
         let mut page = crate::catalog::parse_page(&response, "Test playlist").unwrap();
         page.shelves = vec![Shelf {
+            strapline: String::new(),
             layout: crate::catalog::ShelfLayout::Songs,
             more: None,
             title: String::new(),
