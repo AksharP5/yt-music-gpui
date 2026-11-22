@@ -50,6 +50,7 @@ mod playback;
 mod player_bar;
 mod player_page;
 mod queue_panel;
+mod selection;
 mod sidebar;
 mod suggestions;
 mod sync;
@@ -172,6 +173,8 @@ pub struct Music {
     sort_focus: FocusHandle,
     /// A playlist's Find in playlist bar, which filters its loaded rows.
     playlist_find: Option<pages::PlaylistFind>,
+    /// Album and playlist songs ticked for the selection toolbar, in the order chosen.
+    selected_songs: Vec<Track>,
     video_fullscreen: bool,
     video_transparent: bool,
     video_error: Option<String>,

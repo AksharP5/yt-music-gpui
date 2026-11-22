@@ -497,6 +497,7 @@ impl Music {
         }
         self.clear_suggestions();
         self.playlist_find = None;
+        self.selected_songs.clear();
         if self.route != route {
             self.forward.clear();
             let state = self.take_navigation_state();
@@ -838,6 +839,7 @@ impl Music {
         self.focus_after_navigation(cx);
         self.clear_suggestions();
         self.playlist_find = None;
+        self.selected_songs.clear();
         let previous = self.take_navigation_state();
         match direction {
             NavigationDirection::Back => self.forward.push(previous),

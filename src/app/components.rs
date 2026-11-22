@@ -385,6 +385,8 @@ pub(in crate::app) fn tinted_button(
         "mute" => "Unmute",
         "plus" => "Add",
         "menu-save-playlist" => "Add to playlist",
+        "playlist-add" => "Save to playlist",
+        "menu-play-next" => "Play next",
         "bookmark" => "Save to library",
         "bookmark-filled" => "Remove from library",
         "back" => "Go back",
@@ -433,7 +435,7 @@ impl Music {
         let theme = self.theme;
         let menu_open = matches!(
             self.overlay,
-            Some(Overlay::Track { .. } | Overlay::Collection(_))
+            Some(Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Selection)
         );
         icon_button(id, "more", theme.text, theme)
             .when(!menu_open, |button| {

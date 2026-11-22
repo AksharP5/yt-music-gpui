@@ -32,6 +32,8 @@ pub(in crate::app) enum Overlay {
         queue_index: Option<usize>,
     },
     Collection(Collection),
+    /// The selection toolbar's More actions menu.
+    Selection,
     PlaylistPicker {
         /// One song from its menu, or the whole queue from Up next's Save.
         tracks: Vec<Track>,
@@ -82,6 +84,7 @@ impl Overlay {
             self,
             Self::Track { .. }
                 | Self::Collection(_)
+                | Self::Selection
                 | Self::Account
                 | Self::LibrarySort
                 | Self::PlaylistSort
@@ -383,7 +386,7 @@ impl Music {
                         .is_some_and(|episode| !episode.subtitle.is_empty()),
                 ),
             ),
-            Some(Overlay::Collection(_)) => Some(1),
+            Some(Overlay::Collection(_) | Overlay::Selection) => Some(1),
             _ => None,
         };
         if let Some(preamble) = menu_preamble {
@@ -431,6 +434,7 @@ impl Music {
             overlay,
             Overlay::Track { .. }
                 | Overlay::Collection(_)
+                | Overlay::Selection
                 | Overlay::LibrarySort
                 | Overlay::PlaylistSort
         );
@@ -684,7 +688,10 @@ impl Music {
                     .mb(px(24.))
                     .gap(px(12.))
                     .when(
-                        matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)),
+                        matches!(
+                            kind,
+                            Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Selection
+                        ),
                         |d| d.h(px(0.)).mb(px(0.)).overflow_hidden(),
                     )
                     .child(
@@ -713,6 +720,7 @@ impl Music {
                                 Overlay::DeletePlaylist { .. } => "Delete playlist?".into(),
                                 Overlay::NoKeyring(_) => "No keyring found".into(),
                                 Overlay::PlaylistForm { .. }
+                                | Overlay::Selection
                                 | Overlay::CountryPicker(_)
                                 | Overlay::LibrarySort
                                 | Overlay::PlaylistSort
@@ -722,7 +730,12 @@ impl Music {
                     .child(
                         button("close-overlay", "close", self.theme)
                             .when(
-                                matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)),
+                                matches!(
+                                    kind,
+                                    Overlay::Track { .. }
+                                        | Overlay::Collection(_)
+                                        | Overlay::Selection
+                                ),
                                 |button| button.tab_stop(false),
                             )
                             .on_click(
@@ -1215,6 +1228,8 @@ impl Music {
                     view.share_collection(&shared, window, cx)
                 }),
             );
+        } else if matches!(kind, Overlay::Selection) {
+            actions.extend(self.selection_actions(cx));
         } else if let Overlay::AlreadyAdded {
             id,
             video_ids,
@@ -1330,7 +1345,10 @@ impl Music {
                 );
             }
         }
-        if matches!(kind, Overlay::Track { .. } | Overlay::Collection(_)) {
+        if matches!(
+            kind,
+            Overlay::Track { .. } | Overlay::Collection(_) | Overlay::Selection
+        ) {
             let viewport = window.viewport_size();
             let menu = size(
                 px(MENU_WIDTH),
