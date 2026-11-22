@@ -60,6 +60,9 @@ impl AssetSource for Assets {
             ))),
             "close" => Some(Cow::Borrowed(include_bytes!("../assets/icons/close.svg"))),
             "back" => Some(Cow::Borrowed(include_bytes!("../assets/icons/back.svg"))),
+            "arrow-back" => Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/arrow-back.svg"
+            ))),
             "forward" => Some(Cow::Borrowed(include_bytes!("../assets/icons/forward.svg"))),
             "external" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/external.svg"

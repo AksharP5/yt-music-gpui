@@ -115,6 +115,8 @@ pub struct Music {
     sidebar_focus: VirtualListFocus,
     queue_focus: VirtualListFocus,
     search: Entity<SearchBox>,
+    /// Below 936px, whether the search button has opened its field.
+    search_open: bool,
     route: Route,
     page: Page,
     rows: Vec<Item>,

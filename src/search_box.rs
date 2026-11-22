@@ -25,6 +25,8 @@ pub enum SearchBoxEvent {
     Menu(Box<Item>),
     SessionRejected(Arc<Session>),
     Blur,
+    /// The narrow window's field closed, by its back arrow or by losing focus.
+    Collapse,
 }
 
 /// Looks up a cached thumbnail, requesting it when missing.
@@ -75,6 +77,9 @@ pub struct SearchBox {
     /// Like the web, typing or clicking the field opens the suggestions, and Escape, Tab or
     /// leaving the field closes them, keeping them for the next click.
     open: bool,
+    /// The field opened from the narrow window's search button: a back arrow
+    /// replaces the search icon, and leaving the field closes it.
+    back: bool,
     clear_focus: FocusHandle,
     artwork: Option<ArtworkLookup>,
     rating: Option<RatingLookup>,
@@ -123,7 +128,12 @@ impl SearchBox {
                     cx.emit(SearchBoxEvent::Blur);
                 }
             });
-        let blur = cx.on_blur(&focus, window, |view, _, cx| view.close(cx));
+        let blur = cx.on_blur(&focus, window, |view, window, cx| {
+            view.close(cx);
+            if view.back && !view.clear_focus.is_focused(window) {
+                cx.emit(SearchBoxEvent::Collapse);
+            }
+        });
         let activation = cx.observe_window_activation(window, |view, window, cx| {
             if !window.is_window_active() {
                 view.close(cx);
@@ -139,6 +149,7 @@ impl SearchBox {
             selected: None,
             hovered: None,
             open: false,
+            back: false,
             clear_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             artwork: None,
             rating: None,
@@ -150,6 +161,11 @@ impl SearchBox {
             trailing: None,
             _subscriptions: [subscription, blur, activation],
         }
+    }
+
+    pub fn set_back(&mut self, back: bool, cx: &mut Context<Self>) {
+        self.back = back;
+        cx.notify();
     }
 
     pub fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -748,7 +764,36 @@ impl Render for SearchBox {
             .gap(px(16.))
             .on_key_down(cx.listener(Self::key_down))
             .on_click(cx.listener(|view, _, window, cx| view.activate(window, cx)))
-            .child(icon(svg().path("search").size(px(20.)).flex_shrink_0()))
+            .when(!self.back, |view| {
+                view.child(icon(svg().path("search").size(px(20.)).flex_shrink_0()))
+            })
+            .when(self.back, |view| {
+                // The web's 32px back button sits 11px in, with the text at 53px.
+                view.pl(px(10.)).child(
+                    div()
+                        .id("search-back")
+                        .size(px(32.))
+                        .mr(px(-5.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|button| button.bg(gpui::white().opacity(0.1)))
+                        .child(
+                            svg()
+                                .path("arrow-back")
+                                .size(px(18.))
+                                .text_color(gpui::white()),
+                        )
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(SearchBoxEvent::Collapse);
+                        })),
+                )
+            })
             .child(div().flex_1().min_w_0().child(self.input.clone()))
             .when(!empty, |view| {
                 view.child(
