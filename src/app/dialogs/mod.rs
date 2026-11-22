@@ -4,6 +4,7 @@ pub(in crate::app) mod account;
 pub(in crate::app) mod credits;
 pub(in crate::app) mod settings;
 pub(in crate::app) mod share;
+pub(in crate::app) mod shortcuts;
 
 use super::*;
 use crate::playlist_choices::{ChoiceList, Destination};
@@ -609,6 +610,7 @@ impl Music {
                 return self.playlist_picker_dialog(window, cx);
             }
             Overlay::Share(share) => return self.share_dialog(share, cx),
+            Overlay::Help => return self.shortcuts_dialog(cx),
             _ => {}
         }
         if let Overlay::CountryPicker(picker) = kind {
@@ -658,8 +660,8 @@ impl Music {
                             .text_size(px(23.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(match kind {
-                                Overlay::Help => "Keyboard shortcuts".to_owned(),
-                                Overlay::Settings
+                                Overlay::Help
+                                | Overlay::Settings
                                 | Overlay::Account
                                 | Overlay::SignIn
                                 | Overlay::PlaylistPicker { .. }
@@ -695,19 +697,7 @@ impl Music {
             );
         let mut actions = Vec::new();
         let mut menu_extra = 0.;
-        if matches!(kind, Overlay::Help) {
-            for &(key, action) in super::interaction::SHORTCUTS {
-                body = body.child(
-                    div()
-                        .py(px(9.))
-                        .flex()
-                        .justify_between()
-                        .text_size(px(14.))
-                        .child(action)
-                        .child(div().text_color(self.theme.muted).child(key)),
-                );
-            }
-        } else if let Overlay::Description { title, text } = kind {
+        if let Overlay::Description { title, text } = kind {
             body = body
                 .child(
                     div()
