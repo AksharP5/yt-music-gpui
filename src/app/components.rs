@@ -518,7 +518,7 @@ pub(in crate::app) fn menu_chip(
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .child(label.into())
-        .child(icon("expand-more", 24., theme.text))
+        .child(icon("expand-more", 18., theme.text))
 }
 /// The volume slider, drawn as the web's: a 2 px track inset 16 px on each
 /// side of its 100 px box, grey with a white fill, and a 12 px round knob.

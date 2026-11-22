@@ -643,8 +643,7 @@ fn country_arrows_choose_the_highlighted_country_after_tabbing_into_rows() -> an
             .unwrap();
         wait_for_presented_frame(window, cx).await;
 
-        // Move through the input and onto the second country row.
-        key(window, cx, "tab").await;
+        // Tab onto the second country row.
         key(window, cx, "tab").await;
         key(window, cx, "tab").await;
         window
