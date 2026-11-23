@@ -1208,7 +1208,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         fs::write(
             &extractor,
             r#"#!/bin/sh
-if [ "$3" = --version ]; then echo 2026.08.19; exit; fi
+if [ "$3" = --version ]; then echo 2026.10.26; exit; fi
 exec python3 -c '
 import json, os, signal, sys
 from pathlib import Path
@@ -1392,7 +1392,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
     }
 
     #[test]
-    #[ignore = "requires Python with yt-dlp 2026.08.19; set YT_DLP_TEST_PYTHON if needed; no network"]
+    #[ignore = "requires Python with yt-dlp 2026.10.26; set YT_DLP_TEST_PYTHON if needed; no network"]
     fn embedded_extractor_binds_the_selected_account() {
         let runtime = tempfile::tempdir().unwrap();
         let plugin_dir = write_account_extractor(runtime.path()).unwrap();
@@ -1939,7 +1939,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let path = directory.path().join("silence?expire=1.wav");
         fs::rename(silent_audio(directory.path(), 120), &path).unwrap();
         let extractor = directory.path().join("extractor");
-        fs::write(&extractor, "#!/bin/sh\necho 2026.08.19\n").unwrap();
+        fs::write(&extractor, "#!/bin/sh\necho 2026.10.26\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
         let player = Player::with_extractor(
             PlayerOptions {
@@ -2000,7 +2000,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         fs::write(
             &extractor,
             format!(
-                "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\necho >> '{}'\nprintf 'file://%s\\n' '{}'\n",
+                "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.10.26; exit; fi\necho >> '{}'\nprintf 'file://%s\\n' '{}'\n",
                 calls.display(),
                 path.display()
             ),
@@ -2073,7 +2073,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let directory = tempfile::tempdir().unwrap();
         let path = silent_audio(directory.path(), 120);
         let extractor = directory.path().join("extractor");
-        fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
+        fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.10.26; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
         let player = Player::with_extractor(
             PlayerOptions {

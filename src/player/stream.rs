@@ -620,7 +620,7 @@ YtMusicAccountIE._real_extract = extract
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic account and process group, no network"]
+    #[ignore = "requires Python with yt-dlp 2026.10.26; synthetic account and process group, no network"]
     fn warm_resolver_reuses_requests_and_supersession_kills_the_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let plugin = synthetic_resolver_plugin(directory.path());
@@ -720,7 +720,7 @@ YtMusicAccountIE._real_extract = extract
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "requires Python with yt-dlp 2026.08.19; synthetic accounts, no network"]
+    #[ignore = "requires Python with yt-dlp 2026.10.26; synthetic accounts, no network"]
     fn warm_credential_change_respawns_with_the_new_account() {
         let directory = tempfile::tempdir().unwrap();
         let plugin = synthetic_resolver_plugin(directory.path());

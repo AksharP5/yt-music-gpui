@@ -634,7 +634,7 @@ pub(super) mod tests {
         let message = notice
             .take()
             .expect("fallback notice must wait for playback");
-        assert!(message.contains("2026.08.19"));
+        assert!(message.contains("2026.10.26"));
         assert!(message.contains("guest"));
         assert!(!message.contains("update yt-dlp"));
         assert!(
