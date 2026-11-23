@@ -28,6 +28,8 @@ use mpv::SeekRequest;
 use stream::{PreparedTarget, ResolverLane, StreamKey};
 #[cfg(all(test, unix))]
 pub(crate) use ytdlp::TEST_YTDLP;
+#[cfg(target_os = "macos")]
+pub(crate) use ytdlp::app_python;
 pub(crate) use ytdlp::{find_ytdlp, private_tool};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

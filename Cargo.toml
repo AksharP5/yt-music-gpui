@@ -45,6 +45,7 @@ objc2-media-player = { version = "0.3", default-features = false, features = [
     "MPRemoteCommandEvent",
 ] }
 security-framework = { version = "3", default-features = false }
+security-framework-sys = { version = "2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

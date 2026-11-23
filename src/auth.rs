@@ -1,5 +1,6 @@
 #[cfg(unix)]
 use crate::os::exit_with_parent;
+#[cfg(any(not(target_os = "macos"), test))]
 use crate::os::private_file;
 #[cfg(target_os = "linux")]
 use crate::os::sealed_file;
@@ -12,7 +13,7 @@ use sha1::{Digest, Sha1};
 use std::{
     ffi::OsStr,
     fs::{self, File},
-    io::{Read, Seek},
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -23,8 +24,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(any(not(target_os = "macos"), test))]
-use std::process::Output;
 #[cfg(unix)]
 use std::{
     fs::OpenOptions,
@@ -34,6 +33,8 @@ use std::{
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
 };
+#[cfg(any(not(target_os = "macos"), test))]
+use std::{io::Seek, process::Output};
 
 /// Sign-in copies a browser session into the Secret Service on Linux and the Keychain on macOS.
 pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
@@ -62,6 +63,8 @@ const KEYRING_ATTRIBUTES: [&str; 4] = [
 ];
 const KEYRING_PREFIX: &[u8] = b"yt-music-session-v1:";
 /// The app's generic password item in the user's default keychain.
+#[cfg(target_os = "macos")]
+use security_framework_sys::base::errSecItemNotFound;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "yt-music-gpui";
 #[cfg(target_os = "macos")]
@@ -222,7 +225,7 @@ impl Session {
             KEYCHAIN_ACCOUNT,
         )) {
             Ok(value) => KeyringLookup::Found(value),
-            Err(error) if error.code() == ITEM_NOT_FOUND => KeyringLookup::Absent,
+            Err(error) if error.code() == errSecItemNotFound => KeyringLookup::Absent,
             Err(_) => KeyringLookup::Failed,
         };
         Self::from_storage(lookup, crate::dirs::data().as_deref())
@@ -319,15 +322,7 @@ impl Session {
         #[cfg(not(target_os = "macos"))]
         clear_keyring(&KEYRING_ATTRIBUTES)?;
         #[cfg(target_os = "macos")]
-        match security_framework::passwords::delete_generic_password(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-        ) {
-            Err(error) if error.code() != ITEM_NOT_FOUND => {
-                return Err(error).context("Could not remove the saved account from the Keychain");
-            }
-            _ => {}
-        }
+        delete_from_keychain()?;
         crate::dirs::data().map_or(Ok(()), |directory| forget_saved(&directory))
     }
     pub(crate) fn resume_scope(&self) -> String {
@@ -587,19 +582,29 @@ fn store_in_keyring(value: &[u8]) -> Result<()> {
 }
 
 /// The item's access list holds only the app that created it, so another
-/// program, or a changed build of this one, must ask the user first.
+/// program, or a changed build of this one, must ask the user first. An
+/// existing item is replaced, never updated: an update keeps the old access
+/// list, which another program could have opened to everyone.
 #[cfg(target_os = "macos")]
 fn store_in_keyring(value: &[u8]) -> Result<()> {
     use security_framework::passwords::{PasswordOptions, set_generic_password_options};
+    delete_from_keychain()?;
     let mut options = PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
     options.set_label("YouTube Music GPUI");
     set_generic_password_options(value, options)
         .context("The macOS Keychain could not save the account")
 }
 
-/// errSecItemNotFound
 #[cfg(target_os = "macos")]
-const ITEM_NOT_FOUND: i32 = -25300;
+fn delete_from_keychain() -> Result<()> {
+    match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    {
+        Err(error) if error.code() != errSecItemNotFound => {
+            Err(error).context("Could not remove the saved account from the Keychain")
+        }
+        _ => Ok(()),
+    }
+}
 
 #[cfg(windows)]
 fn store_in_keyring(_: &[u8]) -> Result<()> {
@@ -718,6 +723,9 @@ fn clear_keyring(attributes: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The most an account helper may print.
+const OUTPUT_LIMIT: u64 = 1024 * 1024;
+
 impl AccountProcess {
     fn output(
         command: &mut Command,
@@ -728,29 +736,67 @@ impl AccountProcess {
             !operation.is_some_and(Operation::is_cancelled),
             "Account connection cancelled"
         );
+        // macOS has no RAM-backed file, and the browser reader prints the
+        // decrypted session, so its output stays in pipes, drained by threads.
+        #[cfg(target_os = "macos")]
+        {
+            fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
+                thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    if let Some(pipe) = pipe {
+                        // One byte past the limit is enough to refuse the output.
+                        let _ = pipe.take(OUTPUT_LIMIT + 1).read_to_end(&mut bytes);
+                    }
+                    bytes
+                })
+            }
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut process = Self::spawn(command)?;
+            let stdout = drain(process.0.stdout.take());
+            let stderr = drain(process.0.stderr.take());
+            let status = process.wait(timeout, operation)?;
+            let collect = |reader: thread::JoinHandle<Vec<u8>>| -> Result<Vec<u8>> {
+                let bytes = reader
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Could not read the account helper"))?;
+                ensure!(
+                    bytes.len() as u64 <= OUTPUT_LIMIT,
+                    "The account helper returned oversized data"
+                );
+                Ok(bytes)
+            };
+            Ok(std::process::Output {
+                status,
+                stdout: collect(stdout)?,
+                stderr: collect(stderr)?,
+            })
+        }
         // A keyring response can exceed pipe capacity while the user unlocks it.
-        let stdout = private_file()?;
-        let stderr = private_file()?;
-        command
-            .stdout(stdout.try_clone()?)
-            .stderr(stderr.try_clone()?);
-        let mut process = Self::spawn(command)?;
-        let status = process.wait(timeout, operation)?;
-        let read_output = |mut file: File| -> Result<Vec<u8>> {
-            ensure!(
-                file.metadata()?.len() <= 1024 * 1024,
-                "The account helper returned oversized data"
-            );
-            file.rewind()?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            Ok(bytes)
-        };
-        Ok(std::process::Output {
-            status,
-            stdout: read_output(stdout)?,
-            stderr: read_output(stderr)?,
-        })
+        #[cfg(not(target_os = "macos"))]
+        {
+            let stdout = private_file()?;
+            let stderr = private_file()?;
+            command
+                .stdout(stdout.try_clone()?)
+                .stderr(stderr.try_clone()?);
+            let mut process = Self::spawn(command)?;
+            let status = process.wait(timeout, operation)?;
+            let read_output = |mut file: File| -> Result<Vec<u8>> {
+                ensure!(
+                    file.metadata()?.len() <= OUTPUT_LIMIT,
+                    "The account helper returned oversized data"
+                );
+                file.rewind()?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            };
+            Ok(std::process::Output {
+                status,
+                stdout: read_output(stdout)?,
+                stderr: read_output(stderr)?,
+            })
+        }
     }
     fn spawn(command: &mut Command) -> Result<Self> {
         // Account helpers run only where sign-in is available.
@@ -1127,10 +1173,11 @@ fn browser_helper(
                 .context("Could not prepare the private browser session reader")
         })
         .transpose()?;
-    // The macOS app bundles its own Python; source builds use Apple's.
+    // The Safe Storage password unlocks every cookie and password the browser
+    // keeps, so only the app's own Python or Apple's ever receives it, never
+    // a copy in the home folder.
     #[cfg(target_os = "macos")]
-    let python = crate::player::private_tool("python/bin/python3")
-        .unwrap_or_else(|| "/usr/bin/python3".into());
+    let python = crate::player::app_python().unwrap_or_else(|| "/usr/bin/python3".into());
     #[cfg(not(target_os = "macos"))]
     let python = PathBuf::from("/usr/bin/python3");
     let mut command = Command::new(python);
@@ -1507,19 +1554,26 @@ mod tests {
             fs::canonicalize(OsStr::new(real_home.to_str().unwrap())).unwrap(),
             "Set HOME to a scratch home with its own login keychain"
         );
-        // The Security framework searches the user's keychain list, which follows HOME.
-        let list = Command::new("/usr/bin/security")
-            .args(["list-keychains", "-d", "user"])
-            .output()
-            .unwrap();
+        // The Security framework searches the user's keychain list and adds to
+        // the default keychain. Both follow HOME, unless its settings name others.
+        let security = |arguments: &[&str]| {
+            let output = Command::new("/usr/bin/security")
+                .args(arguments)
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
         let home = fs::canonicalize(&home).unwrap();
-        let keychains: Vec<_> = String::from_utf8(list.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| PathBuf::from(line.trim().trim_matches('"')))
-            .collect();
+        let keychains: Vec<_> = [
+            security(&["list-keychains", "-d", "user"]),
+            security(&["default-keychain", "-d", "user"]),
+        ]
+        .concat()
+        .lines()
+        .map(|line| PathBuf::from(line.trim().trim_matches('"')))
+        .collect();
         assert!(
-            !keychains.is_empty()
+            keychains.len() >= 2
                 && keychains
                     .iter()
                     .all(|path| fs::canonicalize(path).is_ok_and(|path| path.starts_with(&home))),
@@ -1527,6 +1581,34 @@ mod tests {
         );
         Session::disconnect().unwrap();
         assert!(Session::load(&Operation::default()).unwrap().is_none());
+        // Another program could plant the item first, open to every app and
+        // with another label. Saving must replace it, never write into it.
+        security(&[
+            "add-generic-password",
+            "-A",
+            "-l",
+            "Planted",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-w",
+            "planted",
+        ]);
+        session("SAPISID=first").save().unwrap();
+        let dump = security(&["dump-keychain", "-a"]);
+        let item = dump
+            .split("keychain: ")
+            .find(|item| item.contains("\"svce\"<blob>=\"yt-music-gpui\""))
+            .unwrap();
+        let decrypt = item
+            .split("entry ")
+            .find(|entry| entry.contains("decrypt"))
+            .unwrap();
+        assert!(
+            !decrypt.contains("applications: <null>"),
+            "Only the app may read the account: {decrypt}"
+        );
         for cookie in ["SAPISID=first", "SAPISID=rotated"] {
             session(cookie).save().unwrap();
             let saved = Session::load(&Operation::default()).unwrap().unwrap();
