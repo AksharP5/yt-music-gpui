@@ -83,7 +83,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 print_cli(format_args!(
-                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading the saved account\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts.\n"
+                    "YouTube Music GPUI\n\nUsage: yt-music-gpui [--guest | --connect]\n\n--guest          Start without reading the saved account\n--connect        Open your default browser and verify a YouTube account\n\nBrowser connection supports Zen, Firefox, Chromium, Google Chrome, Brave, Helium and, on macOS, Ardia. Cookie files are unsupported.\nCtrl K searches. Press ? in the app for all shortcuts.\n"
                 ));
                 return;
             }

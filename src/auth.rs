@@ -1107,6 +1107,7 @@ fn safe_storage_password(browser: &str) -> Result<Option<Vec<u8>>> {
         "Google Chrome" => ("Chrome Safe Storage", "Chrome"),
         "Brave" => ("Brave Safe Storage", "Brave"),
         "Helium" => ("Helium Storage Key", "Helium"),
+        "Ardia" => ("Ardia Safe Storage", "Ardia"),
         _ => return Ok(None),
     };
     generic_password(PasswordOptions::new_generic_password(service, account))
