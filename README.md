@@ -70,7 +70,7 @@ On macOS you can sign in for your library, playlists and history, and play audio
 
 ## Sign in
 
-Sign-in needs a supported default browser: Zen, Firefox, Chromium, Google Chrome, Brave or Helium. Safari isn't supported. On Linux the app saves your session in a Secret Service keyring such as GNOME Keyring or KWallet. Without one, it asks whether to save the session unencrypted in a file only your user can read, or keep you signed in until you quit. On macOS it saves the session in your Keychain. With Chromium, Google Chrome, Brave or Helium, macOS asks once whether the app may use the browser's Safe Storage key; choose **Allow**. After each app update, macOS asks for your login password once before the app can read its saved account; choose **Always Allow**.
+Sign-in needs a supported default browser: Zen, Firefox, Chromium, Google Chrome, Brave or Helium, or Ardia on macOS. Safari isn't supported. On Linux the app saves your session in a Secret Service keyring such as GNOME Keyring or KWallet. Without one, it asks whether to save the session unencrypted in a file only your user can read, or keep you signed in until you quit. On macOS it saves the session in your Keychain. With Chromium, Google Chrome, Brave, Helium or Ardia, macOS asks once whether the app may use the browser's Safe Storage key; choose **Allow**. After each app update, macOS asks for your login password once before the app can read its saved account; choose **Always Allow**.
 
 1. Choose **Sign in**.
 2. Sign in to YouTube Music in your browser.

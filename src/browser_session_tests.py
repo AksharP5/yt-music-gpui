@@ -282,6 +282,25 @@ connection.close()
             with self.assertRaisesRegex(ValueError, "decrypt"):
                 helper["youtube_cookies"]("Google Chrome", profile, Path(profile) / "snapshot")
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Keychain key derivation and CommonCrypto")
+    def test_ardia_reads_cookies_from_its_profile_root(self):
+        # Encrypted with `openssl enc -aes-128-cbc`, keyed by `openssl kdf PBKDF2` of "synthetic-ardia-storage"
+        # with 1003 rounds, and a SHA-256 host prefix, the format Ardia 0.2 writes.
+        value = b"v10" + bytes.fromhex(
+            "6be6978b3cd6205f7c905ea0a2a6915285384d1ecf9cdbd7ef16a4968e81df4f7db1ba885a2e9755933e9044a3ba0cd0")
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            root = home / "Library/Application Support/com.ardia.browser/Chromium"
+            (root / "Default").mkdir(parents=True)
+            (root / "Local State").write_text("{}")
+            profile = helper["default_profile"]("com.ardia.browser", home, home / ".config")
+            # Ardia keeps Cookies in the profile root, not in Network/.
+            database = self.chromium_profile(profile["path"], 24, [(".youtube.com", "", "SAPISID", value, "/", 0)])
+            database.rename(Path(profile["path"]) / "Cookies")
+            self.keyring(b"synthetic-ardia-storage")
+            cookies = helper["youtube_cookies"](profile["browser"], profile["path"], home / "snapshot")
+            self.assertEqual([(cookie["name"], cookie["value"]) for cookie in cookies], [("SAPISID", "ardia-sapisid")])
+
     def test_snapshot_rejects_oversized_database(self):
         with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as snapshot:
             database = Path(profile) / "cookies.sqlite"

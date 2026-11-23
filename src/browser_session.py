@@ -31,12 +31,13 @@ MACOS = {
     "com.google.Chrome": ("Google Chrome", "Google/Chrome"),
     "com.brave.Browser": ("Brave", "BraveSoftware/Brave-Browser"),
     "net.imput.helium": ("Helium", "net.imput.helium"),
+    "com.ardia.browser": ("Ardia", "com.ardia.browser/Chromium"),
 }
 UNAMBIGUOUS = "The browser has no unambiguous default profile. Set its default profile and retry."
 UNDECRYPTABLE = "Could not decrypt the browser's YouTube session. " + (
     "Allow access to the browser's Keychain item and retry." if sys.platform == "darwin"
     else "Unlock your desktop keyring and retry.")
-UNSUPPORTED = ("Browser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. "
+UNSUPPORTED = ("Browser connection supports Zen, Firefox, Chromium, Google Chrome, Brave, Helium and, on macOS, Ardia. "
                "Your default browser is not supported.")
 
 
@@ -316,12 +317,14 @@ def youtube_cookies(browser, profile, snapshot):
     profile = Path(profile)
     if browser in ("Zen", "Firefox"):
         database, read = profile / "cookies.sqlite", read_firefox_cookies
-    elif browser in CHROMIUM:
+    elif browser in CHROMIUM or browser == "Ardia":
         # Chromium 96 moved the database into Network/; some builds still use the profile root.
         database = profile / "Network/Cookies"
         if not database.exists():
             database = profile / "Cookies"
-        read = functools.partial(read_chromium_cookies, application=CHROMIUM[browser][2])
+        # Ardia is macOS-only, so it has no Secret Service application.
+        application = CHROMIUM[browser][2] if browser in CHROMIUM else None
+        read = functools.partial(read_chromium_cookies, application=application)
     else:
         raise ValueError("Unknown browser.")
     try:
