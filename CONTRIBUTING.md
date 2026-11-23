@@ -12,7 +12,7 @@ sudo pacman -S --needed git rust base-devel mpv yt-dlp deno libglvnd wayland lib
 
 On Debian and Ubuntu, [the CI setup](.github/actions/setup/action.yml) lists the packages to install. Sign-in also needs Python 3, xdg-utils and libsecret's `secret-tool`, and saves accounts in a running Secret Service keyring.
 
-On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. See [Release](#release) to package it as an app. Source builds use Homebrew's libmpv; the macOS app ships an LGPL libmpv built from source (see [Release](#release)). The macOS build plays signed-out audio and video; sign-in is Linux-only for now. Media keys and Control Center's Now Playing work on macOS, and CI checks the build on Apple Silicon with macOS 15.
+On macOS, install Xcode's command line tools and `brew install mpv yt-dlp deno`, then build with `cargo build --release --locked`. See [Release](#release) to package it as an app. Source builds use Homebrew's libmpv; the macOS app ships an LGPL libmpv built from source (see [Release](#release)). On macOS, sign-in runs the browser reader with Apple's `/usr/bin/python3` from the command line tools; the app uses its bundled Python. Media keys and Control Center's Now Playing work on macOS, and CI checks the build on Apple Silicon with macOS 15.
 
 On Windows, install Rust with the MSVC toolchain, build with `cargo build --release --locked`, and put `libmpv-2.dll` from mpv's release `libmpv-*-x86_64-w64-mingw32-lgpl.zip` next to the executable or on `PATH`; [the CI setup](.github/actions/setup/action.yml) pins the one CI uses. yt-dlp and Deno come from `PATH`. The Windows build also plays signed-out audio only, and CI checks it on Windows Server 2025.
 
@@ -73,6 +73,7 @@ No test signs in to a real Google account. Do not add one that does. Use synthet
 - **libmpv** (`plays_with_the_installed_libmpv`) checks the player's options against the installed libmpv with a short silent file.
 - **`live_*` tests** call public YouTube Music endpoints as a guest. The one exception is `catalog::tests::live_owned_playlist_suggestions`, which reads with your saved account and needs `YT_MUSIC_LIVE_PLAYLIST` set to an editable playlist's `VLPL…` browse ID. It sends no edits and does not save refreshed credentials.
 - **Keyring and browser tests** (`live_keyring_removal_is_idempotent`, `live_default_browser_profile_resolves_omarchy_launcher`) use your desktop session. They create only a synthetic keyring entry and read only browser profile metadata.
+- **macOS Keychain** (`live_keychain_saves_reads_and_forgets_the_account`) saves, reads and removes a synthetic account under the app's real item name, so it refuses to run unless `HOME` is a scratch home that holds every keychain on its search list. Create one with `HOME=$scratch security create-keychain -p PASSWORD $scratch/Library/Keychains/login.keychain`, which becomes that home's default, then run `CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" HOME="$scratch" bin/test -- --ignored --exact auth::tests::live_keychain_saves_reads_and_forgets_the_account` and remove the folder afterwards.
 
 ### Native window tests
 

@@ -52,7 +52,6 @@ jobs:
           player::tests::embedded_extractor_binds_the_selected_account
 
   # Builds and plays audio on Apple Silicon with the LGPL libmpv the app ships.
-  # Sign-in is Linux-only so far.
   macos:
     runs-on: macos-15
     steps:

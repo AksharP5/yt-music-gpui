@@ -14,7 +14,7 @@ use std::{
     fs::{self, File},
     io::{Read, Seek},
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -23,6 +23,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(any(not(target_os = "macos"), test))]
+use std::process::Output;
 #[cfg(unix)]
 use std::{
     fs::OpenOptions,
@@ -33,8 +35,8 @@ use std::{
     },
 };
 
-/// Sign-in copies a browser session into the Secret Service, which only Linux has.
-pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(target_os = "linux");
+/// Sign-in copies a browser session into the Secret Service on Linux and the Keychain on macOS.
+pub const ACCOUNT_LOGIN_ENABLED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 pub const ORIGIN: &str = "https://music.youtube.com";
 pub type SharedSession = Arc<RwLock<Option<Arc<Session>>>>;
 
@@ -51,6 +53,7 @@ impl Operation {
         !self.is_cancelled() && Arc::ptr_eq(&self.0, &other.0)
     }
 }
+#[cfg(not(target_os = "macos"))]
 const KEYRING_ATTRIBUTES: [&str; 4] = [
     "application",
     "yt-music-gpui",
@@ -58,6 +61,33 @@ const KEYRING_ATTRIBUTES: [&str; 4] = [
     "youtube-session",
 ];
 const KEYRING_PREFIX: &[u8] = b"yt-music-session-v1:";
+/// The app's generic password item in the user's default keychain.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "yt-music-gpui";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "youtube-session";
+
+/// What the keyring returned for the saved account.
+enum KeyringLookup {
+    Found(Vec<u8>),
+    Absent,
+    /// The keyring could not be read: it is locked, refused access or is not running.
+    Failed,
+}
+
+impl KeyringLookup {
+    #[cfg(any(not(target_os = "macos"), test))]
+    fn from_secret_tool(output: &Output) -> Self {
+        // A silent status 1 means the keyring has no account.
+        if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+            Self::Absent
+        } else if output.status.success() {
+            Self::Found(output.stdout.clone())
+        } else {
+            Self::Failed
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RejectedSession;
@@ -83,6 +113,7 @@ impl std::fmt::Display for KeyringUnavailable {
 impl std::error::Error for KeyringUnavailable {}
 
 /// secret-tool names the Secret Service bus name only when it cannot reach that service.
+#[cfg(not(target_os = "macos"))]
 fn secret_service_missing(output: &Output) -> bool {
     !output.status.success()
         && String::from_utf8_lossy(&output.stderr).contains("org.freedesktop.secrets")
@@ -167,6 +198,7 @@ impl Session {
     }
 
     /// Called on the account worker. The OS keyring may ask the user to unlock it.
+    #[cfg(not(target_os = "macos"))]
     pub fn load(operation: &Operation) -> Result<Option<Self>> {
         let mut command = Command::new("/usr/bin/secret-tool");
         command
@@ -175,10 +207,28 @@ impl Session {
             .stdin(Stdio::null());
         let output =
             AccountProcess::output(&mut command, Some(operation), Duration::from_secs(30))?;
-        Self::from_storage(&output, crate::dirs::data().as_deref())
+        Self::from_storage(
+            KeyringLookup::from_secret_tool(&output),
+            crate::dirs::data().as_deref(),
+        )
+    }
+    /// Called on the account worker. macOS may ask the user to unlock the
+    /// keychain, or to allow this build of the app to read its item.
+    #[cfg(target_os = "macos")]
+    pub fn load(_: &Operation) -> Result<Option<Self>> {
+        use security_framework::passwords::{PasswordOptions, generic_password};
+        let lookup = match generic_password(PasswordOptions::new_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+        )) {
+            Ok(value) => KeyringLookup::Found(value),
+            Err(error) if error.code() == ITEM_NOT_FOUND => KeyringLookup::Absent,
+            Err(_) => KeyringLookup::Failed,
+        };
+        Self::from_storage(lookup, crate::dirs::data().as_deref())
     }
     /// The keyring wins; the session file is read only when the keyring has no account.
-    fn from_storage(lookup: &Output, directory: Option<&Path>) -> Result<Option<Self>> {
+    fn from_storage(lookup: KeyringLookup, directory: Option<&Path>) -> Result<Option<Self>> {
         let Some(directory) = directory else {
             return Self::from_lookup(lookup, None);
         };
@@ -189,22 +239,20 @@ impl Session {
     }
     /// Without a keyring service, a lookup fails even for people who never signed in.
     /// The marker tells a failure that may hide a saved account apart from that.
-    fn from_lookup(output: &Output, marker: Option<&Path>) -> Result<Option<Self>> {
-        if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
-            // The keyring has no account, for example after deleting it in a keyring app.
-            if let Some(marker) = marker {
-                let _ = remove_if_present(marker);
+    fn from_lookup(lookup: KeyringLookup, marker: Option<&Path>) -> Result<Option<Self>> {
+        let value = match lookup {
+            KeyringLookup::Found(value) => value,
+            KeyringLookup::Absent => {
+                // The keyring has no account, for example after deleting it in a keyring app.
+                if let Some(marker) = marker {
+                    let _ = remove_if_present(marker);
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-        if !output.status.success() && !marker.is_some_and(Path::exists) {
-            return Ok(None);
-        }
-        ensure!(
-            output.status.success(),
-            "Could not unlock the saved YouTube Music account"
-        );
-        let session = Self::from_saved(&output.stdout)?;
+            KeyringLookup::Failed if !marker.is_some_and(Path::exists) => return Ok(None),
+            KeyringLookup::Failed => bail!("Could not unlock the saved YouTube Music account"),
+        };
+        let session = Self::from_saved(&value)?;
         // Accounts saved before the marker existed get it on their next start.
         record_saved_account(marker);
         Ok(Some(session))
@@ -268,7 +316,18 @@ impl Session {
         remove_if_present(&directory.join(MARKER)).context("Could not forget the saved account")
     }
     pub fn disconnect() -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
         clear_keyring(&KEYRING_ATTRIBUTES)?;
+        #[cfg(target_os = "macos")]
+        match security_framework::passwords::delete_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+        ) {
+            Err(error) if error.code() != ITEM_NOT_FOUND => {
+                return Err(error).context("Could not remove the saved account from the Keychain");
+            }
+            _ => {}
+        }
         crate::dirs::data().map_or(Ok(()), |directory| forget_saved(&directory))
     }
     pub(crate) fn resume_scope(&self) -> String {
@@ -527,7 +586,22 @@ fn store_in_keyring(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The item's access list holds only the app that created it, so another
+/// program, or a changed build of this one, must ask the user first.
+#[cfg(target_os = "macos")]
+fn store_in_keyring(value: &[u8]) -> Result<()> {
+    use security_framework::passwords::{PasswordOptions, set_generic_password_options};
+    let mut options = PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
+    options.set_label("YouTube Music GPUI");
+    set_generic_password_options(value, options)
+        .context("The macOS Keychain could not save the account")
+}
+
+/// errSecItemNotFound
+#[cfg(target_os = "macos")]
+const ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(windows)]
 fn store_in_keyring(_: &[u8]) -> Result<()> {
     bail!("Sign-in isn't available on this system yet")
 }
@@ -627,6 +701,7 @@ fn record_saved_account(marker: Option<&Path>) {
         });
 }
 
+#[cfg(not(target_os = "macos"))]
 fn clear_keyring(attributes: &[&str]) -> Result<()> {
     let mut command = Command::new("/usr/bin/secret-tool");
     command.arg("clear").args(attributes).stdin(Stdio::null());
@@ -758,8 +833,9 @@ pub(crate) fn validate_private_runtime(runtime: &Path) -> Result<()> {
         metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
         "The desktop runtime directory must be private to your user"
     );
-    // macOS has no tmpfs. Nothing secret is written there: credentials reach
-    // helpers over stdin, and browser sessions are read only on Linux.
+    // macOS has no tmpfs. Credentials reach helpers over stdin. Only a cookie
+    // database the browser holds locked is copied there, owner-only, and
+    // deleted as soon as it is read.
     #[cfg(target_os = "linux")]
     {
         let runtime_name = std::ffi::CString::new(runtime.as_os_str().as_encoded_bytes())?;
@@ -897,17 +973,26 @@ impl BrowserProfile {
     /// That request authorizes reading its session when the user returns.
     pub fn open(operation: &Operation) -> Result<Self> {
         ensure!(ACCOUNT_LOGIN_ENABLED, "Account connection is unavailable");
+        #[cfg(target_os = "linux")]
         ensure!(
             Path::new("/usr/bin/secret-tool").is_file(),
             "Account connection requires the desktop OS keyring"
         );
         let desktop = default_browser(operation)?;
-        let profile =
-            serde_json::from_slice(&browser_helper("profile", &[desktop.as_ref()], operation)?)
-                .context("Could not identify the default browser profile")?;
+        let profile = serde_json::from_slice(&browser_helper(
+            "profile",
+            &[desktop.as_ref()],
+            None,
+            operation,
+        )?)
+        .context("Could not identify the default browser profile")?;
         ensure!(!operation.is_cancelled(), "Account connection cancelled");
-        // xdg-open reuses the normal browser. It is user-owned and must outlive us.
-        let mut opener = Command::new("/usr/bin/xdg-open")
+        // The opener reuses the normal browser. It is user-owned and must outlive us.
+        #[cfg(target_os = "macos")]
+        let opener = "/usr/bin/open";
+        #[cfg(not(target_os = "macos"))]
+        let opener = "/usr/bin/xdg-open";
+        let mut opener = Command::new(opener)
             .arg(ORIGIN)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -922,9 +1007,14 @@ impl BrowserProfile {
 
     /// Read the named profile after consent, including refresh of its confirmed account.
     pub fn read_session(&self, operation: &Operation) -> Result<Session> {
+        #[cfg(target_os = "macos")]
+        let safe_storage = safe_storage_password(&self.browser)?;
+        #[cfg(not(target_os = "macos"))]
+        let safe_storage = None;
         let cookies: Vec<Cookie> = serde_json::from_slice(&browser_helper(
             "cookies",
             &[self.browser.as_ref(), self.path.as_os_str()],
+            safe_storage.as_deref(),
             operation,
         )?)
         .context("The browser returned an unreadable YouTube session")?;
@@ -960,6 +1050,41 @@ impl BrowserProfile {
     }
 }
 
+/// macOS encrypts a Chromium-family browser's cookies with a password in the
+/// user's keychain. The app reads it itself, so macOS asks on the app's behalf
+/// and "Always Allow" trusts only this app, never a shared tool like Python.
+#[cfg(target_os = "macos")]
+fn safe_storage_password(browser: &str) -> Result<Option<Vec<u8>>> {
+    use security_framework::passwords::{PasswordOptions, generic_password};
+    let (service, account) = match browser {
+        "Chromium" => ("Chromium Safe Storage", "Chromium"),
+        "Google Chrome" => ("Chrome Safe Storage", "Chrome"),
+        "Brave" => ("Brave Safe Storage", "Brave"),
+        "Helium" => ("Helium Storage Key", "Helium"),
+        _ => return Ok(None),
+    };
+    generic_password(PasswordOptions::new_generic_password(service, account))
+        .map(Some)
+        .with_context(|| {
+            format!("Could not read the browser's \"{service}\" key from your Keychain. Allow access and retry.")
+        })
+}
+
+/// The bundle identifier of the app that opens web links.
+#[cfg(target_os = "macos")]
+fn default_browser(_: &Operation) -> Result<String> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSBundle, NSString, NSURL};
+    let url = NSURL::URLWithString(&NSString::from_str(ORIGIN))
+        .context("Could not identify your default browser")?;
+    NSWorkspace::sharedWorkspace()
+        .URLForApplicationToOpenURL(&url)
+        .and_then(|app| NSBundle::bundleWithURL(&app)?.bundleIdentifier())
+        .map(|identifier| identifier.to_string())
+        .context("Could not identify your default browser")
+}
+
+#[cfg(not(target_os = "macos"))]
 fn default_browser(operation: &Operation) -> Result<String> {
     let mut command = Command::new("/usr/bin/xdg-settings");
     command.args(["get", "default-web-browser"]);
@@ -986,7 +1111,13 @@ fn default_browser(operation: &Operation) -> Result<String> {
     Ok(desktop)
 }
 
-fn browser_helper(mode: &str, values: &[&OsStr], operation: &Operation) -> Result<Vec<u8>> {
+/// `secret` reaches the helper on its stdin.
+fn browser_helper(
+    mode: &str,
+    values: &[&OsStr],
+    secret: Option<&[u8]>,
+    operation: &Operation,
+) -> Result<Vec<u8>> {
     // Rust owns cleanup even if cancellation kills the helper during a locked-DB read.
     let snapshot = (mode == "cookies")
         .then(|| {
@@ -996,11 +1127,27 @@ fn browser_helper(mode: &str, values: &[&OsStr], operation: &Operation) -> Resul
                 .context("Could not prepare the private browser session reader")
         })
         .transpose()?;
-    let mut command = Command::new("/usr/bin/python3");
+    // The macOS app bundles its own Python; source builds use Apple's.
+    #[cfg(target_os = "macos")]
+    let python = crate::player::private_tool("python/bin/python3")
+        .unwrap_or_else(|| "/usr/bin/python3".into());
+    #[cfg(not(target_os = "macos"))]
+    let python = PathBuf::from("/usr/bin/python3");
+    let mut command = Command::new(python);
     command
         .args(["-I", "-c", include_str!("browser_session.py"), mode])
-        .args(values)
-        .stdin(Stdio::null());
+        .args(values);
+    match secret {
+        Some(secret) => {
+            // A few bytes fit in the pipe, so this never waits for the helper.
+            let (input, mut writer) = std::io::pipe()?;
+            std::io::Write::write_all(&mut writer, secret)?;
+            command.stdin(input);
+        }
+        None => {
+            command.stdin(Stdio::null());
+        }
+    }
     if let Some(snapshot) = &snapshot {
         command.arg(snapshot.path());
     }
@@ -1152,14 +1299,21 @@ mod tests {
             desktop != "omarchy-browser.desktop",
             "Launcher was not resolved"
         );
-        let _: BrowserProfile =
-            serde_json::from_slice(&browser_helper("profile", &[desktop.as_ref()], &operation)?)?;
+        let _: BrowserProfile = serde_json::from_slice(&browser_helper(
+            "profile",
+            &[desktop.as_ref()],
+            None,
+            &operation,
+        )?)?;
         Ok(())
     }
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn browser_reader_uses_configured_profile_and_scoped_read_only_wal() {
-        let mut source = sealed_file(include_bytes!("browser_session.py")).unwrap();
+        let mut source = private_file().unwrap();
+        source
+            .write_all(include_bytes!("browser_session.py"))
+            .unwrap();
         source.rewind().unwrap();
         let output = Command::new("/usr/bin/python3")
             .args(["-I", "-c", include_str!("browser_session_tests.py")])
@@ -1341,6 +1495,48 @@ mod tests {
         );
     }
     #[test]
+    #[ignore = "saves, reads and removes a synthetic account; runs only when HOME is a scratch home whose keychains are all inside it"]
+    #[cfg(target_os = "macos")]
+    fn live_keychain_saves_reads_and_forgets_the_account() {
+        // The item has a fixed name, so a run against the real home would replace a saved account.
+        let real_home =
+            unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::geteuid())).pw_dir) };
+        let home = std::env::var_os("HOME").unwrap();
+        assert_ne!(
+            fs::canonicalize(&home).unwrap(),
+            fs::canonicalize(OsStr::new(real_home.to_str().unwrap())).unwrap(),
+            "Set HOME to a scratch home with its own login keychain"
+        );
+        // The Security framework searches the user's keychain list, which follows HOME.
+        let list = Command::new("/usr/bin/security")
+            .args(["list-keychains", "-d", "user"])
+            .output()
+            .unwrap();
+        let home = fs::canonicalize(&home).unwrap();
+        let keychains: Vec<_> = String::from_utf8(list.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| PathBuf::from(line.trim().trim_matches('"')))
+            .collect();
+        assert!(
+            !keychains.is_empty()
+                && keychains
+                    .iter()
+                    .all(|path| fs::canonicalize(path).is_ok_and(|path| path.starts_with(&home))),
+            "Every keychain the test can reach must be inside the scratch HOME: {keychains:?}"
+        );
+        Session::disconnect().unwrap();
+        assert!(Session::load(&Operation::default()).unwrap().is_none());
+        for cookie in ["SAPISID=first", "SAPISID=rotated"] {
+            session(cookie).save().unwrap();
+            let saved = Session::load(&Operation::default()).unwrap().unwrap();
+            assert_eq!(saved.cookie, cookie);
+        }
+        Session::disconnect().unwrap();
+        assert!(Session::load(&Operation::default()).unwrap().is_none());
+        Session::disconnect().unwrap();
+    }
+    #[test]
     #[ignore = "requires the desktop Secret Service; uses only a unique synthetic test entry"]
     #[cfg(target_os = "linux")]
     fn live_keyring_removal_is_idempotent() {
@@ -1447,38 +1643,47 @@ mod tests {
             b"secret-tool: The name org.freedesktop.secrets was not provided by any .service files\n",
         );
         assert!(
-            Session::from_lookup(&no_service, Some(&marker))
+            Session::from_lookup(KeyringLookup::from_secret_tool(&no_service), Some(&marker))
                 .unwrap()
                 .is_none(),
             "Someone who never signed in has no account to unlock"
         );
         assert!(
-            Session::from_lookup(&output(1, b"", b""), Some(&marker))
-                .unwrap()
-                .is_none()
+            Session::from_lookup(
+                KeyringLookup::from_secret_tool(&output(1, b"", b"")),
+                Some(&marker)
+            )
+            .unwrap()
+            .is_none()
         );
 
         let saved = session("SAPISID=synthetic").saved_value().unwrap();
         assert!(
-            Session::from_lookup(&output(0, &saved, b""), Some(&marker))
-                .unwrap()
-                .is_some()
+            Session::from_lookup(
+                KeyringLookup::from_secret_tool(&output(0, &saved, b"")),
+                Some(&marker)
+            )
+            .unwrap()
+            .is_some()
         );
         assert!(
             marker.exists(),
             "A readable saved account records the marker"
         );
         assert_eq!(
-            Session::from_lookup(&no_service, Some(&marker))
+            Session::from_lookup(KeyringLookup::from_secret_tool(&no_service), Some(&marker))
                 .err()
                 .map(|error| error.to_string())
                 .as_deref(),
             Some("Could not unlock the saved YouTube Music account")
         );
         assert!(
-            Session::from_lookup(&output(1, b"", b""), Some(&marker))
-                .unwrap()
-                .is_none()
+            Session::from_lookup(
+                KeyringLookup::from_secret_tool(&output(1, b"", b"")),
+                Some(&marker)
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
             !marker.exists(),
@@ -1568,9 +1773,12 @@ mod tests {
             (output(1, b"", b""), "SAPISID=file"),
             (output(0, &keyring, b""), "SAPISID=keyring"),
         ] {
-            let restored = Session::from_storage(&lookup, Some(directory.path()))
-                .unwrap()
-                .unwrap();
+            let restored = Session::from_storage(
+                KeyringLookup::from_secret_tool(&lookup),
+                Some(directory.path()),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(restored.cookie, expected);
         }
     }
