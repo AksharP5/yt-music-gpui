@@ -54,7 +54,8 @@ def report_player_response(ydl):
     """Return a function that reports what the player needs from the last
     request's player responses, which yt-dlp drops: the loudness YouTube sent
     for the selected audio format, so the player can level volume the way
-    YouTube Music does, and the caption tracks, which the player validates.
+    YouTube Music does, and the first caption tracks the player can fetch,
+    which it validates.
 
     The returned function also forgets the request. Each field is None when
     it is missing or this yt-dlp version extracts differently.
@@ -112,11 +113,16 @@ def report_player_response(ydl):
             pass
         return None
 
+    def needs_po_token(track):
+        # Like yt-dlp: these tracks return an empty body without a PO token, which the player can't supply.
+        experiments = parse_qs(urlsplit(track.get('baseUrl') or '').query).get('exp', [])
+        return any(name in ('xpe', 'xpv') for value in experiments for name in value.split(','))
+
     def captions():
         try:
             for response in responses:
                 renderer = (response.get('captions') or {}).get('playerCaptionsTracklistRenderer') or {}
-                if not renderer.get('captionTracks'):
+                if not renderer.get('captionTracks') or any(map(needs_po_token, renderer['captionTracks'])):
                     continue
                 return {
                     'captionTracks': [{name: track.get(name) for name in ('baseUrl', 'languageCode', 'kind')}

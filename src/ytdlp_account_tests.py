@@ -266,6 +266,12 @@ YoutubeIE._extract_player_responses = lambda self, *args, **kwargs: ([{
     'streamingData': {'adaptiveFormats': [{'itag': 251, 'loudnessDb': 2.5}]},
     'playerConfig': {'audioConfig': {'loudnessDb': float('nan'), 'loudnessTargetLkfs': -14}},
 }, {
+    # Web clients' tracks need a PO token and come back empty without one.
+    'captions': {'playerCaptionsTracklistRenderer': {
+        'captionTracks': [{'baseUrl': 'https://www.youtube.com/api/timedtext?exp=xpo,xwmhp,xpe&lang=en',
+                           'languageCode': 'en'}],
+    }},
+}, {
     'captions': {'playerCaptionsTracklistRenderer': {
         'captionTracks': [{'baseUrl': 'https://www.youtube.com/api/timedtext?lang=en', 'languageCode': 'en',
                            'name': {'runs': [{'text': 'English'}]}}],
