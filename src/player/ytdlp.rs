@@ -436,6 +436,13 @@ pub(crate) fn private_tool(name: &str) -> Option<PathBuf> {
         .map(|(path, ..)| path)
 }
 
+/// The Python inside the running macOS app, never a copy in the home folder.
+#[cfg(target_os = "macos")]
+pub(crate) fn app_python() -> Option<PathBuf> {
+    let (resources, _) = bundled_helpers(&std::env::current_exe().ok()?)?;
+    private_tool("python/bin/python3").filter(|python| python.starts_with(&resources))
+}
+
 // Where the running executable's own helpers live, by platform layout, and the
 // directory they are checked up to. On Linux only the package binary has
 // bundled helpers: /usr/bin/yt-music-gpui uses /usr/lib/yt-music-gpui. After a

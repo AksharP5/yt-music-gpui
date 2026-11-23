@@ -23,11 +23,26 @@ CHROMIUM = {
     # Helium keeps Chromium's unbranded Safe Storage item, so its application is "chromium".
     "Helium": (("helium.desktop", "net.imput.helium.desktop"), "net.imput.helium", "chromium"),
 }
+# Bundle identifier: (browser, user data directory under ~/Library/Application Support).
+MACOS = {
+    "app.zen-browser.zen": ("Zen", "zen"),
+    "org.mozilla.firefox": ("Firefox", "Firefox"),
+    "org.chromium.Chromium": ("Chromium", "Chromium"),
+    "com.google.Chrome": ("Google Chrome", "Google/Chrome"),
+    "com.brave.Browser": ("Brave", "BraveSoftware/Brave-Browser"),
+    "net.imput.helium": ("Helium", "net.imput.helium"),
+}
 UNAMBIGUOUS = "The browser has no unambiguous default profile. Set its default profile and retry."
-UNDECRYPTABLE = "Could not decrypt the browser's YouTube session. Unlock your desktop keyring and retry."
+UNDECRYPTABLE = "Could not decrypt the browser's YouTube session. " + (
+    "Allow access to the browser's Keychain item and retry." if sys.platform == "darwin"
+    else "Unlock your desktop keyring and retry.")
+UNSUPPORTED = ("Browser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. "
+               "Your default browser is not supported.")
 
 
 def default_profile(desktop, home, config):
+    if sys.platform == "darwin":
+        return macos_profile(desktop, home / "Library/Application Support")
     if desktop in ("zen.desktop", "zen-browser.desktop", "app.zen_browser.zen.desktop"):
         return firefox_profile("Zen", (config / "zen", home / ".zen"))
     if desktop in ("firefox.desktop", "org.mozilla.firefox.desktop"):
@@ -35,8 +50,17 @@ def default_profile(desktop, home, config):
     for browser, (desktops, directory, _) in CHROMIUM.items():
         if desktop in desktops:
             return chromium_profile(browser, config / directory)
-    raise ValueError("Browser connection supports Zen, Firefox, Chromium, Google Chrome, Brave and Helium. "
-                     "Your default browser is not supported.")
+    raise ValueError(UNSUPPORTED)
+
+
+def macos_profile(bundle, support):
+    # Safari keeps its cookies where only apps with Full Disk Access can read them.
+    if bundle not in MACOS:
+        raise ValueError(UNSUPPORTED)
+    browser, directory = MACOS[bundle]
+    if browser in ("Zen", "Firefox"):
+        return firefox_profile(browser, (support / directory,))
+    return chromium_profile(browser, support / directory)
 
 
 def chromium_profile(browser, root):
@@ -154,12 +178,23 @@ def decrypt_chromium_value(application, version, domain, value, encrypted):
 
 @functools.cache
 def chromium_key(application, prefix):
+    if sys.platform == "darwin":
+        # macOS uses only v10, keyed by the keychain's Safe Storage password.
+        if prefix != b"v10":
+            raise ValueError("The browser encrypts cookies in an unsupported format.")
+        return hashlib.pbkdf2_hmac("sha1", safe_storage_password(application), b"saltysalt", 1003, 16)
     # v10 uses Chromium's fixed fallback password; v11 uses the Secret Service "Safe Storage" item.
     password = b"peanuts" if prefix == b"v10" else safe_storage_password(application)
     return hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1, 16)
 
 
 def safe_storage_password(application):
+    if sys.platform == "darwin":
+        # The app reads the keychain item itself and sends the password on stdin.
+        password = sys.stdin.buffer.read(1024)
+        if not password:
+            raise ValueError(UNDECRYPTABLE)
+        return password
     result = subprocess.run(["/usr/bin/secret-tool", "lookup", "application", application],
                             stdin=subprocess.DEVNULL, capture_output=True, timeout=25)
     if result.returncode != 0 or not result.stdout:
@@ -183,9 +218,7 @@ def openssl():
     return crypto
 
 
-def aes_128_cbc_decrypt(key, ciphertext):
-    if not ciphertext or len(ciphertext) % 16:
-        raise ValueError(UNDECRYPTABLE)
+def openssl_decrypt(key, ciphertext):
     crypto = openssl()
     context = crypto.EVP_CIPHER_CTX_new()
     if not context:
@@ -193,16 +226,38 @@ def aes_128_cbc_decrypt(key, ciphertext):
     output = ctypes.create_string_buffer(len(ciphertext))
     written = ctypes.c_int()
     try:
-        # Chromium uses a fixed IV of 16 spaces and PKCS#7 padding, checked below.
         decrypted = (crypto.EVP_DecryptInit_ex(context, crypto.EVP_aes_128_cbc(), None, key, b" " * 16) == 1
                      and crypto.EVP_CIPHER_CTX_set_padding(context, 0) == 1
                      and crypto.EVP_DecryptUpdate(context, output, ctypes.byref(written),
                                                   ciphertext, len(ciphertext)) == 1)
     finally:
         crypto.EVP_CIPHER_CTX_free(context)
-    plaintext = output.raw
-    padding = plaintext[-1]
-    if not decrypted or written.value != len(ciphertext) or not 1 <= padding <= 16 \
+    return output.raw[:written.value] if decrypted else b""
+
+
+def common_crypto_decrypt(key, ciphertext):
+    # macOS has no system libcrypto for apps; CommonCrypto is part of libSystem.
+    crypt = ctypes.CDLL("/usr/lib/libSystem.B.dylib").CCCrypt
+    crypt.restype = ctypes.c_int32
+    crypt.argtypes = (ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
+                      ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t,
+                      ctypes.POINTER(ctypes.c_size_t))
+    output = ctypes.create_string_buffer(len(ciphertext))
+    written = ctypes.c_size_t()
+    # kCCDecrypt, kCCAlgorithmAES, no padding option: the padding is checked by the caller.
+    status = crypt(1, 0, 0, key, len(key), b" " * 16, ciphertext, len(ciphertext),
+                   output, len(ciphertext), ctypes.byref(written))
+    return output.raw[:written.value] if status == 0 else b""
+
+
+def aes_128_cbc_decrypt(key, ciphertext):
+    if not ciphertext or len(ciphertext) % 16:
+        raise ValueError(UNDECRYPTABLE)
+    # Chromium uses a fixed IV of 16 spaces and PKCS#7 padding, checked below.
+    decrypt = common_crypto_decrypt if sys.platform == "darwin" else openssl_decrypt
+    plaintext = decrypt(key, ciphertext)
+    padding = plaintext[-1] if plaintext else 0
+    if len(plaintext) != len(ciphertext) or not 1 <= padding <= 16 \
             or plaintext[-padding:] != bytes([padding]) * padding:
         raise ValueError(UNDECRYPTABLE)
     return plaintext[:-padding]
@@ -272,7 +327,11 @@ def youtube_cookies(browser, profile, snapshot):
     try:
         return read(database)
     except sqlite3.OperationalError as error:
-        if error.sqlite_errorcode & 0xff not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        # Apple's Python 3.9, which macOS source builds use, has no SQLite error codes.
+        code = getattr(error, "sqlite_errorcode", None)
+        busy = code & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) if code is not None \
+            else "locked" in str(error)
+        if not busy:
             raise
     # SQLite rebuilds the WAL index and recovers a hot journal on this copy only.
     return read(snapshot_database(database, Path(snapshot)), mode="rw")

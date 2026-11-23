@@ -13,6 +13,7 @@ exec(compile(sys.stdin.read(), "browser_session.py", "exec"), helper)
 
 
 class BrowserSessionTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "darwin", "Linux browser layout and keyring")
     def test_install_default_wins_over_legacy_profile_default(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -122,6 +123,7 @@ connection.close()
                 finally:
                     writer.communicate("q", timeout=5)
 
+    @unittest.skipIf(sys.platform == "darwin", "Linux browser layout and keyring")
     def test_chromium_default_profile_is_the_last_used_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -165,6 +167,7 @@ connection.close()
         helper["safe_storage_password"] = lambda application: lookups.append(application) or password
         return lookups
 
+    @unittest.skipIf(sys.platform == "darwin", "Linux browser layout and keyring")
     def test_chromium_cookies_decrypt_v11_keyring_and_v10_fallback_values(self):
         # Encrypted with `openssl enc -aes-128-cbc` using Chromium's key derivation and IV.
         # v11: keyring password "synthetic-safe-storage"; v10: Chromium's fixed password.
@@ -206,6 +209,7 @@ connection.close()
                 snapshot.mkdir()
                 self.assertEqual(helper["youtube_cookies"]("Google Chrome", profile, snapshot), cookies)
 
+    @unittest.skipIf(sys.platform == "darwin", "Linux browser layout and keyring")
     def test_chromium_values_bound_to_another_host_or_key_are_rejected(self):
         keyring_value = b"v11" + bytes.fromhex(
             "17f911b7385fa70e4798db5cb6372e68ddbc329eed3cb9bd5f65b6e36d08947f8a1b6ce029fd87b07591b838f9cafe67")
@@ -216,6 +220,7 @@ connection.close()
                 with self.assertRaisesRegex(ValueError, "decrypt"):
                     helper["youtube_cookies"]("Chromium", profile, Path(profile) / "snapshot")
 
+    @unittest.skipIf(sys.platform == "darwin", "Linux browser layout and keyring")
     def test_chromium_cookies_before_version_24_have_no_host_prefix(self):
         legacy_value = b"v11" + bytes.fromhex("e4b28f92b6254c10848c12f6856fd5fa")
         with tempfile.TemporaryDirectory() as profile:
@@ -225,6 +230,7 @@ connection.close()
             self.assertEqual([(cookie["name"], cookie["value"]) for cookie in cookies], [("SAPISID", "legacy-sapisid")])
             self.assertEqual(lookups, ["brave"])
 
+    @unittest.skipIf(sys.platform == "darwin", "Linux browser layout and keyring")
     def test_helium_reads_its_profile_with_the_chromium_safe_storage_key(self):
         keyring_value = b"v11" + bytes.fromhex(
             "17f911b7385fa70e4798db5cb6372e68ddbc329eed3cb9bd5f65b6e36d08947f8a1b6ce029fd87b07591b838f9cafe67")
@@ -241,6 +247,40 @@ connection.close()
             cookies = helper["youtube_cookies"]("Helium", profile["path"], Path(temporary) / "snapshot")
             self.assertEqual([(cookie["name"], cookie["value"]) for cookie in cookies], [("SAPISID", "keyring-sapisid")])
             self.assertEqual(lookups, ["chromium"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS browser layout")
+    def test_macos_default_browser_resolves_its_profile_and_safari_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            support = home / "Library/Application Support"
+            for bundle, (browser, directory) in helper["MACOS"].items():
+                root = support / directory
+                (root / "Default").mkdir(parents=True)
+                if browser in ("Zen", "Firefox"):
+                    (root / "profiles.ini").write_text("[Profile0]\nName=Music\nPath=Default\nIsRelative=1\nDefault=1\n")
+                else:
+                    (root / "Local State").write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Music"}}}}))
+                profile = helper["default_profile"](bundle, home, home / ".config")
+                self.assertEqual(profile, {"browser": browser, "name": "Music", "path": str((root / "Default").resolve())})
+            for bundle in ("com.apple.Safari", "org.mozilla.firefox.evil"):
+                with self.assertRaisesRegex(ValueError, "not supported"):
+                    helper["default_profile"](bundle, home, home / ".config")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Keychain key derivation and CommonCrypto")
+    def test_macos_chromium_cookies_use_the_keychain_password(self):
+        # Encrypted with `openssl enc -aes-128-cbc`: PBKDF2-SHA1 of "synthetic-safe-storage" with
+        # 1003 rounds, as Chromium does on macOS, and a SHA-256 host prefix (database version 24).
+        value = b"v10" + bytes.fromhex(
+            "2545d8e39da1a18b5b4aa2b75a5e92bece6e2529d9e533850c4760d1fc19c7773be063f8c28dab2f65b6a3b1bef12188")
+        with tempfile.TemporaryDirectory() as profile:
+            self.chromium_profile(profile, 24, [(".youtube.com", "", "SAPISID", value, "/", 0)])
+            lookups = self.keyring(b"synthetic-safe-storage")
+            cookies = helper["youtube_cookies"]("Google Chrome", profile, Path(profile) / "snapshot")
+            self.assertEqual([(cookie["name"], cookie["value"]) for cookie in cookies], [("SAPISID", "keyring-sapisid")])
+            self.assertEqual(lookups, ["chrome"])
+            self.keyring(b"wrong")
+            with self.assertRaisesRegex(ValueError, "decrypt"):
+                helper["youtube_cookies"]("Google Chrome", profile, Path(profile) / "snapshot")
 
     def test_snapshot_rejects_oversized_database(self):
         with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as snapshot:
