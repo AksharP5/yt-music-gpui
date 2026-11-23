@@ -1010,7 +1010,7 @@ impl BrowserProfile {
         #[cfg(target_os = "macos")]
         let safe_storage = safe_storage_password(&self.browser)?;
         #[cfg(not(target_os = "macos"))]
-        let safe_storage = None;
+        let safe_storage: Option<Vec<u8>> = None;
         let cookies: Vec<Cookie> = serde_json::from_slice(&browser_helper(
             "cookies",
             &[self.browser.as_ref(), self.path.as_os_str()],
