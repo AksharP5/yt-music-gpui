@@ -3,9 +3,10 @@ description: Restore or build the LGPL libmpv the macOS app ships, and link the 
 runs:
   using: composite
   steps:
-    # Keyed on the recipe, so it rebuilds only when a pin or option changes.
-    # Tags and main read only caches saved on main; pull requests save their own.
+    # Reuse the recipe-keyed cache on branch and pull request builds.
+    # Tagged releases build from hash-checked sources every time.
     - id: cache
+      if: github.ref_type != 'tag'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: target/libmpv
