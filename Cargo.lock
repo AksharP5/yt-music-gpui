@@ -6895,6 +6895,7 @@ dependencies = [
  "base64 0.22.1",
  "block2 0.6.2",
  "cc",
+ "core-foundation 0.10.1",
  "getrandom 0.4.3",
  "gpui-pre",
  "gpui-pre-platform",

@@ -44,6 +44,7 @@ objc2-media-player = { version = "0.3", default-features = false, features = [
     "MPRemoteCommandCenter",
     "MPRemoteCommandEvent",
 ] }
+core-foundation = "0.10"
 security-framework = { version = "3", default-features = false }
 security-framework-sys = { version = "2", default-features = false }
 

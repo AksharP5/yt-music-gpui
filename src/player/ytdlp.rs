@@ -477,7 +477,7 @@ fn ytdlp_command(ytdlp: &Path) -> Command {
         return Command::new(ytdlp);
     };
     let mut command = Command::new(python);
-    command.arg(ytdlp);
+    command.arg("-B").arg(ytdlp);
     command
 }
 
