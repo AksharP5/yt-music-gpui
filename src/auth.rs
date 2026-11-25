@@ -279,11 +279,6 @@ impl Session {
         self.validate()?;
         let mut value = KEYRING_PREFIX.to_vec();
         value.extend_from_slice(STANDARD.encode(serde_json::to_vec(self)?).as_bytes());
-        // secret-tool's stdin reader truncates input beyond 8192 bytes.
-        ensure!(
-            value.len() <= 8192,
-            "The account session exceeds the desktop keyring helper's storage limit"
-        );
         Ok(value)
     }
     /// Saves to the keyring. Without one, it updates a session file the user already chose.
@@ -562,6 +557,11 @@ const SESSION_FILE: &str = "account-session";
 
 #[cfg(target_os = "linux")]
 fn store_in_keyring(value: &[u8]) -> Result<()> {
+    // secret-tool's stdin reader truncates input beyond 8192 bytes.
+    ensure!(
+        value.len() <= 8192,
+        "The account session exceeds the desktop keyring helper's storage limit"
+    );
     // A RAM stdin file cannot block on a full pipe while the keyring is locked.
     let mut input = sealed_file(value)?;
     input.rewind()?;
@@ -587,12 +587,57 @@ fn store_in_keyring(value: &[u8]) -> Result<()> {
 /// list, which another program could have opened to everyone.
 #[cfg(target_os = "macos")]
 fn store_in_keyring(value: &[u8]) -> Result<()> {
-    use security_framework::passwords::{PasswordOptions, set_generic_password_options};
     delete_from_keychain()?;
-    let mut options = PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
-    options.set_label("YouTube Music GPUI");
-    set_generic_password_options(value, options)
-        .context("The macOS Keychain could not save the account")
+    add_to_keychain(value).context("The macOS Keychain could not save the account")
+}
+
+#[cfg(target_os = "macos")]
+fn add_to_keychain(value: &[u8]) -> security_framework::base::Result<()> {
+    use core_foundation::{
+        base::TCFType, data::CFData, dictionary::CFDictionary, string::CFString,
+    };
+    use security_framework_sys::{
+        base::errSecSuccess,
+        item::{
+            kSecAttrAccount, kSecAttrLabel, kSecAttrService, kSecClass, kSecClassGenericPassword,
+            kSecValueData,
+        },
+        keychain_item::SecItemAdd,
+    };
+
+    // The keys and class are Security framework constants. The dictionary
+    // retains its values, and SecItemAdd needs no returned item reference.
+    let status = unsafe {
+        let attributes = [
+            (
+                kSecClass,
+                CFString::wrap_under_get_rule(kSecClassGenericPassword).into_CFType(),
+            ),
+            (
+                kSecAttrService,
+                CFString::new(KEYCHAIN_SERVICE).into_CFType(),
+            ),
+            (
+                kSecAttrAccount,
+                CFString::new(KEYCHAIN_ACCOUNT).into_CFType(),
+            ),
+            (
+                kSecAttrLabel,
+                CFString::new("YouTube Music GPUI").into_CFType(),
+            ),
+            (kSecValueData, CFData::from_buffer(value).into_CFType()),
+        ]
+        .map(|(key, value)| (CFString::wrap_under_get_rule(key), value));
+        let attributes = CFDictionary::from_CFType_pairs(&attributes);
+        SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut())
+    };
+    // A duplicate can appear between delete and add. Updating it would
+    // preserve another program's access list.
+    if status == errSecSuccess {
+        Ok(())
+    } else {
+        Err(security_framework::base::Error::from_code(status))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1183,7 +1228,7 @@ fn browser_helper(
     let python = PathBuf::from("/usr/bin/python3");
     let mut command = Command::new(python);
     command
-        .args(["-I", "-c", include_str!("browser_session.py"), mode])
+        .args(["-I", "-B", "-c", include_str!("browser_session.py"), mode])
         .args(values);
     match secret {
         Some(secret) => {
@@ -1562,6 +1607,11 @@ mod tests {
                 .args(arguments)
                 .output()
                 .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             String::from_utf8(output.stdout).unwrap()
         };
         let home = fs::canonicalize(&home).unwrap();
@@ -1596,6 +1646,21 @@ mod tests {
             "-w",
             "planted",
         ]);
+        // Simulate another program adding the item after our delete.
+        let value = session("SAPISID=first").saved_value().unwrap();
+        assert_eq!(
+            add_to_keychain(&value).unwrap_err().code(),
+            security_framework_sys::base::errSecDuplicateItem
+        );
+        let password = security(&[
+            "find-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-w",
+        ]);
+        assert_eq!(password.trim_end(), "planted");
         session("SAPISID=first").save().unwrap();
         let dump = security(&["dump-keychain", "-a"]);
         let item = dump
@@ -1615,6 +1680,29 @@ mod tests {
             let saved = Session::load(&Operation::default()).unwrap().unwrap();
             assert_eq!(saved.cookie, cookie);
         }
+        let cookies = [
+            "SAPISID",
+            "SID",
+            "HSID",
+            "SSID",
+            "__Secure-1PSID",
+            "__Secure-3PSID",
+        ]
+        .map(|name| Cookie {
+            name: name.into(),
+            value: "synthetic".repeat(56),
+            domain: ".youtube.com".into(),
+            path: "/".into(),
+            secure: true,
+            expires: 0,
+        });
+        let (cookie, playback_cookie) = cookie_headers(&cookies).unwrap();
+        let mut large = session(&cookie);
+        large.playback_cookie = playback_cookie;
+        assert!(large.saved_value().unwrap().len() > 8192);
+        large.save().unwrap();
+        let saved = Session::load(&Operation::default()).unwrap().unwrap();
+        assert!(saved.same_credentials(&large));
         Session::disconnect().unwrap();
         assert!(Session::load(&Operation::default()).unwrap().is_none());
         Session::disconnect().unwrap();
@@ -1706,8 +1794,16 @@ mod tests {
             assert_eq!(restored.cookie, expected.cookie);
         }
         assert!(Session::from_saved(b"yt-music-session-v1:invalid!").is_err());
-        expected.playback_cookie = "x".repeat(8192);
-        assert!(expected.saved_value().is_err());
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn secret_tool_rejects_values_it_would_truncate() {
+        let error = store_in_keyring(&[b'x'; 8193]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the desktop keyring helper's storage limit")
+        );
     }
     #[cfg(unix)]
     #[test]
