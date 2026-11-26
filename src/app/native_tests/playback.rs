@@ -15,7 +15,7 @@ fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> cr
 
 #[test]
 #[ignore = "requires an isolated desktop, private D-Bus and libmpv; no audio playback"]
-fn now_playing_keeps_its_artist_link_when_watch_only_links_the_album() -> Result<()> {
+fn now_playing_keeps_artist_links_missing_from_watch_details() -> Result<()> {
     use super::navigation::check_cache_window;
     use crate::app::{PlaybackResult, QueueUpdate};
     use crate::watch::Watch;
@@ -24,45 +24,61 @@ fn now_playing_keeps_its_artist_link_when_watch_only_links_the_album() -> Result
     check_cache_window(async |window, cx| {
         window
             .update(cx, |view, _, cx| {
-                let artist = BrowseLink::new("UCartist", "Artist");
+                let artists = [
+                    BrowseLink::new("UCfirst", "First Artist"),
+                    BrowseLink::new("UCsecond", "Second Artist"),
+                ];
                 let album = BrowseLink::new("MPREalbum", "Album");
                 let mut queued = continuation_page(0..1, None).tracks().remove(0);
-                queued.artist = artist.title.clone();
-                queued.details.artist_id = Some(artist.id.clone());
-                queued.details.links = vec![artist.clone()];
-                let mut issued = queued.clone();
-                issued.details.artist_id = None;
-                issued.details.links = vec![album.clone()];
-                issued.details.byline = Some("Artist • Album • 2024".into());
-                view.library.queue.replace(vec![queued], 0);
-                view.playback_result(
-                    PlaybackResult::Watch {
-                        id: view.playback_generation.load(Ordering::Relaxed),
-                        account_revision: view.account_revision,
-                        update: QueueUpdate::Preserve,
-                        collection: None,
-                        result: Ok(Box::new(Watch {
-                            current: Some(issued),
-                            current_index: Some(0),
-                            queue: Vec::new(),
-                            source: None,
-                            lyrics: None,
-                            related: None,
-                            comments: None,
-                            alternatives: None,
-                            continuation: None,
-                            source_target: None,
-                            shuffle: None,
-                            chips: Vec::new(),
-                        })),
-                        session_rejected: false,
-                    },
-                    cx,
-                );
-                let links = [artist, album];
-                let issued = view.current_watch().unwrap().current.as_ref().unwrap();
-                assert_eq!(issued.details.links, links);
-                assert_eq!(view.library.queue.current().unwrap().details.links, links);
+                queued.artist = "First Artist & Second Artist".into();
+                queued.details.artist_id = Some(artists[0].id.clone());
+                queued.details.links = artists.to_vec();
+                for known in [&artists[..0], &artists[..1], &artists[1..]] {
+                    let mut expected = artists.to_vec();
+                    let mut issued = queued.clone();
+                    issued.details.artist_id = known.first().map(|artist| artist.id.clone());
+                    issued.details.links = known.to_vec();
+                    if let Some(explicit) = issued.details.links.first_mut() {
+                        explicit.params = Some("from-watch".into());
+                        let position = usize::from(explicit.id == artists[1].id);
+                        expected[position] = explicit.clone();
+                    }
+                    issued.details.links.push(album.clone());
+                    expected.push(album.clone());
+                    issued.details.byline =
+                        Some("First Artist & Second Artist • Album • 2024".into());
+                    view.library.queue.replace(vec![queued.clone()], 0);
+                    view.playback_result(
+                        PlaybackResult::Watch {
+                            id: view.playback_generation.load(Ordering::Relaxed),
+                            account_revision: view.account_revision,
+                            update: QueueUpdate::Preserve,
+                            collection: None,
+                            result: Ok(Box::new(Watch {
+                                current: Some(issued),
+                                current_index: Some(0),
+                                queue: Vec::new(),
+                                source: None,
+                                lyrics: None,
+                                related: None,
+                                comments: None,
+                                alternatives: None,
+                                continuation: None,
+                                source_target: None,
+                                shuffle: None,
+                                chips: Vec::new(),
+                            })),
+                            session_rejected: false,
+                        },
+                        cx,
+                    );
+                    let issued = view.current_watch().unwrap().current.as_ref().unwrap();
+                    assert_eq!(issued.details.links, expected);
+                    assert_eq!(
+                        view.library.queue.current().unwrap().details.links,
+                        expected
+                    );
+                }
             })
             .unwrap();
     })

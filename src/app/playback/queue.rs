@@ -255,28 +255,14 @@ impl Music {
                                 track.details.clear_account_state();
                             }
                         }
-                        // A watch byline can name the artist without linking it.
                         if let Some(issued) = &mut watch.current
-                            && issued.details.artist_id.is_none()
                             && let Some(queued) = self
                                 .library
                                 .queue
                                 .current()
                                 .filter(|queued| queued.id == issued.id)
                         {
-                            issued
-                                .details
-                                .artist_id
-                                .clone_from(&queued.details.artist_id);
-                            issued.details.links.splice(
-                                ..0,
-                                queued
-                                    .details
-                                    .links
-                                    .iter()
-                                    .filter(|link| link.id.starts_with("UC"))
-                                    .cloned(),
-                            );
+                            retain_artist_links(issued, queued);
                         }
                         let replaced =
                             match adopt_watch_queue(&mut self.library.queue, &watch, update) {
@@ -1091,6 +1077,38 @@ pub(in crate::app) fn append_recommendations(
             .into_iter()
             .filter(|track| seen.insert(track.id.clone())),
     );
+}
+
+fn retain_artist_links(issued: &mut Track, queued: &Track) {
+    if issued.details.artist_id.is_none() {
+        issued
+            .details
+            .artist_id
+            .clone_from(&queued.details.artist_id);
+    }
+    // Watch can leave some artists as plain text. Keep the explicit links and
+    // insert the missing ones in the order their names appear in the byline.
+    let byline = issued.details.byline.as_deref().unwrap_or(&queued.artist);
+    let offset = |link: &BrowseLink| byline.find(link.title.as_str()).unwrap_or(usize::MAX);
+    let links = &mut issued.details.links;
+    for artist in queued
+        .details
+        .links
+        .iter()
+        .filter(|link| link.id.starts_with("UC"))
+    {
+        if links.iter().any(|link| {
+            link.id.starts_with("UC") && (link.id == artist.id || link.title == artist.title)
+        }) {
+            continue;
+        }
+        let start = offset(artist);
+        let index = links
+            .iter()
+            .position(|link| !link.id.starts_with("UC") || offset(link) > start)
+            .unwrap_or(links.len());
+        links.insert(index, artist.clone());
+    }
 }
 
 pub(in crate::app) fn adopt_watch_queue(
