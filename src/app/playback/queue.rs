@@ -255,6 +255,29 @@ impl Music {
                                 track.details.clear_account_state();
                             }
                         }
+                        // A watch byline can name the artist without linking it.
+                        if let Some(issued) = &mut watch.current
+                            && issued.details.artist_id.is_none()
+                            && let Some(queued) = self
+                                .library
+                                .queue
+                                .current()
+                                .filter(|queued| queued.id == issued.id)
+                        {
+                            issued
+                                .details
+                                .artist_id
+                                .clone_from(&queued.details.artist_id);
+                            issued.details.links.splice(
+                                ..0,
+                                queued
+                                    .details
+                                    .links
+                                    .iter()
+                                    .filter(|link| link.id.starts_with("UC"))
+                                    .cloned(),
+                            );
+                        }
                         let replaced =
                             match adopt_watch_queue(&mut self.library.queue, &watch, update) {
                                 Ok(replaced) => replaced,

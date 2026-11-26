@@ -14,6 +14,61 @@ fn continuation_page(indices: std::ops::Range<usize>, token: Option<&str>) -> cr
 }
 
 #[test]
+#[ignore = "requires an isolated desktop, private D-Bus and libmpv; no audio playback"]
+fn now_playing_keeps_its_artist_link_when_watch_only_links_the_album() -> Result<()> {
+    use super::navigation::check_cache_window;
+    use crate::app::{PlaybackResult, QueueUpdate};
+    use crate::watch::Watch;
+    use std::sync::atomic::Ordering;
+
+    check_cache_window(async |window, cx| {
+        window
+            .update(cx, |view, _, cx| {
+                let artist = BrowseLink::new("UCartist", "Artist");
+                let album = BrowseLink::new("MPREalbum", "Album");
+                let mut queued = continuation_page(0..1, None).tracks().remove(0);
+                queued.artist = artist.title.clone();
+                queued.details.artist_id = Some(artist.id.clone());
+                queued.details.links = vec![artist.clone()];
+                let mut issued = queued.clone();
+                issued.details.artist_id = None;
+                issued.details.links = vec![album.clone()];
+                issued.details.byline = Some("Artist • Album • 2024".into());
+                view.library.queue.replace(vec![queued], 0);
+                view.playback_result(
+                    PlaybackResult::Watch {
+                        id: view.playback_generation.load(Ordering::Relaxed),
+                        account_revision: view.account_revision,
+                        update: QueueUpdate::Preserve,
+                        collection: None,
+                        result: Ok(Box::new(Watch {
+                            current: Some(issued),
+                            current_index: Some(0),
+                            queue: Vec::new(),
+                            source: None,
+                            lyrics: None,
+                            related: None,
+                            comments: None,
+                            alternatives: None,
+                            continuation: None,
+                            source_target: None,
+                            shuffle: None,
+                            chips: Vec::new(),
+                        })),
+                        session_rejected: false,
+                    },
+                    cx,
+                );
+                let links = [artist, album];
+                let issued = view.current_watch().unwrap().current.as_ref().unwrap();
+                assert_eq!(issued.details.links, links);
+                assert_eq!(view.library.queue.current().unwrap().details.links, links);
+            })
+            .unwrap();
+    })
+}
+
+#[test]
 #[ignore = "requires an isolated desktop, private D-Bus and libmpv; uses null audio"]
 fn restored_song_preparation_preserves_the_player_startup_error() -> Result<()> {
     use super::navigation::{check_cache_window, reply};
