@@ -17,8 +17,8 @@ from yt_dlp.utils.traversal import traverse_obj
 from yt_dlp.version import __version__
 
 # Installer downloads are pinned here with the reviewed extractor version.
-REVIEWED_VERSION = "2026.08.19"
-REVIEWED_SHA256 = "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6"
+REVIEWED_VERSION = "2026.11.23"
+REVIEWED_SHA256 = "e8665ed64d6b9172773e812f891fb707a0cb1ee8d9ef4fc1acb00cabee4c5256"
 
 DENO_VERSION = "2.9.8"
 DENO_SHA256 = "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609"

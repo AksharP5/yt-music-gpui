@@ -63,7 +63,10 @@ pub(super) fn account_credentials(
     None
 }
 
-fn extractor_arguments(command: &mut Command, credentials: Option<&ExtractorCredentials>) {
+pub(super) fn extractor_arguments(
+    command: &mut Command,
+    credentials: Option<&ExtractorCredentials>,
+) {
     command.args([
         "--ignore-config",
         "--no-playlist",
@@ -81,6 +84,15 @@ fn extractor_arguments(command: &mut Command, credentials: Option<&ExtractorCred
         command
             .arg("--js-runtimes")
             .arg(format!("deno:{}", deno.display()));
+    }
+    // The default tv_samsung (TVHTML5) client's stream URLs return 403 for several
+    // seconds after extraction, and mpv opens them at once (#246). Drop this once
+    // a reviewed yt-dlp no longer picks that client by default. The account
+    // extractor reads extractor arguments under its own name.
+    for extractor in ["youtube", "ytmusicaccount"] {
+        command
+            .arg("--extractor-args")
+            .arg(format!("{extractor}:player_client=default,-tv_samsung"));
     }
     command.arg("--no-plugin-dirs");
     // The account extractor reads cookies and identity from stdin; see send_credentials.
@@ -634,7 +646,7 @@ pub(super) mod tests {
         let message = notice
             .take()
             .expect("fallback notice must wait for playback");
-        assert!(message.contains("2026.08.19"));
+        assert!(message.contains("2026.11.23"));
         assert!(message.contains("guest"));
         assert!(!message.contains("update yt-dlp"));
         assert!(

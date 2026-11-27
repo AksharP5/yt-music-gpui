@@ -1,4 +1,4 @@
-//! Cookie-free VISIONOS player lookup, reviewed against yt-dlp 2026.08.19.
+//! Cookie-free VISIONOS player lookup, reviewed against yt-dlp 2026.11.23.
 use super::stream::normalization_gain;
 use super::{AudioQuality, VideoQuality};
 use anyhow::{Context, Result, bail, ensure};
