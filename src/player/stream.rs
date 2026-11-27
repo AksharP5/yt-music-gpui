@@ -53,11 +53,25 @@ pub(super) struct PreparedTarget {
     pub(super) track_id: u64,
 }
 
+/// The line yt-dlp prints beside the URLs: when its selected formats open.
+/// YouTube holds a TV client's streams until its pre-roll ad would have ended,
+/// and returns 403 before then (yt-dlp #17389). yt-dlp's own downloader waits
+/// for this time; the app opens URLs itself, so it waits instead of mpv.
+/// A merged video lists both formats, a single format reports its own.
+pub(super) const AVAILABLE_AT_PRINT: &str =
+    "available_at %(requested_formats.:.available_at)j %(available_at)j";
+
+/// The longest the player holds a stream for. Pre-roll ads last seconds; past
+/// this, opening anyway shows a failure instead of an endless loading track.
+const LONGEST_AD: Duration = Duration::from_secs(60);
+
 pub(super) struct ResolvedStream {
     pub(super) key: StreamKey,
     pub(super) url: String,
     pub(super) gain_db: f64,
     pub(super) expires: SystemTime,
+    /// When YouTube serves the stream, if that is still ahead. See AVAILABLE_AT_PRINT.
+    pub(super) available: Option<SystemTime>,
     /// A validated timedtext URL. Only video streams keep one: captions draw over the video.
     pub(super) captions: Option<String>,
 }
@@ -70,10 +84,22 @@ impl ResolvedStream {
         now: SystemTime,
     ) -> Result<Self> {
         let text = std::str::from_utf8(bytes)?;
-        let urls = text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
+        let mut available = None;
+        let mut urls = Vec::new();
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            let Some(times) = line.strip_prefix("available_at ") else {
+                urls.push(line);
+                continue;
+            };
+            // JSON numbers, lists of them, or NA: take the latest timestamp.
+            available = times
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|digits| digits.parse::<u64>().ok())
+                .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+                .max()
+                .filter(|available| *available > now)
+                .map(|available| available.min(now + LONGEST_AD));
+        }
         ensure!(
             !urls.is_empty() && urls.len() <= 2,
             "Invalid prepared stream"
@@ -120,6 +146,7 @@ impl ResolvedStream {
             url,
             gain_db,
             expires,
+            available,
             captions: None,
         })
     }
@@ -137,6 +164,12 @@ impl ResolvedStream {
 
     pub(super) fn matches(&self, key: &StreamKey) -> bool {
         self.key == *key && SystemTime::now() < self.expires
+    }
+
+    /// When YouTube starts serving the stream, if it still holds it.
+    pub(super) fn opens_at(&self) -> Option<Instant> {
+        let wait = self.available?.duration_since(SystemTime::now()).ok()?;
+        (!wait.is_zero()).then(|| Instant::now() + wait)
     }
 }
 
@@ -1289,6 +1322,41 @@ YtMusicAccountIE._real_extract = extract
         )
         .unwrap();
         assert!(video.url.contains(";!new_stream;"));
+    }
+
+    #[test]
+    fn streams_wait_for_the_time_youtube_serves_them_capped_at_a_minute() {
+        let key = StreamKey {
+            url: "https://music.youtube.com/watch?v=abcdefghijk".into(),
+            quality: AudioQuality::Normal,
+            video: None,
+        };
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let urls = "https://rr1.googlevideo.com/video?expire=1800009999\nhttps://rr1.googlevideo.com/audio?expire=1800009999\n";
+        let available = |printed: &str| {
+            let stream =
+                ResolvedStream::parse(key.clone(), format!("{printed}{urls}").as_bytes(), 0., now)
+                    .unwrap();
+            // The availability line never becomes part of what mpv opens.
+            assert!(stream.url.starts_with("edl://") && !stream.url.contains("available_at"));
+            stream.available
+        };
+        let at = |seconds| Some(UNIX_EPOCH + Duration::from_secs(seconds));
+        // As yt-dlp prints it: a merged video lists both formats, the latest wins.
+        assert_eq!(
+            available("available_at [1800000009, 1800000014] NA\n"),
+            at(1_800_000_014)
+        );
+        assert_eq!(available("available_at [] 1800000005\n"), at(1_800_000_005));
+        // Already served, not reported, or from an older yt-dlp: open at once.
+        assert_eq!(
+            available("available_at [1799999990, 1800000000] NA\n"),
+            None
+        );
+        assert_eq!(available("available_at [] NA\n"), None);
+        assert_eq!(available(""), None);
+        // An implausibly late time waits no longer than a minute.
+        assert_eq!(available("available_at [] 1800003600\n"), at(1_800_000_060));
     }
 
     #[test]
