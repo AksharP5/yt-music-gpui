@@ -218,12 +218,8 @@ impl Session {
     /// Called on the account worker. macOS may ask the user to unlock the
     /// keychain, or to allow this build of the app to read its item.
     #[cfg(target_os = "macos")]
-    pub fn load(_: &Operation) -> Result<Option<Self>> {
-        use security_framework::passwords::{PasswordOptions, generic_password};
-        let lookup = match generic_password(PasswordOptions::new_generic_password(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-        )) {
+    pub fn load(operation: &Operation) -> Result<Option<Self>> {
+        let lookup = match keychain_password(operation, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)? {
             Ok(value) => KeyringLookup::Found(value),
             Err(error) if error.code() == errSecItemNotFound => KeyringLookup::Absent,
             Err(_) => KeyringLookup::Failed,
@@ -1099,7 +1095,7 @@ impl BrowserProfile {
     /// Read the named profile after consent, including refresh of its confirmed account.
     pub fn read_session(&self, operation: &Operation) -> Result<Session> {
         #[cfg(target_os = "macos")]
-        let safe_storage = safe_storage_password(&self.browser)?;
+        let safe_storage = safe_storage_password(&self.browser, operation)?;
         #[cfg(not(target_os = "macos"))]
         let safe_storage: Option<Vec<u8>> = None;
         let cookies: Vec<Cookie> = serde_json::from_slice(&browser_helper(
@@ -1145,8 +1141,7 @@ impl BrowserProfile {
 /// user's keychain. The app reads it itself, so macOS asks on the app's behalf
 /// and "Always Allow" trusts only this app, never a shared tool like Python.
 #[cfg(target_os = "macos")]
-fn safe_storage_password(browser: &str) -> Result<Option<Vec<u8>>> {
-    use security_framework::passwords::{PasswordOptions, generic_password};
+fn safe_storage_password(browser: &str, operation: &Operation) -> Result<Option<Vec<u8>>> {
     let (service, account) = match browser {
         "Chromium" => ("Chromium Safe Storage", "Chromium"),
         "Google Chrome" => ("Chrome Safe Storage", "Chrome"),
@@ -1155,11 +1150,52 @@ fn safe_storage_password(browser: &str) -> Result<Option<Vec<u8>>> {
         "Ardia" => ("Ardia Safe Storage", "Ardia"),
         _ => return Ok(None),
     };
-    generic_password(PasswordOptions::new_generic_password(service, account))
+    keychain_password(operation, service, account)?
         .map(Some)
         .with_context(|| {
             format!("Could not read the browser's \"{service}\" key from your Keychain. Allow access and retry.")
         })
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_password(
+    operation: &Operation,
+    service: &'static str,
+    account: &'static str,
+) -> Result<security_framework::base::Result<Vec<u8>>> {
+    use security_framework::passwords::{PasswordOptions, generic_password};
+    until_cancelled(operation, move || {
+        generic_password(PasswordOptions::new_generic_password(service, account))
+    })
+}
+
+/// A Keychain read waits for as long as macOS shows its prompt. The read runs
+/// on its own thread so that cancelling the operation, as quitting and signing
+/// out do, stops the wait. An abandoned read ends with its prompt or the process;
+/// until then, macOS makes this process's changes to the same item wait for it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn until_cancelled<T: Send + 'static>(
+    operation: &Operation,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    ensure!(!operation.is_cancelled(), "Account connection cancelled");
+    let (sender, receiver) = sync_channel(1);
+    thread::Builder::new()
+        .name("keychain-read".into())
+        .spawn(move || {
+            let _ = sender.send(read());
+        })
+        .context("Could not start the Keychain read")?;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Timeout) => {
+                ensure!(!operation.is_cancelled(), "Account connection cancelled");
+            }
+            Err(RecvTimeoutError::Disconnected) => bail!("The Keychain read stopped unexpectedly"),
+        }
+    }
 }
 
 /// The bundle identifier of the app that opens web links.

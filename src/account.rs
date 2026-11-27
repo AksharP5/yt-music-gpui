@@ -1948,6 +1948,66 @@ mod tests {
         assert!(commands.is_empty());
     }
     #[test]
+    fn finishing_worker_abandons_a_cancelled_keychain_read_but_not_queued_persistence() {
+        let shared = auth::shared(Some(synthetic_session()));
+        let expected = shared.read().unwrap().clone().unwrap();
+        let (commands, pending) = async_channel::bounded(2);
+        let (reading, read_started) = std::sync::mpsc::channel();
+        let (saved, save_finished) = std::sync::mpsc::channel();
+        // A Keychain prompt that nobody answers.
+        let (_unanswered, prompt) = std::sync::mpsc::channel::<()>();
+        let worker = Worker {
+            commands: commands.clone(),
+            thread: thread::spawn(move || {
+                let Ok(Command::Restore(operation)) = pending.recv_blocking() else {
+                    panic!("expected a restore")
+                };
+                let read = auth::until_cancelled(&operation, move || {
+                    reading.send(()).unwrap();
+                    prompt.recv()
+                });
+                assert!(read.is_err());
+                while let Ok(command) = pending.recv_blocking() {
+                    let Command::Persist(session) = command else {
+                        panic!("expected persistence")
+                    };
+                    persist_current_session(
+                        &shared,
+                        &session,
+                        || {
+                            saved.send(()).unwrap();
+                            Ok(())
+                        },
+                        || anyhow::bail!("The current session must not be cleared"),
+                    )?;
+                }
+                Ok(())
+            }),
+        };
+        let restore = Operation::default();
+        commands
+            .send_blocking(Command::Restore(restore.clone()))
+            .unwrap();
+        commands.send_blocking(Command::Persist(expected)).unwrap();
+        read_started
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || done.send(worker.finish()));
+        // Until the read is cancelled, quitting still waits for it.
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+        restore.cancel();
+        finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(save_finished.try_recv().is_ok());
+    }
+    #[test]
     fn sign_out_waits_for_playback_cleanup_and_preserves_failures() {
         for result in [Ok(()), Err("Synthetic player cleanup failure".to_owned())] {
             let expected = result.clone();
