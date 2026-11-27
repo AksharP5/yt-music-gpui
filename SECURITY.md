@@ -23,7 +23,15 @@ In scope: anything that exposes, persists or sends the session somewhere other t
 
 ## Release installer
 
-The installer trusts this repository's release build, its build dependencies, GitHub's HTTPS service and your distribution's package repositories. The app tarball and checksum come from the same GitHub Release. That checksum detects corrupted or partial downloads, not a compromised maintainer account or release. Each release file also has a GitHub build provenance attestation that records the workflow run, tag and commit that built it. To check that a download came from this repository's release workflow, run `gh attestation verify FILE --repo AksharP5/yt-music-gpui`. It shows where a file was built, not that the source is safe.
+The installer trusts this repository's release build, its build dependencies, GitHub's HTTPS service and your distribution's package repositories. The app tarball and checksum come from the same GitHub Release. That checksum detects corrupted or partial downloads, not a compromised maintainer account or release. Each release file also has a GitHub build provenance attestation that records the workflow run, tag and commit that built it. To check that a download came from this repository's release workflow for the release you meant, run this with that release's tag:
+
+```sh
+gh attestation verify FILE --repo AksharP5/yt-music-gpui \
+  --signer-workflow AksharP5/yt-music-gpui/.github/workflows/release.yml \
+  --source-ref refs/tags/vX.Y.Z
+```
+
+With `--repo` alone, any file this repository's workflows built passes, including an older release's. The check shows where a file was built, not that the source is safe.
 
 A downloaded yt-dlp zipapp must match its upstream checksum and the hash reviewed in `src/ytdlp_account.py`. During upgrades, the installer can reuse an existing private copy if its ownership, permissions and reviewed hash all match. The optional private Deno archive must match its reviewed hash too. These pins reject changed upstream assets; they cannot protect against a compromised app release that changes the pins. Updating helpers requires a new reviewed app release and re-running the installer. The app never downloads tools or JavaScript solver scripts.
 
