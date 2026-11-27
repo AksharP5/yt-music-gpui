@@ -1,5 +1,6 @@
 use super::mpv::{
-    MpvCore, PlaybackState, load_command, read_message, request, write_command, write_pause,
+    MpvCore, PlaybackState, load_command, read_message, request, resync_opening_seek,
+    write_command, write_pause,
 };
 use super::native;
 use super::stream::{
@@ -690,6 +691,11 @@ impl Actor<'_> {
                 .map_err(|_| anyhow::anyhow!("Could not enable the video track"))?;
                 attached.ready = true;
                 let _ = self.events.send_blocking(PlayerEvent::VideoChanged);
+                // Play on a restored video loads it before the renderer is
+                // ready, so the track can turn on mid-seek.
+                resync_opening_seek(&mut self.socket, &mut self.pending, |value| {
+                    self.state.message(value, self.events)
+                })?;
             }
             Ok(())
         });
