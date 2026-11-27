@@ -783,7 +783,9 @@ mod tests {
     #[cfg(unix)]
     use super::ytdlp::{REVIEWED_YTDLP, tests::alive};
     use super::ytdlp::{
-        extractor_arguments, tests::synthetic_credentials, write_account_extractor,
+        extractor_arguments,
+        tests::{signed_in, synthetic_credentials},
+        write_account_extractor,
     };
     use super::*;
     use crate::os::{IpcStream, ipc_path};
@@ -1401,9 +1403,14 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
         let server_script = runtime.path().join("ytdlp_resolver.py");
         fs::write(&server_script, include_str!("ytdlp_resolver.py")).unwrap();
-        let mut app = Command::new("yt-dlp");
-        extractor_arguments(&mut app, None);
-        let app_arguments: Vec<_> = app.get_args().map(|arg| arg.to_string_lossy()).collect();
+        let account = signed_in(synthetic_credentials("INVENTED_COOKIE"), &plugin_dir);
+        let app_arguments = [None, Some(&account)].map(|credentials| {
+            let mut app = Command::new("yt-dlp");
+            extractor_arguments(&mut app, credentials);
+            app.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        });
         let mut child = Command::new(python)
             .args(["-B", "-"])
             .arg(plugin_dir)
@@ -1991,6 +1998,122 @@ os.kill(os.getpid(), signal.SIGSTOP)
             }
             assert_eq!(requested, reload, "buffer {buffer}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires libmpv; uses a synthetic extractor, local silent audio, null audio and no network"]
+    fn streams_open_only_once_youtube_serves_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("song.test-stream.wav");
+        fs::rename(silent_audio(directory.path(), 60), &path).unwrap();
+        let calls = directory.path().join("calls");
+        // As yt-dlp reports a pre-roll ad: "delayed…" streams open 4 s after
+        // extraction, "served…" ones already have, the rest report nothing.
+        let extractor = directory.path().join("extractor");
+        fs::write(
+            &extractor,
+            format!(
+                r#"#!/bin/sh
+if [ "$3" = --version ]; then echo 2026.11.23; exit; fi
+eval "url=\${{$#}}"
+echo "$url" >> '{}'
+case "$url" in
+*v=delayed*) echo "available_at [] $(($(date +%s) + 4))" ;;
+*v=served*) echo "available_at [$(($(date +%s) - 30))] NA" ;;
+esac
+printf 'file://%s\n' '{}'
+"#,
+                calls.display(),
+                path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
+        let resolutions = || fs::read_to_string(&calls).map_or(0, |calls| calls.lines().count());
+        let player = Player::with_extractor(
+            PlayerOptions {
+                volume: 0.,
+                audio_output: Some("null".into()),
+                ..Default::default()
+            },
+            extractor.clone(),
+        )
+        .unwrap();
+        // Seconds from `since` until `id` plays, failing on any other track starting.
+        let plays = |id: u64, since: Instant| {
+            let deadline = since + Duration::from_secs(15);
+            loop {
+                assert!(Instant::now() < deadline, "track {id} never played");
+                match player.try_recv() {
+                    Some(PlayerEvent::Error { message, .. }) => panic!("{message}"),
+                    Some(PlayerEvent::Started { track_id, .. }) => {
+                        assert_eq!(track_id, id, "a superseded stream opened")
+                    }
+                    Some(PlayerEvent::Position { track_id, seconds })
+                        if track_id == id && seconds > 0. =>
+                    {
+                        return since.elapsed().as_secs_f64();
+                    }
+                    Some(_) => {}
+                    None => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        };
+
+        for video_id in ["servedaaaaa", "unreportedx"] {
+            let clicked = Instant::now();
+            let id = player
+                .play(video_id, video_id, PlayOptions::default())
+                .unwrap();
+            assert!(plays(id, clicked) < 3., "{video_id} waited");
+        }
+
+        let clicked = Instant::now();
+        let id = player
+            .play("delayedaaaa", "Delayed", PlayOptions::default())
+            .unwrap();
+        assert!(plays(id, clicked) >= 2.9, "opened before YouTube serves it");
+
+        // Skipping away during the wait must never open the earlier stream.
+        let clicked = Instant::now();
+        player
+            .play("delayedbbbb", "Delayed", PlayOptions::default())
+            .unwrap();
+        while resolutions() < 4 {
+            assert!(clicked.elapsed() < Duration::from_secs(5), "never resolved");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let skipped_to = player
+            .play("unreportedy", "Next", PlayOptions::default())
+            .unwrap();
+        plays(skipped_to, Instant::now());
+        let past_the_wait = clicked + Duration::from_secs(6);
+        while Instant::now() < past_the_wait {
+            plays(skipped_to, Instant::now());
+        }
+
+        // A prepared stream waits out what is left of its time too.
+        player
+            .prepare_next(Some("delayedcccc"), PlayOptions::default())
+            .unwrap();
+        let prepared_at = Instant::now();
+        while resolutions() < 6 {
+            assert!(
+                prepared_at.elapsed() < Duration::from_secs(5),
+                "never prepared"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(500));
+        let id = player
+            .play("delayedcccc", "Prepared", PlayOptions::default())
+            .unwrap();
+        assert!(
+            plays(id, prepared_at) >= 2.9,
+            "opened before YouTube serves it"
+        );
+        assert_eq!(resolutions(), 6, "Play resolved the prepared song again");
     }
 
     #[cfg(unix)]

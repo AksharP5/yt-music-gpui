@@ -1727,6 +1727,7 @@ pub(super) mod tests {
             url: "https://rr1.googlevideo.com/video".into(),
             gain_db: 0.,
             expires: SystemTime::now() + Duration::from_secs(60),
+            available: None,
             captions: Some(captions.into()),
         };
         let mut state = PlaybackState {

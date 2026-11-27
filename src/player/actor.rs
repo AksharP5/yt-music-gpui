@@ -114,6 +114,8 @@ struct PendingPlay {
     target: PreparedTarget,
     title: String,
     options: PlayOptions,
+    /// Resolved, and waiting until YouTube serves it.
+    stream: Option<ResolvedStream>,
 }
 
 fn playback_runtime(parent: &Path) -> Result<tempfile::TempDir> {
@@ -241,6 +243,7 @@ pub(super) fn run(
             }
         }
         actor.load_resolved()?;
+        actor.load_opened()?;
         actor.append_prepared()?;
         actor.refresh_expired_preparation()?;
         actor.enable_video();
@@ -253,6 +256,7 @@ pub(super) fn run(
             .deadline()
             .into_iter()
             .chain(actor.expiry())
+            .chain(actor.opens_at())
             .min();
         if actor.pending.contains(&b'\n')
             || wait_for_player_input(&actor.socket, wake, actor.resolver.fd(), deadline)?
@@ -389,17 +393,6 @@ impl Actor<'_> {
             );
         }
         write_command(&mut self.socket, json!(["stop"]), None)?;
-        // The append acknowledgement can still be queued when the
-        // user clicks Next. Reuse its resolved URL in that case.
-        if let Some((_, stream)) = resolved {
-            self.resolver.cancel();
-            state.load_captions(track_id, &stream);
-            return write_command(
-                &mut self.socket,
-                load_command(&stream.url, &title, stream.gain_db, options),
-                Some(json!(track_id)),
-            );
-        }
         let target = PreparedTarget {
             lane: if options.full_lookup {
                 ResolverLane::Full
@@ -409,10 +402,23 @@ impl Actor<'_> {
             key,
             track_id,
         };
+        // The append acknowledgement can still be queued when the
+        // user clicks Next. Reuse its resolved URL in that case.
+        if let Some((_, stream)) = resolved {
+            self.resolver.cancel();
+            self.pending_play = Some(PendingPlay {
+                target,
+                title,
+                options,
+                stream: Some(stream),
+            });
+            return self.load_opened();
+        }
         self.pending_play = Some(PendingPlay {
             target: target.clone(),
             title,
             options,
+            stream: None,
         });
         if self
             .resolver
@@ -540,30 +546,18 @@ impl Actor<'_> {
         ) else {
             return Ok(());
         };
-        if let Some(play) = self.pending_play.take_if(|play| {
-            play.target.track_id == target.track_id && play.target.key == target.key
+        if let Some(play) = self.pending_play.as_mut().filter(|play| {
+            play.stream.is_none()
+                && play.target.track_id == target.track_id
+                && play.target.key == target.key
         }) {
             match result {
                 Ok(stream) => {
-                    let options = PlayOptions {
-                        paused: self.state.paused,
-                        ..play.options
-                    };
-                    self.state.load_captions(target.track_id, &stream);
-                    write_command(
-                        &mut self.socket,
-                        load_command(&stream.url, &play.title, stream.gain_db, options),
-                        Some(json!(target.track_id)),
-                    )?;
-                    if let Some(target) = self.next_target.clone()
-                        && !self.prepared.as_ref().is_some_and(|(current, stream)| {
-                            current.track_id == target.track_id && stream.matches(&target.key)
-                        })
-                    {
-                        let _ = self.resolver.start(target, self.credentials.as_ref());
-                    }
+                    play.stream = Some(stream);
+                    self.load_opened()?;
                 }
                 Err(_) => {
+                    self.pending_play = None;
                     self.next_target = None;
                     stream_error(target.track_id, self.events);
                 }
@@ -579,6 +573,55 @@ impl Actor<'_> {
         Ok(())
     }
 
+    /// Load the resolved click once YouTube serves its stream. Any other play,
+    /// stop or account change replaces `pending_play`, so a stale wait never loads.
+    fn load_opened(&mut self) -> Result<()> {
+        let Some(PendingPlay {
+            target,
+            title,
+            options,
+            stream: Some(stream),
+        }) = self.pending_play.take_if(|play| {
+            play.stream
+                .as_ref()
+                .is_some_and(|stream| stream.opens_at().is_none())
+        })
+        else {
+            return Ok(());
+        };
+        let options = PlayOptions {
+            paused: self.state.paused,
+            ..options
+        };
+        self.state.load_captions(target.track_id, &stream);
+        write_command(
+            &mut self.socket,
+            load_command(&stream.url, &title, stream.gain_db, options),
+            Some(json!(target.track_id)),
+        )?;
+        if let Some(target) = self.next_target.clone()
+            && !self.prepared.as_ref().is_some_and(|(current, stream)| {
+                current.track_id == target.track_id && stream.matches(&target.key)
+            })
+        {
+            let _ = self.resolver.start(target, self.credentials.as_ref());
+        }
+        Ok(())
+    }
+
+    /// When a resolved click or the prepared song's stream opens.
+    fn opens_at(&self) -> Option<Instant> {
+        let play = self
+            .pending_play
+            .as_ref()
+            .and_then(|play| play.stream.as_ref());
+        let prepared = self.prepared.as_ref().map(|(_, stream)| stream);
+        play.into_iter()
+            .chain(prepared)
+            .filter_map(ResolvedStream::opens_at)
+            .min()
+    }
+
     /// Append the prepared song to mpv's playlist, so it can play on at the end.
     fn append_prepared(&mut self) -> Result<()> {
         // A full preparation can finish while a native click is resolving. Hold
@@ -588,6 +631,8 @@ impl Actor<'_> {
             && self.state.upcoming != Some(target.track_id)
             // After a natural transition the prepared song is already playing.
             && self.state.current != Some(target.track_id)
+            // mpv would open it at the end of the current song, maybe too early.
+            && stream.opens_at().is_none()
         {
             let mut command = load_command(
                 &stream.url,

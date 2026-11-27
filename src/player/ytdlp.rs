@@ -1,5 +1,5 @@
 use super::native;
-use super::stream::{PreparedTarget, ResolvedStream, normalization_gain};
+use super::stream::{AVAILABLE_AT_PRINT, PreparedTarget, ResolvedStream, normalization_gain};
 use crate::auth::PlaybackCredentials;
 use crate::os::{ChildOutput, ExitNotice, Group, child_output, exit_notice, private_file};
 use anyhow::{Context, Result, bail, ensure};
@@ -73,6 +73,8 @@ pub(super) fn extractor_arguments(
         "--no-warnings",
         "--quiet",
         "--get-url",
+        "--print",
+        AVAILABLE_AT_PRINT,
         // Extraction must not persist account data or signed URLs in a disk cache.
         "--no-cache-dir",
     ]);
@@ -85,14 +87,21 @@ pub(super) fn extractor_arguments(
             .arg("--js-runtimes")
             .arg(format!("deno:{}", deno.display()));
     }
-    // The default tv_samsung (TVHTML5) client's stream URLs return 403 for several
-    // seconds after extraction, and mpv opens them at once (#246). Drop this once
-    // a reviewed yt-dlp no longer picks that client by default. The account
-    // extractor reads extractor arguments under its own name.
+    // TV clients' streams can wait for a pre-roll ad (see AVAILABLE_AT_PRINT).
+    // Signed out, the default tv_samsung would make every play wait, while
+    // VISIONOS needs none (#246). Signed in, tv_downgraded has the formats the
+    // web clients lack without a PO token, as it did before yt-dlp 2026.10.26;
+    // signed out it fails. The account extractor reads extractor arguments
+    // under its own name.
+    let clients = if credentials.is_some() {
+        "default,-tv_samsung,tv_downgraded"
+    } else {
+        "default,-tv_samsung"
+    };
     for extractor in ["youtube", "ytmusicaccount"] {
         command
             .arg("--extractor-args")
-            .arg(format!("{extractor}:player_client=default,-tv_samsung"));
+            .arg(format!("{extractor}:player_client={clients}"));
     }
     command.arg("--no-plugin-dirs");
     // The account extractor reads cookies and identity from stdin; see send_credentials.
@@ -370,7 +379,8 @@ impl StreamPreparation {
             .take(16 * 1024 + 1)
             .read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 16 * 1024, "Oversized prepared stream");
-        // The CLI fallback prints only URLs, so these streams play unnormalized.
+        // The CLI fallback prints only URLs and when they open, so these
+        // streams play unnormalized.
         ResolvedStream::parse(self.target.key.clone(), &bytes, 0., SystemTime::now()).map(Some)
     }
 }

@@ -34,7 +34,8 @@ jobs:
           bin/test -- --ignored --exact \
             player::tests::plays_with_the_installed_libmpv \
             player::tests::playback_checks_the_account_version_once_when_needed \
-            player::tests::idle_player_plays_the_restored_song_from_its_preparation
+            player::tests::idle_player_plays_the_restored_song_from_its_preparation \
+            player::tests::streams_open_only_once_youtube_serves_them
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         id: python
         with:
