@@ -45,11 +45,11 @@ install_main() {
         # Under curl | sh, stdin is the script; package managers prompt on the terminal.
         case "$answer" in y|Y|yes|YES) sudo "$@" < /dev/tty ;; *) return 1 ;; esac
     }
-    if ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    if ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
         case "$manager" in pacman) python_package=python ;; *) python_package=python3 ;; esac
         packages "$python_package" || exit 1
-        python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 10))' || {
-            printf '%s\n' 'Python 3.10 or newer is required.' >&2; exit 1;
+        python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
+            printf '%s\n' 'Python 3.11 or newer is required.' >&2; exit 1;
         }
     fi
     if [ "$action" != uninstall ]; then

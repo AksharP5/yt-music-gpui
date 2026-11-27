@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import subprocess
 import unittest
@@ -29,6 +30,8 @@ from yt_dlp.utils import DownloadError, ExtractorError
 plugin_dirs.value = []
 plugin_root = Path(sys.argv.pop(1))
 server_script = Path(sys.argv.pop(1)).read_text()
+# The arguments the app gives every yt-dlp it runs, from extractor_arguments.
+app_arguments = json.loads(sys.argv.pop(1))
 spec = importlib.util.spec_from_file_location("account_contract", plugin_root / "account/yt_dlp_plugins/extractor/account.py")
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
@@ -239,6 +242,20 @@ with YoutubeDL({'quiet': True, 'allowed_extractors': ['^ytmusicaccount$']}) as y
         load_all_plugins()
         with yt_dlp.YoutubeDL(params) as ydl:
             self.assertEqual([ie.IE_NAME for ie in ydl._ies.values()], ["ytmusicaccount"])
+
+    def test_app_arguments_never_request_tv_samsung(self):
+        # Its stream URLs return 403 for several seconds after extraction (#246).
+        _, _, _, params = yt_dlp.parse_options(app_arguments)
+        ydl = yt_dlp.YoutubeDL(params, auto_init=False)
+        for ie in [YoutubeIE(ydl), plugin.YtMusicAccountIE(ydl)]:
+            # The app always passes Deno, so a JS runtime is available.
+            ie._jsc_director = SimpleNamespace(providers={"deno": SimpleNamespace(is_available=lambda: True)})
+            for authenticated, premium in [(False, False), (True, False), (True, True)]:
+                with self.subTest(ie=ie.IE_NAME, authenticated=authenticated, premium=premium), \
+                        patch.object(type(ie), "is_authenticated", authenticated):
+                    clients = ie._get_requested_clients("https://music.youtube.com/watch?v=abcdefghijk", {}, premium)
+                    self.assertTrue(clients)
+                    self.assertNotIn("tv_samsung", clients)
 
 
 class WarmServerContract(unittest.TestCase):

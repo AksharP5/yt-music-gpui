@@ -782,7 +782,9 @@ mod tests {
     use super::stream::tests::synthetic_full_extractor;
     #[cfg(unix)]
     use super::ytdlp::{REVIEWED_YTDLP, tests::alive};
-    use super::ytdlp::{tests::synthetic_credentials, write_account_extractor};
+    use super::ytdlp::{
+        extractor_arguments, tests::synthetic_credentials, write_account_extractor,
+    };
     use super::*;
     use crate::os::{IpcStream, ipc_path};
     #[cfg(target_os = "linux")]
@@ -1208,7 +1210,7 @@ assert all(choose(s, [progressive[1]]) is None for s in video_selectors)
         fs::write(
             &extractor,
             r#"#!/bin/sh
-if [ "$3" = --version ]; then echo 2026.08.19; exit; fi
+if [ "$3" = --version ]; then echo 2026.11.23; exit; fi
 exec python3 -c '
 import json, os, signal, sys
 from pathlib import Path
@@ -1392,17 +1394,21 @@ os.kill(os.getpid(), signal.SIGSTOP)
     }
 
     #[test]
-    #[ignore = "requires Python with yt-dlp 2026.08.19; set YT_DLP_TEST_PYTHON if needed; no network"]
+    #[ignore = "requires Python with yt-dlp 2026.11.23; set YT_DLP_TEST_PYTHON if needed; no network"]
     fn embedded_extractor_binds_the_selected_account() {
         let runtime = tempfile::tempdir().unwrap();
         let plugin_dir = write_account_extractor(runtime.path()).unwrap();
         let python = std::env::var_os("YT_DLP_TEST_PYTHON").unwrap_or_else(|| "python3".into());
         let server_script = runtime.path().join("ytdlp_resolver.py");
         fs::write(&server_script, include_str!("ytdlp_resolver.py")).unwrap();
+        let mut app = Command::new("yt-dlp");
+        extractor_arguments(&mut app, None);
+        let app_arguments: Vec<_> = app.get_args().map(|arg| arg.to_string_lossy()).collect();
         let mut child = Command::new(python)
             .args(["-B", "-"])
             .arg(plugin_dir)
             .arg(server_script)
+            .arg(serde_json::to_string(&app_arguments).unwrap())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1939,7 +1945,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let path = directory.path().join("silence?expire=1.wav");
         fs::rename(silent_audio(directory.path(), 120), &path).unwrap();
         let extractor = directory.path().join("extractor");
-        fs::write(&extractor, "#!/bin/sh\necho 2026.08.19\n").unwrap();
+        fs::write(&extractor, "#!/bin/sh\necho 2026.11.23\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
         let player = Player::with_extractor(
             PlayerOptions {
@@ -2000,7 +2006,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         fs::write(
             &extractor,
             format!(
-                "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\necho >> '{}'\nprintf 'file://%s\\n' '{}'\n",
+                "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.11.23; exit; fi\necho >> '{}'\nprintf 'file://%s\\n' '{}'\n",
                 calls.display(),
                 path.display()
             ),
@@ -2073,7 +2079,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
         let directory = tempfile::tempdir().unwrap();
         let path = silent_audio(directory.path(), 120);
         let extractor = directory.path().join("extractor");
-        fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.08.19; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
+        fs::write(&extractor, "#!/bin/sh\nif [ \"$3\" = --version ]; then echo 2026.11.23; exit; fi\nprintf 'https://rr1.googlevideo.com/audio?expire=%s\\n' \"$(($(date +%s) + 62))\"\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700)).unwrap();
         let player = Player::with_extractor(
             PlayerOptions {

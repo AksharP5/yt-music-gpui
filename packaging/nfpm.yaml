@@ -69,7 +69,7 @@ overrides:
       - libfontconfig1
       - libfreetype6
       - libvulkan1
-      - python3 (>= 3.10)
+      - python3 (>= 3.11)
       - libsecret-tools
       - xdg-utils
     recommends:
@@ -92,7 +92,7 @@ overrides:
       - libfontconfig.so.1()(64bit)
       - libfreetype.so.6()(64bit)
       - libvulkan.so.1()(64bit)
-      - python3 >= 3.10
+      - python3 >= 3.11
       - /usr/bin/secret-tool
       - /usr/bin/xdg-open
 
