@@ -15,6 +15,22 @@ pub(in crate::app) enum SettingMenu {
     VideoQuality,
 }
 
+impl SettingMenu {
+    fn selected_index(self, library: &Library) -> Option<usize> {
+        match self {
+            Self::Speed => PlaybackSpeed::ALL
+                .iter()
+                .position(|speed| *speed == library.speed),
+            Self::AudioQuality => AudioQuality::ALL
+                .iter()
+                .position(|quality| *quality == library.quality),
+            Self::VideoQuality => VideoQuality::ALL
+                .iter()
+                .position(|quality| *quality == library.video_quality),
+        }
+    }
+}
+
 impl Music {
     /// Close a setting's choices and return focus to the field that opened them.
     pub(in crate::app) fn close_settings_menu(
@@ -84,7 +100,14 @@ impl Music {
                     ))
                     .on_click(cx.listener(move |view, _, window, cx| {
                         view.settings_menu = Some((kind, window.focused(cx)));
-                        window.focus(&view.settings_focus, cx);
+                        window.focus(
+                            if kind.selected_index(&view.library).is_some() {
+                                &view.settings_selection_focus
+                            } else {
+                                &view.settings_focus
+                            },
+                            cx,
+                        );
                         let bounds = field_bounds.get();
                         view.overlay_anchor = Some(point(bounds.left(), bounds.bottom()));
                         cx.notify();
@@ -285,31 +308,17 @@ impl Music {
             .inset_0()
             .child(self.backdrop(body.into_any_element(), cx));
         if let Some((kind, _)) = self.settings_menu {
-            let (choices, selected): (Vec<String>, Option<usize>) = match kind {
-                SettingMenu::Speed => (
-                    PlaybackSpeed::ALL
-                        .map(|speed| format!("{}×", f64::from(speed)))
-                        .to_vec(),
-                    PlaybackSpeed::ALL
-                        .iter()
-                        .position(|speed| *speed == self.library.speed),
-                ),
-                SettingMenu::AudioQuality => (
-                    AudioQuality::ALL
-                        .map(|quality| quality.label().to_owned())
-                        .to_vec(),
-                    AudioQuality::ALL
-                        .iter()
-                        .position(|quality| *quality == self.library.quality),
-                ),
-                SettingMenu::VideoQuality => (
-                    VideoQuality::ALL
-                        .map(|quality| quality.label().to_owned())
-                        .to_vec(),
-                    VideoQuality::ALL
-                        .iter()
-                        .position(|quality| *quality == self.library.video_quality),
-                ),
+            let selected = kind.selected_index(&self.library);
+            let choices = match kind {
+                SettingMenu::Speed => PlaybackSpeed::ALL
+                    .map(|speed| format!("{}×", f64::from(speed)))
+                    .to_vec(),
+                SettingMenu::AudioQuality => AudioQuality::ALL
+                    .map(|quality| quality.label().to_owned())
+                    .to_vec(),
+                SettingMenu::VideoQuality => VideoQuality::ALL
+                    .map(|quality| quality.label().to_owned())
+                    .to_vec(),
             };
             let menu = div()
                 .id("settings-options")
@@ -333,7 +342,8 @@ impl Music {
                         .text_size(px(14.))
                         .cursor_pointer()
                         .when(selected == Some(index), |row| {
-                            row.bg(gpui::white().opacity(0.1))
+                            row.track_focus(&self.settings_selection_focus)
+                                .bg(gpui::white().opacity(0.1))
                         })
                         .hover(|row| row.bg(gpui::white().opacity(0.1)))
                         .child(label)

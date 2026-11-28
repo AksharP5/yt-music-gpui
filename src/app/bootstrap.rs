@@ -451,6 +451,7 @@ impl Music {
             picker_focus: VirtualListFocus::default(),
             picker_scroll: UniformListScrollHandle::new(),
             settings_focus: cx.focus_handle(),
+            settings_selection_focus: cx.focus_handle().tab_stop(true),
             overlay_opener: None,
             overlay_subscription: None,
             drag: None,

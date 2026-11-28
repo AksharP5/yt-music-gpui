@@ -209,6 +209,7 @@ pub struct Music {
     picker_focus: VirtualListFocus<crate::playlist_choices::Destination>,
     picker_scroll: UniformListScrollHandle,
     settings_focus: FocusHandle,
+    settings_selection_focus: FocusHandle,
     /// The control focused when the overlay opened, which regains focus when it closes.
     overlay_opener: Option<FocusHandle>,
     overlay_subscription: Option<Subscription>,
