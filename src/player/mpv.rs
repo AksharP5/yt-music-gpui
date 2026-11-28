@@ -262,6 +262,36 @@ pub(super) fn request(
     }
 }
 
+/// mpv starts a track enabled during a file's opening seek from 0:00, not from
+/// the position the other tracks seek to. A video resumed partway would then
+/// read and decode everything before that point first, which at 720p and up
+/// takes minutes. Seeking again starts every track at that position.
+pub(super) fn resync_opening_seek(
+    socket: &mut IpcStream,
+    pending: &mut Vec<u8>,
+    mut on_event: impl FnMut(Value),
+) -> Result<()> {
+    let seeking = request(
+        socket,
+        pending,
+        json!(["get_property", "seeking"]),
+        &mut on_event,
+    );
+    if !seeking.is_ok_and(|seeking| seeking == true) {
+        return Ok(());
+    }
+    // While seeking, mpv reports the seek's target as the position.
+    let Ok(position) = request(
+        socket,
+        pending,
+        json!(["get_property", "time-pos"]),
+        &mut on_event,
+    ) else {
+        return Ok(());
+    };
+    write_command(socket, json!(["seek", position, "absolute+exact"]), None)
+}
+
 pub(super) fn read_message(
     socket: &mut IpcStream,
     pending: &mut Vec<u8>,
@@ -1022,6 +1052,44 @@ pub(super) mod tests {
         assert!(first_id.as_i64().unwrap() < 0);
         assert!(second_id.as_i64().unwrap() < 0);
         assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn video_enabled_mid_seek_seeks_again_to_the_target() {
+        for (seeking, expected) in [
+            (true, Some(json!(["seek", 114.56, "absolute+exact"]))),
+            (false, None),
+        ] {
+            let (mut socket, mut mpv) = IpcStream::pair().unwrap();
+            mpv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let worker = thread::spawn(move || {
+                let mut answer = |data: Value| {
+                    let request = socket_message(&mut mpv);
+                    let id = request["request_id"].clone();
+                    writeln!(
+                        mpv,
+                        "{}",
+                        json!({"request_id":id,"error":"success","data":data})
+                    )
+                    .unwrap();
+                    request["command"].clone()
+                };
+                assert_eq!(answer(json!(seeking)), json!(["get_property", "seeking"]));
+                if !seeking {
+                    // Read here: Windows cancels a pipe read when its thread exits.
+                    mpv.set_read_timeout(Some(Duration::from_millis(50)))
+                        .unwrap();
+                    let sent = mpv.read(&mut [0]).is_ok().then(|| json!("a command"));
+                    return (sent, mpv);
+                }
+                assert_eq!(answer(json!(114.56)), json!(["get_property", "time-pos"]));
+                let sent = socket_message(&mut mpv)["command"].clone();
+                (Some(sent), mpv)
+            });
+            resync_opening_seek(&mut socket, &mut Vec::new(), |_| {}).unwrap();
+            let (sent, _mpv) = worker.join().unwrap();
+            assert_eq!(sent, expected);
+        }
     }
 
     #[test]
