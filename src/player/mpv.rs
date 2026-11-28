@@ -1075,24 +1075,20 @@ pub(super) mod tests {
                     request["command"].clone()
                 };
                 assert_eq!(answer(json!(seeking)), json!(["get_property", "seeking"]));
-                if seeking {
-                    assert_eq!(answer(json!(114.56)), json!(["get_property", "time-pos"]));
-                }
-                mpv
-            });
-            resync_opening_seek(&mut socket, &mut Vec::new(), |_| {}).unwrap();
-            let mut mpv = worker.join().unwrap();
-            match expected {
-                Some(seek) => assert_eq!(socket_message(&mut mpv)["command"], seek),
-                None => {
+                if !seeking {
+                    // Read here: Windows cancels a pipe read when its thread exits.
                     mpv.set_read_timeout(Some(Duration::from_millis(50)))
                         .unwrap();
-                    assert!(
-                        mpv.read(&mut [0]).is_err(),
-                        "a player that is not seeking must not seek again"
-                    );
+                    let sent = mpv.read(&mut [0]).is_ok().then(|| json!("a command"));
+                    return (sent, mpv);
                 }
-            }
+                assert_eq!(answer(json!(114.56)), json!(["get_property", "time-pos"]));
+                let sent = socket_message(&mut mpv)["command"].clone();
+                (Some(sent), mpv)
+            });
+            resync_opening_seek(&mut socket, &mut Vec::new(), |_| {}).unwrap();
+            let (sent, _mpv) = worker.join().unwrap();
+            assert_eq!(sent, expected);
         }
     }
 
