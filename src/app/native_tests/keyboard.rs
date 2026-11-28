@@ -9,6 +9,81 @@ use gpui::{
     AppContext, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
 };
 
+#[test]
+#[ignore = "requires desktop, private D-Bus and isolated runtime/data; synthetic accounts only"]
+fn settings_dropdown_arrows_start_at_the_selected_option() -> anyhow::Result<()> {
+    use crate::app::{Music, SettingsSection};
+    use crate::player::{AudioQuality, PlaybackSpeed, VideoQuality};
+
+    type SelectedIndex = fn(&Music) -> usize;
+    check_cache_window(async |window, cx| {
+        let choices: [(_, _, _, _, SelectedIndex); 3] = [
+            ("Audio quality", 5, 1, 2, |view| {
+                AudioQuality::ALL
+                    .iter()
+                    .position(|choice| *choice == view.library.quality)
+                    .unwrap()
+            }),
+            ("Video quality", 6, 4, 7, |view| {
+                VideoQuality::ALL
+                    .iter()
+                    .position(|choice| *choice == view.library.video_quality)
+                    .unwrap()
+            }),
+            ("Playback speed", 7, 3, 7, |view| {
+                PlaybackSpeed::ALL
+                    .iter()
+                    .position(|choice| *choice == view.library.speed)
+                    .unwrap()
+            }),
+        ];
+        for (label, tabs, selected, last, current) in choices {
+            window
+                .update(cx, |view, window, cx| {
+                    view.settings_section = SettingsSection::Playback;
+                    view.open_overlay(Overlay::Settings, window, cx);
+                })
+                .unwrap();
+            wait_for_presented_frame(window, cx).await;
+            for _ in 0..tabs {
+                key(window, cx, "tab").await;
+            }
+            let opener = window
+                .update(cx, |view, window, cx| {
+                    assert_eq!(current(view), selected, "{label} initial value");
+                    window.focused(cx).unwrap()
+                })
+                .unwrap();
+
+            for (keys, before, after) in [
+                (&["down"][..], selected, selected + 1),
+                (&["end", "down"][..], selected + 1, 0),
+                (&["end", "home", "up"][..], 0, last),
+                (&[][..], last, last),
+            ] {
+                key(window, cx, "enter").await;
+                for name in keys {
+                    key(window, cx, name).await;
+                }
+                window
+                    .update(cx, |view, _, _| {
+                        assert!(view.settings_menu.is_some(), "{label} menu is open");
+                        assert_eq!(current(view), before, "{label} before Enter");
+                    })
+                    .unwrap();
+                key(window, cx, "enter").await;
+                window
+                    .update(cx, |view, window, _| {
+                        assert_eq!(current(view), after, "{label} after {keys:?} and Enter");
+                        assert!(view.settings_menu.is_none(), "{label} menu closed");
+                        assert!(opener.is_focused(window), "{label} focus returned");
+                    })
+                    .unwrap();
+            }
+        }
+    })
+}
+
 mod focus_return {
     use super::super::navigation::{check_cache_window, reply};
     use super::super::render::{key, wait_for_presented_frame};
